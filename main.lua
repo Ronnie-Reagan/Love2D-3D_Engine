@@ -25,14 +25,14 @@ local function generateGround(tileSize, gridCount, baseHeight)
     local tiles = {}
     local half = tileSize / 2
 
-    for x = -gridCount/2, gridCount/2 - 1 do
-        for z = -gridCount/2, gridCount/2 - 1 do
+    for x = -gridCount / 2, gridCount / 2 - 1 do
+        for z = -gridCount / 2, gridCount / 2 - 1 do
             local posX = x * tileSize + half
             local posZ = z * tileSize + half
-            -- random greenish color variation
-            local r = 0.2 + math.random() * 0.1
-            local g = 0.6 + math.random() * 0.2
-            local b = 0.2 + math.random() * 0.1
+            -- small color variation for realism
+            local r = 0.2 + math.random() * 0.05
+            local g = 0.6 + math.random() * 0.1
+            local b = 0.2 + math.random() * 0.05
 
             table.insert(tiles, {
                 model = cubeModel,
@@ -40,13 +40,14 @@ local function generateGround(tileSize, gridCount, baseHeight)
                 rot = q.identity(),
                 color = { r, g, b },
                 isSolid = true,
-                halfSize = { x = tileSize/2, y = 0.1, z = tileSize/2 } -- thin tile
+                halfSize = { x = tileSize / 2, y = 0.005, z = tileSize / 2 } -- thin tile
             })
         end
     end
 
     return tiles
 end
+
 -- === Initial Configuration ===
 function love.load()
     -- 80% screen size
@@ -76,7 +77,7 @@ function love.load()
         maxSpeed = 50,
         box = {
             halfSize = { x = 0.5, y = 1.8, z = 0.5 }, -- width/height/depth half extents
-            pos = { 0, 0, -5 },                 -- center at camera
+            pos = { 0, 0, -5 },                       -- center at camera
             isSolid = true
         }
     }
@@ -92,16 +93,16 @@ function love.load()
         }
     }
 
--- generate a 1000x1000 ground made of 10x10 tiles
-local tileSize = 10
-local gridCount = 100 -- 100 tiles per side -> 1000 units total
-local baseHeight = -0.1
+    -- generate a 1000x1000 ground made of 10x10 tiles
+    local tileSize = 2
+    local gridCount = 10 -- 100 tiles per side -> 1000 units total
+    local baseHeight = -0.1
 
-local groundTiles = generateGround(tileSize, gridCount, baseHeight)
+    local groundTiles = generateGround(tileSize, gridCount, baseHeight)
 
-for _, tile in ipairs(groundTiles) do
-    table.insert(objects, tile)
-end
+    for _, tile in ipairs(groundTiles) do
+        table.insert(objects, tile)
+    end
 end
 
 -- === Mouse Look ===
