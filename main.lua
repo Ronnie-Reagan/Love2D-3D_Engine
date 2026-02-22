@@ -180,15 +180,21 @@ function handlePacket(data)
     end
 
     if parts[1] == "STATE" then
-        if not peers[parts[#parts]] then
-            peers[parts[#parts]] = createObjectForPeer(tonumber(parts[#parts]))
+        local id = tonumber(parts[#parts])
+
+        if not peers[id] then
+            peers[id] = createObjectForPeer(id)
         end
-        objects[2].pos = {
+
+        local obj = peers[id]
+
+        obj.pos = {
             tonumber(parts[2]),
             tonumber(parts[3]),
             tonumber(parts[4])
         }
-        objects[2].rot = {
+
+        obj.rot = {
             w = tonumber(parts[5]),
             x = tonumber(parts[6]),
             y = tonumber(parts[7]),
@@ -263,7 +269,7 @@ function love.update(dt)
         camera.rot = q.normalize(q.multiply(roll, camera.rot))
     end
     updateNet()
-    local event = relay:service()
+    event = relay:service()
 
     while event do
         if event.type == "receive" then
