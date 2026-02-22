@@ -6,26 +6,24 @@ local clients = {}
 print("Relay running on port 1988")
 
 function love.update(dt)
-    while true do
-        local event = host:service(10)
+    local event = host:service(10)
 
-        while event do
-            if event.type == "connect" then
-                print("Client connected:", event.peer)
-                clients[event.peer:index()] = event.peer
-            elseif event.type == "receive" then
-                -- Forward to all other clients
-                for id, peer in pairs(clients) do
-                    if peer ~= event.peer then
-                        peer:send(event.data .. tostring(event.peer))
-                    end
+    while event do
+        if event.type == "connect" then
+            print("Client connected:", event.peer)
+            clients[event.peer:index()] = event.peer
+        elseif event.type == "receive" then
+            -- Forward to all other clients
+            for id, peer in pairs(clients) do
+                if peer ~= event.peer then
+                    peer:send(event.data .. "|" .. tostring(event.peer:index()))
                 end
-            elseif event.type == "disconnect" then
-                print("Client disconnected:", event.peer)
-                clients[event.peer:index()] = nil
             end
-
-            event = host:service()
+        elseif event.type == "disconnect" then
+            print("Client disconnected:", event.peer)
+            clients[event.peer:index()] = nil
         end
+
+        event = host:service()
     end
 end

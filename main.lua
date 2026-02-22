@@ -159,15 +159,17 @@ function love.mousemoved(x, y, dx, dy)
 end
 
 local function createObjectForPeer(peerID)
-            table.insert(objects, {
-            model = cubeModel,
-            pos = { 50, 10, 10 },
-            rot = q.identity(),
-            color = { 0.9, 0.4, 0.1 },
-            isSolid = true,
-            id = peerID
-        }
-    )
+    local obj = {
+        model = cubeModel,
+        pos = {0,0,0},
+        rot = q.identity(),
+        color = {math.random(), math.random(), math.random()},
+        isSolid = true,
+        id = peerID
+    }
+
+    table.insert(objects, obj)
+    return obj
 end
 
 local peers = {}
