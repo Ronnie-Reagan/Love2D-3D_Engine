@@ -51,13 +51,7 @@ function love.load()
             color = { 0.9, 0.4, 0.1 },
             isSolid = true
         },
-        [2] = {
-            model = cubeModel,
-            pos = { 50, 10, 10 },
-            rot = q.identity(),
-            color = { 0.9, 0.4, 0.1 },
-            isSolid = true
-        }
+
     }
 
     groundObject = {
@@ -164,7 +158,19 @@ function love.mousemoved(x, y, dx, dy)
     camera.rot = q.normalize(q.multiply(yawQuat, q.multiply(pitchQuat, camera.rot)))
 end
 
-players = players or {}
+local function createObjectForPeer(peerID)
+            table.insert(objects, {
+            model = cubeModel,
+            pos = { 50, 10, 10 },
+            rot = q.identity(),
+            color = { 0.9, 0.4, 0.1 },
+            isSolid = true,
+            id = peerID
+        }
+    )
+end
+
+local peers = {}
 function handlePacket(data)
     local parts = {}
     for p in string.gmatch(data, "([^|]+)") do
@@ -172,21 +178,41 @@ function handlePacket(data)
     end
 
     if parts[1] == "STATE" then
-        -- simple example using peer index as ID later if needed
+        if not peers[parts[#parts]] then
+            peers[parts[#parts]] = createObjectForPeer(tonumber(parts[#parts]))
+        end
         objects[2].pos = {
-                tonumber(parts[2]),
-                tonumber(parts[3]),
-                tonumber(parts[4])
-            }
-            objects[2].rot = {
-                w = tonumber(parts[5]),
-                x = tonumber(parts[6]),
-                y = tonumber(parts[7]),
-                z = tonumber(parts[8])
-            }
+            tonumber(parts[2]),
+            tonumber(parts[3]),
+            tonumber(parts[4])
+        }
+        objects[2].rot = {
+            w = tonumber(parts[5]),
+            x = tonumber(parts[6]),
+            y = tonumber(parts[7]),
+            z = tonumber(parts[8])
+        }
     end
 end
+
 local event = relay:service()
+
+local function updateNet()
+    if relayServer then
+        local packet = string.format(
+            "STATE|%f|%f|%f|%f|%f|%f|%f",
+            camera.pos[1],
+            camera.pos[2],
+            camera.pos[3],
+            camera.rot.w,
+            camera.rot.x,
+            camera.rot.y,
+            camera.rot.z
+        )
+        relayServer:send(packet)
+    end
+end
+
 -- === Camera Movement ===
 function love.update(dt)
     local speed = camera.speed * dt
@@ -234,21 +260,7 @@ function love.update(dt)
         local roll = q.fromAxisAngle(q.rotateVector(camera.rot, { 0, 0, 0.5 }), math.rad(2.5))
         camera.rot = q.normalize(q.multiply(roll, camera.rot))
     end
-    if relayServer then
-        local packet = string.format(
-            "STATE|%f|%f|%f|%f|%f|%f|%f",
-            camera.pos[1],
-            camera.pos[2],
-            camera.pos[3],
-            camera.rot.w,
-            camera.rot.x,
-            camera.rot.y,
-            camera.rot.z
-        )
-
-        relayServer:send(packet)
-    end
-    
+    updateNet()
     local event = relay:service()
 
     while event do

@@ -17,7 +17,7 @@ function love.update(dt)
                 -- Forward to all other clients
                 for id, peer in pairs(clients) do
                     if peer ~= event.peer then
-                        peer:send(event.data)
+                        peer:send(event.data .. tostring(event.peer))
                     end
                 end
             elseif event.type == "disconnect" then
