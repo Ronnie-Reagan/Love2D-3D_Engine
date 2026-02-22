@@ -1,7 +1,8 @@
 local enet = require("enet")
-
-local host = enet.host_create("*:1988")
-local clients = {}
+local love = require "love" -- avoids nil report from intellisense, safe to remove if causes issues (it should be OK)
+local host = enet.host_create("*:1988") -- 1987 is used, increment upwards
+local clients = {} -- {[peer:index] = peer, etc.}
+local projectiles = {} -- maybe to contain projectile class for bullet handling as server after initial post of creation(validated with pos and such)
 
 print("Relay running on port 1988")
 

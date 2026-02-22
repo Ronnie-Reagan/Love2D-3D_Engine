@@ -1,22 +1,8 @@
-function love.load()
-    love.window.setTitle("4D Object Viewing")
-    love.window.setMode(800, 600)
+local love = require "love"
+local screen, fov, pitch, angleYaw, anglePitch, rotationSpeed, rotating, mode, cube, lastX, lastY
 
-    screen = {
-        w = 800,
-        h = 600
-    }
-    fov = 600
-    pitch = 0.75
-    angleYaw, anglePitch = 0, 0
-    rotationSpeed = 0.01
-    rotating = false
 
-    mode = 1 -- 1 = tesseract, 2 = hypercube
-    buildTesseract(mode)
-end
-
-function buildTesseract(mode)
+local function buildTesseract(mode)
     cube = {
         vertices = {},
         edges = {}
@@ -101,7 +87,25 @@ function buildTesseract(mode)
     end
 end
 
-function rotate4D(x, y, z, w, yaw, pitch)
+function love.load()
+    love.window.setTitle("4D Object Viewing")
+    love.window.setMode(800, 600)
+
+    screen = {
+        w = 800,
+        h = 600
+    }
+    fov = 600
+    pitch = 0.75
+    angleYaw, anglePitch = 0, 0
+    rotationSpeed = 0.01
+    rotating = false
+
+    mode = 1 -- 1 = tesseract, 2 = hypercube
+    buildTesseract(mode)
+end
+
+local function rotate4D(x, y, z, w, yaw, pitch)
     local c, s = math.cos(yaw), math.sin(yaw)
     x, y = x * c - y * s, x * s + y * c
 
@@ -111,13 +115,13 @@ function rotate4D(x, y, z, w, yaw, pitch)
     return x, y, z, w
 end
 
-function project4Dto3D(x, y, z, w)
+local function project4Dto3D(x, y, z, w)
     local d = 4
     local wFactor = 1 / (d - w)
     return x * wFactor, y * wFactor, z * wFactor
 end
 
-function project3Dto2D(x, y, z)
+local function project3Dto2D(x, y, z)
     local scale = fov / (z + 5)
     return x * scale + screen.w / 2, y * scale + screen.h / 2
 end

@@ -1,18 +1,52 @@
 local q = require("quat")
 local vector3 = require("vector3")
-local love = love
+local love = require "love" -- avoids nil report from intellisense, safe to remove if causes issues (it should be OK)
 local enet = require "enet"
-
+local engine = require "engine"
+local networking = require "networking"
 local hostAddy = "ecosim.donreagan.ca:1988"
 local relay = enet.host_create()
 local relayServer = relay:connect(hostAddy)
+local flightSimMode = false
+local relative = true
+local peers = {}
+local event = relay:service()
+local objects = require "object"
+local cubeModel = objects.cubeModel
+local screen, camera, groundObject, triangleCount --, zBuffer
 
 --[[
 Notes:
 
 positions are {x = left/right(width), y = up/down(height), z = in/out(depth)} IN WORLD SPACE!!
 ]]
+-- Procedurally generate a ground grid of cubes
+local function generateGround(tileSize, gridCount, baseHeight)
+    local tiles = {}
+    local half = tileSize / 2
 
+    for x = -gridCount/2, gridCount/2 - 1 do
+        for z = -gridCount/2, gridCount/2 - 1 do
+            local posX = x * tileSize + half
+            local posZ = z * tileSize + half
+            -- random greenish color variation
+            local r = 0.2 + math.random() * 0.1
+            local g = 0.6 + math.random() * 0.2
+            local b = 0.2 + math.random() * 0.1
+
+            table.insert(tiles, {
+                model = cubeModel,
+                pos = { posX, baseHeight, posZ },
+                rot = q.identity(),
+                color = { r, g, b },
+                isSolid = true,
+                halfSize = { x = tileSize/2, y = 0.1, z = tileSize/2 } -- thin tile
+            })
+        end
+    end
+
+    return tiles
+end
 -- === Initial Configuration ===
 function love.load()
     -- 80% screen size
@@ -22,7 +56,7 @@ function love.load()
     love.window.setTitle("Don's 3D Engine")
     love.window.setMode(width, height)
     love.mouse.setRelativeMode(true)
-    zBuffer = {}
+    --zBuffer = {}
 
     screen = {
         w = width,
@@ -33,16 +67,21 @@ function love.load()
         pos = { 0, 0, -5 },
         rot = q.identity(),
         speed = 10,
-        fov = math.rad(90)
+        fov = math.rad(90),
+        vel = { 0, 0, 0 }, -- current velocity
+        onGround = false,  -- contacting
+        gravity = -9.81,   -- units/sec^2
+        jumpSpeed = 5,     -- initial jump
+        throttle = 0,
+        maxSpeed = 50,
+        box = {
+            halfSize = { x = 0.5, y = 1.8, z = 0.5 }, -- width/height/depth half extents
+            pos = { 0, 0, -5 },                 -- center at camera
+            isSolid = true
+        }
     }
-
-    -- defualt testing cube
-    cubeModel = {
-        vertices = { { -1, -1, -1 }, { 1, -1, -1 }, { 1, 1, -1 }, { -1, 1, -1 }, { -1, -1, 1 }, { 1, -1, 1 }, { 1, 1, 1 }, { -1, 1, 1 } },
-        faces = { { 4, 3, 2, 1 }, { 5, 6, 7, 8 }, { 1, 2, 6, 5 }, { 2, 3, 7, 6 }, { 3, 4, 8, 7 }, { 4, 1, 5, 8 } }
-    }
-
     -- creating the cube's object
+    -- disabled now that other players can join allowing for non-static testing of latency and culling/depth ordering
     objects = {
         [1] = {
             model = cubeModel,
@@ -50,160 +89,40 @@ function love.load()
             rot = q.identity(),
             color = { 0.9, 0.4, 0.1 },
             isSolid = true
-        },
-
+        }
     }
 
-    groundObject = {
-        model = {
-            vertices = { { -50, 0, -50 }, { 50, 0, -50 }, { 50, 0, 50 }, { -50, 0, 50 } },
-            faces = { { 1, 2, 3, 4 }, -- top
-                { 4, 3, 2, 1 }        -- bottom (backface)
-            }
-        },
-        pos = { 0, -80, 0 },
-        rot = q.identity(),
-        isSolid = true,
-        color = { 0.3, 0.3, 0.3 }
-    }
+-- generate a 1000x1000 ground made of 10x10 tiles
+local tileSize = 10
+local gridCount = 100 -- 100 tiles per side -> 1000 units total
+local baseHeight = -0.1
 
-    table.insert(objects, groundObject)
+local groundTiles = generateGround(tileSize, gridCount, baseHeight)
+
+for _, tile in ipairs(groundTiles) do
+    table.insert(objects, tile)
+end
 end
 
--- === Utilities ===
-function loadSTL(path)
-    local vertices, faces = {}, {}
-    -- Parse ASCII STL (add binary support later if needed)
-    for line in love.filesystem.lines(path) do
-        if line:match("^vertex") then
-            local x, y, z = line:match("vertex%s+([%-%d%.]+)%s+([%-%d%.]+)%s+([%-%d%.]+)")
-            table.insert(vertices, { tonumber(x), tonumber(y), tonumber(z) })
-        elseif line:match("^endfacet") then
-            local count = #vertices
-            table.insert(faces, { count - 2, count - 1, count })
-        end
-    end
-    return {
-        vertices = vertices,
-        faces = faces,
-        isSolid = true
-    }
-end
-
-function checkCollision(objA, objB)
-    if not objA.isSolid or not objB.isSolid then
-        return false
-    end
-    local ax, ay, az = unpack(objA.pos)
-    local bx, by, bz = unpack(objB.pos)
-    local dx = ax - bx
-    local dy = ay - by
-    local dz = az - bz
-    local distSq = dx * dx + dy * dy + dz * dz
-    return distSq < (objA.radius + objB.radius) ^ 2
-end
-
-local function getCameraBasis()
-    local forward = q.rotateVector(camera.rot, { 0, 0, 1 })
-    local right = q.rotateVector(camera.rot, { 1, 0, 0 })
-    local up = q.rotateVector(camera.rot, { 0, 1, 0 })
-    return vector3.normalizeVec(forward), vector3.normalizeVec(right), vector3.normalizeVec(up)
-end
-
-local function transformVertex(v, obj)
-    local rotated = q.rotateVector(obj.rot, v)
-    local world = { rotated[1] + obj.pos[1], rotated[2] + obj.pos[2], rotated[3] + obj.pos[3] }
-
-    local rel = { world[1] - camera.pos[1], world[2] - camera.pos[2], world[3] - camera.pos[3] }
-
-    local camConj = q.conjugate and q.conjugate(camera.rot) or {
-        w = camera.rot.w,
-        x = -camera.rot.x,
-        y = -camera.rot.y,
-        z = -camera.rot.z
-    }
-
-    local camSpace = q.rotateVector(camConj, rel)
-    return camSpace[1], camSpace[2], camSpace[3]
-end
-
-local function project(x, y, z)
-    z = math.max(0.01, z)
-    local f = 1 / math.tan(camera.fov / 2)
-    local aspect = screen.w / screen.h
-    local px = x * f / z
-    local py = y * f / z
-    return screen.w / 2 + px * screen.w / 2, screen.h / 2 - py * screen.h / 2
-end
-
-local flightSimMode = false
 -- === Mouse Look ===
-local relative = true
 function love.mousemoved(x, y, dx, dy)
     if not relative then
         return
     end
-    x, y, dx, dy = -x, -y, -dx * 2, -dy
+    x, y, dx, dy = -x, -y, -dx, -dy
     local horizontal_sensitivity = 0.001
-    local vertical_sensitivity = 0.0005
+    local vertical_sensitivity = 0.001
 
     -- Rotate around camera's local Y axis (yaw) and local X axis (pitch)
     local right = q.rotateVector(camera.rot, { 1, 0, 0 })
     local up = q.rotateVector(camera.rot, { 0, 1, 0 })
 
-    local pitchQuat = q.fromAxisAngle(right, -dy * horizontal_sensitivity)
-    local yawQuat = q.fromAxisAngle(up, -dx * vertical_sensitivity)
+    local pitchQuat = q.fromAxisAngle(right, -dy * vertical_sensitivity)
+    local yawQuat = q.fromAxisAngle(up, -dx * horizontal_sensitivity)
 
     -- Apply pitch then yaw (relative to current orientation)
     camera.rot = q.normalize(q.multiply(yawQuat, q.multiply(pitchQuat, camera.rot)))
 end
-
-local function createObjectForPeer(peerID)
-    local obj = {
-        model = cubeModel,
-        pos = {0,0,0},
-        rot = q.identity(),
-        color = {math.random(), math.random(), math.random()},
-        isSolid = true,
-        id = peerID
-    }
-
-    table.insert(objects, obj)
-    return obj
-end
-
-local peers = {}
-function handlePacket(data)
-    local parts = {}
-    for p in string.gmatch(data, "([^|]+)") do
-        table.insert(parts, p)
-    end
-
-    if parts[1] == "STATE" then
-        local id = tonumber(parts[#parts])
-
-        if not peers[id] then
-            peers[id] = createObjectForPeer(id)
-        end
-
-        local obj = peers[id]
-
-        obj.pos = {
-            tonumber(parts[2]),
-            tonumber(parts[3]),
-            tonumber(parts[4])
-        }
-
-        obj.rot = {
-            w = tonumber(parts[5]),
-            x = tonumber(parts[6]),
-            y = tonumber(parts[7]),
-            z = tonumber(parts[8])
-        }
-    end
-end
-
-local event = relay:service()
 
 local function updateNet()
     if relayServer then
@@ -223,57 +142,13 @@ end
 
 -- === Camera Movement ===
 function love.update(dt)
-    local speed = camera.speed * dt
-    local forward, right, up = getCameraBasis()
-
-    if love.keyboard.isDown("w") or flightSimMode == true then
-        for i = 1, 3 do
-            camera.pos[i] = camera.pos[i] + forward[i] * (speed * (camera.speedBoost and 1.5 or 1))
-        end
-    end
-    if love.keyboard.isDown("s") then
-        for i = 1, 3 do
-            camera.pos[i] = camera.pos[i] - forward[i] * (speed * (camera.speedBoost and 1.5 or 1))
-        end
-    end
-    if love.keyboard.isDown("d") then
-        for i = 1, 3 do
-            camera.pos[i] = camera.pos[i] + right[i] * (speed * (camera.speedBoost and 1.5 or 1))
-        end
-    end
-    if love.keyboard.isDown("a") then
-        for i = 1, 3 do
-            camera.pos[i] = camera.pos[i] - right[i] * (speed * (camera.speedBoost and 1.5 or 1))
-        end
-    end
-    if love.keyboard.isDown("x") or love.keyboard.isDown("space") then
-        for i = 1, 3 do
-            camera.pos[i] = camera.pos[i] + up[i] * (speed * (camera.speedBoost and 1.5 or 1))
-        end
-    end
-    if love.keyboard.isDown("lshift") then
-        camera.speedBoost = true
-    else
-        camera.speedBoost = false
-    end
-    if love.keyboard.isDown("z") or love.keyboard.isDown("lctrl") then
-        for i = 1, 3 do
-            camera.pos[i] = camera.pos[i] - up[i] * (speed * (camera.speedBoost and 1.5 or 1))
-        end
-    end
-    if love.keyboard.isDown("e") then
-        local roll = q.fromAxisAngle(q.rotateVector(camera.rot, { 0, 0, 0.5 }), -math.rad(2.5))
-        camera.rot = q.normalize(q.multiply(roll, camera.rot))
-    elseif love.keyboard.isDown("q") then
-        local roll = q.fromAxisAngle(q.rotateVector(camera.rot, { 0, 0, 0.5 }), math.rad(2.5))
-        camera.rot = q.normalize(q.multiply(roll, camera.rot))
-    end
+    camera = engine.processMovement(camera, dt, flightSimMode, vector3, q, objects)
     updateNet()
     event = relay:service()
 
     while event do
         if event.type == "receive" then
-            handlePacket(event.data)
+            networking.handlePacket(event.data)
         end
 
         event = relay:service()
@@ -291,7 +166,7 @@ function love.keypressed(key)
     if key == "p" then
         local pos = camera.pos
         local rot = camera.rot
-        local forward, right, up = getCameraBasis()
+        local forward, right, up = engine.getCameraBasis(camera, q, vector3)
 
         print("\n=== Camera Debug Info ===")
         print(string.format("Position:    x=%.3f  y=%.3f  z=%.3f", pos[1], pos[2], pos[3]))
@@ -316,73 +191,8 @@ function love.mousefocus(focused)
     end
 end
 
-local function drawTriangle(v1, v2, v3, color)
-    love.graphics.setColor(color or { 1, 1, 1 })
-    love.graphics.polygon("fill",
-        v1[1], v1[2],
-        v2[1], v2[2],
-        v3[1], v3[2]
-    )
-    love.graphics.setColor(0, 0, 0)
-    love.graphics.polygon("line",
-        v1[1], v1[2],
-        v2[1], v2[2],
-        v3[1], v3[2]
-    )
-end
-
-function drawObject(obj, skipCulling)
-    local transformedVerts = {}
-    local screenVerts = {}
-
-    -- Transform vertices into camera space and screen space
-    for i, v in ipairs(obj.model.vertices) do
-        local x, y, z = transformVertex(v, obj)
-        transformedVerts[i] = { x, y, z }
-        if z > 0.01 then
-            local sx, sy = project(x, y, z)
-            screenVerts[i] = { sx, sy, z }
-        end
-    end
-
-    -- Triangulate faces and raster using Z-buffer
-    for _, face in ipairs(obj.model.faces) do
-        local visibleCount = 0
-        for _, vi in ipairs(face) do
-            if screenVerts[vi] then
-                visibleCount = visibleCount + 1
-            end
-        end
-        if visibleCount < 3 then
-            goto continue
-        end
-
-        -- Optional backface culling
-        if not skipCulling then
-            local v1, v2, v3 = transformedVerts[face[1]], transformedVerts[face[2]], transformedVerts[face[3]]
-            local edge1 = vector3.sub(v2, v1)
-            local edge2 = vector3.sub(v3, v1)
-            local normal = vector3.normalizeVec(vector3.cross(edge1, edge2))
-            local toCam = vector3.normalizeVec({ -v1[1], -v1[2], -v1[3] })
-            local dot = vector3.dot(normal, toCam)
-            if dot <= 0 then
-                goto continue
-            end
-        end
-
-        -- Triangulate quad/poly faces using fan method
-        for i = 2, #face - 1 do
-            local v1 = screenVerts[face[1]]
-            local v2 = screenVerts[face[i]]
-            local v3 = screenVerts[face[i + 1]]
-
-            if v1 and v2 and v3 then
-                drawTriangle(v1, v2, v3, obj.color or { 0.5, 0.5, 0.5 })
-            end
-        end
-
-        ::continue::
-    end
+local function drawHud(w, h, cx, cy)
+    -- to do: add bars on the bottom or left of the screen, white background rectangles, thinner coloured rectangle to indicate pos along the different axis with wrap around
 end
 
 function love.draw()
@@ -399,21 +209,16 @@ function love.draw()
     --    end
     --end
 
-    -- Sort objects by distance from camera (farther first)
     table.sort(objects, function(a, b)
-        local ax, ay, az = unpack(a.pos)
-        local bx, by, bz = unpack(b.pos)
-        local cx, cy, cz = unpack(camera.pos)
+        local aCam = engine.worldToCamera(a.pos, camera, q)
+        local bCam = engine.worldToCamera(b.pos, camera, q)
 
-        local da = (ax - cx) ^ 2 + (ay - cy) ^ 2 + (az - cz) ^ 2
-        local db = (bx - cx) ^ 2 + (by - cy) ^ 2 + (bz - cz) ^ 2
-
-        return da > db -- farthest first
+        return aCam[3] > bCam[3] -- farther first
     end)
 
     -- Draw objects in sorted order
     for _, obj in ipairs(objects) do
-        drawObject(obj)
+        engine.drawObject(obj, false, camera, vector3, q, screen)
     end
 
 
@@ -421,4 +226,6 @@ function love.draw()
     love.graphics.print("WASD + QE/ZC, Mouse to look, Esc to release mouse", 10, 10)
     love.graphics.setColor(1, 0, 0, 0.5)
     love.graphics.circle("fill", centerX, centerY, 1)
+
+    drawHud(screen.w, screen.h, centerX, centerY)
 end
