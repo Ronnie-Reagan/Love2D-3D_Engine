@@ -32,6 +32,14 @@ local pauseMenu = {
 	itemBounds = {},
 	tabBounds = {},
 	helpScroll = 0,
+	dragRange = {
+		active = false,
+		itemIndex = nil,
+		startX = 0,
+		lastX = 0,
+		totalDx = 0,
+		moved = false
+	},
 	statusText = "",
 	statusUntil = 0,
 	confirmItemId = nil,
@@ -52,27 +60,38 @@ local pauseMenu = {
 	}
 }
 
-local function getPauseHelpText()
-	return table.concat({
-		"GAME CONTROLS",
-		"WASD: move",
-		"Space: jump (ground mode)",
-		"Mouse: look",
-		"F: toggle flight mode",
-		"Q/E: roll while in flight mode",
-		"G: toggle GPU/CPU renderer",
-		"P: print camera debug info",
-		"Esc: open/close pause menu",
-		"",
-		"PAUSE MENU",
-		"Tab or H: switch Game/Help tabs",
-		"Up/Down or W/S: select options",
-		"Left/Right or A/D: adjust selected value",
-		"PgUp/PgDn: coarse value adjust",
-		"Enter/Space: activate option",
-		"Mouse wheel: adjust values (Game tab) / scroll (Help tab)",
-		"Esc: resume game"
-	}, "\n")
+local function getPauseHelpSections()
+	return {
+		{
+			title = "Movement",
+			items = {
+				{ keys = "W A S D", text = "Move around in ground mode." },
+				{ keys = "Space", text = "Jump while grounded." },
+				{ keys = "F", text = "Toggle flight mode." },
+				{ keys = "Q / E", text = "Roll left or right while flying." }
+			}
+		},
+		{
+			title = "Camera",
+			items = {
+				{ keys = "Mouse", text = "Look around." },
+				{ keys = "P", text = "Print camera debug details to console." },
+				{ keys = "G", text = "Toggle between GPU and CPU renderer." }
+			}
+		},
+		{
+			title = "Pause Menu",
+			items = {
+				{ keys = "Tab / H", text = "Switch between Game and Help tabs." },
+				{ keys = "W/S or Up/Down", text = "Move selection." },
+				{ keys = "A/D or Left/Right", text = "Adjust selected value." },
+				{ keys = "Mouse Drag", text = "Drag left/right on range rows to decrease/increase." },
+				{ keys = "Mouse Wheel", text = "Adjust ranges (Game tab) or scroll help (Help tab)." },
+				{ keys = "Enter", text = "Activate selected action." },
+				{ keys = "Esc", text = "Resume game." }
+			}
+		}
+	}
 end
 
 --[[
@@ -395,6 +414,15 @@ local function clearPauseConfirm()
 	pauseMenu.confirmUntil = 0
 end
 
+local function clearPauseRangeDrag()
+	pauseMenu.dragRange.active = false
+	pauseMenu.dragRange.itemIndex = nil
+	pauseMenu.dragRange.startX = 0
+	pauseMenu.dragRange.lastX = 0
+	pauseMenu.dragRange.totalDx = 0
+	pauseMenu.dragRange.moved = false
+end
+
 local function setPauseTab(tab)
 	if tab ~= "game" and tab ~= "help" then
 		return
@@ -407,6 +435,7 @@ local function setPauseTab(tab)
 	pauseMenu.helpScroll = 0
 	pauseMenu.itemBounds = {}
 	pauseMenu.tabBounds = {}
+	clearPauseRangeDrag()
 	clearPauseConfirm()
 end
 
@@ -540,6 +569,7 @@ end
 local function movePauseSelection(delta)
 	local itemCount = #pauseMenu.items
 	pauseMenu.selected = ((pauseMenu.selected - 1 + delta) % itemCount) + 1
+	clearPauseRangeDrag()
 	clearPauseConfirm()
 end
 
@@ -570,15 +600,82 @@ local function activateSelectedPauseItem()
 end
 
 local function updatePauseMenuHover(x, y)
+	if pauseMenu.tab ~= "game" then
+		return
+	end
+	if pauseMenu.dragRange.active then
+		return
+	end
+
 	for i, bounds in ipairs(pauseMenu.itemBounds) do
 		if x >= bounds.x and x <= bounds.x + bounds.w and y >= bounds.y and y <= bounds.y + bounds.h then
 			if pauseMenu.selected ~= i then
 				pauseMenu.selected = i
+				clearPauseRangeDrag()
 				clearPauseConfirm()
 			end
 			return
 		end
 	end
+end
+
+local function beginPauseRangeDrag(itemIndex, x)
+	pauseMenu.dragRange.active = true
+	pauseMenu.dragRange.itemIndex = itemIndex
+	pauseMenu.dragRange.startX = x
+	pauseMenu.dragRange.lastX = x
+	pauseMenu.dragRange.totalDx = 0
+	pauseMenu.dragRange.moved = false
+end
+
+local function updatePauseRangeDrag(x)
+	if not pauseMenu.dragRange.active then
+		return
+	end
+
+	local itemIndex = pauseMenu.dragRange.itemIndex
+	local item = itemIndex and pauseMenu.items[itemIndex] or nil
+	if not item or item.kind ~= "range" then
+		clearPauseRangeDrag()
+		return
+	end
+
+	local dx = x - pauseMenu.dragRange.lastX
+	pauseMenu.dragRange.lastX = x
+	pauseMenu.dragRange.totalDx = pauseMenu.dragRange.totalDx + dx
+
+	local stepPixels = 12
+	while math.abs(pauseMenu.dragRange.totalDx) >= stepPixels do
+		local direction = pauseMenu.dragRange.totalDx > 0 and 1 or -1
+		adjustPauseItem(item, direction)
+		pauseMenu.dragRange.totalDx = pauseMenu.dragRange.totalDx - (direction * stepPixels)
+		pauseMenu.dragRange.moved = true
+	end
+end
+
+local function endPauseRangeDrag(x)
+	if not pauseMenu.dragRange.active then
+		return false
+	end
+
+	local itemIndex = pauseMenu.dragRange.itemIndex
+	local moved = pauseMenu.dragRange.moved
+	local item = itemIndex and pauseMenu.items[itemIndex] or nil
+	local bounds = itemIndex and pauseMenu.itemBounds[itemIndex] or nil
+
+	clearPauseRangeDrag()
+
+	if moved or not item or item.kind ~= "range" or not bounds then
+		return moved
+	end
+
+	if x >= bounds.x and x <= (bounds.x + bounds.w) then
+		local direction = (x >= (bounds.x + bounds.w * 0.5)) and 1 or -1
+		adjustPauseItem(item, direction)
+		return true
+	end
+
+	return false
 end
 
 local function handlePauseMenuMouseClick(x, y)
@@ -597,12 +694,12 @@ local function handlePauseMenuMouseClick(x, y)
 		if x >= bounds.x and x <= bounds.x + bounds.w and y >= bounds.y and y <= bounds.y + bounds.h then
 			pauseMenu.selected = i
 			local item = pauseMenu.items[i]
+			clearPauseRangeDrag()
 			if item and item.id ~= "quit" then
 				clearPauseConfirm()
 			end
 			if item and item.kind == "range" then
-				local direction = (x >= (bounds.x + bounds.w * 0.5)) and 1 or -1
-				adjustPauseItem(item, direction)
+				beginPauseRangeDrag(i, x)
 			elseif item then
 				activatePauseItem(item)
 			end
@@ -623,12 +720,14 @@ setPauseState = function(paused)
 		pauseMenu.selected = clamp(pauseMenu.selected, 1, #pauseMenu.items)
 		pauseMenu.itemBounds = {}
 		pauseMenu.tabBounds = {}
+		clearPauseRangeDrag()
 		setPauseStatus("", 0)
 		clearPauseConfirm()
 		setMouseCapture(false)
 		logger.log("Pause menu opened.")
 	else
 		pauseMenu.tabBounds = {}
+		clearPauseRangeDrag()
 		setPauseStatus("", 0)
 		clearPauseConfirm()
 		if love.window.hasFocus and love.window.hasFocus() then
@@ -639,6 +738,11 @@ setPauseState = function(paused)
 end
 
 local function drawPauseMenuRows(layout, rowTextHeight)
+	local font = love.graphics.getFont()
+	local arrowText = "<"
+	local rightArrowText = ">"
+	local arrowPad = 12
+
 	pauseMenu.itemBounds = {}
 	for i, item in ipairs(pauseMenu.items) do
 		local rowY = layout.panelY + layout.topPad + (i - 1) * layout.rowH
@@ -646,6 +750,7 @@ local function drawPauseMenuRows(layout, rowTextHeight)
 		local rowTextY = rowY + math.floor((rowHeight - rowTextHeight) / 2)
 		local selected = i == pauseMenu.selected
 		local value = getPauseItemValue(item)
+		local centerText = item.label
 
 		if selected then
 			love.graphics.setColor(0.22, 0.28, 0.42, 0.95)
@@ -654,13 +759,20 @@ local function drawPauseMenuRows(layout, rowTextHeight)
 		end
 		love.graphics.rectangle("fill", layout.rowX, rowY, layout.rowW, rowHeight, 6, 6)
 
-		love.graphics.setColor(1, 1, 1, 1)
-		love.graphics.print(item.label, layout.rowX + 12, rowTextY)
-		if item.kind == "range" then
-			value = "< " .. value .. " >"
-		end
 		if value ~= "" then
-			love.graphics.printf(value, layout.rowX + 12, rowTextY, layout.rowW - 24, "right")
+			centerText = item.label .. "  " .. value
+		end
+		local centerTextW = font:getWidth(centerText)
+		local centerTextX = layout.rowX + math.floor((layout.rowW - centerTextW) / 2)
+
+		love.graphics.setColor(1, 1, 1, 1)
+		love.graphics.print(centerText, centerTextX, rowTextY)
+
+		if item.kind == "range" then
+			local leftX = layout.rowX + arrowPad
+			local rightX = layout.rowX + layout.rowW - arrowPad - font:getWidth(rightArrowText)
+			love.graphics.print(arrowText, leftX, rowTextY)
+			love.graphics.print(rightArrowText, rightX, rowTextY)
 		end
 
 		pauseMenu.itemBounds[i] = { x = layout.rowX, y = rowY, w = layout.rowW, h = rowHeight }
@@ -703,30 +815,94 @@ end
 
 local function drawPauseHelpContent(layout)
 	local font = love.graphics.getFont()
-	local helpText = getPauseHelpText()
-	local helpLines = getWrappedLines(font, helpText, layout.contentW)
-	local visibleLines = math.max(1, math.floor(layout.contentH / layout.lineH))
-	local maxScroll = math.max(0, #helpLines - visibleLines)
-	pauseMenu.helpScroll = clamp(pauseMenu.helpScroll, 0, maxScroll)
+	local sections = getPauseHelpSections()
+	local cardGap = 10
+	local cardPad = 10
+	local cardX = layout.contentX + 4
+	local cardW = layout.contentW - 8
+	local lineH = font:getHeight()
 
-	local startLine = pauseMenu.helpScroll + 1
-	local endLine = math.min(#helpLines, startLine + visibleLines - 1)
-	local y = layout.contentY
+	local function measureItemHeight(item)
+		local badgeText = "[" .. item.keys .. "]"
+		local badgeW = font:getWidth(badgeText) + 12
+		local descW = math.max(40, cardW - cardPad * 2 - badgeW - 10)
+		local lines = getWrappedLines(font, item.text, descW)
+		local textH = math.max(lineH, #lines * lineH)
+		return textH + 4
+	end
+
+	local function measureSectionHeight(section)
+		local h = cardPad + lineH + 8
+		for _, item in ipairs(section.items) do
+			h = h + measureItemHeight(item) + 6
+		end
+		h = h + cardPad - 6
+		return h
+	end
+
+	local totalH = 0
+	for _, section in ipairs(sections) do
+		totalH = totalH + measureSectionHeight(section) + cardGap
+	end
+	totalH = math.max(0, totalH - cardGap)
+
+	local maxScroll = math.max(0, totalH - layout.contentH)
+	pauseMenu.helpScroll = clamp(pauseMenu.helpScroll, 0, maxScroll)
+	local y = layout.contentY + 4 - pauseMenu.helpScroll
 
 	love.graphics.setColor(0.12, 0.13, 0.16, 0.9)
 	love.graphics.rectangle("fill", layout.contentX, layout.contentY, layout.contentW, layout.contentH, 6, 6)
-	love.graphics.setColor(1, 1, 1, 0.95)
+	love.graphics.setScissor(layout.contentX, layout.contentY, layout.contentW, layout.contentH)
 
-	for i = startLine, endLine do
-		love.graphics.print(helpLines[i], layout.contentX + 10, y)
-		y = y + layout.lineH
+	for sectionIndex, section in ipairs(sections) do
+		local sectionH = measureSectionHeight(section)
+		local cardY = y
+
+		if cardY + sectionH >= layout.contentY and cardY <= (layout.contentY + layout.contentH) then
+			local tint = 0.14 + ((sectionIndex - 1) * 0.03)
+			love.graphics.setColor(tint, tint + 0.02, tint + 0.05, 0.95)
+			love.graphics.rectangle("fill", cardX, cardY, cardW, sectionH, 8, 8)
+			love.graphics.setColor(1, 1, 1, 0.22)
+			love.graphics.rectangle("line", cardX, cardY, cardW, sectionH, 8, 8)
+
+			love.graphics.setColor(0.85, 0.92, 1.0, 1.0)
+			love.graphics.print(section.title, cardX + cardPad, cardY + cardPad)
+
+			local itemY = cardY + cardPad + lineH + 8
+			for _, item in ipairs(section.items) do
+				local badgeText = "[" .. item.keys .. "]"
+				local badgeW = font:getWidth(badgeText) + 12
+				local badgeH = lineH + 2
+				local descX = cardX + cardPad + badgeW + 10
+				local descW = math.max(40, cardW - cardPad * 2 - badgeW - 10)
+				local lines = getWrappedLines(font, item.text, descW)
+				local textH = math.max(lineH, #lines * lineH)
+				local rowH = math.max(badgeH, textH) + 4
+				local badgeY = itemY + math.floor((rowH - badgeH) / 2)
+
+				love.graphics.setColor(0.24, 0.29, 0.38, 0.95)
+				love.graphics.rectangle("fill", cardX + cardPad, badgeY, badgeW, badgeH, 4, 4)
+				love.graphics.setColor(1, 1, 1, 1)
+				love.graphics.printf(badgeText, cardX + cardPad, badgeY + 1, badgeW, "center")
+
+				love.graphics.setColor(0.95, 0.95, 0.95, 0.98)
+				love.graphics.printf(table.concat(lines, "\n"), descX, itemY + 2, descW, "left")
+
+				itemY = itemY + rowH + 6
+			end
+		end
+
+		y = y + sectionH + cardGap
 	end
+
+	love.graphics.setScissor()
 
 	if maxScroll > 0 then
 		local barX = layout.contentX + layout.contentW - 6
 		local barY = layout.contentY + 4
 		local barH = layout.contentH - 8
-		local thumbH = math.max(16, barH * (visibleLines / #helpLines))
+		local visibleRatio = math.max(0.05, math.min(1, layout.contentH / math.max(layout.contentH, totalH)))
+		local thumbH = math.max(16, barH * visibleRatio)
 		local thumbY = barY + (barH - thumbH) * (pauseMenu.helpScroll / maxScroll)
 
 		love.graphics.setColor(1, 1, 1, 0.18)
@@ -844,6 +1020,7 @@ function love.load()
 	pauseMenu.itemBounds = {}
 	pauseMenu.tabBounds = {}
 	pauseMenu.helpScroll = 0
+	clearPauseRangeDrag()
 	pauseMenu.statusText = ""
 	pauseMenu.statusUntil = 0
 	pauseMenu.confirmItemId = nil
@@ -900,6 +1077,7 @@ end
 function love.mousemoved(x, y, dx, dy)
 	if pauseMenu.active then
 		updatePauseMenuHover(x, y)
+		updatePauseRangeDrag(x)
 		return
 	end
 
@@ -1084,6 +1262,13 @@ function love.mousepressed(x, y, button)
 	if not love.mouse.getRelativeMode() then
 		setMouseCapture(true)
 	end
+end
+
+function love.mousereleased(x, y, button)
+	if not pauseMenu.active or button ~= 1 then
+		return
+	end
+	endPauseRangeDrag(x)
 end
 
 function love.wheelmoved(x, y)
