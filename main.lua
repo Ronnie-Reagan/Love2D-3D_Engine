@@ -20,24 +20,60 @@ local useGpuRenderer = true
 local perfElapsed, perfFrames, perfLoggedLowFps = 0, 0, false
 local zBuffer = {}
 local mouseSensitivity = 0.001
+local invertLookY = false
+local showCrosshair = true
+local showDebugOverlay = true
 local pauseTitleFont, pauseItemFont
 
 local pauseMenu = {
 	active = false,
+	tab = "game",
 	selected = 1,
 	itemBounds = {},
+	tabBounds = {},
+	helpScroll = 0,
+	statusText = "",
+	statusUntil = 0,
+	confirmItemId = nil,
+	confirmUntil = 0,
 	items = {
-		{ id = "resume", label = "Resume", kind = "action" },
-		{ id = "flight", label = "Flight Mode", kind = "toggle" },
-		{ id = "renderer", label = "Renderer", kind = "toggle" },
-		{ id = "speed", label = "Move Speed", kind = "range", min = 2, max = 30, step = 1 },
-		{ id = "fov", label = "Field of View", kind = "range", min = 60, max = 120, step = 5 },
-		{ id = "sensitivity", label = "Mouse Sensitivity", kind = "range", min = 0.0004, max = 0.004, step = 0.0002 },
-		{ id = "reset", label = "Reset Camera", kind = "action" },
-		{ id = "reconnect", label = "Reconnect Relay", kind = "action" },
-		{ id = "quit", label = "Quit Game", kind = "action" }
+		{ id = "resume", label = "Resume", kind = "action", help = "Close pause menu and continue playing." },
+		{ id = "flight", label = "Flight Mode", kind = "toggle", help = "Toggle no-gravity flight movement mode." },
+		{ id = "renderer", label = "Renderer", kind = "toggle", help = "Switch between GPU and CPU renderer paths." },
+		{ id = "crosshair", label = "Crosshair", kind = "toggle", help = "Show or hide center crosshair dot." },
+		{ id = "overlay", label = "Debug Overlay", kind = "toggle", help = "Toggle top-left help/perf text." },
+		{ id = "speed", label = "Move Speed", kind = "range", min = 2, max = 30, step = 1, help = "Adjust player movement speed." },
+		{ id = "fov", label = "Field of View", kind = "range", min = 60, max = 120, step = 5, help = "Adjust camera FOV in degrees." },
+		{ id = "sensitivity", label = "Mouse Sensitivity", kind = "range", min = 0.0004, max = 0.004, step = 0.0002, help = "Adjust mouse look sensitivity." },
+		{ id = "invertY", label = "Invert Look Y", kind = "toggle", help = "Invert vertical mouse look direction." },
+		{ id = "reset", label = "Reset Camera", kind = "action", help = "Reset camera position and orientation." },
+		{ id = "reconnect", label = "Reconnect Relay", kind = "action", help = "Reconnect to multiplayer relay server." },
+		{ id = "quit", label = "Quit Game", kind = "action", confirm = true, help = "Exit the game client." }
 	}
 }
+
+local function getPauseHelpText()
+	return table.concat({
+		"GAME CONTROLS",
+		"WASD: move",
+		"Space: jump (ground mode)",
+		"Mouse: look",
+		"F: toggle flight mode",
+		"Q/E: roll while in flight mode",
+		"G: toggle GPU/CPU renderer",
+		"P: print camera debug info",
+		"Esc: open/close pause menu",
+		"",
+		"PAUSE MENU",
+		"Tab or H: switch Game/Help tabs",
+		"Up/Down or W/S: select options",
+		"Left/Right or A/D: adjust selected value",
+		"PgUp/PgDn: coarse value adjust",
+		"Enter/Space: activate option",
+		"Mouse wheel: adjust values (Game tab) / scroll (Help tab)",
+		"Esc: resume game"
+	}, "\n")
+end
 
 --[[
 Notes:
@@ -202,6 +238,193 @@ end
 
 local setPauseState
 
+local function setPauseStatus(message, duration)
+	pauseMenu.statusText = message or ""
+	if message and message ~= "" then
+		pauseMenu.statusUntil = love.timer.getTime() + (duration or 2.0)
+	else
+		pauseMenu.statusUntil = 0
+	end
+end
+
+local function getWrappedLines(font, text, width)
+	if not text or text == "" then
+		return {}
+	end
+	local _, lines = font:getWrap(text, width)
+	return lines
+end
+
+local function trimWrappedLines(lines, maxLines)
+	if #lines <= maxLines then
+		return lines
+	end
+
+	local trimmed = {}
+	for i = 1, maxLines do
+		trimmed[i] = lines[i]
+	end
+	trimmed[maxLines] = trimmed[maxLines] .. "..."
+	return trimmed
+end
+
+local function buildPauseMenuLayout()
+	local titleFont = pauseTitleFont or love.graphics.getFont()
+	local itemFont = pauseItemFont or love.graphics.getFont()
+	local isGameTab = pauseMenu.tab == "game"
+	local itemCount = #pauseMenu.items
+
+	local panelW = math.min(660, screen.w * 0.9)
+	local panelX = (screen.w - panelW) / 2
+	local contentX = panelX + 18
+	local contentW = panelW - 36
+	local footerTextW = contentW
+	local controlsText = isGameTab
+			and "Tab/H for Help | Up/Down select | Enter apply | Esc resume"
+		or "Tab/H for Game | Mouse wheel scroll | Esc resume"
+
+	local selectedItem = pauseMenu.items[pauseMenu.selected]
+	local detailText = isGameTab and (selectedItem and selectedItem.help or "") or ""
+	local statusText = pauseMenu.statusText
+
+	local lineH = itemFont:getHeight()
+	local titleTopPad = 14
+	local titleH = titleFont:getHeight()
+	local tabH = lineH + 8
+	local topPad = titleTopPad + titleH + 8 + tabH + 10
+	local footerTopPad = 10
+	local footerGap = 6
+	local footerBottomPad = 10
+	local maxPanelH = math.max(220, screen.h - 24)
+	maxPanelH = math.min(maxPanelH, screen.h - 8)
+
+	local function computeFooterContentHeight(controlsLines, detailLines, statusLines)
+		local h = #controlsLines * lineH
+		if #detailLines > 0 then
+			h = h + footerGap + (#detailLines * lineH)
+		end
+		if #statusLines > 0 then
+			h = h + footerGap + (#statusLines * lineH)
+		end
+		return h
+	end
+
+	local controlsLines = trimWrappedLines(getWrappedLines(itemFont, controlsText, footerTextW), 2)
+	local detailLines = trimWrappedLines(getWrappedLines(itemFont, detailText, footerTextW), 2)
+	local statusLines = trimWrappedLines(getWrappedLines(itemFont, statusText, footerTextW), 2)
+	local footerContentH = computeFooterContentHeight(controlsLines, detailLines, statusLines)
+	local bottomPad = footerTopPad + footerContentH + footerBottomPad
+
+	if (maxPanelH - topPad - bottomPad) < itemCount * 18 then
+		controlsLines = trimWrappedLines(getWrappedLines(itemFont, controlsText, footerTextW), 1)
+		detailLines = trimWrappedLines(getWrappedLines(itemFont, detailText, footerTextW), 1)
+		statusLines = trimWrappedLines(getWrappedLines(itemFont, statusText, footerTextW), 1)
+		footerContentH = computeFooterContentHeight(controlsLines, detailLines, statusLines)
+		bottomPad = footerTopPad + footerContentH + footerBottomPad
+	end
+
+	local availableContentH = math.max(1, maxPanelH - topPad - bottomPad)
+	local rowH = 0
+	local contentH = availableContentH
+	if isGameTab then
+		local minRowH = math.max(lineH + 8, 24)
+		local maxRowH = 40
+		if availableContentH >= minRowH * itemCount then
+			rowH = clamp(math.floor(availableContentH / itemCount), minRowH, maxRowH)
+		else
+			rowH = math.max(lineH + 4, math.floor(availableContentH / itemCount))
+		end
+		contentH = math.max(1, rowH * itemCount)
+	else
+		contentH = math.max(lineH * 8, availableContentH)
+	end
+
+	local panelH = topPad + contentH + bottomPad
+	if panelH > maxPanelH then
+		panelH = maxPanelH
+	end
+
+	local finalContentH = math.max(1, panelH - topPad - bottomPad)
+	if isGameTab then
+		rowH = math.max(1, math.floor(finalContentH / itemCount))
+		finalContentH = rowH * itemCount
+		panelH = topPad + finalContentH + bottomPad
+		if panelH > maxPanelH then
+			panelH = maxPanelH
+			finalContentH = math.max(1, panelH - topPad - bottomPad)
+			rowH = math.max(1, math.floor(finalContentH / itemCount))
+			finalContentH = rowH * itemCount
+			panelH = topPad + finalContentH + bottomPad
+		end
+	end
+
+	local panelY = (screen.h - panelH) / 2
+	local titleY = panelY + titleTopPad
+	local tabY = titleY + titleH + 8
+	local contentY = panelY + topPad
+
+	return {
+		isGameTab = isGameTab,
+		panelX = panelX,
+		panelY = panelY,
+		panelW = panelW,
+		panelH = panelH,
+		topPad = topPad,
+		bottomPad = bottomPad,
+		titleY = titleY,
+		tabY = tabY,
+		tabH = tabH,
+		contentX = contentX,
+		contentY = contentY,
+		contentW = contentW,
+		contentH = finalContentH,
+		rowX = contentX,
+		rowW = contentW,
+		rowH = rowH,
+		footerTopPad = footerTopPad,
+		footerGap = footerGap,
+		controlsLines = controlsLines,
+		detailLines = detailLines,
+		statusLines = statusLines,
+		lineH = lineH
+	}
+end
+
+local function clearPauseConfirm()
+	pauseMenu.confirmItemId = nil
+	pauseMenu.confirmUntil = 0
+end
+
+local function setPauseTab(tab)
+	if tab ~= "game" and tab ~= "help" then
+		return
+	end
+	if pauseMenu.tab == tab then
+		return
+	end
+
+	pauseMenu.tab = tab
+	pauseMenu.helpScroll = 0
+	pauseMenu.itemBounds = {}
+	pauseMenu.tabBounds = {}
+	clearPauseConfirm()
+end
+
+local function cyclePauseTab(direction)
+	if direction == 0 then
+		return
+	end
+	if pauseMenu.tab == "game" then
+		setPauseTab("help")
+	else
+		setPauseTab("game")
+	end
+end
+
+local function isPauseConfirmActive(itemId)
+	return pauseMenu.confirmItemId == itemId and love.timer.getTime() <= pauseMenu.confirmUntil
+end
+
 local function getPauseItemValue(item)
 	if item.id == "flight" then
 		return flightSimMode and "On" or "Off"
@@ -211,6 +434,12 @@ local function getPauseItemValue(item)
 			return useGpuRenderer and "GPU" or "CPU"
 		end
 		return "CPU (GPU unavailable)"
+	end
+	if item.id == "crosshair" then
+		return showCrosshair and "On" or "Off"
+	end
+	if item.id == "overlay" then
+		return showDebugOverlay and "On" or "Off"
 	end
 	if item.id == "speed" and camera then
 		return string.format("%.1f", camera.speed)
@@ -222,32 +451,43 @@ local function getPauseItemValue(item)
 	if item.id == "sensitivity" then
 		return string.format("%.4f", mouseSensitivity)
 	end
+	if item.id == "invertY" then
+		return invertLookY and "On" or "Off"
+	end
 	if item.id == "reconnect" then
 		return getRelayStatus()
+	end
+	if item.id == "quit" and isPauseConfirmActive("quit") then
+		return "Are you Sure?"
 	end
 	return ""
 end
 
-local function adjustPauseItem(item, direction)
+local function adjustPauseItem(item, direction, multiplier)
 	if direction == 0 then
 		return
 	end
 
+	local scale = multiplier or 1
+
 	if item.id == "speed" and camera then
-		camera.speed = clamp(camera.speed + item.step * direction, item.min, item.max)
+		camera.speed = clamp(camera.speed + item.step * direction * scale, item.min, item.max)
+		setPauseStatus("Move Speed: " .. getPauseItemValue(item), 1.2)
 		return
 	end
 
 	if item.id == "fov" and camera then
 		local fovDeg = math.deg(camera.fov)
-		fovDeg = clamp(fovDeg + item.step * direction, item.min, item.max)
+		fovDeg = clamp(fovDeg + item.step * direction * scale, item.min, item.max)
 		camera.fov = math.rad(fovDeg)
+		setPauseStatus("Field of View: " .. getPauseItemValue(item), 1.2)
 		return
 	end
 
 	if item.id == "sensitivity" then
-		local nextValue = clamp(mouseSensitivity + item.step * direction, item.min, item.max)
+		local nextValue = clamp(mouseSensitivity + item.step * direction * scale, item.min, item.max)
 		mouseSensitivity = math.floor(nextValue * 10000 + 0.5) / 10000
+		setPauseStatus("Mouse Sensitivity: " .. getPauseItemValue(item), 1.2)
 	end
 end
 
@@ -257,16 +497,41 @@ local function activatePauseItem(item)
 		return
 	end
 
+	if item.confirm and not isPauseConfirmActive(item.id) then
+		pauseMenu.confirmItemId = item.id
+		pauseMenu.confirmUntil = love.timer.getTime() + 2.5
+		setPauseStatus("Confirm to \"" .. item.label .. "\".", 2.5)
+		return
+	end
+	clearPauseConfirm()
+
 	if item.id == "resume" then
 		setPauseState(false)
 	elseif item.id == "flight" then
 		setFlightMode(not flightSimMode)
+		setPauseStatus("Flight Mode: " .. getPauseItemValue(item), 1.2)
 	elseif item.id == "renderer" then
 		setRendererPreference(not useGpuRenderer)
+		setPauseStatus("Renderer: " .. getPauseItemValue(item), 1.2)
+	elseif item.id == "crosshair" then
+		showCrosshair = not showCrosshair
+		setPauseStatus("Crosshair: " .. getPauseItemValue(item), 1.2)
+	elseif item.id == "overlay" then
+		showDebugOverlay = not showDebugOverlay
+		setPauseStatus("Debug Overlay: " .. getPauseItemValue(item), 1.2)
+	elseif item.id == "invertY" then
+		invertLookY = not invertLookY
+		setPauseStatus("Invert Look Y: " .. getPauseItemValue(item), 1.2)
 	elseif item.id == "reset" then
 		resetCameraTransform()
+		setPauseStatus("Camera reset.", 1.2)
 	elseif item.id == "reconnect" then
-		reconnectRelay()
+		local ok = reconnectRelay()
+		if ok then
+			setPauseStatus("Relay reconnect requested.", 1.6)
+		else
+			setPauseStatus("Relay reconnect failed. Check logs.", 1.6)
+		end
 	elseif item.id == "quit" then
 		love.event.quit()
 	end
@@ -275,6 +540,7 @@ end
 local function movePauseSelection(delta)
 	local itemCount = #pauseMenu.items
 	pauseMenu.selected = ((pauseMenu.selected - 1 + delta) % itemCount) + 1
+	clearPauseConfirm()
 end
 
 local function adjustSelectedPauseItem(direction)
@@ -289,6 +555,13 @@ local function adjustSelectedPauseItem(direction)
 	end
 end
 
+local function adjustSelectedPauseItemCoarse(direction)
+	local item = pauseMenu.items[pauseMenu.selected]
+	if item and item.kind == "range" then
+		adjustPauseItem(item, direction, 5)
+	end
+end
+
 local function activateSelectedPauseItem()
 	local item = pauseMenu.items[pauseMenu.selected]
 	if item then
@@ -296,11 +569,37 @@ local function activateSelectedPauseItem()
 	end
 end
 
+local function updatePauseMenuHover(x, y)
+	for i, bounds in ipairs(pauseMenu.itemBounds) do
+		if x >= bounds.x and x <= bounds.x + bounds.w and y >= bounds.y and y <= bounds.y + bounds.h then
+			if pauseMenu.selected ~= i then
+				pauseMenu.selected = i
+				clearPauseConfirm()
+			end
+			return
+		end
+	end
+end
+
 local function handlePauseMenuMouseClick(x, y)
+	for _, tabBounds in ipairs(pauseMenu.tabBounds) do
+		if x >= tabBounds.x and x <= tabBounds.x + tabBounds.w and y >= tabBounds.y and y <= tabBounds.y + tabBounds.h then
+			setPauseTab(tabBounds.id)
+			return
+		end
+	end
+
+	if pauseMenu.tab ~= "game" then
+		return
+	end
+
 	for i, bounds in ipairs(pauseMenu.itemBounds) do
 		if x >= bounds.x and x <= bounds.x + bounds.w and y >= bounds.y and y <= bounds.y + bounds.h then
 			pauseMenu.selected = i
 			local item = pauseMenu.items[i]
+			if item and item.id ~= "quit" then
+				clearPauseConfirm()
+			end
 			if item and item.kind == "range" then
 				local direction = (x >= (bounds.x + bounds.w * 0.5)) and 1 or -1
 				adjustPauseItem(item, direction)
@@ -319,51 +618,31 @@ setPauseState = function(paused)
 
 	pauseMenu.active = paused and true or false
 	if pauseMenu.active then
-		pauseMenu.selected = 1
+		pauseMenu.tab = "game"
+		pauseMenu.helpScroll = 0
+		pauseMenu.selected = clamp(pauseMenu.selected, 1, #pauseMenu.items)
 		pauseMenu.itemBounds = {}
+		pauseMenu.tabBounds = {}
+		setPauseStatus("", 0)
+		clearPauseConfirm()
 		setMouseCapture(false)
 		logger.log("Pause menu opened.")
 	else
-		setMouseCapture(true)
+		pauseMenu.tabBounds = {}
+		setPauseStatus("", 0)
+		clearPauseConfirm()
+		if love.window.hasFocus and love.window.hasFocus() then
+			setMouseCapture(true)
+		end
 		logger.log("Pause menu closed.")
 	end
 end
 
-local function drawPauseMenu()
-	local rowH = math.max(28, math.min(40, math.floor((screen.h - 190) / #pauseMenu.items)))
-	local topPad = 56
-	local bottomPad = 28
-	local panelW = math.min(560, screen.w * 0.82)
-	local panelH = topPad + #pauseMenu.items * rowH + bottomPad
-	local panelX = (screen.w - panelW) / 2
-	local panelY = (screen.h - panelH) / 2
-	local rowX = panelX + 18
-	local rowW = panelW - 36
-
-	love.graphics.setColor(0, 0, 0, 0.68)
-	love.graphics.rectangle("fill", 0, 0, screen.w, screen.h)
-
-	love.graphics.setColor(0.08, 0.08, 0.1, 0.95)
-	love.graphics.rectangle("fill", panelX, panelY, panelW, panelH, 8, 8)
-	love.graphics.setColor(1, 1, 1, 0.2)
-	love.graphics.rectangle("line", panelX, panelY, panelW, panelH, 8, 8)
-
-	local oldFont = love.graphics.getFont()
-	if pauseTitleFont then
-		love.graphics.setFont(pauseTitleFont)
-	end
-	love.graphics.setColor(1, 1, 1, 1)
-	love.graphics.printf("PAUSED", panelX, panelY + 14, panelW, "center")
-
-	if pauseItemFont then
-		love.graphics.setFont(pauseItemFont)
-	end
-
+local function drawPauseMenuRows(layout, rowTextHeight)
 	pauseMenu.itemBounds = {}
-	local rowTextHeight = love.graphics.getFont():getHeight()
 	for i, item in ipairs(pauseMenu.items) do
-		local rowY = panelY + topPad + (i - 1) * rowH
-		local rowHeight = rowH - 4
+		local rowY = layout.panelY + layout.topPad + (i - 1) * layout.rowH
+		local rowHeight = math.max(1, layout.rowH - 4)
 		local rowTextY = rowY + math.floor((rowHeight - rowTextHeight) / 2)
 		local selected = i == pauseMenu.selected
 		local value = getPauseItemValue(item)
@@ -373,28 +652,140 @@ local function drawPauseMenu()
 		else
 			love.graphics.setColor(0.15, 0.16, 0.2, 0.9)
 		end
-		love.graphics.rectangle("fill", rowX, rowY, rowW, rowHeight, 6, 6)
+		love.graphics.rectangle("fill", layout.rowX, rowY, layout.rowW, rowHeight, 6, 6)
 
 		love.graphics.setColor(1, 1, 1, 1)
-		love.graphics.print(item.label, rowX + 12, rowTextY)
+		love.graphics.print(item.label, layout.rowX + 12, rowTextY)
 		if item.kind == "range" then
 			value = "< " .. value .. " >"
 		end
 		if value ~= "" then
-			love.graphics.printf(value, rowX + 12, rowTextY, rowW - 24, "right")
+			love.graphics.printf(value, layout.rowX + 12, rowTextY, layout.rowW - 24, "right")
 		end
 
-		pauseMenu.itemBounds[i] = { x = rowX, y = rowY, w = rowW, h = rowHeight }
+		pauseMenu.itemBounds[i] = { x = layout.rowX, y = rowY, w = layout.rowW, h = rowHeight }
+	end
+end
+
+local function drawPauseMenuTabs(layout)
+	local font = love.graphics.getFont()
+	pauseMenu.tabBounds = {}
+	local labels = {
+		{ id = "game", label = "Game" },
+		{ id = "help", label = "Help" }
+	}
+	local tabGap = 8
+	local totalW = 0
+	for _, tab in ipairs(labels) do
+		totalW = totalW + font:getWidth(tab.label) + 22
+	end
+	totalW = totalW + tabGap
+
+	local x = layout.panelX + (layout.panelW - totalW) / 2
+	for i, tab in ipairs(labels) do
+		local tabW = font:getWidth(tab.label) + 22
+		local active = pauseMenu.tab == tab.id
+
+		if active then
+			love.graphics.setColor(0.2, 0.3, 0.46, 0.95)
+		else
+			love.graphics.setColor(0.14, 0.16, 0.2, 0.95)
+		end
+		love.graphics.rectangle("fill", x, layout.tabY, tabW, layout.tabH, 6, 6)
+
+		love.graphics.setColor(1, 1, 1, active and 1 or 0.85)
+		love.graphics.printf(tab.label, x, layout.tabY + math.floor((layout.tabH - font:getHeight()) / 2), tabW, "center")
+
+		pauseMenu.tabBounds[i] = { id = tab.id, x = x, y = layout.tabY, w = tabW, h = layout.tabH }
+		x = x + tabW + tabGap
+	end
+end
+
+local function drawPauseHelpContent(layout)
+	local font = love.graphics.getFont()
+	local helpText = getPauseHelpText()
+	local helpLines = getWrappedLines(font, helpText, layout.contentW)
+	local visibleLines = math.max(1, math.floor(layout.contentH / layout.lineH))
+	local maxScroll = math.max(0, #helpLines - visibleLines)
+	pauseMenu.helpScroll = clamp(pauseMenu.helpScroll, 0, maxScroll)
+
+	local startLine = pauseMenu.helpScroll + 1
+	local endLine = math.min(#helpLines, startLine + visibleLines - 1)
+	local y = layout.contentY
+
+	love.graphics.setColor(0.12, 0.13, 0.16, 0.9)
+	love.graphics.rectangle("fill", layout.contentX, layout.contentY, layout.contentW, layout.contentH, 6, 6)
+	love.graphics.setColor(1, 1, 1, 0.95)
+
+	for i = startLine, endLine do
+		love.graphics.print(helpLines[i], layout.contentX + 10, y)
+		y = y + layout.lineH
 	end
 
+	if maxScroll > 0 then
+		local barX = layout.contentX + layout.contentW - 6
+		local barY = layout.contentY + 4
+		local barH = layout.contentH - 8
+		local thumbH = math.max(16, barH * (visibleLines / #helpLines))
+		local thumbY = barY + (barH - thumbH) * (pauseMenu.helpScroll / maxScroll)
+
+		love.graphics.setColor(1, 1, 1, 0.18)
+		love.graphics.rectangle("fill", barX, barY, 2, barH)
+		love.graphics.setColor(0.8, 0.9, 1.0, 0.7)
+		love.graphics.rectangle("fill", barX - 1, thumbY, 4, thumbH, 2, 2)
+	end
+end
+
+local function drawPauseMenuFooter(layout)
+	local footerX = layout.panelX + 18
+	local footerW = layout.panelW - 36
+	local y = layout.panelY + layout.panelH - layout.bottomPad + layout.footerTopPad
+
 	love.graphics.setColor(1, 1, 1, 0.85)
-	love.graphics.printf(
-		"Arrow keys / WASD to navigate, Enter to select, Left/Right to adjust, Esc to resume",
-		panelX + 18,
-		panelY + panelH - 22,
-		panelW - 36,
-		"center"
-	)
+	if #layout.controlsLines > 0 then
+		love.graphics.printf(table.concat(layout.controlsLines, "\n"), footerX, y, footerW, "center")
+		y = y + (#layout.controlsLines * layout.lineH) + layout.footerGap
+	end
+
+	if #layout.detailLines > 0 then
+		love.graphics.setColor(0.9, 0.95, 1.0, 0.9)
+		love.graphics.printf(table.concat(layout.detailLines, "\n"), footerX, y, footerW, "center")
+		y = y + (#layout.detailLines * layout.lineH) + layout.footerGap
+	end
+
+	if #layout.statusLines > 0 then
+		love.graphics.setColor(0.8, 1.0, 0.8, 1.0)
+		love.graphics.printf(table.concat(layout.statusLines, "\n"), footerX, y, footerW, "center")
+	end
+end
+
+local function drawPauseMenu()
+	local oldFont = love.graphics.getFont()
+	local titleFont = pauseTitleFont or oldFont
+	local itemFont = pauseItemFont or oldFont
+	local layout = buildPauseMenuLayout()
+
+	love.graphics.setColor(0, 0, 0, 0.68)
+	love.graphics.rectangle("fill", 0, 0, screen.w, screen.h)
+
+	love.graphics.setColor(0.08, 0.08, 0.1, 0.95)
+	love.graphics.rectangle("fill", layout.panelX, layout.panelY, layout.panelW, layout.panelH, 8, 8)
+	love.graphics.setColor(1, 1, 1, 0.2)
+	love.graphics.rectangle("line", layout.panelX, layout.panelY, layout.panelW, layout.panelH, 8, 8)
+
+	love.graphics.setFont(titleFont)
+	love.graphics.setColor(1, 1, 1, 1)
+	love.graphics.printf("PAUSED", layout.panelX, layout.titleY, layout.panelW, "center")
+
+	love.graphics.setFont(itemFont)
+	drawPauseMenuTabs(layout)
+	if layout.isGameTab then
+		drawPauseMenuRows(layout, itemFont:getHeight())
+	else
+		pauseMenu.itemBounds = {}
+		drawPauseHelpContent(layout)
+	end
+	drawPauseMenuFooter(layout)
 
 	love.graphics.setFont(oldFont)
 end
@@ -410,6 +801,7 @@ function love.load()
 	if not modeOk then
 		love.window.setMode(width, height, { vsync = false })
 	end
+	love.keyboard.setKeyRepeat(true)
 	setMouseCapture(true)
 
 	logger.reset()
@@ -447,8 +839,15 @@ function love.load()
 	gpuErrorLogged = false
 	perfElapsed, perfFrames, perfLoggedLowFps = 0, 0, false
 	pauseMenu.active = false
+	pauseMenu.tab = "game"
 	pauseMenu.selected = 1
 	pauseMenu.itemBounds = {}
+	pauseMenu.tabBounds = {}
+	pauseMenu.helpScroll = 0
+	pauseMenu.statusText = ""
+	pauseMenu.statusUntil = 0
+	pauseMenu.confirmItemId = nil
+	pauseMenu.confirmUntil = 0
 
 	-- creating the cube's object
 	-- disabled now that other players can join allowing for non-static testing of latency and culling/depth ordering
@@ -499,6 +898,11 @@ end
 
 -- === Mouse Look ===
 function love.mousemoved(x, y, dx, dy)
+	if pauseMenu.active then
+		updatePauseMenuHover(x, y)
+		return
+	end
+
 	if not relative then
 		return
 	end
@@ -508,7 +912,8 @@ function love.mousemoved(x, y, dx, dy)
 	local right = q.rotateVector(camera.rot, { 1, 0, 0 })
 	local up = q.rotateVector(camera.rot, { 0, 1, 0 })
 
-	local pitchQuat = q.fromAxisAngle(right, -dy * mouseSensitivity)
+	local verticalSign = invertLookY and 1 or -1
+	local pitchQuat = q.fromAxisAngle(right, verticalSign * dy * mouseSensitivity)
 	local yawQuat = q.fromAxisAngle(up, -dx * mouseSensitivity)
 
 	-- Apply pitch then yaw (relative to current orientation)
@@ -563,6 +968,14 @@ end
 
 -- === Camera Movement ===
 function love.update(dt)
+	if pauseMenu.statusUntil > 0 and love.timer.getTime() >= pauseMenu.statusUntil then
+		pauseMenu.statusText = ""
+		pauseMenu.statusUntil = 0
+	end
+	if pauseMenu.confirmItemId and love.timer.getTime() > pauseMenu.confirmUntil then
+		clearPauseConfirm()
+	end
+
 	if not pauseMenu.active then
 		camera = engine.processMovement(camera, dt, flightSimMode, vector3, q, objects)
 		updateNet()
@@ -593,14 +1006,44 @@ function love.keypressed(key)
 	end
 
 	if pauseMenu.active then
+		if key == "tab" or key == "h" then
+			cyclePauseTab(1)
+			return
+		end
+
+		if pauseMenu.tab == "help" then
+			if key == "up" or key == "w" then
+				pauseMenu.helpScroll = math.max(0, pauseMenu.helpScroll - 1)
+			elseif key == "down" or key == "s" then
+				pauseMenu.helpScroll = pauseMenu.helpScroll + 1
+			elseif key == "left" or key == "a" then
+				setPauseTab("game")
+			elseif key == "right" or key == "d" then
+				setPauseTab("help")
+			elseif key == "home" then
+				pauseMenu.helpScroll = 0
+			end
+			return
+		end
+
 		if key == "up" or key == "w" then
 			movePauseSelection(-1)
 		elseif key == "down" or key == "s" then
 			movePauseSelection(1)
+		elseif key == "home" then
+			pauseMenu.selected = 1
+			clearPauseConfirm()
+		elseif key == "end" then
+			pauseMenu.selected = #pauseMenu.items
+			clearPauseConfirm()
 		elseif key == "left" or key == "a" then
 			adjustSelectedPauseItem(-1)
 		elseif key == "right" or key == "d" then
 			adjustSelectedPauseItem(1)
+		elseif key == "pageup" then
+			adjustSelectedPauseItemCoarse(1)
+		elseif key == "pagedown" then
+			adjustSelectedPauseItemCoarse(-1)
 		elseif key == "return" or key == "kpenter" or key == "space" then
 			activateSelectedPauseItem()
 		end
@@ -643,9 +1086,32 @@ function love.mousepressed(x, y, button)
 	end
 end
 
+function love.wheelmoved(x, y)
+	if not pauseMenu.active or y == 0 then
+		return
+	end
+
+	if pauseMenu.tab == "help" then
+		pauseMenu.helpScroll = math.max(0, pauseMenu.helpScroll - y)
+		return
+	end
+
+	local item = pauseMenu.items[pauseMenu.selected]
+	if item and item.kind == "range" then
+		adjustPauseItem(item, y > 0 and 1 or -1)
+	end
+end
+
 function love.mousefocus(focused)
 	if not focused then
 		setMouseCapture(false)
+	end
+end
+
+function love.focus(focused)
+	if not focused and not pauseMenu.active then
+		setPauseState(true)
+		setPauseStatus("Paused: window focus lost.", 1.8)
 	end
 end
 
@@ -697,16 +1163,18 @@ function love.draw()
 		love.graphics.draw(frameImage)
 	end
 
-	love.graphics.setColor(1, 1, 1)
-	love.graphics.print(
-		"WASD + Space (ground), F = flight mode, Q/E roll (flight), G = GPU toggle, Esc = pause menu\n" ..
-		"Render: " .. tostring(renderMode) .. " | Triangles: " .. tostring(math.floor(triangleCount)) .. " | FPS: " ..
-		love.timer.getFPS(),
-		10,
-		10
-	)
+	if showDebugOverlay then
+		love.graphics.setColor(1, 1, 1)
+		love.graphics.print(
+			"Esc = pause menu (see Help tab for full controls)\n" ..
+			"Render: " .. tostring(renderMode) .. " | Triangles: " .. tostring(math.floor(triangleCount)) .. " | FPS: " ..
+			tostring(love.timer.getFPS()),
+			10,
+			10
+		)
+	end
 
-	if not pauseMenu.active then
+	if showCrosshair and not pauseMenu.active then
 		love.graphics.setColor(1, 0, 0, 0.5)
 		love.graphics.circle("fill", centerX, centerY, 1)
 	end
