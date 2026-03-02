@@ -377,13 +377,18 @@ function engine.processMovement(camera, dt, flightSimMode, vector3, q, objects, 
         local dragCoeff = camera.flightDragCoefficient or 0.018
         local airBrakeDrag = (inputState.flightAirBrakes and (camera.flightAirBrakeDrag or 0.11)) or 0
         local forwardAirspeed = math.max(0, vector3.dot(airVel, forward))
-        local liftCoeff = camera.flightLiftCoefficient or 0.028
+        local liftCoeff = camera.flightLiftCoefficient or 0.11
         local stallSpeed = camera.flightStallSpeed or 8
         local fullLiftSpeed = camera.flightFullLiftSpeed or 24
         local liftWindow = math.max(1, fullLiftSpeed - stallSpeed)
         local liftFactor = math.max(0, math.min((forwardAirspeed - stallSpeed) / liftWindow, 1))
-        local liftMagnitude = liftCoeff * forwardAirspeed * forwardAirspeed * (0.25 + 0.75 * liftFactor)
-        local inducedDragMagnitude = (camera.flightInducedDragCoefficient or 0.0035) * liftMagnitude
+        local verticalAirspeed = vector3.dot(airVel, up)
+        local aoa = math.atan2(-verticalAirspeed, math.max(1e-5, forwardAirspeed))
+        local zeroLiftAngle = camera.flightZeroLiftAngle or 0
+        local maxLiftAngle = camera.flightMaxLiftAngle or math.rad(20)
+        local effectiveAoa = math.max(-maxLiftAngle, math.min(aoa - zeroLiftAngle, maxLiftAngle))
+        local liftMagnitude = liftCoeff * forwardAirspeed * forwardAirspeed * effectiveAoa * liftFactor
+        local inducedDragMagnitude = (camera.flightInducedDragCoefficient or 0.0035) * math.abs(liftMagnitude)
         local dragMagnitude = (dragCoeff + airBrakeDrag) * airSpeed * airSpeed
 
         local accel = {

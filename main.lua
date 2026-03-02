@@ -3246,7 +3246,9 @@ function love.load()
 		flightThrustAccel = 32,
 		flightDragCoefficient = 0.018,
 		flightAirBrakeDrag = 0.11,
-		flightLiftCoefficient = 0.028,
+		flightLiftCoefficient = 0.11,
+		flightZeroLiftAngle = 0,
+		flightMaxLiftAngle = math.rad(20),
 		flightStallSpeed = 8,
 		flightFullLiftSpeed = 24,
 		flightInducedDragCoefficient = 0.0035,
@@ -3258,7 +3260,7 @@ function love.load()
 		flightThrottleDamping = 5,
 		wheelThrottleStep = 2,
 		flightPitchRate = 78,
-		flightYawRate = 90,
+		flightYawRate = 10,
 		flightRollRate = 95,
 		flightMousePitchMultiplier = 1.9,
 		flightMouseYawMultiplier = 3.5,
@@ -3876,6 +3878,39 @@ function love.focus(focused)
 end
 
 local function drawHud(w, h, cx, cy)
+	if flightSimMode and camera then
+		local currentMaxThrottle = math.max(0.001, camera.maxSpeed or 1)
+		if isActionDown("flight_afterburner") then
+			currentMaxThrottle = currentMaxThrottle * (camera.afterburnerMultiplier or 1.6)
+		end
+
+		local throttleRatio = clamp((camera.throttle or 0) / currentMaxThrottle, 0, 1)
+		local barHeight = math.floor(math.min(h * 0.34, 240))
+		local barWidth = 18
+		local barX = 24
+		local barY = math.floor((h - barHeight) * 0.5)
+		local handleSize = barWidth + 8
+		local handleY = barY + (1 - throttleRatio) * barHeight - (handleSize * 0.5)
+		handleY = clamp(handleY, barY - (handleSize * 0.5), barY + barHeight - (handleSize * 0.5))
+
+		love.graphics.setColor(0.05, 0.07, 0.08, 0.75)
+		love.graphics.rectangle("fill", barX, barY, barWidth, barHeight, 3, 3)
+		love.graphics.setColor(0.75, 0.85, 0.92, 0.9)
+		love.graphics.rectangle("line", barX, barY, barWidth, barHeight, 3, 3)
+
+		local fillTop = barY + (1 - throttleRatio) * barHeight
+		love.graphics.setColor(0.22, 0.82, 0.36, 0.65)
+		love.graphics.rectangle("fill", barX + 1, fillTop, barWidth - 2, (barY + barHeight) - fillTop)
+
+		love.graphics.setColor(0.95, 0.97, 1.0, 0.95)
+		love.graphics.rectangle("fill", barX - 4, handleY, handleSize, handleSize, 2, 2)
+		love.graphics.setColor(0.10, 0.12, 0.15, 0.95)
+		love.graphics.rectangle("line", barX - 4, handleY, handleSize, handleSize, 2, 2)
+
+		love.graphics.setColor(0.86, 0.92, 1.0, 0.95)
+		love.graphics.print(string.format("THR %d%%", math.floor((throttleRatio * 100) + 0.5)), barX - 8, barY + barHeight + 6)
+	end
+
 	if not mapState.visible then
 		return
 	end
