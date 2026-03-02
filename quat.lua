@@ -69,7 +69,7 @@ function q.rotateVector(quat, v)
 end
 
 function q.getBasis(rot)
-    return q.normalize(q.rotateVector(rot, {0, 0, 1})),  -- forward
+    return q.normalize(q.rotateVector(rot, {0, 0, -1})),  -- forward
            q.normalize(q.rotateVector(rot, {1, 0, 0})),  -- right
            q.normalize(q.rotateVector(rot, {0, 1, 0}))   -- up
 end

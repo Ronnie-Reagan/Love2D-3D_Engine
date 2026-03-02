@@ -1,6 +1,22 @@
 local engine = {}
 local love = require "love"
+-- === GPU Shader Setup ===
+engine.defaultShaderCode = [[
+extern mat4 modelViewProjection;
 
+vec4 position(mat4 transform_projection, vec4 vertex_position)
+{
+    // transform vertex using our MVP matrix
+    return modelViewProjection * vertex_position;
+}
+
+vec4 effect(vec4 color, Image texture, vec2 texCoords, vec2 screenCoords)
+{
+    // pass vertex color to fragment
+    return color;
+}
+]]
+engine.defaultShader = love.graphics.newShader(engine.defaultShaderCode)
 
 --[[
 Loads an STL obj file and creates vertices/faces for it to be added to the world for rendering and simulation
@@ -94,51 +110,100 @@ function engine.checkAABBCollision(box, obj)
 end
 
 -- === Camera Movement ===
-function engine.processMovement(camera, dt, flightSimMode, vector3, q, objects)
+function engine.processMovement(camera, dt, flightSimMode, vector3, q, objects, inputState)
+    inputState = inputState or {}
+
+    local function axis(positive, negative)
+        local value = 0
+        if positive then
+            value = value + 1
+        end
+        if negative then
+            value = value - 1
+        end
+        return value
+    end
+
     local speed = camera.speed * dt
     local forward, right, up = engine.getCameraBasis(camera, q, vector3)
 
     if flightSimMode then
-        -- Flight mode: throttle & roll
-        camera.thrust = 0
-        if love.keyboard.isDown("w") then camera.thrust = camera.thrust + 1 end
-        if love.keyboard.isDown("s") then camera.thrust = camera.thrust - 1 end
-
-        camera.throttle = math.max(0, math.min(camera.throttle + (camera.thrust or 0) * dt, camera.maxSpeed))
-        for i = 1, 3 do
-            camera.pos[i] = camera.pos[i] + forward[i] * camera.throttle * dt
+        local throttleAxis = axis(inputState.flightThrottleUp, inputState.flightThrottleDown)
+        local throttleAccel = camera.throttleAccel or 24
+        local maxSpeed = camera.maxSpeed or 50
+        if inputState.flightAfterburner then
+            maxSpeed = maxSpeed * (camera.afterburnerMultiplier or 1.6)
         end
 
-        if love.keyboard.isDown("q") then
-            local roll = q.fromAxisAngle(forward, math.rad(45 * dt))
-            camera.rot = q.normalize(q.multiply(roll, camera.rot))
-        elseif love.keyboard.isDown("e") then
-            local roll = q.fromAxisAngle(forward, -math.rad(45 * dt))
-            camera.rot = q.normalize(q.multiply(roll, camera.rot))
+        camera.throttle = math.max(0, math.min(camera.throttle + throttleAxis * throttleAccel * dt, maxSpeed))
+        if inputState.flightAirBrakes then
+            local brakeStrength = camera.airBrakeStrength or 45
+            camera.throttle = math.max(0, camera.throttle - brakeStrength * dt)
+        end
+
+        local pitchAxis = axis(inputState.flightPitchDown, inputState.flightPitchUp)
+        local yawAxis = axis(inputState.flightYawRight, inputState.flightYawLeft)
+        local rollAxis = axis(inputState.flightRollLeft, inputState.flightRollRight)
+
+        if pitchAxis ~= 0 then
+            local pitchRate = math.rad(camera.flightPitchRate or 60)
+            local pitchQuat = q.fromAxisAngle(right, pitchAxis * pitchRate * dt)
+            camera.rot = q.normalize(q.multiply(pitchQuat, camera.rot))
+        end
+        if yawAxis ~= 0 then
+            local yawRate = math.rad(camera.flightYawRate or 70)
+            local yawQuat = q.fromAxisAngle(up, yawAxis * yawRate * dt)
+            camera.rot = q.normalize(q.multiply(yawQuat, camera.rot))
+        end
+        if rollAxis ~= 0 then
+            local rollRate = math.rad(camera.flightRollRate or 90)
+            local rollQuat = q.fromAxisAngle(forward, rollAxis * rollRate * dt)
+            camera.rot = q.normalize(q.multiply(rollQuat, camera.rot))
+        end
+
+        forward = vector3.normalizeVec(q.rotateVector(camera.rot, { 0, 0, 1 }))
+        for i = 1, 3 do
+            camera.pos[i] = camera.pos[i] + forward[i] * camera.throttle * dt
         end
         return camera
     end
 
     -- === Ground movement ===
-    -- Horizontal input
     local moveDir = { 0, 0, 0 }
     local groundForward = vector3.normalizeVec({ forward[1], 0, forward[3] })
     local groundRight = vector3.normalizeVec({ right[1], 0, right[3] })
-    if love.keyboard.isDown("w") then moveDir = vector3.add(moveDir, groundForward) end
-    if love.keyboard.isDown("s") then moveDir = vector3.sub(moveDir, groundForward) end
-    if love.keyboard.isDown("d") then moveDir = vector3.add(moveDir, groundRight) end
-    if love.keyboard.isDown("a") then moveDir = vector3.sub(moveDir, groundRight) end
+    if inputState.walkForward then
+        moveDir = vector3.add(moveDir, groundForward)
+    end
+    if inputState.walkBackward then
+        moveDir = vector3.sub(moveDir, groundForward)
+    end
+    if inputState.walkStrafeRight then
+        moveDir = vector3.add(moveDir, groundRight)
+    end
+    if inputState.walkStrafeLeft then
+        moveDir = vector3.sub(moveDir, groundRight)
+    end
     moveDir = vector3.normalizeVec(moveDir)
 
-    camera.pos[1] = camera.pos[1] + moveDir[1] * speed
-    camera.pos[3] = camera.pos[3] + moveDir[3] * speed
+    local sprintMultiplier = inputState.walkSprint and (camera.sprintMultiplier or 1.6) or 1
+    local walkSpeed = speed * sprintMultiplier
+    camera.pos[1] = camera.pos[1] + moveDir[1] * walkSpeed
+    camera.pos[3] = camera.pos[3] + moveDir[3] * walkSpeed
+
+    local tiltAxis = axis(inputState.walkTiltLeft, inputState.walkTiltRight)
+    if tiltAxis ~= 0 then
+        local tiltRate = math.rad(camera.walkTiltRate or 35)
+        local tiltQuat = q.fromAxisAngle(forward, tiltAxis * tiltRate * dt)
+        camera.rot = q.normalize(q.multiply(tiltQuat, camera.rot))
+    end
 
     -- Gravity
     camera.vel[2] = camera.vel[2] + camera.gravity * dt
     camera.pos[2] = camera.pos[2] + camera.vel[2] * dt
 
     -- Update camera box
-    camera.box.pos = { camera.pos[1], camera.pos[2] - camera.box.halfSize.y, camera.pos[3] }
+    camera.box.pos = { camera.pos[1], camera.pos[2], camera.pos[3] }
 
     -- Collision with ground tiles: find highest tile under camera
     local highestY = -math.huge
@@ -148,7 +213,9 @@ function engine.processMovement(camera, dt, flightSimMode, vector3, q, objects)
             local dz = math.abs(camera.box.pos[3] - obj.pos[3])
             if dx <= obj.halfSize.x + camera.box.halfSize.x and dz <= obj.halfSize.z + camera.box.halfSize.z then
                 local topY = obj.pos[2] + obj.halfSize.y
-                if topY > highestY then highestY = topY end
+                if topY > highestY then
+                    highestY = topY
+                end
             end
         end
     end
@@ -162,8 +229,7 @@ function engine.processMovement(camera, dt, flightSimMode, vector3, q, objects)
         camera.onGround = false
     end
 
-    -- Jump
-    if love.keyboard.isDown("space") and camera.onGround then
+    if inputState.walkJump and camera.onGround then
         camera.vel[2] = camera.jumpSpeed
         camera.onGround = false
     end
@@ -243,14 +309,14 @@ function engine.drawObject(obj, skipCulling, camera, vector3, q, screen, zBuffer
         end
         if not faceValid then goto continue end
 
-        poly = engine.clipPolygonToNearPlane(poly, 0.01)
+        poly = engine.clipPolygonToNearPlane(poly, 0.0001)
 
         if #poly < 3 then
             goto continue
         end
 
         -- Optional backface culling
-        if not skipCulling then
+        if skipCulling then
             local v1, v2, v3 = transformedVerts[face[1]], transformedVerts[face[2]], transformedVerts[face[3]]
             local edge1 = vector3.sub(v2, v1)
             local edge2 = vector3.sub(v3, v1)
@@ -285,6 +351,69 @@ function engine.drawObject(obj, skipCulling, camera, vector3, q, screen, zBuffer
         ::continue::
     end
     return imageData
+end
+
+function engine.perspectiveMatrix(fov, aspect, near, far)
+    local f = 1 / math.tan(fov / 2)
+    return {
+        { f / aspect, 0, 0,                               0 },
+        { 0,          f, 0,                               0 },
+        { 0,          0, (far + near) / (near - far),     -1 },
+        { 0,          0, (2 * far * near) / (near - far), 0 }
+    }
+end
+
+function engine.mat4Multiply(a, b)
+    local r = {}
+    for i = 1, 4 do
+        r[i] = {}
+        for j = 1, 4 do
+            r[i][j] = 0
+            for k = 1, 4 do
+                r[i][j] = r[i][j] + a[i][k] * b[k][j]
+            end
+        end
+    end
+    return r
+end
+
+function engine.drawObjectGPU(obj, camera, q, vector3, screen)
+    if not obj.mesh then
+        return
+    end
+    local function flattenMat4(m)
+        return {
+            m[1][1], m[1][2], m[1][3], m[1][4],
+            m[2][1], m[2][2], m[2][3], m[2][4],
+            m[3][1], m[3][2], m[3][3], m[3][4],
+            m[4][1], m[4][2], m[4][3], m[4][4]
+        }
+    end
+
+    local aspect = screen.w / screen.h
+    local proj = engine.perspectiveMatrix(camera.fov, aspect, 20, 1000)
+
+    local function mat4LookAt(pos, rot)
+        local f = q.rotateVector(rot, { 0, 0, -1 })
+        local r = q.rotateVector(rot, { 1, 0, 0 })
+        local u = q.rotateVector(rot, { 0, 1, 0 })
+        return {
+            { r[1], u[1], -f[1], 0 },
+            { r[2], u[2], -f[2], 0 },
+            { r[3], u[3], -f[3], 0 },
+            { -(r[1] * pos[1] + r[2] * pos[2] + r[3] * pos[3]),
+                -(u[1] * pos[1] + u[2] * pos[2] + u[3] * pos[3]),
+                f[1] * pos[1] + f[2] * pos[2] + f[3] * pos[3], 1 },
+        }
+    end
+
+    local view = mat4LookAt(camera.pos, camera.rot)
+    local mvp = flattenMat4(engine.mat4Multiply(proj, view))
+
+    love.graphics.setShader(engine.defaultShader)
+    engine.defaultShader:send("modelViewProjection", mvp)
+    love.graphics.draw(obj.mesh)
+    love.graphics.setShader()
 end
 
 function engine.worldToCamera(worldPos, camera, q)
