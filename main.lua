@@ -79,6 +79,19 @@ local cloudState = {
 	minPuffs = 5,
 	maxPuffs = 10
 }
+local cloudNetState = {
+	role = "standalone", -- standalone, pending, authority, follower
+	connectedAt = 0,
+	decisionDelay = 1.2,
+	sawPeerOnJoin = false,
+	authorityPeerId = nil,
+	lastSnapshotSentAt = -math.huge,
+	lastSnapshotReceivedAt = -math.huge,
+	lastSnapshotRequestAt = -math.huge,
+	snapshotInterval = 10.0,
+	requestCooldown = 2.0,
+	staleTimeout = 13.5
+}
 
 -- Correct imported player STL orientation to engine forward/up axes.
 local playerModelRotationOffset = q.normalize(q.multiply(
@@ -909,6 +922,19 @@ local function getWindVectorXZ()
 	return math.cos(windState.angle) * windState.speed, math.sin(windState.angle) * windState.speed
 end
 
+local function getWindVector3()
+	local windX, windZ = getWindVectorXZ()
+	return { windX, 0, windZ }
+end
+
+local function clearCloudObjects()
+	for i = #objects, 1, -1 do
+		if objects[i].isCloud then
+			table.remove(objects, i)
+		end
+	end
+end
+
 local function chooseCloudCenter(spawnUpwind)
 	local refX = (camera and camera.pos and camera.pos[1]) or 0
 	local refZ = (camera and camera.pos and camera.pos[3]) or 0
@@ -967,8 +993,12 @@ local function randomizeCloudGroup(group, spawnUpwind)
 	updateCloudGroupVisuals(group, love.timer.getTime())
 end
 
-local function spawnCloudField()
+local function spawnCloudField(groupCountOverride)
+	clearCloudObjects()
 	cloudState.groups = {}
+	cloudState.groupCount = math.max(1, math.floor(groupCountOverride or cloudState.groupCount or 1))
+	cloudState.minPuffs = math.max(1, math.floor(cloudState.minPuffs or 1))
+	cloudState.maxPuffs = math.max(cloudState.minPuffs, math.floor(cloudState.maxPuffs or cloudState.minPuffs))
 
 	for _ = 1, cloudState.groupCount do
 		local puffCount = math.random(cloudState.minPuffs, cloudState.maxPuffs)
@@ -1006,7 +1036,11 @@ local function updateClouds(dt)
 		return
 	end
 
-	updateWind(dt)
+	local isAuthoritySimulation = cloudNetState.role ~= "follower"
+	if isAuthoritySimulation then
+		updateWind(dt)
+	end
+
 	local windX, windZ = getWindVectorXZ()
 	local now = love.timer.getTime()
 	local maxDistSq = cloudState.despawnRadius * cloudState.despawnRadius
@@ -1017,7 +1051,7 @@ local function updateClouds(dt)
 
 		local dx = group.center[1] - camera.pos[1]
 		local dz = group.center[3] - camera.pos[3]
-		if (dx * dx + dz * dz) > maxDistSq then
+		if isAuthoritySimulation and (dx * dx + dz * dz) > maxDistSq then
 			randomizeCloudGroup(group, true)
 		else
 			updateCloudGroupVisuals(group, now)
@@ -1050,8 +1084,11 @@ local function setFlightMode(enabled)
 		if flightSimMode then
 			camera.walkYaw = nil
 			camera.walkPitch = nil
+			camera.flightVel = camera.flightVel or { 0, 0, 0 }
 		else
 			camera.throttle = 0
+			camera.flightVel = { 0, 0, 0 }
+			camera.vel = { 0, 0, 0 }
 			syncWalkingLookFromRotation()
 		end
 	end
@@ -1094,6 +1131,7 @@ local function resetCameraTransform()
 	camera.pos = { 0, 0, -5 }
 	camera.rot = q.identity()
 	camera.vel = { 0, 0, 0 }
+	camera.flightVel = { 0, 0, 0 }
 	camera.throttle = 0
 	camera.onGround = false
 	camera.walkYaw = 0
@@ -1114,6 +1152,298 @@ local function clearPeerObjects()
 		end
 	end
 	peers = {}
+end
+
+local function splitPacketFields(data)
+	local parts = {}
+	if type(data) ~= "string" then
+		return parts
+	end
+
+	for part in string.gmatch(data, "([^|]+)") do
+		parts[#parts + 1] = part
+	end
+	return parts
+end
+
+local function formatNetFloat(value)
+	return string.format("%.4f", tonumber(value) or 0)
+end
+
+local function relayIsConnected()
+	if not relayServer then
+		return false
+	end
+
+	local ok, state = pcall(function()
+		return relayServer:state()
+	end)
+	return ok and state == "connected"
+end
+
+local function setCloudRole(role, detail)
+	if cloudNetState.role == role then
+		return
+	end
+	cloudNetState.role = role
+	if detail and detail ~= "" then
+		logger.log(string.format("Cloud sync role: %s (%s)", role, detail))
+	else
+		logger.log("Cloud sync role: " .. role)
+	end
+end
+
+local function beginCloudRoleElection(reason)
+	cloudNetState.connectedAt = love.timer.getTime()
+	cloudNetState.sawPeerOnJoin = false
+	cloudNetState.authorityPeerId = nil
+	cloudNetState.lastSnapshotSentAt = -math.huge
+	cloudNetState.lastSnapshotReceivedAt = -math.huge
+	cloudNetState.lastSnapshotRequestAt = -math.huge
+	setCloudRole("pending", reason or "relay connected")
+end
+
+local function requestCloudSnapshot(reason)
+	if cloudNetState.role ~= "follower" then
+		return false
+	end
+	if not relayIsConnected() then
+		return false
+	end
+
+	local now = love.timer.getTime()
+	if (now - cloudNetState.lastSnapshotRequestAt) < cloudNetState.requestCooldown then
+		return false
+	end
+
+	local packet = string.format("CLOUD_REQUEST|%s", formatNetFloat(now))
+	local ok = pcall(function()
+		relayServer:send(packet)
+	end)
+	if ok then
+		cloudNetState.lastSnapshotRequestAt = now
+		if reason and reason ~= "" then
+			logger.log("Requested cloud snapshot (" .. reason .. ").")
+		end
+	end
+	return ok
+end
+
+local function buildCloudSnapshotPacket(now)
+	local parts = {
+		"CLOUD_SNAPSHOT",
+		formatNetFloat(now),
+		formatNetFloat(windState.angle),
+		formatNetFloat(windState.speed),
+		tostring(#cloudState.groups),
+		formatNetFloat(cloudState.minAltitude),
+		formatNetFloat(cloudState.maxAltitude),
+		formatNetFloat(cloudState.spawnRadius),
+		formatNetFloat(cloudState.despawnRadius),
+		formatNetFloat(cloudState.minGroupSize),
+		formatNetFloat(cloudState.maxGroupSize),
+		tostring(math.floor(cloudState.minPuffs)),
+		tostring(math.floor(cloudState.maxPuffs))
+	}
+
+	for _, group in ipairs(cloudState.groups) do
+		parts[#parts + 1] = table.concat({
+			formatNetFloat(group.center[1]),
+			formatNetFloat(group.center[2]),
+			formatNetFloat(group.center[3]),
+			formatNetFloat(group.radius),
+			formatNetFloat(group.windDrift)
+		}, ",")
+	end
+
+	return table.concat(parts, "|")
+end
+
+local function sendCloudSnapshot(forceSend, reason)
+	if cloudNetState.role ~= "authority" then
+		return false
+	end
+	if not relayIsConnected() then
+		return false
+	end
+
+	local now = love.timer.getTime()
+	if (not forceSend) and (now - cloudNetState.lastSnapshotSentAt) < cloudNetState.snapshotInterval then
+		return false
+	end
+
+	local packet = buildCloudSnapshotPacket(now)
+	local ok = pcall(function()
+		relayServer:send(packet)
+	end)
+	if ok then
+		cloudNetState.lastSnapshotSentAt = now
+		if forceSend and reason and reason ~= "" then
+			logger.log("Sent cloud snapshot (" .. reason .. ").")
+		end
+	end
+	return ok
+end
+
+local function applyCloudSnapshotParts(parts, senderId)
+	if #parts < 15 then
+		return false
+	end
+
+	local snapshotGroupCount = math.max(1, math.floor(tonumber(parts[5]) or cloudState.groupCount))
+	local expectedFields = 13 + snapshotGroupCount + 1
+	if #parts < expectedFields then
+		return false
+	end
+
+	local snapshotMinAltitude = tonumber(parts[6]) or cloudState.minAltitude
+	local snapshotMaxAltitude = tonumber(parts[7]) or cloudState.maxAltitude
+	local snapshotSpawnRadius = tonumber(parts[8]) or cloudState.spawnRadius
+	local snapshotDespawnRadius = tonumber(parts[9]) or cloudState.despawnRadius
+	local snapshotMinGroupSize = tonumber(parts[10]) or cloudState.minGroupSize
+	local snapshotMaxGroupSize = tonumber(parts[11]) or cloudState.maxGroupSize
+	local snapshotMinPuffs = math.max(1, math.floor(tonumber(parts[12]) or cloudState.minPuffs))
+	local snapshotMaxPuffs = math.max(snapshotMinPuffs, math.floor(tonumber(parts[13]) or cloudState.maxPuffs))
+	local snapshotWindAngle = tonumber(parts[3])
+	local snapshotWindSpeed = tonumber(parts[4])
+
+	cloudState.groupCount = snapshotGroupCount
+	cloudState.minAltitude = math.min(snapshotMinAltitude, snapshotMaxAltitude)
+	cloudState.maxAltitude = math.max(snapshotMinAltitude, snapshotMaxAltitude)
+	cloudState.spawnRadius = math.max(10, snapshotSpawnRadius)
+	cloudState.despawnRadius = math.max(cloudState.spawnRadius + 10, snapshotDespawnRadius)
+	cloudState.minGroupSize = math.max(1, math.min(snapshotMinGroupSize, snapshotMaxGroupSize))
+	cloudState.maxGroupSize = math.max(cloudState.minGroupSize, snapshotMaxGroupSize)
+	cloudState.minPuffs = snapshotMinPuffs
+	cloudState.maxPuffs = snapshotMaxPuffs
+
+	if snapshotWindAngle then
+		windState.angle = wrapAngle(snapshotWindAngle)
+	end
+	if snapshotWindSpeed then
+		windState.speed = math.max(0, snapshotWindSpeed)
+	end
+	windState.targetAngle = windState.angle
+	windState.targetSpeed = windState.speed
+	windState.retargetIn = math.huge
+
+	if #cloudState.groups ~= snapshotGroupCount then
+		spawnCloudField(snapshotGroupCount)
+	end
+
+	local now = love.timer.getTime()
+	for i = 1, snapshotGroupCount do
+		local token = parts[13 + i]
+		local gx, gy, gz, gr, gd = token and token:match("^([^,]+),([^,]+),([^,]+),([^,]+),([^,]+)$")
+		local group = cloudState.groups[i]
+		if group and gx and gy and gz and gr and gd then
+			group.center[1] = tonumber(gx) or group.center[1]
+			group.center[2] = tonumber(gy) or group.center[2]
+			group.center[3] = tonumber(gz) or group.center[3]
+			group.radius = math.max(1, tonumber(gr) or group.radius)
+			group.windDrift = tonumber(gd) or group.windDrift
+			updateCloudGroupVisuals(group, now)
+		end
+	end
+
+	cloudNetState.authorityPeerId = senderId
+	cloudNetState.lastSnapshotReceivedAt = now
+	return true
+end
+
+local function handleCloudSnapshotPacket(data)
+	local parts = splitPacketFields(data)
+	if parts[1] ~= "CLOUD_SNAPSHOT" then
+		return false
+	end
+
+	local senderId = tonumber(parts[#parts])
+	if not senderId then
+		return false
+	end
+
+	if cloudNetState.role == "authority" then
+		return false
+	end
+
+	if cloudNetState.role == "follower" and cloudNetState.authorityPeerId and cloudNetState.authorityPeerId ~= senderId then
+		return false
+	end
+
+	if cloudNetState.role ~= "follower" then
+		setCloudRole("follower", "cloud snapshot received")
+	end
+	cloudNetState.sawPeerOnJoin = true
+	return applyCloudSnapshotParts(parts, senderId)
+end
+
+local function handleCloudRequestPacket(data)
+	local parts = splitPacketFields(data)
+	if parts[1] ~= "CLOUD_REQUEST" then
+		return false
+	end
+
+	local senderId = tonumber(parts[#parts])
+	if not senderId then
+		return false
+	end
+
+	if cloudNetState.role == "pending" then
+		cloudNetState.sawPeerOnJoin = true
+	end
+
+	if cloudNetState.role == "authority" then
+		sendCloudSnapshot(true, "request from peer " .. tostring(senderId))
+	end
+	return true
+end
+
+local function notePeerStateReceived(peerId)
+	if not peerId then
+		return
+	end
+	if cloudNetState.role == "standalone" and relayIsConnected() then
+		beginCloudRoleElection("peer state observed")
+	end
+
+	if cloudNetState.role == "pending" then
+		cloudNetState.sawPeerOnJoin = true
+		cloudNetState.authorityPeerId = cloudNetState.authorityPeerId or peerId
+		setCloudRole("follower", "peer state received during join")
+		requestCloudSnapshot("joining populated session")
+	elseif cloudNetState.role == "follower" and not cloudNetState.authorityPeerId then
+		cloudNetState.authorityPeerId = peerId
+	end
+end
+
+local function updateCloudNetworkState(now)
+	if not relayIsConnected() then
+		if cloudNetState.role ~= "standalone" then
+			setCloudRole("standalone", "relay unavailable")
+		end
+		cloudNetState.authorityPeerId = nil
+		return
+	end
+
+	if cloudNetState.role == "standalone" then
+		beginCloudRoleElection("relay connected")
+	end
+
+	if cloudNetState.role == "pending" then
+		if cloudNetState.sawPeerOnJoin then
+			setCloudRole("follower", "peer detected during join window")
+			requestCloudSnapshot("peer already present")
+		elseif (now - cloudNetState.connectedAt) >= cloudNetState.decisionDelay then
+			cloudNetState.authorityPeerId = nil
+			cloudNetState.lastSnapshotSentAt = -math.huge
+			setCloudRole("authority", "no peers detected at connect")
+		end
+		return
+	end
+
+	if cloudNetState.role == "follower" and (now - cloudNetState.lastSnapshotReceivedAt) >= cloudNetState.staleTimeout then
+		requestCloudSnapshot("snapshot stale")
+	end
 end
 
 local function getRelayStatus()
@@ -1153,6 +1483,8 @@ local function reconnectRelay()
 	end
 
 	clearPeerObjects()
+	cloudNetState.authorityPeerId = nil
+	setCloudRole("standalone", "relay reconnecting")
 
 	local ok, peerOrErr = pcall(function()
 		return relay:connect(hostAddy)
@@ -2394,6 +2726,16 @@ function love.load()
 		throttle = 0,
 		maxSpeed = 34,
 		throttleAccel = 18,
+		flightThrustAccel = 32,
+		flightDragCoefficient = 0.018,
+		flightAirBrakeDrag = 0.11,
+		flightLiftCoefficient = 0.028,
+		flightStallSpeed = 8,
+		flightFullLiftSpeed = 24,
+		flightInducedDragCoefficient = 0.0035,
+		flightGravity = -9.81,
+		flightMaxVelocity = 92,
+		flightVel = { 0, 0, 0 },
 		afterburnerMultiplier = 1.45,
 		airBrakeStrength = 65,
 		flightThrottleDamping = 5,
@@ -2424,6 +2766,13 @@ function love.load()
 	mapState.mUsedForZoom = false
 	mapState.zoomIndex = 2
 	mapState.logicalCamera = nil
+	cloudNetState.role = "standalone"
+	cloudNetState.connectedAt = 0
+	cloudNetState.sawPeerOnJoin = false
+	cloudNetState.authorityPeerId = nil
+	cloudNetState.lastSnapshotSentAt = -math.huge
+	cloudNetState.lastSnapshotReceivedAt = -math.huge
+	cloudNetState.lastSnapshotRequestAt = -math.huge
 
 	renderMode = "CPU"
 	gpuErrorLogged = false
@@ -2666,15 +3015,7 @@ function love.mousemoved(x, y, dx, dy)
 end
 
 local function updateNet()
-	local canSend = relayServer ~= nil
-	if canSend then
-		local ok, state = pcall(function()
-			return relayServer:state()
-		end)
-		if ok and state == "disconnected" then
-			canSend = false
-		end
-	end
+	local canSend = relayIsConnected()
 
 	if canSend then
 		local packet = string.format(
@@ -2690,6 +3031,8 @@ local function updateNet()
 		pcall(function()
 			relayServer:send(packet)
 		end)
+
+		sendCloudSnapshot(false)
 	end
 end
 
@@ -2700,10 +3043,30 @@ local function serviceNetworkEvents()
 
 	event = relay:service()
 	while event do
-		if event.type == "receive" then
-			networking.handlePacket(event.data, peers, objects, q, playerModel, playerModelRotationOffset)
+		if event.type == "connect" and relayServer and event.peer == relayServer then
+			beginCloudRoleElection("relay handshake complete")
+		elseif event.type == "receive" then
+			local packetType = type(event.data) == "string" and event.data:match("^([^|]+)")
+			if packetType == "STATE" then
+				local peerId = networking.handlePacket(
+					event.data,
+					peers,
+					objects,
+					q,
+					playerModel,
+					playerModelRotationOffset
+				)
+				notePeerStateReceived(peerId)
+			elseif packetType == "CLOUD_REQUEST" then
+				handleCloudRequestPacket(event.data)
+			elseif packetType == "CLOUD_SNAPSHOT" then
+				handleCloudSnapshotPacket(event.data)
+			end
 		elseif event.type == "disconnect" and relayServer and event.peer == relayServer then
 			relayServer = nil
+			clearPeerObjects()
+			cloudNetState.authorityPeerId = nil
+			setCloudRole("standalone", "relay disconnected")
 			logger.log("Relay disconnected.")
 		end
 
@@ -2713,6 +3076,9 @@ end
 
 -- === Camera Movement ===
 function love.update(dt)
+	local now = love.timer.getTime()
+	updateCloudNetworkState(now)
+
 	if pauseMenu.statusUntil > 0 and love.timer.getTime() >= pauseMenu.statusUntil then
 		pauseMenu.statusText = ""
 		pauseMenu.statusUntil = 0
@@ -2723,11 +3089,12 @@ function love.update(dt)
 
 	if not pauseMenu.active then
 		local movementInput = buildMovementInputState()
-		camera = engine.processMovement(camera, dt, flightSimMode, vector3, q, objects, movementInput)
+		camera = engine.processMovement(camera, dt, flightSimMode, vector3, q, objects, movementInput, {
+			wind = getWindVector3()
+		})
 		syncLocalPlayerObject()
 		updateClouds(dt)
 		updateZoomFov(dt)
-		updateNet()
 
 		perfElapsed = perfElapsed + dt
 		perfFrames = perfFrames + 1
@@ -2744,8 +3111,10 @@ function love.update(dt)
 		end
 	end
 
+	updateNet()
 	resolveActiveRenderCamera()
 	serviceNetworkEvents()
+	updateCloudNetworkState(love.timer.getTime())
 end
 
 -- === Input Management ===
@@ -3167,8 +3536,13 @@ function love.draw()
 				mapState.visible and "on" or "off",
 				mapState.zoomIndex
 			) ..
-			string.format("Wind: %.1f u/s @ %d deg | Clouds: %d", windState.speed, math.floor(math.deg(windState.angle) + 0.5),
-				#cloudState.groups),
+			string.format(
+				"Wind: %.1f u/s @ %d deg | Clouds: %d | CloudSync: %s",
+				windState.speed,
+				math.floor(math.deg(windState.angle) + 0.5),
+				#cloudState.groups,
+				cloudNetState.role
+			),
 			10,
 			10
 		)

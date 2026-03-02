@@ -22,7 +22,7 @@ end
 
 function networking.handlePacket(data, peers, objects, q, playerModel, playerModelRotationOffset)
     if type(data) ~= "string" then
-        return
+        return nil
     end
 
     local parts = {}
@@ -31,11 +31,11 @@ function networking.handlePacket(data, peers, objects, q, playerModel, playerMod
     end
 
     if parts[1] ~= "STATE" then
-        return
+        return nil
     end
 
     if #parts < 9 then
-        return
+        return nil
     end
 
     local id = tonumber(parts[#parts])
@@ -48,7 +48,7 @@ function networking.handlePacket(data, peers, objects, q, playerModel, playerMod
     local rz = tonumber(parts[8])
 
     if not (id and px and py and pz and rw and rx and ry and rz) then
-        return
+        return nil
     end
 
     if not peers[id] then
@@ -63,6 +63,8 @@ function networking.handlePacket(data, peers, objects, q, playerModel, playerMod
     else
         obj.rot = baseRot
     end
+
+    return id
 end
 
 return networking

@@ -299,7 +299,7 @@ function engine.checkAABBCollision(box, obj)
 end
 
 -- === Camera Movement ===
-function engine.processMovement(camera, dt, flightSimMode, vector3, q, objects, inputState)
+function engine.processMovement(camera, dt, flightSimMode, vector3, q, objects, inputState, flightEnvironment)
     inputState = inputState or {}
 
     local function axis(positive, negative)
@@ -354,9 +354,70 @@ function engine.processMovement(camera, dt, flightSimMode, vector3, q, objects, 
         end
 
         forward = vector3.normalizeVec(q.rotateVector(camera.rot, { 0, 0, 1 }))
-        for i = 1, 3 do
-            camera.pos[i] = camera.pos[i] + forward[i] * camera.throttle * dt
+        up = vector3.normalizeVec(q.rotateVector(camera.rot, { 0, 1, 0 }))
+
+        local wind = (flightEnvironment and flightEnvironment.wind) or { 0, 0, 0 }
+        camera.flightVel = camera.flightVel or { 0, 0, 0 }
+
+        local airVel = {
+            camera.flightVel[1] - (wind[1] or 0),
+            camera.flightVel[2] - (wind[2] or 0),
+            camera.flightVel[3] - (wind[3] or 0)
+        }
+        local airSpeed = vector3.length(airVel)
+        local airDir = (airSpeed > 1e-5) and {
+            airVel[1] / airSpeed,
+            airVel[2] / airSpeed,
+            airVel[3] / airSpeed
+        } or { 0, 0, 0 }
+
+        local throttleRange = math.max(1e-5, maxSpeed)
+        local throttleRatio = math.max(0, math.min(camera.throttle / throttleRange, 1))
+        local thrustAccel = throttleRatio * (camera.flightThrustAccel or 32)
+        local dragCoeff = camera.flightDragCoefficient or 0.018
+        local airBrakeDrag = (inputState.flightAirBrakes and (camera.flightAirBrakeDrag or 0.11)) or 0
+        local forwardAirspeed = math.max(0, vector3.dot(airVel, forward))
+        local liftCoeff = camera.flightLiftCoefficient or 0.028
+        local stallSpeed = camera.flightStallSpeed or 8
+        local fullLiftSpeed = camera.flightFullLiftSpeed or 24
+        local liftWindow = math.max(1, fullLiftSpeed - stallSpeed)
+        local liftFactor = math.max(0, math.min((forwardAirspeed - stallSpeed) / liftWindow, 1))
+        local liftMagnitude = liftCoeff * forwardAirspeed * forwardAirspeed * (0.25 + 0.75 * liftFactor)
+        local inducedDragMagnitude = (camera.flightInducedDragCoefficient or 0.0035) * liftMagnitude
+        local dragMagnitude = (dragCoeff + airBrakeDrag) * airSpeed * airSpeed
+
+        local accel = {
+            forward[1] * thrustAccel,
+            forward[2] * thrustAccel,
+            forward[3] * thrustAccel
+        }
+        accel[1] = accel[1] + up[1] * liftMagnitude
+        accel[2] = accel[2] + up[2] * liftMagnitude + (camera.flightGravity or camera.gravity or -9.81)
+        accel[3] = accel[3] + up[3] * liftMagnitude
+        if airSpeed > 1e-5 then
+            accel[1] = accel[1] - airDir[1] * (dragMagnitude + inducedDragMagnitude)
+            accel[2] = accel[2] - airDir[2] * (dragMagnitude + inducedDragMagnitude)
+            accel[3] = accel[3] - airDir[3] * (dragMagnitude + inducedDragMagnitude)
         end
+
+        for i = 1, 3 do
+            camera.flightVel[i] = camera.flightVel[i] + accel[i] * dt
+        end
+
+        local maxVelocity = camera.flightMaxVelocity or (maxSpeed * 2.1)
+        local speedNow = vector3.length(camera.flightVel)
+        if speedNow > maxVelocity and speedNow > 1e-5 then
+            local scale = maxVelocity / speedNow
+            camera.flightVel[1] = camera.flightVel[1] * scale
+            camera.flightVel[2] = camera.flightVel[2] * scale
+            camera.flightVel[3] = camera.flightVel[3] * scale
+        end
+
+        for i = 1, 3 do
+            camera.pos[i] = camera.pos[i] + camera.flightVel[i] * dt
+        end
+        camera.vel = { camera.flightVel[1], camera.flightVel[2], camera.flightVel[3] }
+        camera.onGround = false
         return camera
     end
 
