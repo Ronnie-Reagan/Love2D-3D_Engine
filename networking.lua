@@ -3,12 +3,12 @@ local networking = {}
 local objectLib = require "object"
 local cubeModel = objectLib.cubeModel
 
-function networking.createObjectForPeer(peerID, objects, q, playerModel)
+function networking.createObjectForPeer(peerID, objects, q, playerModel, playerModelRotationOffset)
     local model = playerModel or cubeModel
     local obj = {
         model = model,
         pos = { 0, 0, 0 },
-        rot = q.identity(),
+        rot = playerModelRotationOffset or q.identity(),
         color = { math.random(), math.random(), math.random() },
         isSolid = true,
         id = peerID,
@@ -20,7 +20,7 @@ function networking.createObjectForPeer(peerID, objects, q, playerModel)
     return obj
 end
 
-function networking.handlePacket(data, peers, objects, q, playerModel)
+function networking.handlePacket(data, peers, objects, q, playerModel, playerModelRotationOffset)
     if type(data) ~= "string" then
         return
     end
@@ -52,12 +52,17 @@ function networking.handlePacket(data, peers, objects, q, playerModel)
     end
 
     if not peers[id] then
-        peers[id] = networking.createObjectForPeer(id, objects, q, playerModel)
+        peers[id] = networking.createObjectForPeer(id, objects, q, playerModel, playerModelRotationOffset)
     end
 
     local obj = peers[id]
     obj.pos = { px, py, pz }
-    obj.rot = { w = rw, x = rx, y = ry, z = rz }
+    local baseRot = { w = rw, x = rx, y = ry, z = rz }
+    if playerModelRotationOffset then
+        obj.rot = q.normalize(q.multiply(baseRot, playerModelRotationOffset))
+    else
+        obj.rot = baseRot
+    end
 end
 
 return networking

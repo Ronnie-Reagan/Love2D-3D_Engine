@@ -28,6 +28,38 @@ local showCrosshair = true
 local showDebugOverlay = true
 local pauseTitleFont, pauseItemFont
 local walkingPitchLimit = math.rad(89)
+local viewState = {
+	mode = "first_person",
+	activeCamera = nil
+}
+local altLookState = {
+	held = false,
+	yaw = 0,
+	pitch = 0,
+	yawLimit = math.rad(85),
+	pitchUpLimit = math.rad(55),
+	pitchDownLimit = math.rad(40),
+	camera = nil
+}
+local thirdPersonState = {
+	offset = { 0, 2.0, -7.0 },
+	minDistance = 1.25,
+	collisionBuffer = 0.35,
+	camera = nil
+}
+local mapState = {
+	visible = false,
+	mHeld = false,
+	mUsedForZoom = false,
+	zoomIndex = 2,
+	zoomExtents = { 140, 400, 1000 },
+	panel = { margin = 14, widthRatio = 0.24, maxSize = 280, minSize = 150 },
+	logicalCamera = nil,
+	gridImage = nil,
+	gridImageSize = 0
+}
+local localPlayerObject = nil
+local worldHalfExtent = 1000
 local windState = {
 	angle = 0,
 	speed = 9,
@@ -47,6 +79,16 @@ local cloudState = {
 	minPuffs = 5,
 	maxPuffs = 10
 }
+
+-- Correct imported player STL orientation to engine forward/up axes.
+local playerModelRotationOffset = q.normalize(q.multiply(
+	q.fromAxisAngle({ 0, 1, 0 }, -math.pi * 0.5), -- rotate left 90 deg
+	q.fromAxisAngle({ 1, 0, 0 }, -math.pi * 0.5) -- rotate forward 90 deg
+))
+
+local function composePlayerModelRotation(baseRot)
+	return q.normalize(q.multiply(baseRot or q.identity(), playerModelRotationOffset))
+end
 
 local pauseMenu = {
 	active = false,
@@ -426,6 +468,15 @@ local function getPauseHelpSections()
 			}
 		},
 		{
+			title = "Cameras and Map",
+			items = {
+				{ keys = "C", text = "Cycle first-person and third-person camera modes." },
+				{ keys = "Hold Left Alt", text = "Temporary alt-look in first-person with head limits." },
+				{ keys = "Tap M", text = "Toggle the top-right mini map overlay." },
+				{ keys = "Hold M + Up/Down", text = "Change mini map zoom level without toggling map visibility." }
+			}
+		},
+		{
 			title = "Pause Menu",
 			items = {
 				{ keys = "Tab / H", text = "Cycle Game, Help, and Controls tabs." },
@@ -523,6 +574,301 @@ local function syncWalkingLookFromRotation()
 	camera.walkYaw = wrapAngle(yaw)
 	camera.walkPitch = clamp(pitch, -walkingPitchLimit, walkingPitchLimit)
 	camera.rot = composeWalkingRotation(camera.walkYaw, camera.walkPitch)
+end
+
+local function resetAltLookState()
+	altLookState.held = false
+	altLookState.yaw = 0
+	altLookState.pitch = 0
+end
+
+local function applyAltLookMouse(dx, dy)
+	if not camera then
+		return
+	end
+
+	local pitchMult = camera.walkMousePitchMultiplier or 2.2
+	local yawMult = camera.walkMouseYawMultiplier or 2.2
+	local yawDelta = dx * mouseSensitivity * yawMult
+	local pitchDelta = (-dy) * mouseSensitivity * pitchMult
+	if invertLookY then
+		pitchDelta = -pitchDelta
+	end
+
+	altLookState.yaw = clamp(altLookState.yaw + yawDelta, -altLookState.yawLimit, altLookState.yawLimit)
+	altLookState.pitch = clamp(
+		altLookState.pitch + pitchDelta,
+		-altLookState.pitchDownLimit,
+		altLookState.pitchUpLimit
+	)
+end
+
+local function buildAltLookCamera(baseCamera)
+	if not baseCamera then
+		return nil
+	end
+
+	local rot = baseCamera.rot or q.identity()
+	if altLookState.yaw ~= 0 then
+		local up = q.rotateVector(rot, { 0, 1, 0 })
+		rot = q.normalize(q.multiply(q.fromAxisAngle(up, altLookState.yaw), rot))
+	end
+	if altLookState.pitch ~= 0 then
+		local right = q.rotateVector(rot, { 1, 0, 0 })
+		rot = q.normalize(q.multiply(q.fromAxisAngle(right, altLookState.pitch), rot))
+	end
+
+	altLookState.camera = altLookState.camera or {
+		pos = { 0, 0, 0 },
+		rot = q.identity(),
+		fov = math.rad(90)
+	}
+	local altCam = altLookState.camera
+	altCam.pos[1] = baseCamera.pos[1]
+	altCam.pos[2] = baseCamera.pos[2]
+	altCam.pos[3] = baseCamera.pos[3]
+	altCam.rot = rot
+	altCam.fov = baseCamera.fov
+	return altCam
+end
+
+local function getYawFromRotation(rotation)
+	local rot = rotation or q.identity()
+	local forward = q.rotateVector(rot, { 0, 0, 1 })
+	return math.atan2(forward[1], forward[3])
+end
+
+local function segmentAabbIntersectionT(startPos, endPos, obj)
+	if not startPos or not endPos or not obj or not obj.pos or not obj.halfSize then
+		return nil
+	end
+
+	local minB = {
+		obj.pos[1] - obj.halfSize.x,
+		obj.pos[2] - obj.halfSize.y,
+		obj.pos[3] - obj.halfSize.z
+	}
+	local maxB = {
+		obj.pos[1] + obj.halfSize.x,
+		obj.pos[2] + obj.halfSize.y,
+		obj.pos[3] + obj.halfSize.z
+	}
+	local dir = {
+		endPos[1] - startPos[1],
+		endPos[2] - startPos[2],
+		endPos[3] - startPos[3]
+	}
+	local tMin = 0
+	local tMax = 1
+
+	for axis = 1, 3 do
+		local origin = startPos[axis]
+		local delta = dir[axis]
+		local slabMin = minB[axis]
+		local slabMax = maxB[axis]
+
+		if math.abs(delta) < 1e-8 then
+			if origin < slabMin or origin > slabMax then
+				return nil
+			end
+		else
+			local invDelta = 1 / delta
+			local t1 = (slabMin - origin) * invDelta
+			local t2 = (slabMax - origin) * invDelta
+			if t1 > t2 then
+				t1, t2 = t2, t1
+			end
+
+			tMin = math.max(tMin, t1)
+			tMax = math.min(tMax, t2)
+			if tMin > tMax then
+				return nil
+			end
+		end
+	end
+
+	return tMin
+end
+
+local function buildThirdPersonCamera(baseCamera, objectList)
+	if not baseCamera then
+		return nil
+	end
+
+	local forward, right, up = engine.getCameraBasis(baseCamera, q, vector3)
+	local target = baseCamera.pos
+	local desiredPos = {
+		target[1] + right[1] * thirdPersonState.offset[1] + up[1] * thirdPersonState.offset[2] +
+		forward[1] * thirdPersonState.offset[3],
+		target[2] + right[2] * thirdPersonState.offset[1] + up[2] * thirdPersonState.offset[2] +
+		forward[2] * thirdPersonState.offset[3],
+		target[3] + right[3] * thirdPersonState.offset[1] + up[3] * thirdPersonState.offset[2] +
+		forward[3] * thirdPersonState.offset[3]
+	}
+
+	local rawDir = {
+		desiredPos[1] - target[1],
+		desiredPos[2] - target[2],
+		desiredPos[3] - target[3]
+	}
+	local rawDist = math.sqrt(rawDir[1] * rawDir[1] + rawDir[2] * rawDir[2] + rawDir[3] * rawDir[3])
+	local dir = { 0, 0, -1 }
+	if rawDist > 1e-6 then
+		dir[1] = rawDir[1] / rawDist
+		dir[2] = rawDir[2] / rawDist
+		dir[3] = rawDir[3] / rawDist
+	end
+
+	local nearestT = 1
+	local checkRadius = rawDist + thirdPersonState.collisionBuffer + 1
+	for _, obj in ipairs(objectList or {}) do
+		if obj and obj ~= localPlayerObject and obj.isSolid and obj.pos and obj.halfSize then
+			local nearX = math.abs(obj.pos[1] - target[1]) <= (obj.halfSize.x + checkRadius)
+			local nearY = math.abs(obj.pos[2] - target[2]) <= (obj.halfSize.y + checkRadius)
+			local nearZ = math.abs(obj.pos[3] - target[3]) <= (obj.halfSize.z + checkRadius)
+			if nearX and nearY and nearZ then
+				local hitT = segmentAabbIntersectionT(target, desiredPos, obj)
+				if hitT and hitT >= 0 and hitT <= nearestT then
+					nearestT = hitT
+				end
+			end
+		end
+	end
+
+	local dist = rawDist
+	if nearestT < 1 then
+		dist = math.max(thirdPersonState.minDistance, rawDist * nearestT - thirdPersonState.collisionBuffer)
+	else
+		dist = math.max(dist, thirdPersonState.minDistance)
+	end
+
+	thirdPersonState.camera = thirdPersonState.camera or {
+		pos = { 0, 0, 0 },
+		rot = q.identity(),
+		fov = math.rad(90)
+	}
+	local cam = thirdPersonState.camera
+	cam.pos[1] = target[1] + dir[1] * dist
+	cam.pos[2] = target[2] + dir[2] * dist
+	cam.pos[3] = target[3] + dir[3] * dist
+	cam.rot = baseCamera.rot
+	cam.fov = baseCamera.fov
+	return cam
+end
+
+local function resolveActiveRenderCamera()
+	if not camera then
+		viewState.activeCamera = nil
+		return nil
+	end
+
+	local activeCam = camera
+	if viewState.mode == "third_person" then
+		activeCam = buildThirdPersonCamera(camera, objects) or camera
+	elseif viewState.mode == "first_person" and altLookState.held then
+		activeCam = buildAltLookCamera(camera) or camera
+	end
+
+	viewState.activeCamera = activeCam
+	return activeCam
+end
+
+local function shouldRenderObjectForView(obj)
+	if not obj then
+		return false
+	end
+	if obj.isLocalPlayer and viewState.mode == "first_person" then
+		return false
+	end
+	return true
+end
+
+local function buildRenderObjectList()
+	local renderObjects = {}
+	for _, obj in ipairs(objects) do
+		if shouldRenderObjectForView(obj) then
+			renderObjects[#renderObjects + 1] = obj
+		end
+	end
+	return renderObjects
+end
+
+local function positiveMod(value, modulus)
+	if modulus == 0 then
+		return 0
+	end
+	local result = value % modulus
+	if result < 0 then
+		result = result + modulus
+	end
+	return result
+end
+
+local function rotateWorldDeltaToMap(dx, dz, yaw)
+	local cosYaw = math.cos(yaw)
+	local sinYaw = math.sin(yaw)
+	local mapX = cosYaw * dx - sinYaw * dz
+	local mapZ = sinYaw * dx + cosYaw * dz
+	return mapX, mapZ
+end
+
+local function ensureMapGridImage()
+	if mapState.gridImage then
+		return mapState.gridImage
+	end
+
+	local size = 128
+	local data = love.image.newImageData(size, size)
+	for y = 0, size - 1 do
+		for x = 0, size - 1 do
+			local major = (x % 32 == 0) or (y % 32 == 0)
+			local minor = (x % 16 == 0) or (y % 16 == 0)
+			local tone = 0.12
+			if minor then
+				tone = 0.16
+			end
+			if major then
+				tone = 0.2
+			end
+			data:setPixel(x, y, tone, tone + 0.04, tone, 1)
+		end
+	end
+
+	mapState.gridImage = love.graphics.newImage(data)
+	mapState.gridImage:setFilter("nearest", "nearest")
+	mapState.gridImageSize = size
+	return mapState.gridImage
+end
+
+local function updateLogicalMapCamera()
+	if not camera then
+		mapState.logicalCamera = nil
+		return nil
+	end
+
+	mapState.logicalCamera = mapState.logicalCamera or {
+		pos = { 0, 0, 0 },
+		heading = 0,
+		extent = mapState.zoomExtents[2] or 400
+	}
+
+	local mapCam = mapState.logicalCamera
+	mapCam.pos[1] = camera.pos[1]
+	mapCam.pos[2] = camera.pos[2]
+	mapCam.pos[3] = camera.pos[3]
+	mapCam.heading = getYawFromRotation(camera.rot)
+	mapCam.extent = mapState.zoomExtents[mapState.zoomIndex] or (worldHalfExtent or 1000)
+	return mapCam
+end
+
+local function syncLocalPlayerObject()
+	if not localPlayerObject or not camera then
+		return
+	end
+	localPlayerObject.pos[1] = camera.pos[1]
+	localPlayerObject.pos[2] = camera.pos[2]
+	localPlayerObject.pos[3] = camera.pos[3]
+	localPlayerObject.rot = composePlayerModelRotation(camera.rot)
 end
 
 local function loadPlayerModelFromStl(path)
@@ -679,16 +1025,16 @@ local function updateClouds(dt)
 	end
 end
 
-local function cameraSpaceDepthForObject(obj)
-	if not obj or not obj.pos or not camera then
+local function cameraSpaceDepthForObject(obj, viewCamera)
+	if not obj or not obj.pos or not viewCamera then
 		return -math.huge
 	end
 	local rel = {
-		obj.pos[1] - camera.pos[1],
-		obj.pos[2] - camera.pos[2],
-		obj.pos[3] - camera.pos[3]
+		obj.pos[1] - viewCamera.pos[1],
+		obj.pos[2] - viewCamera.pos[2],
+		obj.pos[3] - viewCamera.pos[3]
 	}
-	local cam = q.rotateVector(q.conjugate(camera.rot), rel)
+	local cam = q.rotateVector(q.conjugate(viewCamera.rot), rel)
 	return cam[3]
 end
 
@@ -709,6 +1055,17 @@ local function setFlightMode(enabled)
 			syncWalkingLookFromRotation()
 		end
 	end
+end
+
+local function cycleViewMode()
+	if viewState.mode == "third_person" then
+		viewState.mode = "first_person"
+	else
+		viewState.mode = "third_person"
+	end
+	resetAltLookState()
+	resolveActiveRenderCamera()
+	logger.log("View mode set to " .. viewState.mode)
 end
 
 local function setRendererPreference(enableGpu)
@@ -741,9 +1098,12 @@ local function resetCameraTransform()
 	camera.onGround = false
 	camera.walkYaw = 0
 	camera.walkPitch = 0
+	resetAltLookState()
 	if camera.box and camera.box.halfSize then
 		camera.box.pos = { camera.pos[1], camera.pos[2] - camera.box.halfSize.y, camera.pos[3] }
 	end
+	syncLocalPlayerObject()
+	resolveActiveRenderCamera()
 	logger.log("Camera transform reset.")
 end
 
@@ -1521,6 +1881,9 @@ setPauseState = function(paused)
 
 	pauseMenu.active = paused and true or false
 	if pauseMenu.active then
+		resetAltLookState()
+		mapState.mHeld = false
+		mapState.mUsedForZoom = false
 		pauseMenu.tab = "game"
 		pauseMenu.helpScroll = 0
 		pauseMenu.controlsScroll = 0
@@ -2053,6 +2416,14 @@ function love.load()
 		}
 	}
 	syncWalkingLookFromRotation()
+	viewState.mode = "first_person"
+	viewState.activeCamera = camera
+	resetAltLookState()
+	mapState.visible = false
+	mapState.mHeld = false
+	mapState.mUsedForZoom = false
+	mapState.zoomIndex = 2
+	mapState.logicalCamera = nil
 
 	renderMode = "CPU"
 	gpuErrorLogged = false
@@ -2077,23 +2448,27 @@ function love.load()
 
 	loadPlayerModelFromStl("objects/Dualengine.stl")
 
-	-- Reference player mesh object for visibility / multiplayer tests
-	-- disabled now that other players can join allowing for non-static testing of latency and culling/depth ordering
+	-- Local avatar is synced to player camera each update; hidden in first-person, shown in third-person.
+	localPlayerObject = {
+		model = playerModel,
+		pos = { camera.pos[1], camera.pos[2], camera.pos[3] },
+		rot = composePlayerModelRotation(camera.rot),
+		scale = { 0.9, 0.9, 0.9 },
+		color = { 0.9, 0.4, 0.1 },
+		isSolid = false,
+		isLocalPlayer = true
+	}
+
 	objects = {
-		[1] = {
-			model = playerModel,
-			pos = { 0, 10, 10 },
-			rot = q.identity(),
-			scale = { 0.9, 0.9, 0.9 },
-			color = { 0.9, 0.4, 0.1 },
-			isSolid = true
-		}
+		[1] = localPlayerObject
 	}
 
 	-- Increase floor coverage: 10x tile size and 10x tile count.
 	local tileSize = 20
 	local gridCount = 100
 	local baseHeight = -0.1
+	worldHalfExtent = (tileSize * gridCount) * 0.5
+	mapState.zoomExtents = { 160, 420, math.max(worldHalfExtent, 420) }
 
 	local groundTiles = generateGround(tileSize, gridCount, baseHeight)
 
@@ -2129,10 +2504,13 @@ function love.load()
 		renderMode = "CPU"
 		logger.log("GPU renderer failed, using CPU fallback: " .. tostring(gpuErr))
 	end
+
+	resolveActiveRenderCamera()
 end
 
 -- === Mouse Look ===
 local function buildMovementInputState()
+	local throttleBlocked = mapState.mHeld and true or false
 	return {
 		flightPitchDown = isActionDown("flight_pitch_down"),
 		flightPitchUp = isActionDown("flight_pitch_up"),
@@ -2140,8 +2518,8 @@ local function buildMovementInputState()
 		flightRollRight = isActionDown("flight_roll_right"),
 		flightYawLeft = isActionDown("flight_yaw_left"),
 		flightYawRight = isActionDown("flight_yaw_right"),
-		flightThrottleDown = isActionDown("flight_throttle_down"),
-		flightThrottleUp = isActionDown("flight_throttle_up"),
+		flightThrottleDown = (not throttleBlocked) and isActionDown("flight_throttle_down"),
+		flightThrottleUp = (not throttleBlocked) and isActionDown("flight_throttle_up"),
 		flightAfterburner = isActionDown("flight_afterburner"),
 		flightAirBrakes = isActionDown("flight_air_brakes"),
 		walkForward = isActionDown("walk_forward"),
@@ -2274,6 +2652,11 @@ function love.mousemoved(x, y, dx, dy)
 		return
 	end
 
+	if viewState.mode == "first_person" and altLookState.held then
+		applyAltLookMouse(dx, dy)
+		return
+	end
+
 	local modifiers = getCurrentModifiers()
 	if flightSimMode then
 		applyFlightMouseLook(dx, dy, modifiers)
@@ -2318,7 +2701,7 @@ local function serviceNetworkEvents()
 	event = relay:service()
 	while event do
 		if event.type == "receive" then
-			networking.handlePacket(event.data, peers, objects, q, playerModel)
+			networking.handlePacket(event.data, peers, objects, q, playerModel, playerModelRotationOffset)
 		elseif event.type == "disconnect" and relayServer and event.peer == relayServer then
 			relayServer = nil
 			logger.log("Relay disconnected.")
@@ -2341,6 +2724,7 @@ function love.update(dt)
 	if not pauseMenu.active then
 		local movementInput = buildMovementInputState()
 		camera = engine.processMovement(camera, dt, flightSimMode, vector3, q, objects, movementInput)
+		syncLocalPlayerObject()
 		updateClouds(dt)
 		updateZoomFov(dt)
 		updateNet()
@@ -2360,11 +2744,12 @@ function love.update(dt)
 		end
 	end
 
+	resolveActiveRenderCamera()
 	serviceNetworkEvents()
 end
 
 -- === Input Management ===
-function love.keypressed(key)
+function love.keypressed(key, scancode, isrepeat)
 	if pauseMenu.active then
 		if pauseMenu.tab == "controls" and pauseMenu.listeningBinding then
 			if key == "escape" then
@@ -2453,6 +2838,34 @@ function love.keypressed(key)
 		setPauseState(true)
 		return
 	end
+	if key == "lalt" then
+		if not isrepeat and viewState.mode == "first_person" then
+			altLookState.held = true
+			altLookState.yaw = 0
+			altLookState.pitch = 0
+		end
+		return
+	end
+	if key == "m" then
+		if not isrepeat then
+			mapState.mHeld = true
+			mapState.mUsedForZoom = false
+		end
+		return
+	end
+	if mapState.mHeld and (key == "up" or key == "down") then
+		local delta = key == "up" and -1 or 1
+		mapState.zoomIndex = clamp(mapState.zoomIndex + delta, 1, 3)
+		mapState.mUsedForZoom = true
+		updateLogicalMapCamera()
+		return
+	end
+	if key == "c" then
+		if not isrepeat then
+			cycleViewMode()
+		end
+		return
+	end
 
 	if flightSimMode and actionTriggeredByKey("flight_fire_projectile", key, getCurrentModifiers()) then
 		triggerProjectileAction()
@@ -2478,6 +2891,23 @@ function love.keypressed(key)
 
 	if key == "g" then
 		setRendererPreference(not useGpuRenderer)
+	end
+end
+
+function love.keyreleased(key)
+	if key == "lalt" then
+		resetAltLookState()
+		resolveActiveRenderCamera()
+		return
+	end
+
+	if key == "m" then
+		local shouldToggle = mapState.mHeld and (not mapState.mUsedForZoom) and (not pauseMenu.active)
+		mapState.mHeld = false
+		mapState.mUsedForZoom = false
+		if shouldToggle then
+			mapState.visible = not mapState.visible
+		end
 	end
 end
 
@@ -2561,15 +2991,114 @@ function love.focus(focused)
 end
 
 local function drawHud(w, h, cx, cy)
+	if not mapState.visible then
+		return
+	end
 
+	local mapCam = updateLogicalMapCamera()
+	if not mapCam then
+		return
+	end
+
+	local panelSize = clamp(
+		math.floor(math.min(w, h) * mapState.panel.widthRatio),
+		mapState.panel.minSize,
+		mapState.panel.maxSize
+	)
+	local panelX = w - mapState.panel.margin - panelSize
+	local panelY = mapState.panel.margin
+	local panelCenterX = panelX + panelSize * 0.5
+	local panelCenterY = panelY + panelSize * 0.5
+	local extent = math.max(1, mapCam.extent)
+	local worldToPixel = (panelSize * 0.5) / extent
+	local zoomLabels = { "Near", "Mid", "Full" }
+	local markerSizes = { 4, 5, 7 }
+	local localMarkerSize = markerSizes[mapState.zoomIndex] or 5
+	local peerMarkerSize = math.max(2, localMarkerSize - 1)
+
+	love.graphics.setColor(0.03, 0.05, 0.06, 0.88)
+	love.graphics.rectangle("fill", panelX, panelY, panelSize, panelSize, 5, 5)
+
+	local gridImage = ensureMapGridImage()
+	local tileWorld = math.max(50, extent / 3.2)
+	local tilePixel = tileWorld * worldToPixel
+	local tileScale = tilePixel / math.max(1, mapState.gridImageSize)
+	local tileSpanCount = math.ceil((panelSize * 1.7) / math.max(1, tilePixel))
+	local worldOffsetX = -positiveMod(mapCam.pos[1], tileWorld)
+	local worldOffsetZ = -positiveMod(mapCam.pos[3], tileWorld)
+
+	love.graphics.setScissor(panelX, panelY, panelSize, panelSize)
+	for ix = -tileSpanCount, tileSpanCount do
+		for iz = -tileSpanCount, tileSpanCount do
+			local worldDX = worldOffsetX + ix * tileWorld
+			local worldDZ = worldOffsetZ + iz * tileWorld
+			local mapX, mapZ = rotateWorldDeltaToMap(worldDX, worldDZ, mapCam.heading)
+			local sx = panelCenterX + mapX * worldToPixel
+			local sy = panelCenterY - mapZ * worldToPixel
+			love.graphics.setColor(0.72, 0.8, 0.72, 0.24)
+			love.graphics.draw(
+				gridImage,
+				sx,
+				sy,
+				-mapCam.heading,
+				tileScale,
+				tileScale,
+				mapState.gridImageSize * 0.5,
+				mapState.gridImageSize * 0.5
+			)
+		end
+	end
+
+	local function drawMarker(worldX, worldZ, color, radius)
+		local dx = worldX - mapCam.pos[1]
+		local dz = worldZ - mapCam.pos[3]
+		local mapX, mapZ = rotateWorldDeltaToMap(dx, dz, mapCam.heading)
+		local sx = panelCenterX + mapX * worldToPixel
+		local sy = panelCenterY - mapZ * worldToPixel
+		if sx < panelX or sx > (panelX + panelSize) or sy < panelY or sy > (panelY + panelSize) then
+			return
+		end
+
+		love.graphics.setColor(color[1], color[2], color[3], color[4] or 1)
+		love.graphics.circle("fill", sx, sy, radius)
+	end
+
+	if localPlayerObject and localPlayerObject.pos then
+		drawMarker(localPlayerObject.pos[1], localPlayerObject.pos[3], { 0.96, 0.36, 0.12, 0.95 }, localMarkerSize)
+	end
+	for _, peerObj in pairs(peers) do
+		if peerObj and peerObj.pos then
+			drawMarker(peerObj.pos[1], peerObj.pos[3], { 0.22, 0.72, 1.0, 0.92 }, peerMarkerSize)
+		end
+	end
+
+	love.graphics.setColor(1, 1, 1, 0.95)
+	love.graphics.circle("line", panelCenterX, panelCenterY, localMarkerSize + 2)
+	love.graphics.polygon(
+		"fill",
+		panelCenterX, panelCenterY - (localMarkerSize + 5),
+		panelCenterX - 3, panelCenterY - (localMarkerSize + 1),
+		panelCenterX + 3, panelCenterY - (localMarkerSize + 1)
+	)
+
+	love.graphics.setScissor()
+	love.graphics.setColor(0.86, 0.92, 1.0, 0.95)
+	love.graphics.rectangle("line", panelX, panelY, panelSize, panelSize, 5, 5)
+	love.graphics.print(
+		string.format("Map %s (M tap/toggle, hold+Up/Down zoom)", zoomLabels[mapState.zoomIndex] or tostring(mapState.zoomIndex)),
+		panelX,
+		panelY + panelSize + 4
+	)
 end
 function love.draw()
 	triangleCount = 0
 	local centerX, centerY = screen.w / 2, screen.h / 2
+	local renderCamera = viewState.activeCamera or resolveActiveRenderCamera() or camera
+	local renderObjects = buildRenderObjectList()
 
 	local usedGpu = false
 	if useGpuRenderer and renderer.isReady() then
-		local ok, renderOk, triOrErr = pcall(renderer.drawWorld, objects, camera, { 0.2, 0.2, 0.75, 1.0 })
+		local ok, renderOk, triOrErr = pcall(renderer.drawWorld, renderObjects, renderCamera, { 0.2, 0.2, 0.75, 1.0 })
 		if ok and renderOk then
 			usedGpu = true
 			renderMode = "GPU"
@@ -2597,7 +3126,7 @@ function love.draw()
 		local imageData = love.image.newImageData(screen.w, screen.h)
 		local opaqueObjects = {}
 		local transparentObjects = {}
-		for _, obj in ipairs(objects) do
+		for _, obj in ipairs(renderObjects) do
 			local alpha = (obj.color and obj.color[4]) or 1
 			if alpha < 0.999 then
 				transparentObjects[#transparentObjects + 1] = obj
@@ -2607,14 +3136,14 @@ function love.draw()
 		end
 
 		for _, obj in ipairs(opaqueObjects) do
-			imageData = engine.drawObject(obj, false, camera, vector3, q, screen, zBuffer, imageData, true)
+			imageData = engine.drawObject(obj, false, renderCamera, vector3, q, screen, zBuffer, imageData, true)
 		end
 
 		table.sort(transparentObjects, function(a, b)
-			return cameraSpaceDepthForObject(a) > cameraSpaceDepthForObject(b)
+			return cameraSpaceDepthForObject(a, renderCamera) > cameraSpaceDepthForObject(b, renderCamera)
 		end)
 		for _, obj in ipairs(transparentObjects) do
-			imageData = engine.drawObject(obj, false, camera, vector3, q, screen, zBuffer, imageData, false)
+			imageData = engine.drawObject(obj, false, renderCamera, vector3, q, screen, zBuffer, imageData, false)
 		end
 		if frameImage then
 			frameImage:replacePixels(imageData)
@@ -2631,6 +3160,13 @@ function love.draw()
 			"Esc = pause menu (see Help/Controls tabs for full controls)\n" ..
 			"Render: " .. tostring(renderMode) .. " | Triangles: " .. tostring(math.floor(triangleCount)) .. " | FPS: " ..
 			tostring(love.timer.getFPS()) .. "\n" ..
+			string.format(
+				"View: %s | AltLook: %s | Map: %s (z%d)\n",
+				viewState.mode,
+				(viewState.mode == "first_person" and altLookState.held) and "on" or "off",
+				mapState.visible and "on" or "off",
+				mapState.zoomIndex
+			) ..
 			string.format("Wind: %.1f u/s @ %d deg | Clouds: %d", windState.speed, math.floor(math.deg(windState.angle) + 0.5),
 				#cloudState.groups),
 			10,
