@@ -3,7 +3,8 @@ local love = require "love"
 local q = require "quat"
 
 local vertexFormat = {
-    { "VertexPosition", "float", 3 }
+    { "VertexPosition", "float", 3 },
+    { "VertexColor", "float", 4 }
 }
 
 local shaderSource = [[
@@ -52,7 +53,7 @@ vec4 position(mat4 transform_projection, vec4 vertex_position)
 
 vec4 effect(vec4 color, Image texture, vec2 texture_coords, vec2 screen_coords)
 {
-    return vec4(uColor, uAlpha);
+    return vec4(color.rgb * uColor, color.a * uAlpha);
 }
 ]]
 
@@ -119,11 +120,23 @@ local function buildMeshForModel(model)
             for i = 2, #face - 1 do
                 local ia, ib, ic = face[1], face[i], face[i + 1]
                 local a, b, c = model.vertices[ia], model.vertices[ib], model.vertices[ic]
+                local ca = model.vertexColors and model.vertexColors[ia]
+                local cb = model.vertexColors and model.vertexColors[ib]
+                local cc = model.vertexColors and model.vertexColors[ic]
 
                 if a and b and c then
-                    triangleVertices[#triangleVertices + 1] = { a[1], a[2], a[3] }
-                    triangleVertices[#triangleVertices + 1] = { b[1], b[2], b[3] }
-                    triangleVertices[#triangleVertices + 1] = { c[1], c[2], c[3] }
+                    triangleVertices[#triangleVertices + 1] = {
+                        a[1], a[2], a[3],
+                        (ca and ca[1]) or 1, (ca and ca[2]) or 1, (ca and ca[3]) or 1, (ca and ca[4]) or 1
+                    }
+                    triangleVertices[#triangleVertices + 1] = {
+                        b[1], b[2], b[3],
+                        (cb and cb[1]) or 1, (cb and cb[2]) or 1, (cb and cb[3]) or 1, (cb and cb[4]) or 1
+                    }
+                    triangleVertices[#triangleVertices + 1] = {
+                        c[1], c[2], c[3],
+                        (cc and cc[1]) or 1, (cc and cc[2]) or 1, (cc and cc[3]) or 1, (cc and cc[4]) or 1
+                    }
                 end
             end
         end

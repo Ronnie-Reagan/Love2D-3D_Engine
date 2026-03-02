@@ -60,6 +60,25 @@ local mapState = {
 }
 local localPlayerObject = nil
 local worldHalfExtent = 1000
+local defaultGroundParams = {
+	seed = 12345,
+	tileSize = 2,
+	gridCount = 128,
+	baseHeight = 0,
+	tileThickness = 0.005,
+	roadCount = 6,
+	roadDensity = 0.10,
+	fieldCount = 10,
+	fieldMinSize = 40,
+	fieldMaxSize = 120,
+	grassColor = { 0.20, 0.62, 0.22 },
+	roadColor = { 0.10, 0.10, 0.10 },
+	fieldColor = { 0.35, 0.45, 0.20 },
+	grassVar = { 0.05, 0.10, 0.05 },
+	roadVar = { 0.02, 0.02, 0.02 },
+	fieldVar = { 0.04, 0.06, 0.04 }
+}
+local activeGroundParams = nil
 local windState = {
 	angle = 0,
 	speed = 9,
@@ -91,6 +110,12 @@ local cloudNetState = {
 	snapshotInterval = 10.0,
 	requestCooldown = 2.0,
 	staleTimeout = 13.5
+}
+local groundNetState = {
+	authorityPeerId = nil,
+	lastSnapshotReceivedAt = -math.huge,
+	lastSnapshotRequestAt = -math.huge,
+	requestCooldown = 2.0
 }
 
 -- Correct imported player STL orientation to engine forward/up axes.
@@ -508,34 +533,6 @@ Notes:
 
 positions are {x = left/right(width), y = up/down(height), z = in/out(depth)} IN CAMERA SPACE!!
 ]]
--- Procedurally generate a ground grid of cubes
-local function generateGround(tileSize, gridCount, baseHeight)
-	local tiles = {}
-	local half = tileSize / 2
-
-	for x = -gridCount / 2, gridCount / 2 - 1 do
-		for z = -gridCount / 2, gridCount / 2 - 1 do
-			local posX = x * tileSize + half
-			local posZ = z * tileSize + half
-			-- small color variation for realism
-			local r = 0.2 + math.random() * 0.05
-			local g = 0.6 + math.random() * 0.1
-			local b = 0.2 + math.random() * 0.05
-
-			table.insert(tiles, {
-				model = cubeModel,
-				pos = { posX, baseHeight, posZ },
-				rot = q.identity(),
-				scale = { tileSize / 2, 0.005, tileSize / 2 },
-				color = { r, g, b },
-				isSolid = true,
-				halfSize = { x = tileSize / 2, y = 0.005, z = tileSize / 2 } -- thin tile
-			})
-		end
-	end
-
-	return tiles
-end
 
 local function clamp(value, minValue, maxValue)
 	if value < minValue then
@@ -1170,6 +1167,26 @@ local function formatNetFloat(value)
 	return string.format("%.4f", tonumber(value) or 0)
 end
 
+function encodeColor3Token(color)
+	return table.concat({
+		formatNetFloat(color[1]),
+		formatNetFloat(color[2]),
+		formatNetFloat(color[3])
+	}, ",")
+end
+
+function decodeColor3Token(token, fallback)
+	local r, g, b = type(token) == "string" and token:match("^([^,]+),([^,]+),([^,]+)$")
+	if not r or not g or not b then
+		return cloneColor3(fallback)
+	end
+	return sanitizeColor3({
+		tonumber(r),
+		tonumber(g),
+		tonumber(b)
+	}, fallback)
+end
+
 local function relayIsConnected()
 	if not relayServer then
 		return false
@@ -1200,6 +1217,9 @@ local function beginCloudRoleElection(reason)
 	cloudNetState.lastSnapshotSentAt = -math.huge
 	cloudNetState.lastSnapshotReceivedAt = -math.huge
 	cloudNetState.lastSnapshotRequestAt = -math.huge
+	groundNetState.authorityPeerId = nil
+	groundNetState.lastSnapshotReceivedAt = -math.huge
+	groundNetState.lastSnapshotRequestAt = -math.huge
 	setCloudRole("pending", reason or "relay connected")
 end
 
@@ -1283,6 +1303,153 @@ local function sendCloudSnapshot(forceSend, reason)
 		end
 	end
 	return ok
+end
+
+function requestGroundSnapshot(reason)
+	if cloudNetState.role ~= "follower" then
+		return false
+	end
+	if not relayIsConnected() then
+		return false
+	end
+
+	local now = love.timer.getTime()
+	if (now - groundNetState.lastSnapshotRequestAt) < groundNetState.requestCooldown then
+		return false
+	end
+
+	local packet = string.format("GROUND_REQUEST|%s", formatNetFloat(now))
+	local ok = pcall(function()
+		relayServer:send(packet)
+	end)
+	if ok then
+		groundNetState.lastSnapshotRequestAt = now
+		if reason and reason ~= "" then
+			logger.log("Requested ground snapshot (" .. reason .. ").")
+		end
+	end
+	return ok
+end
+
+function buildGroundSnapshotPacket(now)
+	local params = activeGroundParams or normalizeGroundParams(defaultGroundParams)
+	local parts = {
+		"GROUND_SNAPSHOT",
+		formatNetFloat(now),
+		tostring(params.seed),
+		formatNetFloat(params.tileSize),
+		tostring(params.gridCount),
+		formatNetFloat(params.baseHeight),
+		formatNetFloat(params.tileThickness),
+		tostring(params.roadCount),
+		formatNetFloat(params.roadDensity),
+		tostring(params.fieldCount),
+		tostring(params.fieldMinSize),
+		tostring(params.fieldMaxSize),
+		encodeColor3Token(params.grassColor),
+		encodeColor3Token(params.roadColor),
+		encodeColor3Token(params.fieldColor),
+		encodeColor3Token(params.grassVar),
+		encodeColor3Token(params.roadVar),
+		encodeColor3Token(params.fieldVar)
+	}
+	return table.concat(parts, "|")
+end
+
+function sendGroundSnapshot(reason)
+	if cloudNetState.role ~= "authority" then
+		return false
+	end
+	if not relayIsConnected() then
+		return false
+	end
+
+	local packet = buildGroundSnapshotPacket(love.timer.getTime())
+	local ok = pcall(function()
+		relayServer:send(packet)
+	end)
+	if ok and reason and reason ~= "" then
+		logger.log("Sent ground snapshot (" .. reason .. ").")
+	end
+	return ok
+end
+
+function applyGroundSnapshotParts(parts, senderId)
+	if #parts < 19 then
+		return false
+	end
+
+	local params = normalizeGroundParams({
+		seed = tonumber(parts[3]),
+		tileSize = tonumber(parts[4]),
+		gridCount = tonumber(parts[5]),
+		baseHeight = tonumber(parts[6]),
+		tileThickness = tonumber(parts[7]),
+		roadCount = tonumber(parts[8]),
+		roadDensity = tonumber(parts[9]),
+		fieldCount = tonumber(parts[10]),
+		fieldMinSize = tonumber(parts[11]),
+		fieldMaxSize = tonumber(parts[12]),
+		grassColor = decodeColor3Token(parts[13], defaultGroundParams.grassColor),
+		roadColor = decodeColor3Token(parts[14], defaultGroundParams.roadColor),
+		fieldColor = decodeColor3Token(parts[15], defaultGroundParams.fieldColor),
+		grassVar = decodeColor3Token(parts[16], defaultGroundParams.grassVar),
+		roadVar = decodeColor3Token(parts[17], defaultGroundParams.roadVar),
+		fieldVar = decodeColor3Token(parts[18], defaultGroundParams.fieldVar)
+	})
+
+	rebuildGroundFromParams(params, "network peer " .. tostring(senderId))
+	groundNetState.authorityPeerId = senderId
+	groundNetState.lastSnapshotReceivedAt = love.timer.getTime()
+	return true
+end
+
+function handleGroundSnapshotPacket(data)
+	local parts = splitPacketFields(data)
+	if parts[1] ~= "GROUND_SNAPSHOT" then
+		return false
+	end
+
+	local senderId = tonumber(parts[#parts])
+	if not senderId then
+		return false
+	end
+
+	if cloudNetState.role == "authority" then
+		return false
+	end
+
+	if cloudNetState.role == "follower" and
+		groundNetState.authorityPeerId and
+		groundNetState.authorityPeerId ~= senderId and
+		groundNetState.lastSnapshotReceivedAt > -1e30 then
+		return false
+	end
+
+	if cloudNetState.role == "pending" then
+		cloudNetState.sawPeerOnJoin = true
+	end
+	return applyGroundSnapshotParts(parts, senderId)
+end
+
+function handleGroundRequestPacket(data)
+	local parts = splitPacketFields(data)
+	if parts[1] ~= "GROUND_REQUEST" then
+		return false
+	end
+
+	local senderId = tonumber(parts[#parts])
+	if not senderId then
+		return false
+	end
+
+	if cloudNetState.role == "pending" then
+		cloudNetState.sawPeerOnJoin = true
+	end
+	if cloudNetState.role == "authority" then
+		sendGroundSnapshot("request from peer " .. tostring(senderId))
+	end
+	return true
 end
 
 local function applyCloudSnapshotParts(parts, senderId)
@@ -1411,6 +1578,7 @@ local function notePeerStateReceived(peerId)
 		cloudNetState.authorityPeerId = cloudNetState.authorityPeerId or peerId
 		setCloudRole("follower", "peer state received during join")
 		requestCloudSnapshot("joining populated session")
+		requestGroundSnapshot("joining populated session")
 	elseif cloudNetState.role == "follower" and not cloudNetState.authorityPeerId then
 		cloudNetState.authorityPeerId = peerId
 	end
@@ -1422,6 +1590,9 @@ local function updateCloudNetworkState(now)
 			setCloudRole("standalone", "relay unavailable")
 		end
 		cloudNetState.authorityPeerId = nil
+		groundNetState.authorityPeerId = nil
+		groundNetState.lastSnapshotReceivedAt = -math.huge
+		groundNetState.lastSnapshotRequestAt = -math.huge
 		return
 	end
 
@@ -1433,16 +1604,22 @@ local function updateCloudNetworkState(now)
 		if cloudNetState.sawPeerOnJoin then
 			setCloudRole("follower", "peer detected during join window")
 			requestCloudSnapshot("peer already present")
+			requestGroundSnapshot("peer already present")
 		elseif (now - cloudNetState.connectedAt) >= cloudNetState.decisionDelay then
 			cloudNetState.authorityPeerId = nil
 			cloudNetState.lastSnapshotSentAt = -math.huge
 			setCloudRole("authority", "no peers detected at connect")
+			sendGroundSnapshot("authority elected")
 		end
 		return
 	end
 
 	if cloudNetState.role == "follower" and (now - cloudNetState.lastSnapshotReceivedAt) >= cloudNetState.staleTimeout then
 		requestCloudSnapshot("snapshot stale")
+	end
+
+	if cloudNetState.role == "follower" and groundNetState.lastSnapshotReceivedAt <= -1e30 then
+		requestGroundSnapshot("awaiting world params")
 	end
 end
 
@@ -1484,6 +1661,9 @@ local function reconnectRelay()
 
 	clearPeerObjects()
 	cloudNetState.authorityPeerId = nil
+	groundNetState.authorityPeerId = nil
+	groundNetState.lastSnapshotReceivedAt = -math.huge
+	groundNetState.lastSnapshotRequestAt = -math.huge
 	setCloudRole("standalone", "relay reconnecting")
 
 	local ok, peerOrErr = pcall(function()
@@ -2684,6 +2864,343 @@ local function drawPauseMenu()
 	love.graphics.setFont(oldFont)
 end
 
+function makeRng(seed)
+    -- Park-Miller LCG using Schrage method (LuaJIT/Lua 5.1 compatible).
+    local m = 2147483647
+    local a = 16807
+    local q = 127773
+    local r = 2836
+    local state = math.floor(tonumber(seed) or 1) % m
+    if state <= 0 then
+        state = state + (m - 1)
+    end
+
+    local function u32()
+        local hi = math.floor(state / q)
+        local lo = state - hi * q
+        local test = (a * lo) - (r * hi)
+        if test > 0 then
+            state = test
+        else
+            state = test + m
+        end
+        return state
+    end
+
+    return {
+        u32 = u32,
+        -- [0,1)
+        rand01 = function()
+            return (u32() - 1) / (m - 1)
+        end,
+        -- inclusive integers
+        randint = function(_, x, y)
+            local low = math.floor(tonumber(x) or 0)
+            local high = math.floor(tonumber(y) or 0)
+            if high < low then
+                low, high = high, low
+            end
+            local span = high - low + 1
+            return low + math.floor(((u32() - 1) / (m - 1)) * span)
+        end
+    }
+end
+
+CELL_GRASS = 0
+CELL_ROAD  = 1
+CELL_FIELD = 2
+
+function generateCellGrid(params)
+    -- params: seed, gridCount, roadCount, roadDensity(0..1), fieldCount, fieldMinSize, fieldMaxSize
+    local rng = makeRng(params.seed or 1)
+    local n = params.gridCount
+    local grid = {}
+    for x = 1, n do
+        grid[x] = {}
+        for z = 1, n do
+            grid[x][z] = CELL_GRASS
+        end
+    end
+
+    local function inBounds(x, z)
+        return x >= 1 and x <= n and z >= 1 and z <= n
+    end
+
+    -- --- Roads ---
+    local roadCount = math.max(0, math.floor(params.roadCount or 3))
+    local roadDensity = clamp(params.roadDensity or 0.15, 0, 1)
+
+    -- total carves roughly proportional to density * cells
+    local totalSteps = math.floor(roadDensity * n * n)
+    local stepsPerRoad = (roadCount > 0) and math.max(1, math.floor(totalSteps / roadCount)) or 0
+
+    for i = 1, roadCount do
+        -- start on a random edge
+        local side = rng:randint(1, 4)
+        local x, z
+        if side == 1 then x, z = 1, rng:randint(1, n)
+        elseif side == 2 then x, z = n, rng:randint(1, n)
+        elseif side == 3 then x, z = rng:randint(1, n), 1
+        else x, z = rng:randint(1, n), n
+        end
+
+        local dirX, dirZ = 0, 0
+        local function randomDir()
+            local d = rng:randint(1, 4)
+            if d == 1 then return 1, 0 end
+            if d == 2 then return -1, 0 end
+            if d == 3 then return 0, 1 end
+            return 0, -1
+        end
+        dirX, dirZ = randomDir()
+
+        for s = 1, stepsPerRoad do
+            if inBounds(x, z) then
+                grid[x][z] = CELL_ROAD
+            end
+
+            -- occasionally turn; higher density -> slightly straighter looks better, so keep turn chance modest
+            local turnChance = 0.18
+            if rng:rand01() < turnChance then
+                dirX, dirZ = randomDir()
+            end
+
+            x, z = x + dirX, z + dirZ
+            if not inBounds(x, z) then
+                -- bounce back in bounds
+                x = clamp(x, 1, n)
+                z = clamp(z, 1, n)
+                dirX, dirZ = randomDir()
+            end
+        end
+    end
+
+    -- --- Fields (patches) ---
+    local fieldCount   = params.fieldCount or 6
+    local fieldMinSize = params.fieldMinSize or math.floor(n * 0.8)
+    local fieldMaxSize = params.fieldMaxSize or math.floor(n * 2.0)
+
+    for i = 1, fieldCount do
+        local sx, sz = rng:randint(1, n), rng:randint(1, n)
+        local targetSize = rng:randint(fieldMinSize, fieldMaxSize)
+
+        local queue = { {sx, sz} }
+        local qi = 1
+        local placed = 0
+
+        while qi <= #queue and placed < targetSize do
+            local x, z = queue[qi][1], queue[qi][2]
+            qi = qi + 1
+
+            if inBounds(x, z) and grid[x][z] ~= CELL_ROAD and grid[x][z] ~= CELL_FIELD then
+                grid[x][z] = CELL_FIELD
+                placed = placed + 1
+
+                -- grow outward randomly
+                if rng:rand01() < 0.80 then queue[#queue+1] = {x+1, z} end
+                if rng:rand01() < 0.80 then queue[#queue+1] = {x-1, z} end
+                if rng:rand01() < 0.80 then queue[#queue+1] = {x, z+1} end
+                if rng:rand01() < 0.80 then queue[#queue+1] = {x, z-1} end
+            end
+        end
+    end
+
+    return grid, rng
+end
+
+cloneColor3 = function(value)
+	return { value[1], value[2], value[3] }
+end
+
+sanitizeColor3 = function(value, fallback)
+	local out = cloneColor3(fallback)
+	if type(value) == "table" then
+		out[1] = clamp(tonumber(value[1]) or out[1], 0, 1)
+		out[2] = clamp(tonumber(value[2]) or out[2], 0, 1)
+		out[3] = clamp(tonumber(value[3]) or out[3], 0, 1)
+	end
+	return out
+end
+
+normalizeGroundParams = function(params)
+	local src = params or defaultGroundParams
+	local normalized = {
+		seed = math.floor(tonumber(src.seed) or defaultGroundParams.seed),
+		tileSize = math.max(0.05, tonumber(src.tileSize) or defaultGroundParams.tileSize),
+		gridCount = math.max(1, math.floor(tonumber(src.gridCount) or defaultGroundParams.gridCount)),
+		baseHeight = tonumber(src.baseHeight) or defaultGroundParams.baseHeight,
+		tileThickness = math.max(0.0001, tonumber(src.tileThickness) or defaultGroundParams.tileThickness),
+		roadCount = math.max(0, math.floor(tonumber(src.roadCount) or defaultGroundParams.roadCount)),
+		roadDensity = clamp(tonumber(src.roadDensity) or defaultGroundParams.roadDensity, 0, 1),
+		fieldCount = math.max(0, math.floor(tonumber(src.fieldCount) or defaultGroundParams.fieldCount)),
+		fieldMinSize = math.max(1, math.floor(tonumber(src.fieldMinSize) or defaultGroundParams.fieldMinSize)),
+		fieldMaxSize = math.max(1, math.floor(tonumber(src.fieldMaxSize) or defaultGroundParams.fieldMaxSize)),
+		grassColor = sanitizeColor3(src.grassColor, defaultGroundParams.grassColor),
+		roadColor = sanitizeColor3(src.roadColor, defaultGroundParams.roadColor),
+		fieldColor = sanitizeColor3(src.fieldColor, defaultGroundParams.fieldColor),
+		grassVar = sanitizeColor3(src.grassVar, defaultGroundParams.grassVar),
+		roadVar = sanitizeColor3(src.roadVar, defaultGroundParams.roadVar),
+		fieldVar = sanitizeColor3(src.fieldVar, defaultGroundParams.fieldVar)
+	}
+	normalized.fieldMaxSize = math.max(normalized.fieldMinSize, normalized.fieldMaxSize)
+	return normalized
+end
+
+function colorsEqual(a, b)
+	local eps = 1e-6
+	for i = 1, 3 do
+		if math.abs((a[i] or 0) - (b[i] or 0)) > eps then
+			return false
+		end
+	end
+	return true
+end
+
+groundParamsEqual = function(a, b)
+	if not a or not b then
+		return false
+	end
+	return a.seed == b.seed and
+		a.tileSize == b.tileSize and
+		a.gridCount == b.gridCount and
+		a.baseHeight == b.baseHeight and
+		a.tileThickness == b.tileThickness and
+		a.roadCount == b.roadCount and
+		a.roadDensity == b.roadDensity and
+		a.fieldCount == b.fieldCount and
+		a.fieldMinSize == b.fieldMinSize and
+		a.fieldMaxSize == b.fieldMaxSize and
+		colorsEqual(a.grassColor, b.grassColor) and
+		colorsEqual(a.roadColor, b.roadColor) and
+		colorsEqual(a.fieldColor, b.fieldColor) and
+		colorsEqual(a.grassVar, b.grassVar) and
+		colorsEqual(a.roadVar, b.roadVar) and
+		colorsEqual(a.fieldVar, b.fieldVar)
+end
+
+function generateGroundMeshModel(params)
+	local tileSize = params.tileSize
+	local gridCount = params.gridCount
+	local half = tileSize / 2
+
+	local grid, rng = generateCellGrid(params)
+
+	local grass = params.grassColor
+	local road = params.roadColor
+	local field = params.fieldColor
+
+	local grassVar = params.grassVar
+	local roadVar = params.roadVar
+	local fieldVar = params.fieldVar
+
+	local function varied(base, var)
+		return {
+			clamp(base[1] + (rng:rand01() * 2 - 1) * var[1], 0, 1),
+			clamp(base[2] + (rng:rand01() * 2 - 1) * var[2], 0, 1),
+			clamp(base[3] + (rng:rand01() * 2 - 1) * var[3], 0, 1)
+		}
+	end
+
+	local vertices, faces = {}, {}
+	local vertexColors, faceColors = {}, {}
+
+	for gx = 1, gridCount do
+		for gz = 1, gridCount do
+			local x = (gx - 1) - gridCount / 2
+			local z = (gz - 1) - gridCount / 2
+			local posX = x * tileSize + half
+			local posZ = z * tileSize + half
+
+			local cellType = grid[gx][gz]
+			local c
+			if cellType == CELL_ROAD then
+				c = varied(road, roadVar)
+			elseif cellType == CELL_FIELD then
+				c = varied(field, fieldVar)
+			else
+				c = varied(grass, grassVar)
+			end
+			local rgba = { c[1], c[2], c[3], 1.0 }
+
+			local base = #vertices
+			vertices[base + 1] = { posX - half, 0, posZ - half }
+			vertices[base + 2] = { posX + half, 0, posZ - half }
+			vertices[base + 3] = { posX + half, 0, posZ + half }
+			vertices[base + 4] = { posX - half, 0, posZ + half }
+
+			vertexColors[base + 1] = rgba
+			vertexColors[base + 2] = rgba
+			vertexColors[base + 3] = rgba
+			vertexColors[base + 4] = rgba
+
+			faces[#faces + 1] = { base + 1, base + 2, base + 3 }
+			faceColors[#faceColors + 1] = rgba
+			faces[#faces + 1] = { base + 1, base + 3, base + 4 }
+			faceColors[#faceColors + 1] = rgba
+		end
+	end
+
+	return {
+		vertices = vertices,
+		faces = faces,
+		vertexColors = vertexColors,
+		faceColors = faceColors,
+		isSolid = true
+	}
+end
+
+function createGroundObject(params)
+	local halfExtent = (params.gridCount * params.tileSize) * 0.5
+	return {
+		model = generateGroundMeshModel(params),
+		pos = { 0, params.baseHeight, 0 },
+		rot = q.identity(),
+		scale = { 1, 1, 1 },
+		color = { 1, 1, 1, 1 },
+		isSolid = true,
+		isGround = true,
+		halfSize = { x = halfExtent, y = params.tileThickness, z = halfExtent }
+	}
+end
+
+rebuildGroundFromParams = function(params, reason)
+	local normalized = normalizeGroundParams(params)
+	if activeGroundParams and groundParamsEqual(activeGroundParams, normalized) then
+		return false
+	end
+
+	activeGroundParams = normalized
+	if groundObject then
+		for i = #objects, 1, -1 do
+			if objects[i] == groundObject or objects[i].isGround then
+				table.remove(objects, i)
+			end
+		end
+	end
+
+	groundObject = createGroundObject(normalized)
+	local insertIndex = 1
+	if localPlayerObject and objects[1] == localPlayerObject then
+		insertIndex = 2
+	end
+	table.insert(objects, insertIndex, groundObject)
+
+	worldHalfExtent = (normalized.tileSize * normalized.gridCount) * 0.5
+	mapState.zoomExtents = { 160, 420, math.max(worldHalfExtent, 420) }
+	mapState.logicalCamera = nil
+	if reason and reason ~= "" then
+		logger.log(string.format(
+			"Ground rebuilt (%s): seed=%d tile=%.3f grid=%d",
+			reason,
+			normalized.seed,
+			normalized.tileSize,
+			normalized.gridCount
+		))
+	end
+
+	return true
+end
+
 -- === Initial Configuration ===
 function love.load()
 	-- 80% screen size
@@ -2773,6 +3290,9 @@ function love.load()
 	cloudNetState.lastSnapshotSentAt = -math.huge
 	cloudNetState.lastSnapshotReceivedAt = -math.huge
 	cloudNetState.lastSnapshotRequestAt = -math.huge
+	groundNetState.authorityPeerId = nil
+	groundNetState.lastSnapshotReceivedAt = -math.huge
+	groundNetState.lastSnapshotRequestAt = -math.huge
 
 	renderMode = "CPU"
 	gpuErrorLogged = false
@@ -2812,18 +3332,7 @@ function love.load()
 		[1] = localPlayerObject
 	}
 
-	-- Increase floor coverage: 10x tile size and 10x tile count.
-	local tileSize = 20
-	local gridCount = 100
-	local baseHeight = -0.1
-	worldHalfExtent = (tileSize * gridCount) * 0.5
-	mapState.zoomExtents = { 160, 420, math.max(worldHalfExtent, 420) }
-
-	local groundTiles = generateGround(tileSize, gridCount, baseHeight)
-
-	for _, tile in ipairs(groundTiles) do
-		table.insert(objects, tile)
-	end
+	rebuildGroundFromParams(defaultGroundParams, "startup")
 
 	windState.angle = randomRange(0, math.pi * 2)
 	windState.speed = randomRange(5, 10)
@@ -3061,11 +3570,18 @@ local function serviceNetworkEvents()
 				handleCloudRequestPacket(event.data)
 			elseif packetType == "CLOUD_SNAPSHOT" then
 				handleCloudSnapshotPacket(event.data)
+			elseif packetType == "GROUND_REQUEST" then
+				handleGroundRequestPacket(event.data)
+			elseif packetType == "GROUND_SNAPSHOT" then
+				handleGroundSnapshotPacket(event.data)
 			end
 		elseif event.type == "disconnect" and relayServer and event.peer == relayServer then
 			relayServer = nil
 			clearPeerObjects()
 			cloudNetState.authorityPeerId = nil
+			groundNetState.authorityPeerId = nil
+			groundNetState.lastSnapshotReceivedAt = -math.huge
+			groundNetState.lastSnapshotRequestAt = -math.huge
 			setCloudRole("standalone", "relay disconnected")
 			logger.log("Relay disconnected.")
 		end

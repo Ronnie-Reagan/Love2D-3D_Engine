@@ -566,7 +566,7 @@ function engine.drawObject(obj, skipCulling, camera, vector3, q, screen, zBuffer
     end
 
     -- Triangulate faces and raster using Z-buffer
-    for _, face in ipairs(obj.model.faces) do
+    for faceIndex, face in ipairs(obj.model.faces) do
         local poly = {}
         local faceValid = true
 
@@ -607,12 +607,23 @@ function engine.drawObject(obj, skipCulling, camera, vector3, q, screen, zBuffer
             projected[i] = { sx, sy, v[3] }
         end
 
+        local triColor = obj.color or { 0.5, 0.5, 0.5, 1.0 }
+        if obj.model.faceColors and obj.model.faceColors[faceIndex] then
+            local c = obj.model.faceColors[faceIndex]
+            triColor = {
+                c[1] or triColor[1],
+                c[2] or triColor[2],
+                c[3] or triColor[3],
+                c[4] or triColor[4] or 1.0
+            }
+        end
+
         for i = 2, #projected - 1 do
             imageData = engine.drawTriangle(
                 projected[1],
                 projected[i],
                 projected[i + 1],
-                obj.color or { 0.5, 0.5, 0.5 },
+                triColor,
                 zBuffer,
                 screen,
                 imageData,
