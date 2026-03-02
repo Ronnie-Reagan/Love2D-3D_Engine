@@ -89,8 +89,8 @@ function engine.checkAABBCollision(box, obj)
     local dz = math.abs(box.pos[3] - obj.pos[3])
 
     return dx <= (box.halfSize.x + obj.halfSize.x) and
-           dy <= (box.halfSize.y + obj.halfSize.y) and
-           dz <= (box.halfSize.z + obj.halfSize.z)
+        dy <= (box.halfSize.y + obj.halfSize.y) and
+        dz <= (box.halfSize.z + obj.halfSize.z)
 end
 
 -- === Camera Movement ===
@@ -100,8 +100,9 @@ function engine.processMovement(camera, dt, flightSimMode, vector3, q, objects)
 
     if flightSimMode then
         -- Flight mode: throttle & roll
-        if love.keyboard.isDown("w") then camera.thrust = 1 end
-        if love.keyboard.isDown("s") then camera.thrust = -1 end
+        camera.thrust = 0
+        if love.keyboard.isDown("w") then camera.thrust = camera.thrust + 1 end
+        if love.keyboard.isDown("s") then camera.thrust = camera.thrust - 1 end
 
         camera.throttle = math.max(0, math.min(camera.throttle + (camera.thrust or 0) * dt, camera.maxSpeed))
         for i = 1, 3 do
@@ -121,10 +122,12 @@ function engine.processMovement(camera, dt, flightSimMode, vector3, q, objects)
     -- === Ground movement ===
     -- Horizontal input
     local moveDir = { 0, 0, 0 }
-    if love.keyboard.isDown("w") then moveDir = vector3.add(moveDir, forward) end
-    if love.keyboard.isDown("s") then moveDir = vector3.sub(moveDir, forward) end
-    if love.keyboard.isDown("d") then moveDir = vector3.add(moveDir, right) end
-    if love.keyboard.isDown("a") then moveDir = vector3.sub(moveDir, right) end
+    local groundForward = vector3.normalizeVec({ forward[1], 0, forward[3] })
+    local groundRight = vector3.normalizeVec({ right[1], 0, right[3] })
+    if love.keyboard.isDown("w") then moveDir = vector3.add(moveDir, groundForward) end
+    if love.keyboard.isDown("s") then moveDir = vector3.sub(moveDir, groundForward) end
+    if love.keyboard.isDown("d") then moveDir = vector3.add(moveDir, groundRight) end
+    if love.keyboard.isDown("a") then moveDir = vector3.sub(moveDir, groundRight) end
     moveDir = vector3.normalizeVec(moveDir)
 
     camera.pos[1] = camera.pos[1] + moveDir[1] * speed
@@ -168,42 +171,77 @@ function engine.processMovement(camera, dt, flightSimMode, vector3, q, objects)
     return camera
 end
 
-function engine.drawTriangle(v1, v2, v3, color)
-    love.graphics.setColor(color or { 1, 1, 1 })
-    love.graphics.polygon("fill",
-        v1[1], v1[2],
-        v2[1], v2[2],
-        v3[1], v3[2]
-    )
-    love.graphics.setColor(0, 0, 0)
-    love.graphics.polygon("line",
-        v1[1], v1[2],
-        v2[1], v2[2],
-        v3[1], v3[2]
-    )
+function engine.drawTriangle(v1, v2, v3, color, zBuffer, screen, imageData)
+    color = color or { 0.5, 0.5, 0.5 }
+    local minX = math.max(1, math.floor(math.min(v1[1], v2[1], v3[1])))
+    local maxX = math.min(screen.w, math.ceil(math.max(v1[1], v2[1], v3[1])))
+    local minY = math.max(1, math.floor(math.min(v1[2], v2[2], v3[2])))
+    local maxY = math.min(screen.h, math.ceil(math.max(v1[2], v2[2], v3[2])))
+    if minX > maxX or minY > maxY then return imageData end
+
+    local function edge(ax, ay, bx, by, cx, cy)
+        return (cx - ax) * (by - ay) - (cy - ay) * (bx - ax)
+    end
+
+    local area = edge(v1[1], v1[2], v2[1], v2[2], v3[1], v3[2])
+    if area == 0 then return imageData end
+
+    for x = minX, maxX do
+        for y = minY, maxY do
+            local w0 = edge(v2[1], v2[2], v3[1], v3[2], x, y)
+            local w1 = edge(v3[1], v3[2], v1[1], v1[2], x, y)
+            local w2 = edge(v1[1], v1[2], v2[1], v2[2], x, y)
+
+            if (area > 0 and w0 >= 0 and w1 >= 0 and w2 >= 0) or
+                (area < 0 and w0 <= 0 and w1 <= 0 and w2 <= 0) then
+                w0 = w0 / area
+                w1 = w1 / area
+                w2 = w2 / area
+
+                local depth =
+                    v1[3] * w0 +
+                    v2[3] * w1 +
+                    v3[3] * w2
+
+                local index = (y - 1) * screen.w + x
+
+                if depth < (zBuffer[index] or math.huge) then
+                    zBuffer[index] = depth
+                    imageData:setPixel(x - 1, y - 1, color[1], color[2], color[3], 1)
+                end
+            end
+        end
+    end
+    return imageData
 end
 
-function engine.drawObject(obj, skipCulling, camera, vector3, q, screen)
-    local transformedVerts = {}
-    local screenVerts = {}
+function engine.drawObject(obj, skipCulling, camera, vector3, q, screen, zBuffer, imageData)
+    if not obj or not obj.model or not obj.model.vertices or not obj.model.faces then
+        return imageData
+    end
 
-    -- Transform vertices into camera space and screen space
+    local transformedVerts = {}
+
+    -- Transform vertices into camera space
     for i, v in ipairs(obj.model.vertices) do
         local x, y, z = engine.transformVertex(v, obj, camera, q)
         transformedVerts[i] = { x, y, z }
-        if z > 0.01 then
-            local sx, sy = engine.project(x, y, z, camera, screen)
-            screenVerts[i] = { sx, sy, z }
-        end
     end
 
     -- Triangulate faces and raster using Z-buffer
     for _, face in ipairs(obj.model.faces) do
         local poly = {}
+        local faceValid = true
 
         for _, vi in ipairs(face) do
-            table.insert(poly, transformedVerts[vi])
+            local vertex = transformedVerts[vi]
+            if not vertex then
+                faceValid = false
+                break
+            end
+            table.insert(poly, vertex)
         end
+        if not faceValid then goto continue end
 
         poly = engine.clipPolygonToNearPlane(poly, 0.01)
 
@@ -233,16 +271,20 @@ function engine.drawObject(obj, skipCulling, camera, vector3, q, screen)
         end
 
         for i = 2, #projected - 1 do
-            engine.drawTriangle(
+            imageData = engine.drawTriangle(
                 projected[1],
                 projected[i],
                 projected[i + 1],
-                obj.color or { 0.5, 0.5, 0.5 }
+                obj.color or { 0.5, 0.5, 0.5 },
+                zBuffer,
+                screen,
+                imageData
             )
         end
 
         ::continue::
     end
+    return imageData
 end
 
 function engine.worldToCamera(worldPos, camera, q)
