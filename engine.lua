@@ -26,23 +26,204 @@ to be revised after implementing globes/spheres/balls; allowing for more complex
 
 "file_path" → {vertices:table, faces:table, isSolid:True}
 ]]
-function engine.loadSTL(path)
+local function readU32LE(data, offset)
+    local b1, b2, b3, b4 = data:byte(offset, offset + 3)
+    if not b4 then
+        return nil
+    end
+    return b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+end
+
+local function readF32LE(data, offset)
+    local b1, b2, b3, b4 = data:byte(offset, offset + 3)
+    if not b4 then
+        return nil
+    end
+
+    local sign = (b4 >= 128) and -1 or 1
+    local exponent = (b4 % 128) * 2 + math.floor(b3 / 128)
+    local mantissa = (b3 % 128) * 65536 + b2 * 256 + b1
+
+    if exponent == 255 then
+        if mantissa == 0 then
+            return sign * math.huge
+        end
+        return 0 / 0
+    end
+
+    if exponent == 0 then
+        if mantissa == 0 then
+            return sign * 0
+        end
+        return sign * math.ldexp(mantissa, -149)
+    end
+
+    return sign * math.ldexp(1 + (mantissa / 8388608), exponent - 127)
+end
+
+local function parseAsciiSTL(data)
     local vertices, faces = {}, {}
-    -- Parse ASCII STL (add binary support later if needed)
-    for line in love.filesystem.lines(path) do
-        if line:match("^vertex") then
-            local x, y, z = line:match("vertex%s+([%-%d%.]+)%s+([%-%d%.]+)%s+([%-%d%.]+)")
-            table.insert(vertices, { tonumber(x), tonumber(y), tonumber(z) })
-        elseif line:match("^endfacet") then
+
+    for line in data:gmatch("[^\r\n]+") do
+        local x, y, z = line:match("^%s*vertex%s+([%+%-]?[%d%.eE]+)%s+([%+%-]?[%d%.eE]+)%s+([%+%-]?[%d%.eE]+)")
+        if x and y and z then
+            vertices[#vertices + 1] = { tonumber(x), tonumber(y), tonumber(z) }
+        elseif line:match("^%s*endfacet") then
             local count = #vertices
-            table.insert(faces, { count - 2, count - 1, count })
+            if count >= 3 then
+                faces[#faces + 1] = { count - 2, count - 1, count }
+            end
         end
     end
+
+    if #faces == 0 then
+        return nil, "no faces found in ASCII STL"
+    end
+
     return {
         vertices = vertices,
         faces = faces,
         isSolid = true
     }
+end
+
+local function parseBinarySTL(data)
+    if #data < 84 then
+        return nil, "binary STL header too short"
+    end
+
+    local triCount = readU32LE(data, 81)
+    if not triCount then
+        return nil, "could not read STL triangle count"
+    end
+
+    local expectedBytes = 84 + triCount * 50
+    if #data < expectedBytes then
+        return nil, string.format("binary STL truncated (%d of %d bytes)", #data, expectedBytes)
+    end
+
+    local vertices, faces = {}, {}
+    local cursor = 85
+
+    for _ = 1, triCount do
+        cursor = cursor + 12
+
+        local ax = readF32LE(data, cursor)
+        local ay = readF32LE(data, cursor + 4)
+        local az = readF32LE(data, cursor + 8)
+        local bx = readF32LE(data, cursor + 12)
+        local by = readF32LE(data, cursor + 16)
+        local bz = readF32LE(data, cursor + 20)
+        local cx = readF32LE(data, cursor + 24)
+        local cy = readF32LE(data, cursor + 28)
+        local cz = readF32LE(data, cursor + 32)
+
+        if not (ax and ay and az and bx and by and bz and cx and cy and cz) then
+            return nil, "invalid triangle data in binary STL"
+        end
+
+        local base = #vertices
+        vertices[base + 1] = { ax, ay, az }
+        vertices[base + 2] = { bx, by, bz }
+        vertices[base + 3] = { cx, cy, cz }
+        faces[#faces + 1] = { base + 1, base + 2, base + 3 }
+
+        cursor = cursor + 36 + 2
+    end
+
+    return {
+        vertices = vertices,
+        faces = faces,
+        isSolid = true
+    }
+end
+
+-- Loads either ASCII or binary STL.
+-- Returns model on success, nil + error message on failure.
+function engine.loadSTL(path)
+    local raw, readErr = love.filesystem.read(path)
+    if not raw then
+        return nil, "failed to read STL: " .. tostring(readErr)
+    end
+
+    local triCount = (#raw >= 84) and readU32LE(raw, 81) or nil
+    local expectedBytes = triCount and (84 + triCount * 50) or nil
+
+    if expectedBytes and expectedBytes == #raw then
+        local model, parseErr = parseBinarySTL(raw)
+        if model then
+            return model
+        end
+        return nil, parseErr
+    end
+
+    local model, parseErr = parseAsciiSTL(raw)
+    if model then
+        return model
+    end
+
+    model, parseErr = parseBinarySTL(raw)
+    if model then
+        return model
+    end
+
+    return nil, parseErr
+end
+
+function engine.normalizeModel(model, targetExtent)
+    if not model or not model.vertices or #model.vertices == 0 then
+        return model
+    end
+
+    local minX, minY, minZ = math.huge, math.huge, math.huge
+    local maxX, maxY, maxZ = -math.huge, -math.huge, -math.huge
+
+    for _, v in ipairs(model.vertices) do
+        minX = math.min(minX, v[1])
+        minY = math.min(minY, v[2])
+        minZ = math.min(minZ, v[3])
+        maxX = math.max(maxX, v[1])
+        maxY = math.max(maxY, v[2])
+        maxZ = math.max(maxZ, v[3])
+    end
+
+    local spanX = maxX - minX
+    local spanY = maxY - minY
+    local spanZ = maxZ - minZ
+    local largestSpan = math.max(spanX, spanY, spanZ)
+    if largestSpan <= 0 then
+        largestSpan = 1
+    end
+
+    local halfTarget = targetExtent and (targetExtent * 0.5) or 1.0
+    local scale = halfTarget / (largestSpan * 0.5)
+    local centerX = (minX + maxX) * 0.5
+    local centerY = (minY + maxY) * 0.5
+    local centerZ = (minZ + maxZ) * 0.5
+
+    local out = {
+        vertices = {},
+        faces = {},
+        isSolid = model.isSolid ~= false
+    }
+
+    for i, v in ipairs(model.vertices) do
+        out.vertices[i] = {
+            (v[1] - centerX) * scale,
+            (v[2] - centerY) * scale,
+            (v[3] - centerZ) * scale
+        }
+    end
+
+    for i, face in ipairs(model.faces or {}) do
+        local copy = {}
+        for j, idx in ipairs(face) do
+            copy[j] = idx
+        end
+        out.faces[i] = copy
+    end
+
+    return out
 end
 
 --[[
@@ -72,8 +253,16 @@ function engine.getCameraBasis(camera, q, vector3)
 end
 
 function engine.transformVertex(v, obj, camera, q)
-    local rotated = q.rotateVector(obj.rot, v)
-    local world = { rotated[1] + obj.pos[1], rotated[2] + obj.pos[2], rotated[3] + obj.pos[3] }
+    local scale = obj.scale
+    local sx = (scale and scale[1]) or 1
+    local sy = (scale and scale[2]) or 1
+    local sz = (scale and scale[3]) or 1
+    local scaled = { v[1] * sx, v[2] * sy, v[3] * sz }
+
+    local objRot = obj.rot or q.identity()
+    local rotated = q.rotateVector(objRot, scaled)
+    local objPos = obj.pos or { 0, 0, 0 }
+    local world = { rotated[1] + objPos[1], rotated[2] + objPos[2], rotated[3] + objPos[3] }
 
     local rel = { world[1] - camera.pos[1], world[2] - camera.pos[2], world[3] - camera.pos[3] }
 
@@ -139,6 +328,9 @@ function engine.processMovement(camera, dt, flightSimMode, vector3, q, objects, 
         if inputState.flightAirBrakes then
             local brakeStrength = camera.airBrakeStrength or 45
             camera.throttle = math.max(0, camera.throttle - brakeStrength * dt)
+        elseif throttleAxis == 0 then
+            --local damping = camera.flightThrottleDamping or 4
+            --camera.throttle = math.max(0, camera.throttle - damping * dt)
         end
 
         local pitchAxis = axis(inputState.flightPitchDown, inputState.flightPitchUp)
@@ -192,7 +384,7 @@ function engine.processMovement(camera, dt, flightSimMode, vector3, q, objects, 
     camera.pos[3] = camera.pos[3] + moveDir[3] * walkSpeed
 
     local tiltAxis = axis(inputState.walkTiltLeft, inputState.walkTiltRight)
-    if tiltAxis ~= 0 then
+    if tiltAxis ~= 0 and camera.allowWalkRoll then
         local tiltRate = math.rad(camera.walkTiltRate or 35)
         local tiltQuat = q.fromAxisAngle(forward, tiltAxis * tiltRate * dt)
         camera.rot = q.normalize(q.multiply(tiltQuat, camera.rot))
@@ -237,8 +429,9 @@ function engine.processMovement(camera, dt, flightSimMode, vector3, q, objects, 
     return camera
 end
 
-function engine.drawTriangle(v1, v2, v3, color, zBuffer, screen, imageData)
+function engine.drawTriangle(v1, v2, v3, color, zBuffer, screen, imageData, writeDepth)
     color = color or { 0.5, 0.5, 0.5 }
+    local alpha = color[4] or 1
     local minX = math.max(1, math.floor(math.min(v1[1], v2[1], v3[1])))
     local maxX = math.min(screen.w, math.ceil(math.max(v1[1], v2[1], v3[1])))
     local minY = math.max(1, math.floor(math.min(v1[2], v2[2], v3[2])))
@@ -272,8 +465,25 @@ function engine.drawTriangle(v1, v2, v3, color, zBuffer, screen, imageData)
                 local index = (y - 1) * screen.w + x
 
                 if depth < (zBuffer[index] or math.huge) then
-                    zBuffer[index] = depth
-                    imageData:setPixel(x - 1, y - 1, color[1], color[2], color[3], 1)
+                    if writeDepth ~= false then
+                        zBuffer[index] = depth
+                    end
+
+                    if alpha >= 0.999 then
+                        imageData:setPixel(x - 1, y - 1, color[1], color[2], color[3], 1)
+                    else
+                        local r, g, b, a = imageData:getPixel(x - 1, y - 1)
+                        local invAlpha = 1 - alpha
+                        local outA = alpha + a * invAlpha
+                        imageData:setPixel(
+                            x - 1,
+                            y - 1,
+                            color[1] * alpha + r * invAlpha,
+                            color[2] * alpha + g * invAlpha,
+                            color[3] * alpha + b * invAlpha,
+                            outA
+                        )
+                    end
                 end
             end
         end
@@ -281,7 +491,7 @@ function engine.drawTriangle(v1, v2, v3, color, zBuffer, screen, imageData)
     return imageData
 end
 
-function engine.drawObject(obj, skipCulling, camera, vector3, q, screen, zBuffer, imageData)
+function engine.drawObject(obj, skipCulling, camera, vector3, q, screen, zBuffer, imageData, writeDepth)
     if not obj or not obj.model or not obj.model.vertices or not obj.model.faces then
         return imageData
     end
@@ -344,7 +554,8 @@ function engine.drawObject(obj, skipCulling, camera, vector3, q, screen, zBuffer
                 obj.color or { 0.5, 0.5, 0.5 },
                 zBuffer,
                 screen,
-                imageData
+                imageData,
+                writeDepth
             )
         end
 

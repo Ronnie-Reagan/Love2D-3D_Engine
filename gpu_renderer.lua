@@ -11,11 +11,13 @@ uniform vec3 uObjPos;
 uniform vec3 uObjRight;
 uniform vec3 uObjUp;
 uniform vec3 uObjForward;
+uniform vec3 uObjScale;
 uniform vec3 uCamPos;
 uniform vec3 uCamRight;
 uniform vec3 uCamUp;
 uniform vec3 uCamForward;
 uniform vec3 uColor;
+uniform float uAlpha;
 uniform float uFov;
 uniform float uAspect;
 uniform float uNear;
@@ -24,9 +26,9 @@ uniform float uFar;
 vec4 position(mat4 transform_projection, vec4 vertex_position)
 {
     vec3 worldPos = uObjPos
-        + vertex_position.x * uObjRight
-        + vertex_position.y * uObjUp
-        + vertex_position.z * uObjForward;
+        + (vertex_position.x * uObjScale.x) * uObjRight
+        + (vertex_position.y * uObjScale.y) * uObjUp
+        + (vertex_position.z * uObjScale.z) * uObjForward;
 
     vec3 rel = worldPos - uCamPos;
     vec3 cam = vec3(
@@ -50,7 +52,7 @@ vec4 position(mat4 transform_projection, vec4 vertex_position)
 
 vec4 effect(vec4 color, Image texture, vec2 texture_coords, vec2 screen_coords)
 {
-    return vec4(uColor, 1.0);
+    return vec4(uColor, uAlpha);
 }
 ]]
 
@@ -62,7 +64,7 @@ local state = {
     shader = nil,
     aspect = 1,
     nearPlane = 0.1,
-    farPlane = 400.0,
+    farPlane = 5000.0,
     log = function(_) end,
     loggedFirstFrame = false
 }
@@ -92,6 +94,12 @@ local function cameraSpaceDepth(worldPos, camera)
     local camConj = q.conjugate(camera.rot)
     local cam = q.rotateVector(camConj, rel)
     return cam[3]
+end
+
+local function isTransparent(obj)
+    local color = obj and obj.color
+    local alpha = color and color[4] or 1
+    return alpha < 0.999
 end
 
 local function buildMeshForModel(model)
@@ -211,33 +219,70 @@ function renderer.drawWorld(objects, camera, backgroundColor)
     state.shader:send("uNear", state.nearPlane)
     state.shader:send("uFar", state.farPlane)
 
-    local drawList = objects
-    if not state.depthSupported then
-        drawList = cloneObjects(objects)
-        table.sort(drawList, function(a, b)
-            return cameraSpaceDepth(a and a.pos, camera) > cameraSpaceDepth(b and b.pos, camera)
-        end)
+    local function drawSingleObject(obj)
+        local mesh = buildMeshForModel(obj.model)
+        if not mesh then
+            return 0
+        end
+
+        local rot = obj.rot or { w = 1, x = 0, y = 0, z = 0 }
+        local scale = obj.scale or { 1, 1, 1 }
+        local color = obj.color or { 0.5, 0.5, 0.5, 1.0 }
+        local alpha = color[4] or 1.0
+        local objRight = q.rotateVector(rot, { 1, 0, 0 })
+        local objUp = q.rotateVector(rot, { 0, 1, 0 })
+        local objForward = q.rotateVector(rot, { 0, 0, 1 })
+
+        state.shader:send("uObjPos", obj.pos or { 0, 0, 0 })
+        state.shader:send("uObjRight", objRight)
+        state.shader:send("uObjUp", objUp)
+        state.shader:send("uObjForward", objForward)
+        state.shader:send("uObjScale", { scale[1] or 1, scale[2] or 1, scale[3] or 1 })
+        state.shader:send("uColor", { color[1] or 0.5, color[2] or 0.5, color[3] or 0.5 })
+        state.shader:send("uAlpha", alpha)
+
+        love.graphics.draw(mesh)
+        return mesh:getVertexCount() / 3
     end
 
     local triangleCount = 0
 
-    for _, obj in ipairs(drawList) do
-        local mesh = buildMeshForModel(obj.model)
-        if mesh then
-            local rot = obj.rot or { w = 1, x = 0, y = 0, z = 0 }
-            local color = obj.color or { 0.5, 0.5, 0.5 }
-            local objRight = q.rotateVector(rot, { 1, 0, 0 })
-            local objUp = q.rotateVector(rot, { 0, 1, 0 })
-            local objForward = q.rotateVector(rot, { 0, 0, 1 })
+    if state.depthSupported then
+        local opaqueObjects = {}
+        local transparentObjects = {}
 
-            state.shader:send("uObjPos", obj.pos or { 0, 0, 0 })
-            state.shader:send("uObjRight", objRight)
-            state.shader:send("uObjUp", objUp)
-            state.shader:send("uObjForward", objForward)
-            state.shader:send("uColor", { color[1] or 0.5, color[2] or 0.5, color[3] or 0.5 })
+        for _, obj in ipairs(objects) do
+            if isTransparent(obj) then
+                transparentObjects[#transparentObjects + 1] = obj
+            else
+                opaqueObjects[#opaqueObjects + 1] = obj
+            end
+        end
 
-            love.graphics.draw(mesh)
-            triangleCount = triangleCount + (mesh:getVertexCount() / 3)
+        love.graphics.setDepthMode("lequal", true)
+        for _, obj in ipairs(opaqueObjects) do
+            triangleCount = triangleCount + drawSingleObject(obj)
+        end
+
+        if #transparentObjects > 0 then
+            table.sort(transparentObjects, function(a, b)
+                return cameraSpaceDepth(a and a.pos, camera) > cameraSpaceDepth(b and b.pos, camera)
+            end)
+
+            love.graphics.setDepthMode("lequal", false)
+            for _, obj in ipairs(transparentObjects) do
+                triangleCount = triangleCount + drawSingleObject(obj)
+            end
+            love.graphics.setDepthMode("lequal", true)
+        end
+    else
+        local drawList = cloneObjects(objects)
+        table.sort(drawList, function(a, b)
+            return cameraSpaceDepth(a and a.pos, camera) > cameraSpaceDepth(b and b.pos, camera)
+        end)
+
+        for _, obj in ipairs(drawList) do
+            triangleCount = triangleCount + drawSingleObject(obj)
         end
     end
 

@@ -6,6 +6,7 @@ local engine = require "engine"
 local networking = require "networking"
 local renderer = require "gpu_renderer"
 local logger = require "logger"
+local objectDefs = require "object"
 local hostAddy = "ecosim.donreagan.ca:1988"
 local relay = enet.host_create()
 local relayServer = relay and relay:connect(hostAddy) or nil
@@ -13,8 +14,10 @@ local flightSimMode = false
 local relative = true
 local peers = {}
 local event = nil
-local objects = require "object"
-local cubeModel = objects.cubeModel
+local objects = {}
+local cubeModel = objectDefs.cubeModel
+local cloudPuffModel = objectDefs.cloudPuffModel or cubeModel
+local playerModel = cubeModel
 local screen, camera, groundObject, triangleCount, frameImage, renderMode, gpuErrorLogged --, zBuffer
 local useGpuRenderer = true
 local perfElapsed, perfFrames, perfLoggedLowFps = 0, 0, false
@@ -24,6 +27,26 @@ local invertLookY = false
 local showCrosshair = true
 local showDebugOverlay = true
 local pauseTitleFont, pauseItemFont
+local walkingPitchLimit = math.rad(89)
+local windState = {
+	angle = 0,
+	speed = 9,
+	targetAngle = 0,
+	targetSpeed = 9,
+	retargetIn = 0
+}
+local cloudState = {
+	groups = {},
+	groupCount = 85,
+	minAltitude = 80,
+	maxAltitude = 180,
+	spawnRadius = 1400,
+	despawnRadius = 1900,
+	minGroupSize = 14,
+	maxGroupSize = 34,
+	minPuffs = 5,
+	maxPuffs = 10
+}
 
 local pauseMenu = {
 	active = false,
@@ -107,8 +130,8 @@ local function buildDefaultControlActions()
 		{ id = "flight_pitch_up", mode = "flight", label = "Pitch Back / Nose Up", description = "Pitch the nose upward in flight mode.", bindings = { bindKey("s"), bindMouseAxis("y", 1) } },
 		{ id = "flight_roll_left", mode = "flight", label = "Bank / Roll Left", description = "Roll left around the forward axis.", bindings = { bindKey("a"), bindMouseAxis("x", -1) } },
 		{ id = "flight_roll_right", mode = "flight", label = "Bank / Roll Right", description = "Roll right around the forward axis.", bindings = { bindKey("d"), bindMouseAxis("x", 1) } },
-		{ id = "flight_yaw_left", mode = "flight", label = "Yaw / Turn Left", description = "Yaw the craft left.", bindings = { bindKey("q"), bindMouseAxis("x", -1, { alt = true }) } },
-		{ id = "flight_yaw_right", mode = "flight", label = "Yaw / Turn Right", description = "Yaw the craft right.", bindings = { bindKey("e"), bindMouseAxis("x", 1, { alt = true }) } },
+		{ id = "flight_yaw_left", mode = "flight", label = "Yaw / Turn Left", description = "Yaw the craft left.", bindings = { bindKey("q") } },
+		{ id = "flight_yaw_right", mode = "flight", label = "Yaw / Turn Right", description = "Yaw the craft right.", bindings = { bindKey("e") } },
 		{ id = "flight_throttle_down", mode = "flight", label = "Throttle Down", description = "Reduce throttle while flying.", bindings = { bindKey("down"), bindMouseWheel(-1) } },
 		{ id = "flight_throttle_up", mode = "flight", label = "Throttle Up", description = "Increase throttle while flying.", bindings = { bindKey("up"), bindMouseWheel(1) } },
 		{ id = "flight_fire_projectile", mode = "flight", label = "Fire Projectile", description = "Trigger the primary fire action.", bindings = { bindMouseButton(1) } },
@@ -124,9 +147,7 @@ local function buildDefaultControlActions()
 		{ id = "walk_forward", mode = "walking", label = "Walk Forwards", description = "Move forwards on the ground.", bindings = { bindKey("w") } },
 		{ id = "walk_backward", mode = "walking", label = "Walk Backwards", description = "Move backwards on the ground.", bindings = { bindKey("s") } },
 		{ id = "walk_strafe_left", mode = "walking", label = "Strafe Left", description = "Strafe left on the ground.", bindings = { bindKey("a") } },
-		{ id = "walk_strafe_right", mode = "walking", label = "Strafe Right", description = "Strafe right on the ground.", bindings = { bindKey("d") } },
-		{ id = "walk_tilt_left", mode = "walking", label = "Tilt Head / Camera Left", description = "Roll camera left while walking.", bindings = { bindKey("q") } },
-		{ id = "walk_tilt_right", mode = "walking", label = "Tilt Head / Camera Right", description = "Roll camera right while walking.", bindings = { bindKey("e") } }
+		{ id = "walk_strafe_right", mode = "walking", label = "Strafe Right", description = "Strafe right on the ground.", bindings = { bindKey("d") } }
 	}
 end
 
@@ -389,7 +410,8 @@ local function getPauseHelpSections()
 			items = {
 				{ keys = "W / S", text = "Pitch nose down or up." },
 				{ keys = "A / D", text = "Bank left or right." },
-				{ keys = "Q / E", text = "Yaw left or right." },
+				{ keys = "Mouse X / Q / E", text = "Yaw left or right for quick heading changes." },
+				{ keys = "Mouse Y", text = "Pitch nose up/down." },
 				{ keys = "Up / Down", text = "Throttle up or down." },
 				{ keys = "Space / Shift", text = "Air brakes and afterburner." }
 			}
@@ -398,9 +420,9 @@ local function getPauseHelpSections()
 			title = "Walking Mode",
 			items = {
 				{ keys = "W A S D", text = "Move and strafe in ground mode." },
+				{ keys = "Mouse X / Y", text = "FPS look (yaw + clamped pitch)." },
 				{ keys = "Space", text = "Jump while grounded." },
-				{ keys = "Shift", text = "Sprint while held." },
-				{ keys = "Q / E", text = "Tilt the camera left or right." }
+				{ keys = "Shift", text = "Sprint while held." }
 			}
 		},
 		{
@@ -440,6 +462,7 @@ local function generateGround(tileSize, gridCount, baseHeight)
 				model = cubeModel,
 				pos = { posX, baseHeight, posZ },
 				rot = q.identity(),
+				scale = { tileSize / 2, 0.005, tileSize / 2 },
 				color = { r, g, b },
 				isSolid = true,
 				halfSize = { x = tileSize / 2, y = 0.005, z = tileSize / 2 } -- thin tile
@@ -460,6 +483,215 @@ local function clamp(value, minValue, maxValue)
 	return value
 end
 
+local function randomRange(minValue, maxValue)
+	return minValue + (maxValue - minValue) * math.random()
+end
+
+local function wrapAngle(angle)
+	local twoPi = math.pi * 2
+	if twoPi == 0 then
+		return angle
+	end
+	angle = angle % twoPi
+	if angle > math.pi then
+		angle = angle - twoPi
+	end
+	return angle
+end
+
+local function shortestAngleDelta(currentAngle, targetAngle)
+	return wrapAngle(targetAngle - currentAngle)
+end
+
+local function composeWalkingRotation(yaw, pitch)
+	local yawQuat = q.fromAxisAngle({ 0, 1, 0 }, yaw)
+	local right = q.rotateVector(yawQuat, { 1, 0, 0 })
+	local pitchQuat = q.fromAxisAngle(right, pitch)
+	return q.normalize(q.multiply(pitchQuat, yawQuat))
+end
+
+local function syncWalkingLookFromRotation()
+	if not camera then
+		return
+	end
+
+	local forward = q.rotateVector(camera.rot, { 0, 0, 1 })
+	local flatMag = math.sqrt(forward[1] * forward[1] + forward[3] * forward[3])
+	local pitch = math.atan2(forward[2], math.max(flatMag, 1e-6))
+	local yaw = math.atan2(forward[1], forward[3])
+
+	camera.walkYaw = wrapAngle(yaw)
+	camera.walkPitch = clamp(pitch, -walkingPitchLimit, walkingPitchLimit)
+	camera.rot = composeWalkingRotation(camera.walkYaw, camera.walkPitch)
+end
+
+local function loadPlayerModelFromStl(path)
+	local stlModel, loadErr = engine.loadSTL(path)
+	if not stlModel then
+		logger.log("Player STL load failed, using cube fallback: " .. tostring(loadErr))
+		playerModel = cubeModel
+		return
+	end
+
+	playerModel = engine.normalizeModel(stlModel, 2.2)
+	logger.log(string.format(
+		"Loaded player STL '%s' (%d verts, %d faces).",
+		path,
+		#(playerModel.vertices or {}),
+		#(playerModel.faces or {})
+	))
+end
+
+local function pickNextWindTarget()
+	windState.targetAngle = randomRange(0, math.pi * 2)
+	windState.targetSpeed = randomRange(4.5, 12.0)
+	windState.retargetIn = randomRange(7.0, 15.0)
+end
+
+local function updateWind(dt)
+	windState.retargetIn = windState.retargetIn - dt
+	if windState.retargetIn <= 0 then
+		pickNextWindTarget()
+	end
+
+	local blend = clamp(dt * 0.6, 0, 1)
+	windState.angle = wrapAngle(windState.angle + shortestAngleDelta(windState.angle, windState.targetAngle) * blend)
+	windState.speed = windState.speed + (windState.targetSpeed - windState.speed) * blend
+end
+
+local function getWindVectorXZ()
+	return math.cos(windState.angle) * windState.speed, math.sin(windState.angle) * windState.speed
+end
+
+local function chooseCloudCenter(spawnUpwind)
+	local refX = (camera and camera.pos and camera.pos[1]) or 0
+	local refZ = (camera and camera.pos and camera.pos[3]) or 0
+	local angle
+	if spawnUpwind then
+		angle = wrapAngle(windState.angle + math.pi + randomRange(-0.8, 0.8))
+	else
+		angle = randomRange(0, math.pi * 2)
+	end
+
+	local distance = randomRange(cloudState.spawnRadius * 0.45, cloudState.spawnRadius)
+	local x = refX + math.cos(angle) * distance
+	local y = randomRange(cloudState.minAltitude, cloudState.maxAltitude)
+	local z = refZ + math.sin(angle) * distance
+	return x, y, z
+end
+
+local function updateCloudGroupVisuals(group, now)
+	for _, puff in ipairs(group.puffs) do
+		local bob = math.sin(now * 0.2 + puff.cloudBobPhase) * puff.cloudBobAmplitude
+		puff.pos[1] = group.center[1] + puff.cloudOffset[1]
+		puff.pos[2] = group.center[2] + puff.cloudOffset[2] + bob
+		puff.pos[3] = group.center[3] + puff.cloudOffset[3]
+	end
+end
+
+local function randomizeCloudGroup(group, spawnUpwind)
+	local cx, cy, cz = chooseCloudCenter(spawnUpwind)
+	group.center[1], group.center[2], group.center[3] = cx, cy, cz
+	group.radius = randomRange(cloudState.minGroupSize, cloudState.maxGroupSize)
+	group.windDrift = randomRange(0.85, 1.25)
+
+	local maxOffset = group.radius
+	for _, puff in ipairs(group.puffs) do
+		local angle = randomRange(0, math.pi * 2)
+		local radial = randomRange(maxOffset * 0.2, maxOffset)
+		puff.cloudOffset[1] = math.cos(angle) * radial
+		puff.cloudOffset[2] = randomRange(-maxOffset * 0.2, maxOffset * 0.25)
+		puff.cloudOffset[3] = math.sin(angle) * radial
+		puff.cloudBobPhase = randomRange(0, math.pi * 2)
+		puff.cloudBobAmplitude = randomRange(0.2, 1.2)
+
+		local puffSize = randomRange(group.radius * 0.22, group.radius * 0.48)
+		puff.scale[1] = puffSize
+		puff.scale[2] = puffSize * randomRange(0.55, 0.78)
+		puff.scale[3] = puffSize
+		puff.rot = q.fromAxisAngle({ 0, 1, 0 }, randomRange(0, math.pi * 2))
+
+		local shade = randomRange(0.88, 0.99)
+		puff.color[1] = shade
+		puff.color[2] = shade
+		puff.color[3] = math.min(1.0, shade + randomRange(0.01, 0.03))
+		puff.color[4] = randomRange(0.17, 0.35)
+	end
+
+	updateCloudGroupVisuals(group, love.timer.getTime())
+end
+
+local function spawnCloudField()
+	cloudState.groups = {}
+
+	for _ = 1, cloudState.groupCount do
+		local puffCount = math.random(cloudState.minPuffs, cloudState.maxPuffs)
+		local group = {
+			center = { 0, 0, 0 },
+			radius = randomRange(cloudState.minGroupSize, cloudState.maxGroupSize),
+			windDrift = randomRange(0.85, 1.25),
+			puffs = {}
+		}
+
+		for _ = 1, puffCount do
+			local puff = {
+				model = cloudPuffModel,
+				pos = { 0, 0, 0 },
+				rot = q.identity(),
+				scale = { 1, 1, 1 },
+				color = { 0.95, 0.95, 0.97, 0.24 },
+				isSolid = false,
+				isCloud = true,
+				cloudOffset = { 0, 0, 0 },
+				cloudBobPhase = 0,
+				cloudBobAmplitude = 0.5
+			}
+			group.puffs[#group.puffs + 1] = puff
+			objects[#objects + 1] = puff
+		end
+
+		randomizeCloudGroup(group, false)
+		cloudState.groups[#cloudState.groups + 1] = group
+	end
+end
+
+local function updateClouds(dt)
+	if #cloudState.groups == 0 or not camera then
+		return
+	end
+
+	updateWind(dt)
+	local windX, windZ = getWindVectorXZ()
+	local now = love.timer.getTime()
+	local maxDistSq = cloudState.despawnRadius * cloudState.despawnRadius
+
+	for _, group in ipairs(cloudState.groups) do
+		group.center[1] = group.center[1] + windX * group.windDrift * dt
+		group.center[3] = group.center[3] + windZ * group.windDrift * dt
+
+		local dx = group.center[1] - camera.pos[1]
+		local dz = group.center[3] - camera.pos[3]
+		if (dx * dx + dz * dz) > maxDistSq then
+			randomizeCloudGroup(group, true)
+		else
+			updateCloudGroupVisuals(group, now)
+		end
+	end
+end
+
+local function cameraSpaceDepthForObject(obj)
+	if not obj or not obj.pos or not camera then
+		return -math.huge
+	end
+	local rel = {
+		obj.pos[1] - camera.pos[1],
+		obj.pos[2] - camera.pos[2],
+		obj.pos[3] - camera.pos[3]
+	}
+	local cam = q.rotateVector(q.conjugate(camera.rot), rel)
+	return cam[3]
+end
+
 local function setMouseCapture(enabled)
 	love.mouse.setRelativeMode(enabled)
 	pcall(love.mouse.setVisible, not enabled)
@@ -468,8 +700,14 @@ end
 
 local function setFlightMode(enabled)
 	flightSimMode = enabled and true or false
-	if not flightSimMode and camera then
-		camera.throttle = 0
+	if camera then
+		if flightSimMode then
+			camera.walkYaw = nil
+			camera.walkPitch = nil
+		else
+			camera.throttle = 0
+			syncWalkingLookFromRotation()
+		end
 	end
 end
 
@@ -501,6 +739,8 @@ local function resetCameraTransform()
 	camera.vel = { 0, 0, 0 }
 	camera.throttle = 0
 	camera.onGround = false
+	camera.walkYaw = 0
+	camera.walkPitch = 0
 	if camera.box and camera.box.halfSize then
 		camera.box.pos = { camera.pos[1], camera.pos[2] - camera.box.halfSize.y, camera.pos[3] }
 	end
@@ -1789,15 +2029,22 @@ function love.load()
 		gravity = -9.81,   -- units/sec^2
 		jumpSpeed = 5,     -- initial jump
 		throttle = 0,
-		maxSpeed = 50,
-		throttleAccel = 24,
-		afterburnerMultiplier = 1.7,
-		airBrakeStrength = 55,
-		wheelThrottleStep = 3,
-		flightPitchRate = 65,
-		flightYawRate = 70,
+		maxSpeed = 34,
+		throttleAccel = 18,
+		afterburnerMultiplier = 1.45,
+		airBrakeStrength = 65,
+		flightThrottleDamping = 5,
+		wheelThrottleStep = 2,
+		flightPitchRate = 78,
+		flightYawRate = 90,
 		flightRollRate = 95,
+		flightMousePitchMultiplier = 1.9,
+		flightMouseYawMultiplier = 3.5,
+		flightMouseRollMultiplier = 1.2,
 		sprintMultiplier = 1.8,
+		walkMousePitchMultiplier = 2.4,
+		walkMouseYawMultiplier = 2.8,
+		allowWalkRoll = false,
 		walkTiltRate = 40,
 		box = {
 			halfSize = { x = 0.5, y = 1.8, z = 0.5 }, -- width/height/depth half extents
@@ -1805,6 +2052,7 @@ function love.load()
 			isSolid = true
 		}
 	}
+	syncWalkingLookFromRotation()
 
 	renderMode = "CPU"
 	gpuErrorLogged = false
@@ -1827,21 +2075,24 @@ function love.load()
 	pauseMenu.confirmItemId = nil
 	pauseMenu.confirmUntil = 0
 
-	-- creating the cube's object
+	loadPlayerModelFromStl("objects/Dualengine.stl")
+
+	-- Reference player mesh object for visibility / multiplayer tests
 	-- disabled now that other players can join allowing for non-static testing of latency and culling/depth ordering
 	objects = {
 		[1] = {
-			model = cubeModel,
-			pos = { 0, 0, 10 },
+			model = playerModel,
+			pos = { 0, 10, 10 },
 			rot = q.identity(),
+			scale = { 0.9, 0.9, 0.9 },
 			color = { 0.9, 0.4, 0.1 },
 			isSolid = true
 		}
 	}
 
-	-- generate a 1000x1000 ground made of 10x10 tiles
-	local tileSize = 2
-	local gridCount = 10 -- 100 tiles per side -> 1000 units total
+	-- Increase floor coverage: 10x tile size and 10x tile count.
+	local tileSize = 20
+	local gridCount = 100
 	local baseHeight = -0.1
 
 	local groundTiles = generateGround(tileSize, gridCount, baseHeight)
@@ -1849,6 +2100,12 @@ function love.load()
 	for _, tile in ipairs(groundTiles) do
 		table.insert(objects, tile)
 	end
+
+	windState.angle = randomRange(0, math.pi * 2)
+	windState.speed = randomRange(5, 10)
+	pickNextWindTarget()
+	spawnCloudField()
+	logger.log(string.format("Cloud field initialized (%d groups).", #cloudState.groups))
 
 	zBuffer = {}
 	for i = 1, screen.w * screen.h do
@@ -1892,9 +2149,7 @@ local function buildMovementInputState()
 		walkStrafeLeft = isActionDown("walk_strafe_left"),
 		walkStrafeRight = isActionDown("walk_strafe_right"),
 		walkSprint = isActionDown("walk_sprint"),
-		walkJump = isActionDown("walk_jump"),
-		walkTiltLeft = isActionDown("walk_tilt_left"),
-		walkTiltRight = isActionDown("walk_tilt_right")
+		walkJump = isActionDown("walk_jump")
 	}
 end
 
@@ -1927,9 +2182,20 @@ local function applyWalkingMouseLook(dx, dy, modifiers)
 		pitchAxis = -pitchAxis
 	end
 
-	local pitchAngle = pitchAxis * mouseSensitivity
-	local yawAngle = yawAxis * mouseSensitivity
-	applyCameraRotations(pitchAngle, yawAngle, 0)
+	camera.walkYaw = camera.walkYaw or 0
+	camera.walkPitch = camera.walkPitch or 0
+
+	local pitchMult = camera.walkMousePitchMultiplier or 2.2
+	local yawMult = camera.walkMouseYawMultiplier or 2.2
+	local pitchLimit = walkingPitchLimit
+
+	camera.walkPitch = clamp(
+		camera.walkPitch + (pitchAxis * mouseSensitivity * pitchMult),
+		-pitchLimit,
+		pitchLimit
+	)
+	camera.walkYaw = wrapAngle(camera.walkYaw + (yawAxis * mouseSensitivity * yawMult))
+	camera.rot = composeWalkingRotation(camera.walkYaw, camera.walkPitch)
 end
 
 local function applyFlightMouseLook(dx, dy, modifiers)
@@ -1948,9 +2214,9 @@ local function applyFlightMouseLook(dx, dy, modifiers)
 		pitchAxis = -pitchAxis
 	end
 
-	local pitchAngle = pitchAxis * mouseSensitivity
-	local yawAngle = yawAxis * mouseSensitivity
-	local rollAngle = rollAxis * mouseSensitivity
+	local pitchAngle = pitchAxis * mouseSensitivity * (camera.flightMousePitchMultiplier or 1.6)
+	local yawAngle = yawAxis * mouseSensitivity * (camera.flightMouseYawMultiplier or 3.0)
+	local rollAngle = rollAxis * mouseSensitivity * (camera.flightMouseRollMultiplier or 1.0)
 	applyCameraRotations(pitchAngle, yawAngle, rollAngle)
 end
 
@@ -2052,7 +2318,7 @@ local function serviceNetworkEvents()
 	event = relay:service()
 	while event do
 		if event.type == "receive" then
-			networking.handlePacket(event.data, peers, objects, q)
+			networking.handlePacket(event.data, peers, objects, q, playerModel)
 		elseif event.type == "disconnect" and relayServer and event.peer == relayServer then
 			relayServer = nil
 			logger.log("Relay disconnected.")
@@ -2075,6 +2341,7 @@ function love.update(dt)
 	if not pauseMenu.active then
 		local movementInput = buildMovementInputState()
 		camera = engine.processMovement(camera, dt, flightSimMode, vector3, q, objects, movementInput)
+		updateClouds(dt)
 		updateZoomFov(dt)
 		updateNet()
 
@@ -2328,8 +2595,26 @@ function love.draw()
 		end
 
 		local imageData = love.image.newImageData(screen.w, screen.h)
+		local opaqueObjects = {}
+		local transparentObjects = {}
 		for _, obj in ipairs(objects) do
-			imageData = engine.drawObject(obj, false, camera, vector3, q, screen, zBuffer, imageData)
+			local alpha = (obj.color and obj.color[4]) or 1
+			if alpha < 0.999 then
+				transparentObjects[#transparentObjects + 1] = obj
+			else
+				opaqueObjects[#opaqueObjects + 1] = obj
+			end
+		end
+
+		for _, obj in ipairs(opaqueObjects) do
+			imageData = engine.drawObject(obj, false, camera, vector3, q, screen, zBuffer, imageData, true)
+		end
+
+		table.sort(transparentObjects, function(a, b)
+			return cameraSpaceDepthForObject(a) > cameraSpaceDepthForObject(b)
+		end)
+		for _, obj in ipairs(transparentObjects) do
+			imageData = engine.drawObject(obj, false, camera, vector3, q, screen, zBuffer, imageData, false)
 		end
 		if frameImage then
 			frameImage:replacePixels(imageData)
@@ -2345,7 +2630,9 @@ function love.draw()
 		love.graphics.print(
 			"Esc = pause menu (see Help/Controls tabs for full controls)\n" ..
 			"Render: " .. tostring(renderMode) .. " | Triangles: " .. tostring(math.floor(triangleCount)) .. " | FPS: " ..
-			tostring(love.timer.getFPS()),
+			tostring(love.timer.getFPS()) .. "\n" ..
+			string.format("Wind: %.1f u/s @ %d deg | Clouds: %d", windState.speed, math.floor(math.deg(windState.angle) + 0.5),
+				#cloudState.groups),
 			10,
 			10
 		)

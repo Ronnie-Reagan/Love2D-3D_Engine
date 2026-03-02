@@ -3,22 +3,24 @@ local networking = {}
 local objectLib = require "object"
 local cubeModel = objectLib.cubeModel
 
-
-function networking.createObjectForPeer(peerID, objects, q)
+function networking.createObjectForPeer(peerID, objects, q, playerModel)
+    local model = playerModel or cubeModel
     local obj = {
-        model = cubeModel,
+        model = model,
         pos = { 0, 0, 0 },
         rot = q.identity(),
         color = { math.random(), math.random(), math.random() },
         isSolid = true,
-        id = peerID
+        id = peerID,
+        scale = { 0.9, 0.9, 0.9 },
+        halfSize = { x = 0.9, y = 0.9, z = 0.9 }
     }
 
     table.insert(objects, obj)
     return obj
 end
 
-function networking.handlePacket(data, peers, objects, q)
+function networking.handlePacket(data, peers, objects, q, playerModel)
     if type(data) ~= "string" then
         return
     end
@@ -50,7 +52,7 @@ function networking.handlePacket(data, peers, objects, q)
     end
 
     if not peers[id] then
-        peers[id] = networking.createObjectForPeer(id, objects, q)
+        peers[id] = networking.createObjectForPeer(id, objects, q, playerModel)
     end
 
     local obj = peers[id]
