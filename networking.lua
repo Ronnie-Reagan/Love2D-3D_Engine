@@ -3,9 +3,31 @@ local networking = {}
 local objectLib = require "object"
 local cubeModel = objectLib.cubeModel
 
+local function sanitizeScale(value, fallback)
+    local scale = tonumber(value)
+    if scale and scale > 0 then
+        return scale
+    end
+    return fallback
+end
+
+local function sanitizeRole(token)
+    if token == "walking" or token == "walk" or token == "w" then
+        return "walking"
+    end
+    return "plane"
+end
+
 function networking.createObjectForPeer(peerID, objects, q, playerModel, playerModelRotationOffset, defaults)
     defaults = defaults or {}
-    local startScale = tonumber(defaults.scale) or 1.35
+    local startScale = sanitizeScale(defaults.scale, 1.35)
+    local planeScale = sanitizeScale(defaults.planeScale, startScale)
+    local walkingScale = sanitizeScale(defaults.walkingScale, startScale)
+    local role = sanitizeRole(defaults.role or "plane")
+    local planeModelHash = defaults.planeModelHash or defaults.modelHash or "builtin-cube"
+    local walkingModelHash = defaults.walkingModelHash or defaults.modelHash or planeModelHash
+    local activeScale = (role == "walking") and walkingScale or planeScale
+    local activeModelHash = (role == "walking") and walkingModelHash or planeModelHash
     local model = playerModel or cubeModel
     local obj = {
         model = model,
@@ -15,10 +37,15 @@ function networking.createObjectForPeer(peerID, objects, q, playerModel, playerM
         color = { math.random(), math.random(), math.random() },
         isSolid = true,
         id = peerID,
-        scale = { startScale, startScale, startScale },
-        halfSize = { x = startScale, y = startScale, z = startScale },
+        scale = { activeScale, activeScale, activeScale },
+        halfSize = { x = activeScale, y = activeScale, z = activeScale },
         visualOffsetY = tonumber(defaults.visualOffsetY) or 0,
-        modelHash = defaults.modelHash
+        modelHash = activeModelHash,
+        remoteRole = role,
+        planeModelHash = planeModelHash,
+        walkingModelHash = walkingModelHash,
+        planeModelScale = planeScale,
+        walkingModelScale = walkingScale
     }
 
     table.insert(objects, obj)
@@ -53,6 +80,11 @@ function networking.handlePacket(data, peers, objects, q, playerModel, playerMod
     local rz = tonumber(parts[8])
     local remoteScale = (#parts >= 10) and tonumber(parts[9]) or nil
     local remoteModelHash = (#parts >= 11) and parts[10] or nil
+    local remoteRole = (#parts >= 12) and sanitizeRole(parts[11]) or nil
+    local remotePlaneScale = (#parts >= 13) and tonumber(parts[12]) or nil
+    local remotePlaneHash = (#parts >= 14) and parts[13] or nil
+    local remoteWalkingScale = (#parts >= 15) and tonumber(parts[14]) or nil
+    local remoteWalkingHash = (#parts >= 16) and parts[15] or nil
 
     if not (id and px and py and pz and rw and rx and ry and rz) then
         return nil
@@ -71,19 +103,82 @@ function networking.handlePacket(data, peers, objects, q, playerModel, playerMod
         if remoteModelHash and remoteModelHash ~= "" then
             defaults.modelHash = remoteModelHash
         end
+        if remoteRole then
+            defaults.role = remoteRole
+        end
+        if remotePlaneScale and remotePlaneScale > 0 then
+            defaults.planeScale = remotePlaneScale
+        end
+        if remoteWalkingScale and remoteWalkingScale > 0 then
+            defaults.walkingScale = remoteWalkingScale
+        end
+        if remotePlaneHash and remotePlaneHash ~= "" then
+            defaults.planeModelHash = remotePlaneHash
+        end
+        if remoteWalkingHash and remoteWalkingHash ~= "" then
+            defaults.walkingModelHash = remoteWalkingHash
+        end
         peers[id] = networking.createObjectForPeer(id, objects, q, playerModel, playerModelRotationOffset, defaults)
     end
 
     local obj = peers[id]
     obj.basePos = { px, py, pz }
     obj.pos = { px, py + (obj.visualOffsetY or 0), pz }
-    if remoteScale and remoteScale > 0 then
-        obj.scale = { remoteScale, remoteScale, remoteScale }
-        obj.halfSize = { x = remoteScale, y = remoteScale, z = remoteScale }
+
+    if remoteRole then
+        obj.remoteRole = remoteRole
     end
+
+    if remotePlaneScale and remotePlaneScale > 0 then
+        obj.planeModelScale = remotePlaneScale
+    end
+    if remoteWalkingScale and remoteWalkingScale > 0 then
+        obj.walkingModelScale = remoteWalkingScale
+    end
+    if remotePlaneHash and remotePlaneHash ~= "" then
+        obj.planeModelHash = remotePlaneHash
+    end
+    if remoteWalkingHash and remoteWalkingHash ~= "" then
+        obj.walkingModelHash = remoteWalkingHash
+    end
+
     if remoteModelHash and remoteModelHash ~= "" then
-        obj.modelHash = remoteModelHash
+        if remoteRole == "walking" then
+            obj.walkingModelHash = remoteModelHash
+        elseif remoteRole == "plane" then
+            obj.planeModelHash = remoteModelHash
+        else
+            obj.planeModelHash = remoteModelHash
+            obj.walkingModelHash = remoteModelHash
+        end
     end
+
+    if remoteScale and remoteScale > 0 then
+        if remoteRole == "walking" then
+            obj.walkingModelScale = remoteScale
+        elseif remoteRole == "plane" then
+            obj.planeModelScale = remoteScale
+        else
+            obj.planeModelScale = remoteScale
+            obj.walkingModelScale = remoteScale
+        end
+    end
+
+    local activeRole = sanitizeRole(obj.remoteRole or "plane")
+    local activeScale
+    local activeModelHash
+    if activeRole == "walking" then
+        activeScale = sanitizeScale(obj.walkingModelScale, sanitizeScale(obj.scale and obj.scale[1], 1.35))
+        activeModelHash = obj.walkingModelHash or obj.modelHash or "builtin-cube"
+    else
+        activeScale = sanitizeScale(obj.planeModelScale, sanitizeScale(obj.scale and obj.scale[1], 1.35))
+        activeModelHash = obj.planeModelHash or obj.modelHash or "builtin-cube"
+    end
+
+    obj.scale = { activeScale, activeScale, activeScale }
+    obj.halfSize = { x = activeScale, y = activeScale, z = activeScale }
+    obj.modelHash = activeModelHash
+
     local baseRot = { w = rw, x = rx, y = ry, z = rz }
     if playerModelRotationOffset then
         obj.rot = q.normalize(q.multiply(baseRot, playerModelRotationOffset))

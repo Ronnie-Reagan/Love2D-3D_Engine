@@ -1065,11 +1065,8 @@ function applyPlaneVisualToObject(obj, modelHash, scale)
 end
 
 function refreshAllPeerModels()
-	for _, peer in pairs(peers) do
-		if peer then
-			local peerScale = (peer.scale and peer.scale[1]) or defaultPlayerModelScale
-			applyPlaneVisualToObject(peer, peer.modelHash, peerScale)
-		end
+	for peerId in pairs(peers) do
+		updatePeerVisualModel(peerId)
 	end
 end
 
@@ -1569,8 +1566,23 @@ function updatePeerVisualModel(peerId)
 		return
 	end
 
-	local wantedHash = peer.modelHash or "builtin-cube"
-	local peerScale = (peer.scale and peer.scale[1]) or defaultPlayerModelScale
+	local role = (peer.remoteRole == "walking") and "walking" or "plane"
+	local planeHash = peer.planeModelHash or peer.modelHash or "builtin-cube"
+	local walkingHash = peer.walkingModelHash or peer.modelHash or planeHash or "builtin-cube"
+	local planeScale = math.max(0.05, tonumber(peer.planeModelScale) or ((peer.scale and peer.scale[1]) or defaultPlayerModelScale))
+	local walkingScale = math.max(0.05, tonumber(peer.walkingModelScale) or planeScale or defaultWalkingModelScale)
+	local wantedHash = (role == "walking") and walkingHash or planeHash
+	local peerScale = (role == "walking") and walkingScale or planeScale
+
+	peer.remoteRole = role
+	peer.planeModelHash = planeHash
+	peer.walkingModelHash = walkingHash
+	peer.planeModelScale = planeScale
+	peer.walkingModelScale = walkingScale
+	peer.modelHash = wantedHash
+	peer.scale = { peerScale, peerScale, peerScale }
+	peer.halfSize = { x = peerScale, y = peerScale, z = peerScale }
+
 	if playerModelCache[wantedHash] then
 		applyPlaneVisualToObject(peer, wantedHash, peerScale)
 		peer.modelHash = wantedHash
@@ -1578,6 +1590,13 @@ function updatePeerVisualModel(peerId)
 		applyPlaneVisualToObject(peer, "builtin-cube", peerScale)
 		peer.modelHash = wantedHash
 		requestModelFromPeers(wantedHash, "missing for peer " .. tostring(peerId))
+	end
+
+	if planeHash ~= "builtin-cube" and not playerModelCache[planeHash] then
+		requestModelFromPeers(planeHash, "prefetch plane for peer " .. tostring(peerId))
+	end
+	if walkingHash ~= "builtin-cube" and not playerModelCache[walkingHash] then
+		requestModelFromPeers(walkingHash, "prefetch walking for peer " .. tostring(peerId))
 	end
 end
 
@@ -4326,18 +4345,27 @@ local function updateNet()
 	local now = love.timer.getTime()
 
 	if canSend then
-		local packet = string.format(
-			"STATE|%f|%f|%f|%f|%f|%f|%f|%s|%s",
-			camera.pos[1],
-			camera.pos[2],
-			camera.pos[3],
-			camera.rot.w,
-			camera.rot.x,
-			camera.rot.y,
-			camera.rot.z,
-			formatNetFloat(playerModelScale),
-			playerModelHash or "builtin-cube"
-		)
+		local activeRole = getActiveModelRole()
+		local activeHash, activeScale = getConfiguredModelForRole(activeRole)
+		local planeHash, planeScale = getConfiguredModelForRole("plane")
+		local walkingHash, walkingScale = getConfiguredModelForRole("walking")
+		local packet = table.concat({
+			"STATE",
+			string.format("%f", camera.pos[1]),
+			string.format("%f", camera.pos[2]),
+			string.format("%f", camera.pos[3]),
+			string.format("%f", camera.rot.w),
+			string.format("%f", camera.rot.x),
+			string.format("%f", camera.rot.y),
+			string.format("%f", camera.rot.z),
+			formatNetFloat(activeScale),
+			activeHash or "builtin-cube",
+			activeRole,
+			formatNetFloat(planeScale),
+			planeHash or "builtin-cube",
+			formatNetFloat(walkingScale),
+			walkingHash or "builtin-cube"
+		}, "|")
 		pcall(function()
 			relayServer:send(packet)
 		end)
@@ -4366,7 +4394,15 @@ local function serviceNetworkEvents()
 					q,
 					cubeModel,
 					playerModelRotationOffset,
-					{ scale = defaultPlayerModelScale, modelHash = "builtin-cube" }
+					{
+						scale = defaultPlayerModelScale,
+						modelHash = "builtin-cube",
+						planeScale = defaultPlayerModelScale,
+						walkingScale = defaultWalkingModelScale,
+						planeModelHash = "builtin-cube",
+						walkingModelHash = "builtin-cube",
+						role = "plane"
+					}
 				)
 				updatePeerVisualModel(peerId)
 				notePeerStateReceived(peerId)
