@@ -5,6 +5,10 @@ local enet = require "enet"
 local engine = require "engine"
 local networking = require "networking"
 local renderer = require "gpu_renderer"
+local controls = require "controls"
+local groundSystem = require "ground_system"
+local viewMath = require "view_math"
+local cloudSim = require "cloud_sim"
 local logger = require "logger"
 local objectDefs = require "object"
 local hostAddy = "ecosim.donreagan.ca:1988"
@@ -18,6 +22,8 @@ local objects = {}
 local cubeModel = objectDefs.cubeModel
 local cloudPuffModel = objectDefs.cloudPuffModel or cubeModel
 local playerModel = cubeModel
+-- too many local scope declarations? fuck it, we're global now baby!
+---@diagnostic disable lowercase-global
 defaultPlayerModelPath = "objects/Dualengine.stl"
 normalizedPlayerModelExtent = 2.2
 defaultPlayerModelScale = 1.35
@@ -70,6 +76,7 @@ local mapState = {
 	gridImageSize = 0
 }
 local localPlayerObject = nil
+
 localGroundClearance = 1.8
 modelLoadPrompt = {
 	active = false,
@@ -211,318 +218,16 @@ local pauseMenu = {
 	}
 }
 
-local function bindKey(key, modifiers)
-	return { kind = "key", key = key, modifiers = modifiers }
-end
-
-local function bindMouseButton(button, modifiers)
-	return { kind = "mouse_button", button = button, modifiers = modifiers }
-end
-
-local function bindMouseAxis(axis, direction, modifiers)
-	return { kind = "mouse_axis", axis = axis, direction = direction, modifiers = modifiers }
-end
-
-local function bindMouseWheel(direction, modifiers)
-	return { kind = "mouse_wheel", direction = direction, modifiers = modifiers }
-end
-
-local function cloneBinding(binding)
-	if not binding then
-		return nil
-	end
-	local clone = {}
-	for key, value in pairs(binding) do
-		if key == "modifiers" and value then
-			clone.modifiers = {
-				alt = value.alt and true or nil,
-				ctrl = value.ctrl and true or nil,
-				shift = value.shift and true or nil
-			}
-		else
-			clone[key] = value
-		end
-	end
-	return clone
-end
-
-local function buildDefaultControlActions()
-	return {
-		{ id = "flight_pitch_down", mode = "flight", label = "Pitch Forward / Nose Down", description = "Pitch the nose downward in flight mode.", bindings = { bindKey("w"), bindMouseAxis("y", -1) } },
-		{ id = "flight_pitch_up", mode = "flight", label = "Pitch Back / Nose Up", description = "Pitch the nose upward in flight mode.", bindings = { bindKey("s"), bindMouseAxis("y", 1) } },
-		{ id = "flight_roll_left", mode = "flight", label = "Bank / Roll Left", description = "Roll left around the forward axis.", bindings = { bindKey("a"), bindMouseAxis("x", -1) } },
-		{ id = "flight_roll_right", mode = "flight", label = "Bank / Roll Right", description = "Roll right around the forward axis.", bindings = { bindKey("d"), bindMouseAxis("x", 1) } },
-		{ id = "flight_yaw_left", mode = "flight", label = "Yaw / Turn Left", description = "Yaw the craft left.", bindings = { bindKey("q") } },
-		{ id = "flight_yaw_right", mode = "flight", label = "Yaw / Turn Right", description = "Yaw the craft right.", bindings = { bindKey("e") } },
-		{ id = "flight_throttle_down", mode = "flight", label = "Throttle Down", description = "Reduce throttle while flying.", bindings = { bindKey("down"), bindMouseWheel(-1) } },
-		{ id = "flight_throttle_up", mode = "flight", label = "Throttle Up", description = "Increase throttle while flying.", bindings = { bindKey("up"), bindMouseWheel(1) } },
-		{ id = "flight_fire_projectile", mode = "flight", label = "Fire Projectile", description = "Trigger the primary fire action.", bindings = { bindMouseButton(1) } },
-		{ id = "flight_zoom_in", mode = "flight", label = "Zoom In", description = "Hold to zoom in while flying.", bindings = { bindMouseButton(2) } },
-		{ id = "flight_afterburner", mode = "flight", label = "After Burner", description = "Hold for temporary extra top speed.", bindings = { bindKey("lshift"), bindMouseButton(4) } },
-		{ id = "flight_air_brakes", mode = "flight", label = "Air Brakes", description = "Hold to rapidly bleed off throttle.", bindings = { bindKey("space") } },
-		{ id = "walk_look_down", mode = "walking", label = "Look Down", description = "Move the camera down in walking mode.", bindings = { bindMouseAxis("y", 1) } },
-		{ id = "walk_look_up", mode = "walking", label = "Look Up", description = "Move the camera up in walking mode.", bindings = { bindMouseAxis("y", -1) } },
-		{ id = "walk_look_left", mode = "walking", label = "Look Left", description = "Move the camera left in walking mode.", bindings = { bindMouseAxis("x", -1) } },
-		{ id = "walk_look_right", mode = "walking", label = "Look Right", description = "Move the camera right in walking mode.", bindings = { bindMouseAxis("x", 1) } },
-		{ id = "walk_sprint", mode = "walking", label = "Sprint", description = "Increase walking speed while held.", bindings = { bindKey("lshift") } },
-		{ id = "walk_jump", mode = "walking", label = "Jump", description = "Jump while grounded.", bindings = { bindKey("space") } },
-		{ id = "walk_forward", mode = "walking", label = "Walk Forwards", description = "Move forwards on the ground.", bindings = { bindKey("w") } },
-		{ id = "walk_backward", mode = "walking", label = "Walk Backwards", description = "Move backwards on the ground.", bindings = { bindKey("s") } },
-		{ id = "walk_strafe_left", mode = "walking", label = "Strafe Left", description = "Strafe left on the ground.", bindings = { bindKey("a") } },
-		{ id = "walk_strafe_right", mode = "walking", label = "Strafe Right", description = "Strafe right on the ground.", bindings = { bindKey("d") } }
-	}
-end
-
-local controlActions = buildDefaultControlActions()
-local controlActionById = {}
-
-local function rebuildControlActionIndex()
-	controlActionById = {}
-	for i, action in ipairs(controlActions) do
-		controlActionById[action.id] = i
-	end
-end
-
-rebuildControlActionIndex()
+local controlActions = controls.getActions()
 
 local function resetControlBindingsToDefaults()
-	controlActions = buildDefaultControlActions()
-	rebuildControlActionIndex()
+	controlActions = controls.resetToDefaults()
 	pauseMenu.controlsSelection = math.max(1, math.min(pauseMenu.controlsSelection, #controlActions))
 	pauseMenu.controlsSlot = math.max(1, math.min(pauseMenu.controlsSlot, 2))
 	pauseMenu.controlsScroll = 0
 	pauseMenu.controlsRowBounds = {}
 	pauseMenu.controlsSlotBounds = {}
 	pauseMenu.listeningBinding = nil
-end
-
-local function getControlAction(actionId)
-	local index = controlActionById[actionId]
-	if not index then
-		return nil
-	end
-	return controlActions[index], index
-end
-
-local keyLabelMap = {
-	up = "Up Arrow",
-	down = "Down Arrow",
-	left = "Left Arrow",
-	right = "Right Arrow",
-	space = "Spacebar",
-	lshift = "Left Shift",
-	rshift = "Right Shift",
-	lalt = "Left Alt",
-	ralt = "Right Alt",
-	lctrl = "Left Ctrl",
-	rctrl = "Right Ctrl",
-	kpenter = "Numpad Enter",
-	["return"] = "Enter"
-}
-
-local mouseButtonLabelMap = {
-	[1] = "Left Mouse Button",
-	[2] = "Right Mouse Button",
-	[3] = "Middle Mouse Button",
-	[4] = "Mouse X1",
-	[5] = "Mouse X2"
-}
-
-local function formatKeyLabel(key)
-	if not key or key == "" then
-		return "Unbound"
-	end
-	if keyLabelMap[key] then
-		return keyLabelMap[key]
-	end
-	if #key == 1 then
-		return string.upper(key)
-	end
-
-	local pretty = key:gsub("_", " ")
-	return pretty:gsub("(%a)([%w_']*)", function(first, rest)
-		return string.upper(first) .. rest
-	end)
-end
-
-local function getCurrentModifiers()
-	return {
-		alt = love.keyboard.isDown("lalt", "ralt"),
-		ctrl = love.keyboard.isDown("lctrl", "rctrl"),
-		shift = love.keyboard.isDown("lshift", "rshift")
-	}
-end
-
-local function extractCaptureModifiers(excludeKey)
-	local mods = getCurrentModifiers()
-	if excludeKey == "lalt" or excludeKey == "ralt" then
-		mods.alt = false
-	elseif excludeKey == "lctrl" or excludeKey == "rctrl" then
-		mods.ctrl = false
-	elseif excludeKey == "lshift" or excludeKey == "rshift" then
-		mods.shift = false
-	end
-
-	if mods.alt or mods.ctrl or mods.shift then
-		return {
-			alt = mods.alt or nil,
-			ctrl = mods.ctrl or nil,
-			shift = mods.shift or nil
-		}
-	end
-	return nil
-end
-
-local function bindingModifiersMatch(required, current, strict)
-	required = required or {}
-	current = current or { alt = false, ctrl = false, shift = false }
-
-	if required.alt and not current.alt then
-		return false
-	end
-	if required.ctrl and not current.ctrl then
-		return false
-	end
-	if required.shift and not current.shift then
-		return false
-	end
-
-	if strict then
-		if current.alt and not required.alt then
-			return false
-		end
-	end
-
-	return true
-end
-
-local function formatBinding(binding)
-	if not binding then
-		return "Unbound"
-	end
-
-	local text = "Unbound"
-	if binding.kind == "key" then
-		text = formatKeyLabel(binding.key)
-	elseif binding.kind == "mouse_button" then
-		text = mouseButtonLabelMap[binding.button] or ("Mouse Button " .. tostring(binding.button))
-	elseif binding.kind == "mouse_axis" then
-		if binding.axis == "x" then
-			text = (binding.direction or 0) < 0 and "Mouse Left" or "Mouse Right"
-		else
-			text = (binding.direction or 0) < 0 and "Mouse Up" or "Mouse Down"
-		end
-	elseif binding.kind == "mouse_wheel" then
-		text = (binding.direction or 0) < 0 and "Mouse Wheel Down" or "Mouse Wheel Up"
-	end
-
-	if binding.modifiers then
-		local prefix = {}
-		if binding.modifiers.ctrl then
-			table.insert(prefix, "Ctrl")
-		end
-		if binding.modifiers.alt then
-			table.insert(prefix, "Alt")
-		end
-		if binding.modifiers.shift then
-			table.insert(prefix, "Shift")
-		end
-		if #prefix > 0 then
-			text = table.concat(prefix, " + ") .. " + " .. text
-		end
-	end
-
-	return text
-end
-
-local function isActionDown(actionId)
-	local action = getControlAction(actionId)
-	if not action then
-		return false
-	end
-
-	local modifiers = getCurrentModifiers()
-	for _, binding in ipairs(action.bindings or {}) do
-		if binding.kind == "key" and binding.key and love.keyboard.isDown(binding.key) then
-			if bindingModifiersMatch(binding.modifiers, modifiers, false) then
-				return true
-			end
-		elseif binding.kind == "mouse_button" and binding.button and love.mouse.isDown(binding.button) then
-			if bindingModifiersMatch(binding.modifiers, modifiers, false) then
-				return true
-			end
-		end
-	end
-	return false
-end
-
-local function getActionMouseAxisValue(actionId, dx, dy, modifiers)
-	local action = getControlAction(actionId)
-	if not action then
-		return 0
-	end
-
-	local total = 0
-	for _, binding in ipairs(action.bindings or {}) do
-		if binding.kind == "mouse_axis" and bindingModifiersMatch(binding.modifiers, modifiers, true) then
-			local component = (binding.axis == "x") and dx or dy
-			local direction = binding.direction or 0
-			if direction < 0 and component < 0 then
-				total = total + math.abs(component)
-			elseif direction > 0 and component > 0 then
-				total = total + math.abs(component)
-			end
-		end
-	end
-
-	return total
-end
-
-local function actionTriggeredByKey(actionId, key, modifiers)
-	local action = getControlAction(actionId)
-	if not action then
-		return false
-	end
-
-	for _, binding in ipairs(action.bindings or {}) do
-		if binding.kind == "key" and binding.key == key and bindingModifiersMatch(binding.modifiers, modifiers, false) then
-			return true
-		end
-	end
-	return false
-end
-
-local function actionTriggeredByMouseButton(actionId, button, modifiers)
-	local action = getControlAction(actionId)
-	if not action then
-		return false
-	end
-
-	for _, binding in ipairs(action.bindings or {}) do
-		if binding.kind == "mouse_button" and binding.button == button and bindingModifiersMatch(binding.modifiers, modifiers, false) then
-			return true
-		end
-	end
-	return false
-end
-
-local function actionTriggeredByWheel(actionId, wheelY, modifiers)
-	local action = getControlAction(actionId)
-	if not action then
-		return false
-	end
-
-	for _, binding in ipairs(action.bindings or {}) do
-		if binding.kind == "mouse_wheel" and bindingModifiersMatch(binding.modifiers, modifiers, false) then
-			if (binding.direction or 0) < 0 and wheelY < 0 then
-				return true
-			end
-			if (binding.direction or 0) > 0 and wheelY > 0 then
-				return true
-			end
-		end
-	end
-	return false
 end
 
 local function getPauseHelpSections()
@@ -590,22 +295,6 @@ local function randomRange(minValue, maxValue)
 	return minValue + (maxValue - minValue) * math.random()
 end
 
-local function wrapAngle(angle)
-	local twoPi = math.pi * 2
-	if twoPi == 0 then
-		return angle
-	end
-	angle = angle % twoPi
-	if angle > math.pi then
-		angle = angle - twoPi
-	end
-	return angle
-end
-
-local function shortestAngleDelta(currentAngle, targetAngle)
-	return wrapAngle(targetAngle - currentAngle)
-end
-
 local function composeWalkingRotation(yaw, pitch)
 	local yawQuat = q.fromAxisAngle({ 0, 1, 0 }, yaw)
 	local right = q.rotateVector(yawQuat, { 1, 0, 0 })
@@ -623,7 +312,7 @@ local function syncWalkingLookFromRotation()
 	local pitch = math.atan2(forward[2], math.max(flatMag, 1e-6))
 	local yaw = math.atan2(forward[1], forward[3])
 
-	camera.walkYaw = wrapAngle(yaw)
+	camera.walkYaw = viewMath.wrapAngle(yaw)
 	camera.walkPitch = clamp(pitch, -walkingPitchLimit, walkingPitchLimit)
 	camera.rot = composeWalkingRotation(camera.walkYaw, camera.walkPitch)
 end
@@ -684,64 +373,6 @@ local function buildAltLookCamera(baseCamera)
 	return altCam
 end
 
-local function getYawFromRotation(rotation)
-	local rot = rotation or q.identity()
-	local forward = q.rotateVector(rot, { 0, 0, 1 })
-	return math.atan2(forward[1], forward[3])
-end
-
-local function segmentAabbIntersectionT(startPos, endPos, obj)
-	if not startPos or not endPos or not obj or not obj.pos or not obj.halfSize then
-		return nil
-	end
-
-	local minB = {
-		obj.pos[1] - obj.halfSize.x,
-		obj.pos[2] - obj.halfSize.y,
-		obj.pos[3] - obj.halfSize.z
-	}
-	local maxB = {
-		obj.pos[1] + obj.halfSize.x,
-		obj.pos[2] + obj.halfSize.y,
-		obj.pos[3] + obj.halfSize.z
-	}
-	local dir = {
-		endPos[1] - startPos[1],
-		endPos[2] - startPos[2],
-		endPos[3] - startPos[3]
-	}
-	local tMin = 0
-	local tMax = 1
-
-	for axis = 1, 3 do
-		local origin = startPos[axis]
-		local delta = dir[axis]
-		local slabMin = minB[axis]
-		local slabMax = maxB[axis]
-
-		if math.abs(delta) < 1e-8 then
-			if origin < slabMin or origin > slabMax then
-				return nil
-			end
-		else
-			local invDelta = 1 / delta
-			local t1 = (slabMin - origin) * invDelta
-			local t2 = (slabMax - origin) * invDelta
-			if t1 > t2 then
-				t1, t2 = t2, t1
-			end
-
-			tMin = math.max(tMin, t1)
-			tMax = math.min(tMax, t2)
-			if tMin > tMax then
-				return nil
-			end
-		end
-	end
-
-	return tMin
-end
-
 local function buildThirdPersonCamera(baseCamera, objectList)
 	if not baseCamera then
 		return nil
@@ -779,7 +410,7 @@ local function buildThirdPersonCamera(baseCamera, objectList)
 			local nearY = math.abs(obj.pos[2] - target[2]) <= (obj.halfSize.y + checkRadius)
 			local nearZ = math.abs(obj.pos[3] - target[3]) <= (obj.halfSize.z + checkRadius)
 			if nearX and nearY and nearZ then
-				local hitT = segmentAabbIntersectionT(target, desiredPos, obj)
+				local hitT = viewMath.segmentAabbIntersectionT(target, desiredPos, obj)
 				if hitT and hitT >= 0 and hitT <= nearestT then
 					nearestT = hitT
 				end
@@ -845,25 +476,6 @@ local function buildRenderObjectList()
 	return renderObjects
 end
 
-local function positiveMod(value, modulus)
-	if modulus == 0 then
-		return 0
-	end
-	local result = value % modulus
-	if result < 0 then
-		result = result + modulus
-	end
-	return result
-end
-
-local function rotateWorldDeltaToMap(dx, dz, yaw)
-	local cosYaw = math.cos(yaw)
-	local sinYaw = math.sin(yaw)
-	local mapX = cosYaw * dx - sinYaw * dz
-	local mapZ = sinYaw * dx + cosYaw * dz
-	return mapX, mapZ
-end
-
 local function ensureMapGridImage()
 	if mapState.gridImage then
 		return mapState.gridImage
@@ -908,7 +520,7 @@ local function updateLogicalMapCamera()
 	mapCam.pos[1] = camera.pos[1]
 	mapCam.pos[2] = camera.pos[2]
 	mapCam.pos[3] = camera.pos[3]
-	mapCam.heading = getYawFromRotation(camera.rot)
+	mapCam.heading = viewMath.getYawFromRotation(camera.rot, q)
 	mapCam.extent = mapState.zoomExtents[mapState.zoomIndex] or (worldHalfExtent or 1000)
 	return mapCam
 end
@@ -1203,176 +815,6 @@ do
 	playerModelCache[fallbackEntry.hash] = fallbackEntry
 end
 
-local function pickNextWindTarget()
-	windState.targetAngle = randomRange(0, math.pi * 2)
-	windState.targetSpeed = randomRange(4.5, 12.0)
-	windState.retargetIn = randomRange(7.0, 15.0)
-end
-
-local function updateWind(dt)
-	windState.retargetIn = windState.retargetIn - dt
-	if windState.retargetIn <= 0 then
-		pickNextWindTarget()
-	end
-
-	local blend = clamp(dt * 0.6, 0, 1)
-	windState.angle = wrapAngle(windState.angle + shortestAngleDelta(windState.angle, windState.targetAngle) * blend)
-	windState.speed = windState.speed + (windState.targetSpeed - windState.speed) * blend
-end
-
-local function getWindVectorXZ()
-	return math.cos(windState.angle) * windState.speed, math.sin(windState.angle) * windState.speed
-end
-
-local function getWindVector3()
-	local windX, windZ = getWindVectorXZ()
-	return { windX, 0, windZ }
-end
-
-local function clearCloudObjects()
-	for i = #objects, 1, -1 do
-		if objects[i].isCloud then
-			table.remove(objects, i)
-		end
-	end
-end
-
-local function chooseCloudCenter(spawnUpwind)
-	local refX = (camera and camera.pos and camera.pos[1]) or 0
-	local refZ = (camera and camera.pos and camera.pos[3]) or 0
-	local angle
-	if spawnUpwind then
-		angle = wrapAngle(windState.angle + math.pi + randomRange(-0.8, 0.8))
-	else
-		angle = randomRange(0, math.pi * 2)
-	end
-
-	local distance = randomRange(cloudState.spawnRadius * 0.45, cloudState.spawnRadius)
-	local x = refX + math.cos(angle) * distance
-	local y = randomRange(cloudState.minAltitude, cloudState.maxAltitude)
-	local z = refZ + math.sin(angle) * distance
-	return x, y, z
-end
-
-local function updateCloudGroupVisuals(group, now)
-	for _, puff in ipairs(group.puffs) do
-		local bob = math.sin(now * 0.2 + puff.cloudBobPhase) * puff.cloudBobAmplitude
-		puff.pos[1] = group.center[1] + puff.cloudOffset[1]
-		puff.pos[2] = group.center[2] + puff.cloudOffset[2] + bob
-		puff.pos[3] = group.center[3] + puff.cloudOffset[3]
-	end
-end
-
-local function randomizeCloudGroup(group, spawnUpwind)
-	local cx, cy, cz = chooseCloudCenter(spawnUpwind)
-	group.center[1], group.center[2], group.center[3] = cx, cy, cz
-	group.radius = randomRange(cloudState.minGroupSize, cloudState.maxGroupSize)
-	group.windDrift = randomRange(0.85, 1.25)
-
-	local maxOffset = group.radius
-	for _, puff in ipairs(group.puffs) do
-		local angle = randomRange(0, math.pi * 2)
-		local radial = randomRange(maxOffset * 0.2, maxOffset)
-		puff.cloudOffset[1] = math.cos(angle) * radial
-		puff.cloudOffset[2] = randomRange(-maxOffset * 0.2, maxOffset * 0.25)
-		puff.cloudOffset[3] = math.sin(angle) * radial
-		puff.cloudBobPhase = randomRange(0, math.pi * 2)
-		puff.cloudBobAmplitude = randomRange(0.2, 1.2)
-
-		local puffSize = randomRange(group.radius * 0.22, group.radius * 0.48)
-		puff.scale[1] = puffSize
-		puff.scale[2] = puffSize * randomRange(0.55, 0.78)
-		puff.scale[3] = puffSize
-		puff.rot = q.fromAxisAngle({ 0, 1, 0 }, randomRange(0, math.pi * 2))
-
-		local shade = randomRange(0.88, 0.99)
-		puff.color[1] = shade
-		puff.color[2] = shade
-		puff.color[3] = math.min(1.0, shade + randomRange(0.01, 0.03))
-		puff.color[4] = randomRange(0.17, 0.35)
-	end
-
-	updateCloudGroupVisuals(group, love.timer.getTime())
-end
-
-local function spawnCloudField(groupCountOverride)
-	clearCloudObjects()
-	cloudState.groups = {}
-	cloudState.groupCount = math.max(1, math.floor(groupCountOverride or cloudState.groupCount or 1))
-	cloudState.minPuffs = math.max(1, math.floor(cloudState.minPuffs or 1))
-	cloudState.maxPuffs = math.max(cloudState.minPuffs, math.floor(cloudState.maxPuffs or cloudState.minPuffs))
-
-	for _ = 1, cloudState.groupCount do
-		local puffCount = math.random(cloudState.minPuffs, cloudState.maxPuffs)
-		local group = {
-			center = { 0, 0, 0 },
-			radius = randomRange(cloudState.minGroupSize, cloudState.maxGroupSize),
-			windDrift = randomRange(0.85, 1.25),
-			puffs = {}
-		}
-
-		for _ = 1, puffCount do
-			local puff = {
-				model = cloudPuffModel,
-				pos = { 0, 0, 0 },
-				rot = q.identity(),
-				scale = { 1, 1, 1 },
-				color = { 0.95, 0.95, 0.97, 0.24 },
-				isSolid = false,
-				isCloud = true,
-				cloudOffset = { 0, 0, 0 },
-				cloudBobPhase = 0,
-				cloudBobAmplitude = 0.5
-			}
-			group.puffs[#group.puffs + 1] = puff
-			objects[#objects + 1] = puff
-		end
-
-		randomizeCloudGroup(group, false)
-		cloudState.groups[#cloudState.groups + 1] = group
-	end
-end
-
-local function updateClouds(dt)
-	if #cloudState.groups == 0 or not camera then
-		return
-	end
-
-	local isAuthoritySimulation = cloudNetState.role ~= "follower"
-	if isAuthoritySimulation then
-		updateWind(dt)
-	end
-
-	local windX, windZ = getWindVectorXZ()
-	local now = love.timer.getTime()
-	local maxDistSq = cloudState.despawnRadius * cloudState.despawnRadius
-
-	for _, group in ipairs(cloudState.groups) do
-		group.center[1] = group.center[1] + windX * group.windDrift * dt
-		group.center[3] = group.center[3] + windZ * group.windDrift * dt
-
-		local dx = group.center[1] - camera.pos[1]
-		local dz = group.center[3] - camera.pos[3]
-		if isAuthoritySimulation and (dx * dx + dz * dz) > maxDistSq then
-			randomizeCloudGroup(group, true)
-		else
-			updateCloudGroupVisuals(group, now)
-		end
-	end
-end
-
-local function cameraSpaceDepthForObject(obj, viewCamera)
-	if not obj or not obj.pos or not viewCamera then
-		return -math.huge
-	end
-	local rel = {
-		obj.pos[1] - viewCamera.pos[1],
-		obj.pos[2] - viewCamera.pos[2],
-		obj.pos[3] - viewCamera.pos[3]
-	}
-	local cam = q.rotateVector(q.conjugate(viewCamera.rot), rel)
-	return cam[3]
-end
 
 local function setMouseCapture(enabled)
 	love.mouse.setRelativeMode(enabled)
@@ -1526,9 +968,9 @@ end
 function decodeColor3Token(token, fallback)
 	local r, g, b = type(token) == "string" and token:match("^([^,]+),([^,]+),([^,]+)$")
 	if not r or not g or not b then
-		return cloneColor3(fallback)
+		return groundSystem.cloneColor3(fallback)
 	end
-	return sanitizeColor3({
+	return groundSystem.sanitizeColor3({
 		tonumber(r),
 		tonumber(g),
 		tonumber(b)
@@ -1976,7 +1418,7 @@ function requestGroundSnapshot(reason)
 end
 
 function buildGroundSnapshotPacket(now)
-	local params = activeGroundParams or normalizeGroundParams(defaultGroundParams)
+	local params = activeGroundParams or groundSystem.normalizeGroundParams(defaultGroundParams, defaultGroundParams)
 	local parts = {
 		"GROUND_SNAPSHOT",
 		formatNetFloat(now),
@@ -2025,7 +1467,7 @@ function applyGroundSnapshotParts(parts, senderId)
 		return false
 	end
 
-	local params = normalizeGroundParams({
+	local params = groundSystem.normalizeGroundParams({
 		seed = tonumber(parts[3]),
 		tileSize = tonumber(parts[4]),
 		gridCount = tonumber(parts[5]),
@@ -2044,7 +1486,7 @@ function applyGroundSnapshotParts(parts, senderId)
 		grassVar = decodeColor3Token(parts[18], defaultGroundParams.grassVar),
 		roadVar = decodeColor3Token(parts[19], defaultGroundParams.roadVar),
 		fieldVar = decodeColor3Token(parts[20], defaultGroundParams.fieldVar)
-	})
+	}, defaultGroundParams)
 
 	rebuildGroundFromParams(params, "network peer " .. tostring(senderId))
 	groundNetState.authorityPeerId = senderId
@@ -2133,7 +1575,7 @@ local function applyCloudSnapshotParts(parts, senderId)
 	cloudState.maxPuffs = snapshotMaxPuffs
 
 	if snapshotWindAngle then
-		windState.angle = wrapAngle(snapshotWindAngle)
+		windState.angle = viewMath.wrapAngle(snapshotWindAngle)
 	end
 	if snapshotWindSpeed then
 		windState.speed = math.max(0, snapshotWindSpeed)
@@ -2142,11 +1584,11 @@ local function applyCloudSnapshotParts(parts, senderId)
 	windState.targetSpeed = windState.speed
 	windState.retargetIn = math.huge
 
+	local now = love.timer.getTime()
 	if #cloudState.groups ~= snapshotGroupCount then
-		spawnCloudField(snapshotGroupCount)
+		cloudSim.spawnCloudField(cloudState, objects, camera, windState, cloudPuffModel, q, snapshotGroupCount, now)
 	end
 
-	local now = love.timer.getTime()
 	for i = 1, snapshotGroupCount do
 		local token = parts[13 + i]
 		local gx, gy, gz, gr, gd = token and token:match("^([^,]+),([^,]+),([^,]+),([^,]+),([^,]+)$")
@@ -2157,7 +1599,7 @@ local function applyCloudSnapshotParts(parts, senderId)
 			group.center[3] = tonumber(gz) or group.center[3]
 			group.radius = math.max(1, tonumber(gr) or group.radius)
 			group.windDrift = tonumber(gd) or group.windDrift
-			updateCloudGroupVisuals(group, now)
+			cloudSim.updateCloudGroupVisuals(group, now)
 		end
 	end
 
@@ -2388,7 +1830,7 @@ local function setControlBinding(actionIndex, slotIndex, binding)
 
 	slotIndex = clamp(slotIndex or 1, 1, 2)
 	action.bindings = action.bindings or {}
-	action.bindings[slotIndex] = cloneBinding(binding)
+	action.bindings[slotIndex] = controls.cloneBinding(binding)
 	return true
 end
 
@@ -2430,7 +1872,7 @@ local function commitControlBindingCapture(binding)
 		local action = controlActions[listen.actionIndex]
 		clearControlBindingCapture()
 		if action then
-			local label = formatBinding(binding)
+			local label = controls.formatBinding(binding)
 			setPauseStatus(action.label .. " -> " .. label, 2.0)
 		end
 		return true
@@ -2483,18 +1925,18 @@ local function captureBindingFromKey(key)
 	if key == "escape" then
 		return false
 	end
-	local binding = bindKey(key, extractCaptureModifiers(key))
+	local binding = controls.bindKey(key, controls.extractCaptureModifiers(key))
 	return commitControlBindingCapture(binding)
 end
 
 local function captureBindingFromMouseButton(button)
-	local binding = bindMouseButton(button, extractCaptureModifiers(nil))
+	local binding = controls.bindMouseButton(button, controls.extractCaptureModifiers(nil))
 	return commitControlBindingCapture(binding)
 end
 
 local function captureBindingFromWheel(y)
 	local direction = y > 0 and 1 or -1
-	local binding = bindMouseWheel(direction, extractCaptureModifiers(nil))
+	local binding = controls.bindMouseWheel(direction, controls.extractCaptureModifiers(nil))
 	return commitControlBindingCapture(binding)
 end
 
@@ -2515,7 +1957,7 @@ local function captureBindingFromMouseMotion(dx, dy)
 		direction = dy >= 0 and 1 or -1
 	end
 
-	local binding = bindMouseAxis(axis, direction, extractCaptureModifiers(nil))
+	local binding = controls.bindMouseAxis(axis, direction, controls.extractCaptureModifiers(nil))
 	return commitControlBindingCapture(binding)
 end
 
@@ -3362,7 +2804,7 @@ local function drawPauseControlsContent(layout)
 						pauseMenu.listeningBinding.actionIndex == i and
 						pauseMenu.listeningBinding.slot == slot
 				local binding = action.bindings and action.bindings[slot] or nil
-				local text = formatBinding(binding)
+				local text = controls.formatBinding(binding)
 				if isListeningSlot then
 					text = "Listening..."
 				elseif text == "Unbound" then
@@ -3591,421 +3033,47 @@ local function drawPauseMenu()
 	love.graphics.setFont(oldFont)
 end
 
-function makeRng(seed)
-    -- Park-Miller LCG using Schrage method (LuaJIT/Lua 5.1 compatible).
-    local m = 2147483647
-    local a = 16807
-    local q = 127773
-    local r = 2836
-    local state = math.floor(tonumber(seed) or 1) % m
-    if state <= 0 then
-        state = state + (m - 1)
-    end
+makeRng = groundSystem.makeRng
+generateCellGrid = groundSystem.generateCellGrid
+CELL_GRASS = groundSystem.CELL_GRASS
+CELL_ROAD = groundSystem.CELL_ROAD
+CELL_FIELD = groundSystem.CELL_FIELD
 
-    local function u32()
-        local hi = math.floor(state / q)
-        local lo = state - hi * q
-        local test = (a * lo) - (r * hi)
-        if test > 0 then
-            state = test
-        else
-            state = test + m
-        end
-        return state
-    end
-
-    return {
-        u32 = u32,
-        -- [0,1)
-        rand01 = function()
-            return (u32() - 1) / (m - 1)
-        end,
-        -- inclusive integers
-        randint = function(_, x, y)
-            local low = math.floor(tonumber(x) or 0)
-            local high = math.floor(tonumber(y) or 0)
-            if high < low then
-                low, high = high, low
-            end
-            local span = high - low + 1
-            return low + math.floor(((u32() - 1) / (m - 1)) * span)
-        end
-    }
-end
-
-CELL_GRASS = 0
-CELL_ROAD  = 1
-CELL_FIELD = 2
-
-function generateCellGrid(params)
-    -- params: seed, gridCount, roadCount, roadDensity(0..1), fieldCount, fieldMinSize, fieldMaxSize
-    local rng = makeRng(params.seed or 1)
-    local n = params.gridCount
-    local grid = {}
-    for x = 1, n do
-        grid[x] = {}
-        for z = 1, n do
-            grid[x][z] = CELL_GRASS
-        end
-    end
-
-    local function inBounds(x, z)
-        return x >= 1 and x <= n and z >= 1 and z <= n
-    end
-
-    -- --- Roads ---
-    local roadCount = math.max(0, math.floor(params.roadCount or 3))
-    local roadDensity = clamp(params.roadDensity or 0.15, 0, 1)
-
-    -- total carves roughly proportional to density * cells
-    local totalSteps = math.floor(roadDensity * n * n)
-    local stepsPerRoad = (roadCount > 0) and math.max(1, math.floor(totalSteps / roadCount)) or 0
-
-    for i = 1, roadCount do
-        -- start on a random edge
-        local side = rng:randint(1, 4)
-        local x, z
-        if side == 1 then x, z = 1, rng:randint(1, n)
-        elseif side == 2 then x, z = n, rng:randint(1, n)
-        elseif side == 3 then x, z = rng:randint(1, n), 1
-        else x, z = rng:randint(1, n), n
-        end
-
-        local dirX, dirZ = 0, 0
-        local function randomDir()
-            local d = rng:randint(1, 4)
-            if d == 1 then return 1, 0 end
-            if d == 2 then return -1, 0 end
-            if d == 3 then return 0, 1 end
-            return 0, -1
-        end
-        dirX, dirZ = randomDir()
-
-        for s = 1, stepsPerRoad do
-            if inBounds(x, z) then
-                grid[x][z] = CELL_ROAD
-            end
-
-            -- occasionally turn; higher density -> slightly straighter looks better, so keep turn chance modest
-            local turnChance = 0.18
-            if rng:rand01() < turnChance then
-                dirX, dirZ = randomDir()
-            end
-
-            x, z = x + dirX, z + dirZ
-            if not inBounds(x, z) then
-                -- bounce back in bounds
-                x = clamp(x, 1, n)
-                z = clamp(z, 1, n)
-                dirX, dirZ = randomDir()
-            end
-        end
-    end
-
-    -- --- Fields (patches) ---
-    local fieldCount   = params.fieldCount or 6
-    local fieldMinSize = params.fieldMinSize or math.floor(n * 0.8)
-    local fieldMaxSize = params.fieldMaxSize or math.floor(n * 2.0)
-
-    for i = 1, fieldCount do
-        local sx, sz = rng:randint(1, n), rng:randint(1, n)
-        local targetSize = rng:randint(fieldMinSize, fieldMaxSize)
-
-        local queue = { {sx, sz} }
-        local qi = 1
-        local placed = 0
-
-        while qi <= #queue and placed < targetSize do
-            local x, z = queue[qi][1], queue[qi][2]
-            qi = qi + 1
-
-            if inBounds(x, z) and grid[x][z] ~= CELL_ROAD and grid[x][z] ~= CELL_FIELD then
-                grid[x][z] = CELL_FIELD
-                placed = placed + 1
-
-                -- grow outward randomly
-                if rng:rand01() < 0.80 then queue[#queue+1] = {x+1, z} end
-                if rng:rand01() < 0.80 then queue[#queue+1] = {x-1, z} end
-                if rng:rand01() < 0.80 then queue[#queue+1] = {x, z+1} end
-                if rng:rand01() < 0.80 then queue[#queue+1] = {x, z-1} end
-            end
-        end
-    end
-
-    return grid, rng
-end
-
-cloneColor3 = function(value)
-	return { value[1], value[2], value[3] }
-end
-
-sanitizeColor3 = function(value, fallback)
-	local out = cloneColor3(fallback)
-	if type(value) == "table" then
-		out[1] = clamp(tonumber(value[1]) or out[1], 0, 1)
-		out[2] = clamp(tonumber(value[2]) or out[2], 0, 1)
-		out[3] = clamp(tonumber(value[3]) or out[3], 0, 1)
-	end
-	return out
-end
-
-normalizeGroundParams = function(params)
-	local src = params or defaultGroundParams
-	local normalized = {
-		seed = math.floor(tonumber(src.seed) or defaultGroundParams.seed),
-		tileSize = math.max(0.05, tonumber(src.tileSize) or defaultGroundParams.tileSize),
-		gridCount = math.max(1, math.floor(tonumber(src.gridCount) or defaultGroundParams.gridCount)),
-		baseHeight = tonumber(src.baseHeight) or defaultGroundParams.baseHeight,
-		tileThickness = math.max(0.0001, tonumber(src.tileThickness) or defaultGroundParams.tileThickness),
-		curvature = math.max(0, tonumber(src.curvature) or defaultGroundParams.curvature),
-		recenterStep = math.max(1, tonumber(src.recenterStep) or defaultGroundParams.recenterStep),
-		roadCount = math.max(0, math.floor(tonumber(src.roadCount) or defaultGroundParams.roadCount)),
-		roadDensity = clamp(tonumber(src.roadDensity) or defaultGroundParams.roadDensity, 0, 1),
-		fieldCount = math.max(0, math.floor(tonumber(src.fieldCount) or defaultGroundParams.fieldCount)),
-		fieldMinSize = math.max(1, math.floor(tonumber(src.fieldMinSize) or defaultGroundParams.fieldMinSize)),
-		fieldMaxSize = math.max(1, math.floor(tonumber(src.fieldMaxSize) or defaultGroundParams.fieldMaxSize)),
-		grassColor = sanitizeColor3(src.grassColor, defaultGroundParams.grassColor),
-		roadColor = sanitizeColor3(src.roadColor, defaultGroundParams.roadColor),
-		fieldColor = sanitizeColor3(src.fieldColor, defaultGroundParams.fieldColor),
-		grassVar = sanitizeColor3(src.grassVar, defaultGroundParams.grassVar),
-		roadVar = sanitizeColor3(src.roadVar, defaultGroundParams.roadVar),
-		fieldVar = sanitizeColor3(src.fieldVar, defaultGroundParams.fieldVar)
-	}
-	normalized.fieldMaxSize = math.max(normalized.fieldMinSize, normalized.fieldMaxSize)
-	return normalized
-end
-
-function colorsEqual(a, b)
-	local eps = 1e-6
-	for i = 1, 3 do
-		if math.abs((a[i] or 0) - (b[i] or 0)) > eps then
-			return false
-		end
-	end
-	return true
-end
-
-groundParamsEqual = function(a, b)
-	if not a or not b then
-		return false
-	end
-	return a.seed == b.seed and
-		a.tileSize == b.tileSize and
-		a.gridCount == b.gridCount and
-		a.baseHeight == b.baseHeight and
-		a.tileThickness == b.tileThickness and
-		a.curvature == b.curvature and
-		a.recenterStep == b.recenterStep and
-		a.roadCount == b.roadCount and
-		a.roadDensity == b.roadDensity and
-		a.fieldCount == b.fieldCount and
-		a.fieldMinSize == b.fieldMinSize and
-		a.fieldMaxSize == b.fieldMaxSize and
-		colorsEqual(a.grassColor, b.grassColor) and
-		colorsEqual(a.roadColor, b.roadColor) and
-		colorsEqual(a.fieldColor, b.fieldColor) and
-		colorsEqual(a.grassVar, b.grassVar) and
-		colorsEqual(a.roadVar, b.roadVar) and
-		colorsEqual(a.fieldVar, b.fieldVar)
-end
-
-function sampleGroundHeightAtWorld(worldX, worldZ, params)
+local function sampleGroundHeightAtWorld(worldX, worldZ, params)
 	local groundParams = params or activeGroundParams or defaultGroundParams
-	local curvature = tonumber(groundParams.curvature) or 0
-	local baseHeight = tonumber(groundParams.baseHeight) or 0
-	return baseHeight - ((worldX * worldX + worldZ * worldZ) * curvature)
-end
-
-function generateGroundMeshModel(params, centerX, centerZ)
-	local tileSize = params.tileSize
-	local gridCount = params.gridCount
-	local half = tileSize / 2
-	centerX = centerX or 0
-	centerZ = centerZ or 0
-
-	local grass = params.grassColor
-	local road = params.roadColor
-	local field = params.fieldColor
-
-	local grassVar = params.grassVar
-	local roadVar = params.roadVar
-	local fieldVar = params.fieldVar
-
-	local function frac(v)
-		return v - math.floor(v)
-	end
-
-	local function hash01(ix, iz, salt)
-		local h = math.sin(ix * 127.1 + iz * 311.7 + params.seed * 13.17 + salt * 17.3) * 43758.5453123
-		return frac(h)
-	end
-
-	local function varied(base, var, ix, iz, salt)
-		return {
-			clamp(base[1] + (hash01(ix, iz, salt) * 2 - 1) * var[1], 0, 1),
-			clamp(base[2] + (hash01(ix, iz, salt + 11) * 2 - 1) * var[2], 0, 1),
-			clamp(base[3] + (hash01(ix, iz, salt + 23) * 2 - 1) * var[3], 0, 1)
-		}
-	end
-
-	local vertices, faces = {}, {}
-	local vertexColors, faceColors = {}, {}
-	local roadWidth = 0.03 + clamp(params.roadDensity, 0, 1) * 0.28
-	local roadFreq = 0.06 + (params.roadCount * 0.012)
-	local fieldChance = clamp((params.fieldCount / 35), 0.08, 0.45)
-
-	for gx = 1, gridCount do
-		for gz = 1, gridCount do
-			local localTileX = (gx - 1) - gridCount / 2
-			local localTileZ = (gz - 1) - gridCount / 2
-			local posX = localTileX * tileSize + half
-			local posZ = localTileZ * tileSize + half
-			local worldCenterX = centerX + posX
-			local worldCenterZ = centerZ + posZ
-			local tileIndexX = math.floor(worldCenterX / tileSize)
-			local tileIndexZ = math.floor(worldCenterZ / tileSize)
-
-			local roadSignalX = math.abs(math.sin((tileIndexX + params.seed * 0.13) * roadFreq))
-			local roadSignalZ = math.abs(math.sin((tileIndexZ - params.seed * 0.21) * (roadFreq * 1.11)))
-			local regionNoise = hash01(math.floor(tileIndexX / 7), math.floor(tileIndexZ / 7), 41)
-			local c
-			if roadSignalX < roadWidth or roadSignalZ < roadWidth then
-				c = varied(road, roadVar, tileIndexX, tileIndexZ, 3)
-			elseif regionNoise < fieldChance then
-				c = varied(field, fieldVar, tileIndexX, tileIndexZ, 7)
-			else
-				c = varied(grass, grassVar, tileIndexX, tileIndexZ, 13)
-			end
-			local rgba = { c[1], c[2], c[3], 1.0 }
-
-			local x0 = posX - half
-			local x1 = posX + half
-			local z0 = posZ - half
-			local z1 = posZ + half
-			local y00 = sampleGroundHeightAtWorld(centerX + x0, centerZ + z0, params)
-			local y10 = sampleGroundHeightAtWorld(centerX + x1, centerZ + z0, params)
-			local y11 = sampleGroundHeightAtWorld(centerX + x1, centerZ + z1, params)
-			local y01 = sampleGroundHeightAtWorld(centerX + x0, centerZ + z1, params)
-
-			local base = #vertices
-			vertices[base + 1] = { x0, y00, z0 }
-			vertices[base + 2] = { x1, y10, z0 }
-			vertices[base + 3] = { x1, y11, z1 }
-			vertices[base + 4] = { x0, y01, z1 }
-
-			vertexColors[base + 1] = rgba
-			vertexColors[base + 2] = rgba
-			vertexColors[base + 3] = rgba
-			vertexColors[base + 4] = rgba
-
-			faces[#faces + 1] = { base + 1, base + 2, base + 3 }
-			faceColors[#faceColors + 1] = rgba
-			faces[#faces + 1] = { base + 1, base + 3, base + 4 }
-			faceColors[#faceColors + 1] = rgba
-		end
-	end
-
-	return {
-		vertices = vertices,
-		faces = faces,
-		vertexColors = vertexColors,
-		faceColors = faceColors,
-		isSolid = true
-	}
-end
-
-function createGroundObject(params, centerX, centerZ)
-	centerX = centerX or 0
-	centerZ = centerZ or 0
-	local halfExtent = (params.gridCount * params.tileSize) * 0.5
-	return {
-		model = generateGroundMeshModel(params, centerX, centerZ),
-		pos = { centerX, 0, centerZ },
-		rot = q.identity(),
-		scale = { 1, 1, 1 },
-		color = { 1, 1, 1, 1 },
-		isSolid = true,
-		isGround = true,
-		halfSize = { x = halfExtent, y = params.tileThickness, z = halfExtent }
-	}
+	return groundSystem.sampleGroundHeightAtWorld(worldX, worldZ, groundParams)
 end
 
 function updateGroundStreaming(forceRebuild)
-	if not groundObject or not activeGroundParams or not camera then
-		return false
+	local changed, updatedObject = groundSystem.updateGroundStreaming(forceRebuild, {
+		groundObject = groundObject,
+		activeGroundParams = activeGroundParams,
+		camera = camera
+	})
+	if changed and updatedObject then
+		groundObject = updatedObject
 	end
-
-	local centerX = groundObject.pos[1] or 0
-	local centerZ = groundObject.pos[3] or 0
-	local halfExtent = (activeGroundParams.gridCount * activeGroundParams.tileSize) * 0.5
-	local threshold = halfExtent * 0.3
-	local needRecentering = forceRebuild or
-		(math.abs(camera.pos[1] - centerX) > threshold) or
-		(math.abs(camera.pos[3] - centerZ) > threshold)
-	if not needRecentering then
-		return false
-	end
-
-	local step = math.max(activeGroundParams.tileSize, activeGroundParams.recenterStep or 1)
-	local snappedX = math.floor((camera.pos[1] / step) + 0.5) * step
-	local snappedZ = math.floor((camera.pos[3] / step) + 0.5) * step
-	if (not forceRebuild) and math.abs(snappedX - centerX) < 1e-6 and math.abs(snappedZ - centerZ) < 1e-6 then
-		return false
-	end
-
-	groundObject.model = generateGroundMeshModel(activeGroundParams, snappedX, snappedZ)
-	groundObject.pos[1] = snappedX
-	groundObject.pos[2] = 0
-	groundObject.pos[3] = snappedZ
-	groundObject.halfSize.x = halfExtent
-	groundObject.halfSize.z = halfExtent
-	return true
+	return changed
 end
 
 rebuildGroundFromParams = function(params, reason)
-	local normalized = normalizeGroundParams(params)
-	if activeGroundParams and groundParamsEqual(activeGroundParams, normalized) then
-		return false
+	local changed, nextState = groundSystem.rebuildGroundFromParams(params, reason, {
+		defaultGroundParams = defaultGroundParams,
+		activeGroundParams = activeGroundParams,
+		groundObject = groundObject,
+		camera = camera,
+		objects = objects,
+		localPlayerObject = localPlayerObject,
+		mapState = mapState,
+		q = q,
+		log = logger.log
+	})
+	if changed and nextState then
+		activeGroundParams = nextState.activeGroundParams
+		groundObject = nextState.groundObject
+		worldHalfExtent = nextState.worldHalfExtent or worldHalfExtent
 	end
-
-	activeGroundParams = normalized
-	if groundObject then
-		for i = #objects, 1, -1 do
-			if objects[i] == groundObject or objects[i].isGround then
-				table.remove(objects, i)
-			end
-		end
-	end
-
-	local step = math.max(normalized.tileSize, normalized.recenterStep or 1)
-	local centerX = 0
-	local centerZ = 0
-	if camera and camera.pos then
-		centerX = math.floor((camera.pos[1] / step) + 0.5) * step
-		centerZ = math.floor((camera.pos[3] / step) + 0.5) * step
-	end
-
-	groundObject = createGroundObject(normalized, centerX, centerZ)
-	local insertIndex = 1
-	if localPlayerObject and objects[1] == localPlayerObject then
-		insertIndex = 2
-	end
-	table.insert(objects, insertIndex, groundObject)
-
-	worldHalfExtent = (normalized.tileSize * normalized.gridCount) * 0.5
-	mapState.zoomExtents = { 160, 420, math.max(worldHalfExtent, 420) }
-	mapState.logicalCamera = nil
-	if reason and reason ~= "" then
-		logger.log(string.format(
-			"Ground rebuilt (%s): seed=%d tile=%.3f grid=%d",
-			reason,
-			normalized.seed,
-			normalized.tileSize,
-			normalized.gridCount
-		))
-	end
-
-	return true
+	return changed
 end
 
 -- === Initial Configuration ===
@@ -4170,8 +3238,8 @@ function love.load()
 
 	windState.angle = randomRange(0, math.pi * 2)
 	windState.speed = randomRange(5, 10)
-	pickNextWindTarget()
-	spawnCloudField()
+	cloudSim.pickNextWindTarget(windState)
+	cloudSim.spawnCloudField(cloudState, objects, camera, windState, cloudPuffModel, q, nil, love.timer.getTime())
 	logger.log(string.format("Cloud field initialized (%d groups).", #cloudState.groups))
 
 	zBuffer = {}
@@ -4204,22 +3272,22 @@ end
 local function buildMovementInputState()
 	local throttleBlocked = mapState.mHeld and true or false
 	return {
-		flightPitchDown = isActionDown("flight_pitch_down"),
-		flightPitchUp = isActionDown("flight_pitch_up"),
-		flightRollLeft = isActionDown("flight_roll_left"),
-		flightRollRight = isActionDown("flight_roll_right"),
-		flightYawLeft = isActionDown("flight_yaw_left"),
-		flightYawRight = isActionDown("flight_yaw_right"),
-		flightThrottleDown = (not throttleBlocked) and isActionDown("flight_throttle_down"),
-		flightThrottleUp = (not throttleBlocked) and isActionDown("flight_throttle_up"),
-		flightAfterburner = isActionDown("flight_afterburner"),
-		flightAirBrakes = isActionDown("flight_air_brakes"),
-		walkForward = isActionDown("walk_forward"),
-		walkBackward = isActionDown("walk_backward"),
-		walkStrafeLeft = isActionDown("walk_strafe_left"),
-		walkStrafeRight = isActionDown("walk_strafe_right"),
-		walkSprint = isActionDown("walk_sprint"),
-		walkJump = isActionDown("walk_jump")
+		flightPitchDown = controls.isActionDown("flight_pitch_down"),
+		flightPitchUp = controls.isActionDown("flight_pitch_up"),
+		flightRollLeft = controls.isActionDown("flight_roll_left"),
+		flightRollRight = controls.isActionDown("flight_roll_right"),
+		flightYawLeft = controls.isActionDown("flight_yaw_left"),
+		flightYawRight = controls.isActionDown("flight_yaw_right"),
+		flightThrottleDown = (not throttleBlocked) and controls.isActionDown("flight_throttle_down"),
+		flightThrottleUp = (not throttleBlocked) and controls.isActionDown("flight_throttle_up"),
+		flightAfterburner = controls.isActionDown("flight_afterburner"),
+		flightAirBrakes = controls.isActionDown("flight_air_brakes"),
+		walkForward = controls.isActionDown("walk_forward"),
+		walkBackward = controls.isActionDown("walk_backward"),
+		walkStrafeLeft = controls.isActionDown("walk_strafe_left"),
+		walkStrafeRight = controls.isActionDown("walk_strafe_right"),
+		walkSprint = controls.isActionDown("walk_sprint"),
+		walkJump = controls.isActionDown("walk_jump")
 	}
 end
 
@@ -4241,10 +3309,10 @@ local function applyCameraRotations(pitchAngle, yawAngle, rollAngle)
 end
 
 local function applyWalkingMouseLook(dx, dy, modifiers)
-	local lookDown = getActionMouseAxisValue("walk_look_down", dx, dy, modifiers)
-	local lookUp = getActionMouseAxisValue("walk_look_up", dx, dy, modifiers)
-	local lookLeft = getActionMouseAxisValue("walk_look_left", dx, dy, modifiers)
-	local lookRight = getActionMouseAxisValue("walk_look_right", dx, dy, modifiers)
+	local lookDown = controls.getActionMouseAxisValue("walk_look_down", dx, dy, modifiers)
+	local lookUp = controls.getActionMouseAxisValue("walk_look_up", dx, dy, modifiers)
+	local lookLeft = controls.getActionMouseAxisValue("walk_look_left", dx, dy, modifiers)
+	local lookRight = controls.getActionMouseAxisValue("walk_look_right", dx, dy, modifiers)
 
 	local pitchAxis = lookDown - lookUp
 	local yawAxis = lookRight - lookLeft
@@ -4264,17 +3332,17 @@ local function applyWalkingMouseLook(dx, dy, modifiers)
 		-pitchLimit,
 		pitchLimit
 	)
-	camera.walkYaw = wrapAngle(camera.walkYaw + (yawAxis * mouseSensitivity * yawMult))
+	camera.walkYaw = viewMath.wrapAngle(camera.walkYaw + (yawAxis * mouseSensitivity * yawMult))
 	camera.rot = composeWalkingRotation(camera.walkYaw, camera.walkPitch)
 end
 
 local function applyFlightMouseLook(dx, dy, modifiers)
-	local pitchDown = getActionMouseAxisValue("flight_pitch_down", dx, dy, modifiers)
-	local pitchUp = getActionMouseAxisValue("flight_pitch_up", dx, dy, modifiers)
-	local rollLeft = getActionMouseAxisValue("flight_roll_left", dx, dy, modifiers)
-	local rollRight = getActionMouseAxisValue("flight_roll_right", dx, dy, modifiers)
-	local yawLeft = getActionMouseAxisValue("flight_yaw_left", dx, dy, modifiers)
-	local yawRight = getActionMouseAxisValue("flight_yaw_right", dx, dy, modifiers)
+	local pitchDown = controls.getActionMouseAxisValue("flight_pitch_down", dx, dy, modifiers)
+	local pitchUp = controls.getActionMouseAxisValue("flight_pitch_up", dx, dy, modifiers)
+	local rollLeft = controls.getActionMouseAxisValue("flight_roll_left", dx, dy, modifiers)
+	local rollRight = controls.getActionMouseAxisValue("flight_roll_right", dx, dy, modifiers)
+	local yawLeft = controls.getActionMouseAxisValue("flight_yaw_left", dx, dy, modifiers)
+	local yawRight = controls.getActionMouseAxisValue("flight_yaw_right", dx, dy, modifiers)
 
 	local pitchAxis = pitchDown - pitchUp
 	local yawAxis = yawRight - yawLeft
@@ -4298,7 +3366,7 @@ end
 local function updateZoomFov(dt)
 	local baseFov = camera.baseFov or camera.fov
 	local targetFov = baseFov
-	if flightSimMode and isActionDown("flight_zoom_in") then
+	if flightSimMode and controls.isActionDown("flight_zoom_in") then
 		local zoomFactor = camera.zoomFactor or 0.6
 		targetFov = math.max(math.rad(20), baseFov * zoomFactor)
 	end
@@ -4375,7 +3443,7 @@ function love.mousemoved(x, y, dx, dy)
 		return
 	end
 
-	local modifiers = getCurrentModifiers()
+	local modifiers = controls.getCurrentModifiers()
 	if flightSimMode then
 		applyFlightMouseLook(dx, dy, modifiers)
 	else
@@ -4500,14 +3568,14 @@ function love.update(dt)
 		updateGroundStreaming(false)
 		local movementInput = buildMovementInputState()
 		camera = engine.processMovement(camera, dt, flightSimMode, vector3, q, objects, movementInput, {
-			wind = getWindVector3(),
+				wind = cloudSim.getWindVector3(windState),
 			groundHeightAt = function(x, z)
 				return sampleGroundHeightAtWorld(x, z, activeGroundParams)
 			end,
 			groundClearance = (camera.box and camera.box.halfSize and camera.box.halfSize.y) or 1.0
 		})
 		syncLocalPlayerObject()
-		updateClouds(dt)
+		cloudSim.updateClouds(dt, cloudState, cloudNetState, camera, windState, love.timer.getTime(), q)
 		updateZoomFov(dt)
 
 		perfElapsed = perfElapsed + dt
@@ -4687,7 +3755,7 @@ function love.keypressed(key, scancode, isrepeat)
 		return
 	end
 
-	if flightSimMode and actionTriggeredByKey("flight_fire_projectile", key, getCurrentModifiers()) then
+	if flightSimMode and controls.actionTriggeredByKey("flight_fire_projectile", key, controls.getCurrentModifiers()) then
 		triggerProjectileAction()
 	end
 
@@ -4761,7 +3829,7 @@ function love.mousepressed(x, y, button)
 		return
 	end
 
-	if flightSimMode and actionTriggeredByMouseButton("flight_fire_projectile", button, getCurrentModifiers()) then
+	if flightSimMode and controls.actionTriggeredByMouseButton("flight_fire_projectile", button, controls.getCurrentModifiers()) then
 		triggerProjectileAction()
 	end
 
@@ -4808,11 +3876,11 @@ function love.wheelmoved(x, y)
 		return
 	end
 
-	local modifiers = getCurrentModifiers()
-	if actionTriggeredByWheel("flight_throttle_up", y, modifiers) then
+	local modifiers = controls.getCurrentModifiers()
+	if controls.actionTriggeredByWheel("flight_throttle_up", y, modifiers) then
 		adjustFlightThrottleFromWheel(1)
 	end
-	if actionTriggeredByWheel("flight_throttle_down", y, modifiers) then
+	if controls.actionTriggeredByWheel("flight_throttle_down", y, modifiers) then
 		adjustFlightThrottleFromWheel(-1)
 	end
 end
@@ -4894,7 +3962,7 @@ end
 
 local function drawHud(w, h, cx, cy)
 	if flightSimMode and camera then
-		local wind = getWindVector3()
+		local wind = cloudSim.getWindVector3(windState)
 		local v = camera.flightVel or camera.vel or { 0, 0, 0 }
 		local airVel = {
 			(v[1] or 0) - (wind[1] or 0),
@@ -4909,7 +3977,7 @@ local function drawHud(w, h, cx, cy)
 		local throttleRatio = clamp(camera.throttle or 0, 0, 1)
 		local throttlePct = math.floor((throttleRatio * 100) + 0.5)
 		local thrustNow = throttleRatio * (camera.flightThrustForce or camera.flightThrustAccel or 0)
-		if isActionDown("flight_afterburner") then
+		if controls.isActionDown("flight_afterburner") then
 			thrustNow = thrustNow * (camera.afterburnerMultiplier or 1.45)
 		end
 		local barHeight = math.floor(math.min(h * 0.34, 240))
@@ -5036,15 +4104,15 @@ local function drawHud(w, h, cx, cy)
 	local tilePixel = tileWorld * worldToPixel
 	local tileScale = tilePixel / math.max(1, mapState.gridImageSize)
 	local tileSpanCount = math.ceil((panelSize * 1.7) / math.max(1, tilePixel))
-	local worldOffsetX = -positiveMod(mapCam.pos[1], tileWorld)
-	local worldOffsetZ = -positiveMod(mapCam.pos[3], tileWorld)
+	local worldOffsetX = -viewMath.positiveMod(mapCam.pos[1], tileWorld)
+	local worldOffsetZ = -viewMath.positiveMod(mapCam.pos[3], tileWorld)
 
 	love.graphics.setScissor(panelX, panelY, panelSize, panelSize)
 	for ix = -tileSpanCount, tileSpanCount do
 		for iz = -tileSpanCount, tileSpanCount do
 			local worldDX = worldOffsetX + ix * tileWorld
 			local worldDZ = worldOffsetZ + iz * tileWorld
-			local mapX, mapZ = rotateWorldDeltaToMap(worldDX, worldDZ, mapCam.heading)
+			local mapX, mapZ = viewMath.rotateWorldDeltaToMap(worldDX, worldDZ, mapCam.heading)
 			local sx = panelCenterX + mapX * worldToPixel
 			local sy = panelCenterY - mapZ * worldToPixel
 			love.graphics.setColor(0.72, 0.8, 0.72, 0.24)
@@ -5064,7 +4132,7 @@ local function drawHud(w, h, cx, cy)
 	local function drawMarker(worldX, worldZ, color, radius)
 		local dx = worldX - mapCam.pos[1]
 		local dz = worldZ - mapCam.pos[3]
-		local mapX, mapZ = rotateWorldDeltaToMap(dx, dz, mapCam.heading)
+		local mapX, mapZ = viewMath.rotateWorldDeltaToMap(dx, dz, mapCam.heading)
 		local sx = panelCenterX + mapX * worldToPixel
 		local sy = panelCenterY - mapZ * worldToPixel
 		if sx < panelX or sx > (panelX + panelSize) or sy < panelY or sy > (panelY + panelSize) then
@@ -5161,7 +4229,7 @@ function love.draw()
 		end
 
 		table.sort(transparentObjects, function(a, b)
-			return cameraSpaceDepthForObject(a, renderCamera) > cameraSpaceDepthForObject(b, renderCamera)
+			return viewMath.cameraSpaceDepthForObject(a, renderCamera, q) > viewMath.cameraSpaceDepthForObject(b, renderCamera, q)
 		end)
 		for _, obj in ipairs(transparentObjects) do
 			imageData = engine.drawObject(obj, false, renderCamera, vector3, q, screen, zBuffer, imageData, false)
