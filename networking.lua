@@ -18,6 +18,22 @@ local function sanitizeRole(token)
     return "plane"
 end
 
+local function sanitizeCallsign(value)
+    if type(value) ~= "string" then
+        return nil
+    end
+    local text = value:gsub("[^ -~]", "")
+    text = text:gsub("|", "")
+    text = text:gsub("^%s+", ""):gsub("%s+$", "")
+    if text == "" then
+        return nil
+    end
+    if #text > 20 then
+        text = text:sub(1, 20)
+    end
+    return text
+end
+
 function networking.createObjectForPeer(peerID, objects, q, playerModel, playerModelRotationOffset, defaults)
     defaults = defaults or {}
     local startScale = sanitizeScale(defaults.scale, 1.35)
@@ -45,7 +61,8 @@ function networking.createObjectForPeer(peerID, objects, q, playerModel, playerM
         planeModelHash = planeModelHash,
         walkingModelHash = walkingModelHash,
         planeModelScale = planeScale,
-        walkingModelScale = walkingScale
+        walkingModelScale = walkingScale,
+        callsign = sanitizeCallsign(defaults.callsign)
     }
 
     table.insert(objects, obj)
@@ -85,6 +102,7 @@ function networking.handlePacket(data, peers, objects, q, playerModel, playerMod
     local remotePlaneHash = (#parts >= 14) and parts[13] or nil
     local remoteWalkingScale = (#parts >= 15) and tonumber(parts[14]) or nil
     local remoteWalkingHash = (#parts >= 16) and parts[15] or nil
+    local remoteCallsign = (#parts >= 17) and sanitizeCallsign(parts[#parts - 1]) or nil
 
     if not (id and px and py and pz and rw and rx and ry and rz) then
         return nil
@@ -118,6 +136,9 @@ function networking.handlePacket(data, peers, objects, q, playerModel, playerMod
         if remoteWalkingHash and remoteWalkingHash ~= "" then
             defaults.walkingModelHash = remoteWalkingHash
         end
+        if remoteCallsign then
+            defaults.callsign = remoteCallsign
+        end
         peers[id] = networking.createObjectForPeer(id, objects, q, playerModel, playerModelRotationOffset, defaults)
     end
 
@@ -140,6 +161,9 @@ function networking.handlePacket(data, peers, objects, q, playerModel, playerMod
     end
     if remoteWalkingHash and remoteWalkingHash ~= "" then
         obj.walkingModelHash = remoteWalkingHash
+    end
+    if remoteCallsign then
+        obj.callsign = remoteCallsign
     end
 
     if remoteModelHash and remoteModelHash ~= "" then

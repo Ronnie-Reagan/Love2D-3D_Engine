@@ -72,14 +72,47 @@ local mapState = {
 	zoomExtents = { 140, 400, 1000 },
 	panel = { margin = 14, widthRatio = 0.24, maxSize = 280, minSize = 150 },
 	logicalCamera = nil,
-	gridImage = nil,
-	gridImageSize = 0
+	mapImage = nil,
+	mapImageData = nil,
+	mapRes = 0,
+	lastCenterX = nil,
+	lastCenterZ = nil,
+	lastHeading = nil,
+	lastExtent = nil,
+	lastGroundSignature = nil,
+	lastRefreshAt = -math.huge
 }
 local localPlayerObject = nil
+local localCallsign = ""
+local geoConfig = {
+	originLat = 0.0,
+	originLon = 0.0,
+	metersPerUnit = 1.0
+}
+local hudTheme = {
+	plateBg = { 0.03, 0.05, 0.08, 0.82 },
+	plateHi = { 0.65, 0.82, 1.0, 0.24 },
+	plateBorder = { 0.74, 0.9, 1.0, 0.88 },
+	text = { 0.9, 0.96, 1.0, 0.95 },
+	textDim = { 0.72, 0.84, 0.95, 0.92 },
+	accent = { 0.26, 0.9, 0.55, 0.98 },
+	needle = { 1.0, 0.36, 0.2, 0.98 },
+	overspeed = { 1.0, 0.2, 0.16, 0.95 },
+	shadow = { 0, 0, 0, 0.34 }
+}
+local hudCache = {
+	dialCanvas = nil,
+	dialSize = 0,
+	dialFontHeight = 0,
+	controlCanvas = nil,
+	controlW = 0,
+	controlH = 0
+}
 
 localGroundClearance = 1.8
 modelLoadPrompt = {
 	active = false,
+	mode = "model_path",
 	text = "",
 	cursor = 0
 }
@@ -204,6 +237,7 @@ local pauseMenu = {
 		{ id = "renderer", label = "Renderer", kind = "toggle", help = "Switch between GPU and CPU renderer paths." },
 		{ id = "crosshair", label = "Crosshair", kind = "toggle", help = "Show or hide center crosshair dot." },
 		{ id = "overlay", label = "Debug Overlay", kind = "toggle", help = "Toggle top-left help/perf text." },
+		{ id = "callsign", label = "Callsign", kind = "action", help = "Set your multiplayer callsign label shown over your player." },
 		{ id = "load_custom_stl", label = "Load Plane STL", kind = "action", help = "Open a path prompt and load any STL from disk (or drop a file on the window)." },
 		{ id = "model_scale", label = "Plane Scale", kind = "range", min = 0.5, max = 3.0, step = 0.05, help = "Scale normalized plane models for all clients." },
 		{ id = "load_walking_stl", label = "Load Walking STL", kind = "action", help = "Load a separate STL used only when not in flight mode." },
@@ -293,6 +327,248 @@ end
 
 local function randomRange(minValue, maxValue)
 	return minValue + (maxValue - minValue) * math.random()
+end
+
+local function sanitizeCallsign(value)
+	if type(value) ~= "string" then
+		return nil
+	end
+	local text = value:gsub("[^ -~]", "")
+	text = text:gsub("|", "")
+	text = text:gsub("^%s+", ""):gsub("%s+$", "")
+	if text == "" then
+		return nil
+	end
+	if #text > 20 then
+		text = text:sub(1, 20)
+	end
+	return text
+end
+
+local function detectDefaultCallsign()
+	local fromEnv = os.getenv("USERNAME") or os.getenv("USER") or "Pilot"
+	return sanitizeCallsign(fromEnv) or "Pilot"
+end
+
+local function drawHudPlate(x, y, w, h, radius)
+	local r = radius or 6
+	love.graphics.setColor(hudTheme.shadow[1], hudTheme.shadow[2], hudTheme.shadow[3], hudTheme.shadow[4])
+	love.graphics.rectangle("fill", x + 2, y + 2, w, h, r, r)
+	love.graphics.setColor(hudTheme.plateBg[1], hudTheme.plateBg[2], hudTheme.plateBg[3], hudTheme.plateBg[4])
+	love.graphics.rectangle("fill", x, y, w, h, r, r)
+	love.graphics.setColor(hudTheme.plateHi[1], hudTheme.plateHi[2], hudTheme.plateHi[3], hudTheme.plateHi[4])
+	love.graphics.rectangle("fill", x + 1, y + 1, w - 2, math.max(4, h * 0.36), r, r)
+	love.graphics.setColor(hudTheme.plateBorder[1], hudTheme.plateBorder[2], hudTheme.plateBorder[3], hudTheme.plateBorder[4])
+	love.graphics.rectangle("line", x, y, w, h, r, r)
+end
+
+local function drawArcLine(cx, cy, radius, a0, a1, segments)
+	local pts = {}
+	local seg = math.max(4, math.floor(segments or 20))
+	for i = 0, seg do
+		local t = i / seg
+		local a = a0 + (a1 - a0) * t
+		pts[#pts + 1] = cx + math.cos(a) * radius
+		pts[#pts + 1] = cy + math.sin(a) * radius
+	end
+	if #pts >= 4 then
+		love.graphics.line(pts)
+	end
+end
+
+local function resetHudCaches()
+	hudCache.dialCanvas = nil
+	hudCache.dialSize = 0
+	hudCache.dialFontHeight = 0
+	hudCache.controlCanvas = nil
+	hudCache.controlW = 0
+	hudCache.controlH = 0
+end
+
+local function invalidateMapCache()
+	mapState.mapImage = nil
+	mapState.mapImageData = nil
+	mapState.mapRes = 0
+	mapState.lastCenterX = nil
+	mapState.lastCenterZ = nil
+	mapState.lastHeading = nil
+	mapState.lastExtent = nil
+	mapState.lastGroundSignature = nil
+	mapState.lastRefreshAt = -math.huge
+end
+
+local function groundParamsSignature(params)
+	if not params then
+		return "none"
+	end
+	local g = params.grassColor or { 0, 0, 0 }
+	local r = params.roadColor or { 0, 0, 0 }
+	local f = params.fieldColor or { 0, 0, 0 }
+	local gv = params.grassVar or { 0, 0, 0 }
+	local rv = params.roadVar or { 0, 0, 0 }
+	local fv = params.fieldVar or { 0, 0, 0 }
+	return table.concat({
+		tostring(params.seed or 0),
+		string.format("%.5f", tonumber(params.tileSize) or 0),
+		tostring(params.gridCount or 0),
+		string.format("%.5f", tonumber(params.roadDensity) or 0),
+		tostring(params.roadCount or 0),
+		tostring(params.fieldCount or 0),
+		string.format("%.3f,%.3f,%.3f", g[1] or 0, g[2] or 0, g[3] or 0),
+		string.format("%.3f,%.3f,%.3f", r[1] or 0, r[2] or 0, r[3] or 0),
+		string.format("%.3f,%.3f,%.3f", f[1] or 0, f[2] or 0, f[3] or 0),
+		string.format("%.3f,%.3f,%.3f", gv[1] or 0, gv[2] or 0, gv[3] or 0),
+		string.format("%.3f,%.3f,%.3f", rv[1] or 0, rv[2] or 0, rv[3] or 0),
+		string.format("%.3f,%.3f,%.3f", fv[1] or 0, fv[2] or 0, fv[3] or 0)
+	}, "|")
+end
+
+local function ensureDialCanvas(size)
+	local dialSize = math.max(96, math.floor(size or 160))
+	local font = love.graphics.getFont()
+	local fontHeight = font and font:getHeight() or 0
+	if hudCache.dialCanvas and hudCache.dialSize == dialSize and hudCache.dialFontHeight == fontHeight then
+		return hudCache.dialCanvas
+	end
+
+	local ok, canvasOrErr = pcall(function()
+		return love.graphics.newCanvas(dialSize, dialSize)
+	end)
+	if not ok or not canvasOrErr then
+		hudCache.dialCanvas = nil
+		hudCache.dialSize = 0
+		hudCache.dialFontHeight = 0
+		return nil
+	end
+
+	local canvas = canvasOrErr
+	local prevCanvas = love.graphics.getCanvas()
+	local prevShader = love.graphics.getShader()
+
+	love.graphics.setCanvas(canvas)
+	love.graphics.clear(0, 0, 0, 0)
+	love.graphics.setShader()
+
+	local cx = dialSize * 0.5
+	local cy = dialSize * 0.5
+	local radius = dialSize * 0.5
+	local gaugeStart = math.rad(150)
+	local gaugeSweep = math.rad(240)
+
+	love.graphics.setColor(0.02, 0.04, 0.06, 0.95)
+	love.graphics.circle("fill", cx, cy, radius * 0.95)
+	love.graphics.setColor(0.12, 0.2, 0.28, 0.95)
+	love.graphics.circle("fill", cx, cy, radius * 0.9)
+	love.graphics.setColor(0.72, 0.86, 1.0, 0.9)
+	love.graphics.circle("line", cx, cy, radius * 0.9)
+	love.graphics.setColor(0.65, 0.78, 0.9, 0.32)
+	love.graphics.circle("line", cx, cy, radius * 0.63)
+
+	love.graphics.setColor(1.0, 0.22, 0.22, 0.82)
+	local redStart = gaugeStart + (850 / 1000) * gaugeSweep
+	drawArcLine(cx, cy, radius * 0.88, redStart, gaugeStart + gaugeSweep, 14)
+
+	for kph = 0, 1000, 20 do
+		local ratio = kph / 1000
+		local angle = gaugeStart + ratio * gaugeSweep
+		local major = (kph % 100) == 0
+		local x0 = cx + math.cos(angle) * (radius * 0.88)
+		local y0 = cy + math.sin(angle) * (radius * 0.88)
+		local x1 = cx + math.cos(angle) * (major and (radius * 0.72) or (radius * 0.79))
+		local y1 = cy + math.sin(angle) * (major and (radius * 0.72) or (radius * 0.79))
+		love.graphics.setColor(major and 0.92 or 0.62, major and 0.96 or 0.74, major and 1.0 or 0.86, major and 0.98 or 0.68)
+		love.graphics.line(x0, y0, x1, y1)
+		if major and (kph % 200 == 0) then
+			local tx = cx + math.cos(angle) * (radius * 0.58)
+			local ty = cy + math.sin(angle) * (radius * 0.58)
+			local label = tostring(kph)
+			love.graphics.print(label, tx - (love.graphics.getFont():getWidth(label) * 0.5), ty - (fontHeight * 0.5))
+		end
+	end
+
+	for mph = 0, 620, 50 do
+		local ratio = mph / 620
+		local angle = gaugeStart + ratio * gaugeSweep
+		local major = (mph % 100) == 0
+		local x0 = cx + math.cos(angle) * (radius * 0.62)
+		local y0 = cy + math.sin(angle) * (radius * 0.62)
+		local x1 = cx + math.cos(angle) * (major and (radius * 0.52) or (radius * 0.56))
+		local y1 = cy + math.sin(angle) * (major and (radius * 0.52) or (radius * 0.56))
+		love.graphics.setColor(0.62, 0.75, 0.9, major and 0.9 or 0.62)
+		love.graphics.line(x0, y0, x1, y1)
+		if major and (mph % 200 == 0) then
+			local tx = cx + math.cos(angle) * (radius * 0.44)
+			local ty = cy + math.sin(angle) * (radius * 0.44)
+			local label = tostring(mph)
+			love.graphics.print(label, tx - (love.graphics.getFont():getWidth(label) * 0.5), ty - (fontHeight * 0.5))
+		end
+	end
+
+	love.graphics.setColor(0.84, 0.94, 1.0, 0.9)
+	love.graphics.print("kph", cx - (love.graphics.getFont():getWidth("kph") * 0.5), cy + radius * 0.75)
+	love.graphics.setColor(0.62, 0.78, 0.95, 0.85)
+	love.graphics.print("mph", cx - (love.graphics.getFont():getWidth("mph") * 0.5), cy + radius * 0.45)
+
+	love.graphics.setCanvas(prevCanvas)
+	love.graphics.setShader(prevShader)
+
+	hudCache.dialCanvas = canvas
+	hudCache.dialSize = dialSize
+	hudCache.dialFontHeight = fontHeight
+	return canvas
+end
+
+local function ensureControlPanelCanvas(width, height)
+	local w = math.max(120, math.floor(width or 200))
+	local h = math.max(80, math.floor(height or 120))
+	if hudCache.controlCanvas and hudCache.controlW == w and hudCache.controlH == h then
+		return hudCache.controlCanvas
+	end
+
+	local ok, canvasOrErr = pcall(function()
+		return love.graphics.newCanvas(w, h)
+	end)
+	if not ok or not canvasOrErr then
+		hudCache.controlCanvas = nil
+		hudCache.controlW = 0
+		hudCache.controlH = 0
+		return nil
+	end
+
+	local canvas = canvasOrErr
+	local prevCanvas = love.graphics.getCanvas()
+	local prevShader = love.graphics.getShader()
+	love.graphics.setCanvas(canvas)
+	love.graphics.clear(0, 0, 0, 0)
+	love.graphics.setShader()
+
+	drawHudPlate(0, 0, w, h, 9)
+	love.graphics.setColor(0.7, 0.86, 1.0, 0.18)
+	love.graphics.line(10, h * 0.35, w - 10, h * 0.35)
+	love.graphics.line(10, h * 0.72, w - 10, h * 0.72)
+
+	love.graphics.setCanvas(prevCanvas)
+	love.graphics.setShader(prevShader)
+	hudCache.controlCanvas = canvas
+	hudCache.controlW = w
+	hudCache.controlH = h
+	return canvas
+end
+
+local function worldToGeo(worldX, worldZ)
+	local metersPerUnit = math.max(1e-6, tonumber(geoConfig.metersPerUnit) or 1.0)
+	local eastMeters = worldX * metersPerUnit
+	local northMeters = worldZ * metersPerUnit
+	local metersPerDegLat = 111132.92
+	local lat = (tonumber(geoConfig.originLat) or 0) + (northMeters / metersPerDegLat)
+	local latRad = math.rad(tonumber(geoConfig.originLat) or 0)
+	local cosLat = math.cos(latRad)
+	if math.abs(cosLat) < 1e-6 then
+		cosLat = (cosLat < 0) and -1e-6 or 1e-6
+	end
+	local metersPerDegLon = 111320 * cosLat
+	local lon = (tonumber(geoConfig.originLon) or 0) + (eastMeters / metersPerDegLon)
+	return lat, lon
 end
 
 local function composeWalkingRotation(yaw, pitch)
@@ -476,32 +752,110 @@ local function buildRenderObjectList()
 	return renderObjects
 end
 
-local function ensureMapGridImage()
-	if mapState.gridImage then
-		return mapState.gridImage
+local function ensureMapGroundImage(panelSize, mapCam)
+	if not mapCam then
+		return nil
 	end
 
-	local size = 128
-	local data = love.image.newImageData(size, size)
-	for y = 0, size - 1 do
-		for x = 0, size - 1 do
-			local major = (x % 32 == 0) or (y % 32 == 0)
-			local minor = (x % 16 == 0) or (y % 16 == 0)
-			local tone = 0.12
-			if minor then
-				tone = 0.16
-			end
-			if major then
-				tone = 0.2
-			end
-			data:setPixel(x, y, tone, tone + 0.04, tone, 1)
+	local now = love.timer.getTime()
+	local targetRes = clamp(math.floor(panelSize), 96, 320)
+	local groundSig = groundParamsSignature(activeGroundParams or defaultGroundParams)
+	local needRefresh = false
+	if not mapState.mapImage then
+		needRefresh = true
+	elseif mapState.mapRes ~= targetRes then
+		needRefresh = true
+	elseif mapState.lastGroundSignature ~= groundSig then
+		needRefresh = true
+	elseif math.abs((mapState.lastExtent or 0) - mapCam.extent) > 1e-6 then
+		needRefresh = true
+	elseif (now - (mapState.lastRefreshAt or -math.huge)) >= 0.05 then
+		local dx = math.abs((mapState.lastCenterX or mapCam.pos[1]) - mapCam.pos[1])
+		local dz = math.abs((mapState.lastCenterZ or mapCam.pos[3]) - mapCam.pos[3])
+		local headingDelta = math.abs(viewMath.shortestAngleDelta(mapState.lastHeading or mapCam.heading, mapCam.heading))
+		local moveThreshold = math.max(2.0, mapCam.extent * 0.02)
+		if dx > moveThreshold or dz > moveThreshold or headingDelta > math.rad(1.4) then
+			needRefresh = true
 		end
 	end
 
-	mapState.gridImage = love.graphics.newImage(data)
-	mapState.gridImage:setFilter("nearest", "nearest")
-	mapState.gridImageSize = size
-	return mapState.gridImage
+	if not needRefresh then
+		return mapState.mapImage
+	end
+
+	if (not mapState.mapImageData) or mapState.mapRes ~= targetRes then
+		local okData, dataOrErr = pcall(function()
+			return love.image.newImageData(targetRes, targetRes)
+		end)
+		if not okData or not dataOrErr then
+			mapState.mapImage = nil
+			mapState.mapImageData = nil
+			mapState.mapRes = 0
+			return nil
+		end
+		mapState.mapImageData = dataOrErr
+		mapState.mapRes = targetRes
+		mapState.mapImage = nil
+	end
+
+	local data = mapState.mapImageData
+	local worldPerPixel = (mapCam.extent * 2) / targetRes
+	local cosH = math.cos(mapCam.heading)
+	local sinH = math.sin(mapCam.heading)
+	local colorParams = activeGroundParams or defaultGroundParams
+	local halfRes = targetRes * 0.5
+
+	for y = 0, targetRes - 1 do
+		for x = 0, targetRes - 1 do
+			local mapX = (x + 0.5 - halfRes) * worldPerPixel
+			local mapZ = (halfRes - (y + 0.5)) * worldPerPixel
+			local worldDX = cosH * mapX + sinH * mapZ
+			local worldDZ = -sinH * mapX + cosH * mapZ
+			local worldX = mapCam.pos[1] + worldDX
+			local worldZ = mapCam.pos[3] + worldDZ
+			local c = groundSystem.sampleGroundColorAtWorld(worldX, worldZ, colorParams)
+			local edgeX = math.abs((x + 0.5) / targetRes * 2 - 1)
+			local edgeY = math.abs((y + 0.5) / targetRes * 2 - 1)
+			local vignette = 1 - (math.max(edgeX, edgeY) * 0.09)
+			vignette = clamp(vignette, 0.78, 1.0)
+			data:setPixel(
+				x,
+				y,
+				clamp(c[1] * vignette, 0, 1),
+				clamp(c[2] * vignette, 0, 1),
+				clamp(c[3] * vignette, 0, 1),
+				0.98
+			)
+		end
+	end
+
+	if mapState.mapImage then
+		local okReplace = pcall(function()
+			mapState.mapImage:replacePixels(data)
+		end)
+		if not okReplace then
+			mapState.mapImage = nil
+		end
+	end
+	if not mapState.mapImage then
+		local okImage, imageOrErr = pcall(function()
+			return love.graphics.newImage(data)
+		end)
+		if not okImage or not imageOrErr then
+			mapState.mapImage = nil
+			return nil
+		end
+		mapState.mapImage = imageOrErr
+		mapState.mapImage:setFilter("linear", "linear")
+	end
+
+	mapState.lastCenterX = mapCam.pos[1]
+	mapState.lastCenterZ = mapCam.pos[3]
+	mapState.lastHeading = mapCam.heading
+	mapState.lastExtent = mapCam.extent
+	mapState.lastGroundSignature = groundSig
+	mapState.lastRefreshAt = now
+	return mapState.mapImage
 end
 
 local function updateLogicalMapCamera()
@@ -2180,6 +2534,9 @@ local function getPauseItemValue(item)
 	if item.id == "overlay" then
 		return showDebugOverlay and "On" or "Off"
 	end
+	if item.id == "callsign" then
+		return (localCallsign and localCallsign ~= "") and localCallsign or "Unset"
+	end
 	if item.id == "load_custom_stl" then
 		return "Open..."
 	end
@@ -2282,15 +2639,23 @@ local function activatePauseItem(item)
 	elseif item.id == "flight" then
 		setFlightMode(not flightSimMode)
 		setPauseStatus("Flight Mode: " .. getPauseItemValue(item), 1.2)
+	elseif item.id == "callsign" then
+		modelLoadPrompt.active = true
+		modelLoadPrompt.mode = "callsign"
+		modelLoadPrompt.text = localCallsign or ""
+		modelLoadPrompt.cursor = #modelLoadPrompt.text
+		setPauseStatus("Callsign: Enter to apply, Esc to cancel.", 4.5)
 	elseif item.id == "load_custom_stl" then
 		modelLoadTargetRole = "plane"
 		modelLoadPrompt.active = true
+		modelLoadPrompt.mode = "model_path"
 		modelLoadPrompt.text = ""
 		modelLoadPrompt.cursor = 0
 		setPauseStatus("Plane STL path: Enter to load, Esc to cancel.", 4.5)
 	elseif item.id == "load_walking_stl" then
 		modelLoadTargetRole = "walking"
 		modelLoadPrompt.active = true
+		modelLoadPrompt.mode = "model_path"
 		modelLoadPrompt.text = ""
 		modelLoadPrompt.cursor = 0
 		setPauseStatus("Walking STL path: Enter to load, Esc to cancel.", 4.5)
@@ -2534,6 +2899,7 @@ setPauseState = function(paused)
 		mapState.mHeld = false
 		mapState.mUsedForZoom = false
 		modelLoadPrompt.active = false
+		modelLoadPrompt.mode = "model_path"
 		modelLoadTargetRole = "plane"
 		pauseMenu.tab = "game"
 		pauseMenu.helpScroll = 0
@@ -2553,6 +2919,7 @@ setPauseState = function(paused)
 		logger.log("Pause menu opened.")
 	else
 		modelLoadPrompt.active = false
+		modelLoadPrompt.mode = "model_path"
 		modelLoadTargetRole = "plane"
 		pauseMenu.tabBounds = {}
 		pauseMenu.itemBounds = {}
@@ -2980,11 +3347,13 @@ function drawModelLoadPrompt(layout)
 	local promptW = layout.panelW - 48
 	local promptH = math.max(54, layout.lineH * 2 + 16)
 	local promptY = layout.panelY + layout.panelH - promptH - 12
-	local targetLabel = (modelLoadTargetRole == "walking") and "Walking STL" or "Plane STL"
+	local isCallsignPrompt = modelLoadPrompt.mode == "callsign"
+	local targetLabel = isCallsignPrompt and "Callsign" or ((modelLoadTargetRole == "walking") and "Walking STL" or "Plane STL")
 	local prefix = targetLabel .. ": "
 	local left = modelLoadPrompt.text:sub(1, modelLoadPrompt.cursor)
 	local cursorX = promptX + 10 + love.graphics.getFont():getWidth(prefix .. left)
 	cursorX = clamp(cursorX, promptX + 10, promptX + promptW - 10)
+	local hint = isCallsignPrompt and "Enter=Apply  Esc=Cancel" or "Enter=Load  Esc=Cancel  Drag/drop STL also works"
 
 	love.graphics.setColor(0.03, 0.04, 0.05, 0.96)
 	love.graphics.rectangle("fill", promptX, promptY, promptW, promptH, 6, 6)
@@ -2995,7 +3364,7 @@ function drawModelLoadPrompt(layout)
 	love.graphics.setColor(0.7, 0.9, 1.0, 0.95)
 	love.graphics.line(cursorX, promptY + 8, cursorX, promptY + 8 + love.graphics.getFont():getHeight())
 	love.graphics.setColor(0.85, 0.9, 0.95, 0.9)
-	love.graphics.print("Enter=Load  Esc=Cancel  Drag/drop STL also works", promptX + 10, promptY + promptH - (layout.lineH + 6))
+	love.graphics.print(hint, promptX + 10, promptY + promptH - (layout.lineH + 6))
 end
 
 local function drawPauseMenu()
@@ -3072,6 +3441,7 @@ rebuildGroundFromParams = function(params, reason)
 		activeGroundParams = nextState.activeGroundParams
 		groundObject = nextState.groundObject
 		worldHalfExtent = nextState.worldHalfExtent or worldHalfExtent
+		invalidateMapCache()
 	end
 	return changed
 end
@@ -3102,6 +3472,9 @@ function love.load()
 		h = height
 	}
 	refreshUiFonts()
+	resetHudCaches()
+	invalidateMapCache()
+	localCallsign = detectDefaultCallsign()
 
 	camera = {
 		pos = { 0, 0, -5 },
@@ -3205,6 +3578,7 @@ function love.load()
 	pauseMenu.confirmItemId = nil
 	pauseMenu.confirmUntil = 0
 	modelLoadPrompt.active = false
+	modelLoadPrompt.mode = "model_path"
 	modelLoadPrompt.text = ""
 	modelLoadPrompt.cursor = 0
 
@@ -3388,18 +3762,32 @@ end
 function closeModelLoadPrompt(statusMessage, duration)
 	modelLoadPrompt.active = false
 	modelLoadPrompt.cursor = math.max(0, #modelLoadPrompt.text)
+	modelLoadPrompt.mode = "model_path"
 	if statusMessage then
 		setPauseStatus(statusMessage, duration or 1.8)
 	end
 end
 
 function submitModelLoadPrompt()
+	if modelLoadPrompt.mode == "callsign" then
+		local nextCallsign = sanitizeCallsign(modelLoadPrompt.text or "")
+		if not nextCallsign then
+			closeModelLoadPrompt("Callsign must contain printable characters.", 1.8)
+			return
+		end
+		localCallsign = nextCallsign
+		if forceStateSync then
+			forceStateSync()
+		end
+		closeModelLoadPrompt("Callsign set: " .. localCallsign, 1.8)
+		return
+	end
+
 	local path = (modelLoadPrompt.text or ""):gsub("^%s+", ""):gsub("%s+$", "")
 	if path == "" then
 		closeModelLoadPrompt("Model load cancelled.", 1.2)
 		return
 	end
-
 	local ok, entryOrErr = loadPlayerModelFromStl(path, modelLoadTargetRole)
 	if ok then
 		closeModelLoadPrompt("Loaded STL: " .. path, 2.4)
@@ -3460,6 +3848,7 @@ local function updateNet()
 		local activeHash, activeScale = getConfiguredModelForRole(activeRole)
 		local planeHash, planeScale = getConfiguredModelForRole("plane")
 		local walkingHash, walkingScale = getConfiguredModelForRole("walking")
+		local outboundCallsign = sanitizeCallsign(localCallsign) or "Pilot"
 		local packet = table.concat({
 			"STATE",
 			string.format("%f", camera.pos[1]),
@@ -3475,7 +3864,8 @@ local function updateNet()
 			formatNetFloat(planeScale),
 			planeHash or "builtin-cube",
 			formatNetFloat(walkingScale),
-			walkingHash or "builtin-cube"
+			walkingHash or "builtin-cube",
+			outboundCallsign
 		}, "|")
 		pcall(function()
 			relayServer:send(packet)
@@ -3806,6 +4196,20 @@ function love.textinput(text)
 	if type(text) ~= "string" or text == "" then
 		return
 	end
+	if modelLoadPrompt.mode == "callsign" then
+		text = text:gsub("[^ -~]", "")
+		text = text:gsub("|", "")
+		if text == "" then
+			return
+		end
+		local room = 20 - #modelLoadPrompt.text
+		if room <= 0 then
+			return
+		end
+		if #text > room then
+			text = text:sub(1, room)
+		end
+	end
 
 	local left = modelLoadPrompt.text:sub(1, modelLoadPrompt.cursor)
 	local right = modelLoadPrompt.text:sub(modelLoadPrompt.cursor + 1)
@@ -3889,6 +4293,12 @@ function love.filedropped(file)
 	if not file then
 		return
 	end
+	if modelLoadPrompt.active and modelLoadPrompt.mode == "callsign" then
+		if pauseMenu.active then
+			setPauseStatus("Finish callsign edit before dropping STL files.", 1.8)
+		end
+		return
+	end
 
 	local name = (file.getFilename and file:getFilename()) or "dropped.stl"
 	local lowerName = string.lower(name or "")
@@ -3937,6 +4347,7 @@ function love.filedropped(file)
 	local ok, entryOrErr = loadPlayerModelFromRaw(raw, name, dropRole)
 	if ok then
 		modelLoadPrompt.active = false
+		modelLoadPrompt.mode = "model_path"
 		if pauseMenu.active then
 			setPauseStatus("Loaded dropped STL: " .. tostring(name), 2.4)
 		end
@@ -3960,7 +4371,71 @@ function love.focus(focused)
 	end
 end
 
-local function drawHud(w, h, cx, cy)
+local function projectWorldToScreen(worldPos, viewCamera, w, h)
+	if not viewCamera or not worldPos then
+		return nil
+	end
+	local rel = {
+		worldPos[1] - viewCamera.pos[1],
+		worldPos[2] - viewCamera.pos[2],
+		worldPos[3] - viewCamera.pos[3]
+	}
+	local cam = q.rotateVector(q.conjugate(viewCamera.rot), rel)
+	if cam[3] <= 0.05 then
+		return nil
+	end
+	local f = 1 / math.tan((viewCamera.fov or math.rad(90)) * 0.5)
+	local nx = cam[1] * f / cam[3]
+	local ny = cam[2] * f / cam[3]
+	local sx = (w * 0.5) + nx * (w * 0.5)
+	local sy = (h * 0.5) - ny * (h * 0.5)
+	return sx, sy, cam[3]
+end
+
+local function drawWorldPeerIndicators(w, h, viewCamera)
+	if not viewCamera then
+		return
+	end
+	local margin = 20
+	for peerId, peerObj in pairs(peers) do
+		if peerObj and peerObj.pos then
+			local anchor = {
+				peerObj.pos[1],
+				peerObj.pos[2] + ((peerObj.halfSize and peerObj.halfSize.y) or 1.2) + 0.7,
+				peerObj.pos[3]
+			}
+			local sx, sy, depth = projectWorldToScreen(anchor, viewCamera, w, h)
+			if sx and sy and depth and depth > 0.05 then
+				sx = clamp(sx, margin, w - margin)
+				sy = clamp(sy, margin, h - margin)
+				local dx = peerObj.pos[1] - viewCamera.pos[1]
+				local dy = peerObj.pos[2] - viewCamera.pos[2]
+				local dz = peerObj.pos[3] - viewCamera.pos[3]
+				local distanceM = math.sqrt(dx * dx + dy * dy + dz * dz) * (geoConfig.metersPerUnit or 1.0)
+				local label = sanitizeCallsign(peerObj.callsign) or ("P" .. tostring(peerId))
+				local alpha = clamp(1 - (distanceM / 2400), 0.28, 0.92)
+				local text = string.format("%s  %dm", label, math.floor(distanceM + 0.5))
+				local textW = love.graphics.getFont():getWidth(text)
+				local boxW = textW + 10
+				local boxH = love.graphics.getFont():getHeight() + 6
+				drawHudPlate(sx - boxW * 0.5, sy - boxH * 0.5, boxW, boxH, 5)
+				love.graphics.setColor(0.32, 0.78, 1.0, alpha)
+				love.graphics.polygon(
+					"fill",
+					sx, sy + (boxH * 0.5) + 8,
+					sx - 4, sy + (boxH * 0.5) + 2,
+					sx + 4, sy + (boxH * 0.5) + 2
+				)
+				love.graphics.setColor(hudTheme.text[1], hudTheme.text[2], hudTheme.text[3], alpha)
+				love.graphics.print(text, sx - textW * 0.5, sy - (boxH * 0.5) + 3)
+			end
+		end
+	end
+end
+
+local function drawHud(w, h, cx, cy, renderCamera)
+	local mapPanelX, mapPanelY, mapPanelSize
+
 	if flightSimMode and camera then
 		local wind = cloudSim.getWindVector3(windState)
 		local v = camera.flightVel or camera.vel or { 0, 0, 0 }
@@ -3970,66 +4445,103 @@ local function drawHud(w, h, cx, cy)
 			(v[3] or 0) - (wind[3] or 0)
 		}
 		local airSpeed = math.sqrt(airVel[1] * airVel[1] + airVel[2] * airVel[2] + airVel[3] * airVel[3])
-		local iasReference = math.max(1.0, camera.flightFullLiftSpeed or 24)
-		local airSpeedRatio = clamp(airSpeed / iasReference, 0, 1)
 		local airSpeedMph = airSpeed * 2.236936
 		local airSpeedKph = airSpeed * 3.6
+		local clampedKph = clamp(airSpeedKph, 0, 1000)
 		local throttleRatio = clamp(camera.throttle or 0, 0, 1)
 		local throttlePct = math.floor((throttleRatio * 100) + 0.5)
 		local thrustNow = throttleRatio * (camera.flightThrustForce or camera.flightThrustAccel or 0)
 		if controls.isActionDown("flight_afterburner") then
 			thrustNow = thrustNow * (camera.afterburnerMultiplier or 1.45)
 		end
-		local barHeight = math.floor(math.min(h * 0.34, 240))
-		local barWidth = 18
-		local throttleX = 20
-		local barY = math.floor((h - barHeight) * 0.5)
-		local digitalW = 96
-		local digitalH = 84
 
-		love.graphics.setColor(0.04, 0.06, 0.08, 0.84)
-		love.graphics.rectangle("fill", throttleX, barY, digitalW, digitalH, 5, 5)
-		love.graphics.setColor(0.78, 0.87, 0.95, 0.92)
-		love.graphics.rectangle("line", throttleX, barY, digitalW, digitalH, 5, 5)
-		love.graphics.setColor(0.86, 0.92, 1.0, 0.96)
-		love.graphics.print("THROTTLE", throttleX + 9, barY + 8)
-		love.graphics.setColor(0.26, 0.95, 0.54, 0.98)
-		love.graphics.print(string.format("%03d%%", throttlePct), throttleX + 14, barY + 28)
-		love.graphics.setColor(0.8, 0.9, 0.98, 0.92)
-		love.graphics.print(string.format("Thrust %.1f", thrustNow), throttleX + 9, barY + 56)
+		local dialSize = clamp(math.floor(math.min(w, h) * 0.22), 130, 220)
+		local dialX = 24 + dialSize * 0.5
+		local dialY = h - dialSize * 0.5 - 22
+		if dialY < (dialSize * 0.5 + 14) then
+			dialY = dialSize * 0.5 + 14
+		end
+		local dialCanvas = ensureDialCanvas(dialSize)
+		if dialCanvas then
+			love.graphics.setColor(1, 1, 1, 0.98)
+			love.graphics.draw(dialCanvas, dialX - dialSize * 0.5, dialY - dialSize * 0.5)
+		else
+			drawHudPlate(dialX - dialSize * 0.5, dialY - dialSize * 0.5, dialSize, dialSize, 9)
+		end
 
-		local iasX = throttleX + digitalW + 18
-		local handleSize = barWidth + 8
-		local iasHandleY = barY + (1 - airSpeedRatio) * barHeight - (handleSize * 0.5)
-		iasHandleY = clamp(iasHandleY, barY - (handleSize * 0.5), barY + barHeight - (handleSize * 0.5))
+		local gaugeStart = math.rad(150)
+		local gaugeSweep = math.rad(240)
+		local speedRatio = clampedKph / 1000
+		local needleAngle = gaugeStart + speedRatio * gaugeSweep
+		local needleLen = dialSize * 0.4
+		local nx = dialX + math.cos(needleAngle) * needleLen
+		local ny = dialY + math.sin(needleAngle) * needleLen
+		love.graphics.setLineWidth(2.5)
+		if airSpeedKph > 1000 then
+			love.graphics.setColor(hudTheme.overspeed[1], hudTheme.overspeed[2], hudTheme.overspeed[3], hudTheme.overspeed[4])
+		else
+			love.graphics.setColor(hudTheme.needle[1], hudTheme.needle[2], hudTheme.needle[3], hudTheme.needle[4])
+		end
+		love.graphics.line(dialX, dialY, nx, ny)
+		love.graphics.setLineWidth(1)
+		love.graphics.setColor(0.88, 0.95, 1.0, 0.96)
+		love.graphics.circle("fill", dialX, dialY, 5)
+		love.graphics.setColor(0.05, 0.09, 0.12, 0.9)
+		love.graphics.circle("line", dialX, dialY, 5)
 
-		love.graphics.setColor(0.05, 0.07, 0.08, 0.75)
-		love.graphics.rectangle("fill", iasX, barY, barWidth, barHeight, 3, 3)
-		love.graphics.setColor(0.75, 0.85, 0.92, 0.9)
-		love.graphics.rectangle("line", iasX, barY, barWidth, barHeight, 3, 3)
+		local centerText = string.format("%4d kph", math.floor(airSpeedKph + 0.5))
+		local mphText = string.format("%3d mph", math.floor(airSpeedMph + 0.5))
+		local overspeedText = (airSpeedKph > 1000) and "OVERSPEED" or "IAS"
+		local centerW = math.max(love.graphics.getFont():getWidth(centerText), love.graphics.getFont():getWidth(mphText)) + 12
+		drawHudPlate(dialX - centerW * 0.5, dialY - 20, centerW, 42, 6)
+		love.graphics.setColor(hudTheme.text[1], hudTheme.text[2], hudTheme.text[3], hudTheme.text[4])
+		love.graphics.print(centerText, dialX - (love.graphics.getFont():getWidth(centerText) * 0.5), dialY - 17)
+		love.graphics.setColor(hudTheme.textDim[1], hudTheme.textDim[2], hudTheme.textDim[3], hudTheme.textDim[4])
+		love.graphics.print(mphText, dialX - (love.graphics.getFont():getWidth(mphText) * 0.5), dialY - 2)
+		if airSpeedKph > 1000 then
+			local x, y = dialX - (love.graphics.getFont():getWidth(overspeedText) * 0.5), dialY + 28
+			love.graphics.rectangle("line", x - 20, y - 3, dialSize / 4, 40)
+			love.graphics.setColor(hudTheme.overspeed[1], hudTheme.overspeed[2], hudTheme.overspeed[3], 0.95)
+			love.graphics.print(overspeedText, x, y)
+		else
+			local x, y = dialX - (love.graphics.getFont():getWidth(overspeedText) * 0.5), dialY + 28
+			love.graphics.rectangle("line", x - 20, y - 3, 60, 20)
+			love.graphics.setColor(0.66, 0.82, 0.98, 0.9)
+			love.graphics.print(overspeedText, x, y)
+		end
 
-		local iasFillTop = barY + (1 - airSpeedRatio) * barHeight
-		love.graphics.setColor(0.22, 0.72, 0.95, 0.65)
-		love.graphics.rectangle("fill", iasX + 1, iasFillTop, barWidth - 2, (barY + barHeight) - iasFillTop)
-
-		love.graphics.setColor(0.95, 0.97, 1.0, 0.95)
-		love.graphics.rectangle("fill", iasX - 4, iasHandleY, handleSize, handleSize, 2, 2)
-		love.graphics.setColor(0.10, 0.12, 0.15, 0.95)
-		love.graphics.rectangle("line", iasX - 4, iasHandleY, handleSize, handleSize, 2, 2)
-
-		love.graphics.setColor(0.86, 0.92, 1.0, 0.95)
-		love.graphics.print("IAS", iasX - 2, barY + barHeight + 6)
-		love.graphics.print(
-			string.format("%d mph / %d kph", math.floor(airSpeedMph + 0.5), math.floor(airSpeedKph + 0.5)),
-			iasX - 18,
-			barY + barHeight + 22
-		)
+		local throttleW = 118
+		local throttleH = 82
+		local throttleX = 18
+		local throttleY = dialY - dialSize * 0.5 - throttleH - 10
+		if throttleY < 14 then
+			throttleY = 14
+		end
+		drawHudPlate(throttleX, throttleY, throttleW, throttleH, 6)
+		love.graphics.setColor(hudTheme.text[1], hudTheme.text[2], hudTheme.text[3], hudTheme.text[4])
+		love.graphics.print("THROTTLE", throttleX + 10, throttleY + 8)
+		love.graphics.setColor(hudTheme.accent[1], hudTheme.accent[2], hudTheme.accent[3], hudTheme.accent[4])
+		love.graphics.print(string.format("%03d%%", throttlePct), throttleX + 16, throttleY + 28)
+		love.graphics.setColor(hudTheme.textDim[1], hudTheme.textDim[2], hudTheme.textDim[3], hudTheme.textDim[4])
+		love.graphics.print(string.format("Thrust %.1f", thrustNow), throttleX + 10, throttleY + 56)
 
 		camera.yoke = camera.yoke or { pitch = 0, yaw = 0, roll = 0 }
 		local yoke = camera.yoke
-		local yokeSize = 96
-		local yokeX = iasX + barWidth + 26
-		local yokeY = math.floor((h - yokeSize) * 0.5)
+		local controlW = clamp(math.floor(w * 0.31), 220, 340)
+		local controlH = clamp(math.floor(h * 0.2), 124, 180)
+		local controlX = math.floor((w - controlW) * 0.5)
+		local controlY = h - controlH - 14
+		local controlCanvas = ensureControlPanelCanvas(controlW, controlH)
+		if controlCanvas then
+			love.graphics.setColor(1, 1, 1, 0.98)
+			love.graphics.draw(controlCanvas, controlX, controlY)
+		else
+			drawHudPlate(controlX, controlY, controlW, controlH, 9)
+		end
+
+		local yokeSize = math.floor(math.min(controlW * 0.42, controlH * 0.56))
+		local yokeX = controlX + 18
+		local yokeY = controlY + 14
 		local centerX = yokeX + yokeSize * 0.5
 		local centerY = yokeY + yokeSize * 0.5
 		local throw = yokeSize * 0.34
@@ -4037,9 +4549,9 @@ local function drawHud(w, h, cx, cy)
 		local yokeHandleX = centerX + clamp(-yoke.roll or 0, -1, 1) * throw - (yokeHandleSize * 0.5)
 		local yokeHandleY = centerY + clamp(-yoke.pitch or 0, -1, 1) * throw - (yokeHandleSize * 0.5)
 
-		love.graphics.setColor(0.05, 0.07, 0.08, 0.75)
+		love.graphics.setColor(0.04, 0.07, 0.1, 0.84)
 		love.graphics.rectangle("fill", yokeX, yokeY, yokeSize, yokeSize, 4, 4)
-		love.graphics.setColor(0.75, 0.85, 0.92, 0.9)
+		love.graphics.setColor(0.74, 0.9, 1.0, 0.9)
 		love.graphics.rectangle("line", yokeX, yokeY, yokeSize, yokeSize, 4, 4)
 		love.graphics.line(centerX, yokeY + 8, centerX, yokeY + yokeSize - 8)
 		love.graphics.line(yokeX + 8, centerY, yokeX + yokeSize - 8, centerY)
@@ -4049,10 +4561,10 @@ local function drawHud(w, h, cx, cy)
 		love.graphics.setColor(0.10, 0.12, 0.15, 0.95)
 		love.graphics.rectangle("line", yokeHandleX, yokeHandleY, yokeHandleSize, yokeHandleSize, 2, 2)
 
-		local rudderWidth = yokeSize
+		local rudderWidth = math.floor(controlW * 0.42)
 		local rudderHeight = 10
-		local rudderX = yokeX
-		local rudderY = yokeY + yokeSize + 22
+		local rudderX = controlX + controlW - rudderWidth - 18
+		local rudderY = controlY + math.floor(controlH * 0.64)
 		local rudderHandleSize = rudderHeight + 8
 		local rudderRatio = (clamp(yoke.yaw or 0, -1, 1) + 1) * 0.5
 		local rudderHandleX = rudderX + rudderRatio * rudderWidth - (rudderHandleSize * 0.5)
@@ -4067,108 +4579,135 @@ local function drawHud(w, h, cx, cy)
 		love.graphics.setColor(0.10, 0.12, 0.15, 0.95)
 		love.graphics.rectangle("line", rudderHandleX, rudderY - 4, rudderHandleSize, rudderHandleSize, 2, 2)
 		love.graphics.setColor(0.86, 0.92, 1.0, 0.95)
-		love.graphics.print("YOKE", yokeX + 22, yokeY + yokeSize + 6)
-		love.graphics.print("RUDDER", rudderX + 20, rudderY + rudderHeight + 5)
+		love.graphics.print("YOKE", yokeX + 20, yokeY + yokeSize + 5)
+		love.graphics.print("RUDDER", rudderX + 8, rudderY + rudderHeight + 6)
+		love.graphics.setColor(0.65, 0.8, 0.95, 0.9)
+		love.graphics.print(
+			string.format("P %.2f  R %.2f  Y %.2f", yoke.pitch or 0, yoke.roll or 0, yoke.yaw or 0),
+			controlX + 14,
+			controlY + controlH - love.graphics.getFont():getHeight() - 7
+		)
 	end
 
-	if not mapState.visible then
-		return
+	if not pauseMenu.active then
+		drawWorldPeerIndicators(w, h, renderCamera or resolveActiveRenderCamera() or camera)
 	end
 
-	local mapCam = updateLogicalMapCamera()
-	if not mapCam then
-		return
-	end
+	if mapState.visible then
+		local mapCam = updateLogicalMapCamera()
+		if mapCam then
+			local panelSize = clamp(
+				math.floor(math.min(w, h) * mapState.panel.widthRatio),
+				mapState.panel.minSize,
+				mapState.panel.maxSize
+			)
+			local panelX = w - mapState.panel.margin - panelSize
+			local panelY = mapState.panel.margin
+			local panelCenterX = panelX + panelSize * 0.5
+			local panelCenterY = panelY + panelSize * 0.5
+			local extent = math.max(1, mapCam.extent)
+			local worldToPixel = (panelSize * 0.5) / extent
+			local zoomLabels = { "Near", "Mid", "Full" }
+			local markerSizes = { 4, 5, 7 }
+			local localMarkerSize = markerSizes[mapState.zoomIndex] or 5
+			local peerMarkerSize = math.max(2, localMarkerSize - 1)
+			local showPeerLabels = mapState.zoomIndex <= 2
 
-	local panelSize = clamp(
-		math.floor(math.min(w, h) * mapState.panel.widthRatio),
-		mapState.panel.minSize,
-		mapState.panel.maxSize
-	)
-	local panelX = w - mapState.panel.margin - panelSize
-	local panelY = mapState.panel.margin
-	local panelCenterX = panelX + panelSize * 0.5
-	local panelCenterY = panelY + panelSize * 0.5
-	local extent = math.max(1, mapCam.extent)
-	local worldToPixel = (panelSize * 0.5) / extent
-	local zoomLabels = { "Near", "Mid", "Full" }
-	local markerSizes = { 4, 5, 7 }
-	local localMarkerSize = markerSizes[mapState.zoomIndex] or 5
-	local peerMarkerSize = math.max(2, localMarkerSize - 1)
+			mapPanelX = panelX
+			mapPanelY = panelY
+			mapPanelSize = panelSize
 
-	love.graphics.setColor(0.03, 0.05, 0.06, 0.88)
-	love.graphics.rectangle("fill", panelX, panelY, panelSize, panelSize, 5, 5)
+			drawHudPlate(panelX, panelY, panelSize, panelSize, 6)
+			local mapImage = ensureMapGroundImage(panelSize, mapCam)
+			love.graphics.setScissor(panelX, panelY, panelSize, panelSize)
+			if mapImage then
+				local scale = panelSize / math.max(1, mapState.mapRes)
+				love.graphics.setColor(1, 1, 1, 0.97)
+				love.graphics.draw(mapImage, panelX, panelY, 0, scale, scale)
+			else
+				love.graphics.setColor(0.16, 0.22, 0.18, 0.92)
+				love.graphics.rectangle("fill", panelX, panelY, panelSize, panelSize)
+			end
 
-	local gridImage = ensureMapGridImage()
-	local tileWorld = math.max(50, extent / 3.2)
-	local tilePixel = tileWorld * worldToPixel
-	local tileScale = tilePixel / math.max(1, mapState.gridImageSize)
-	local tileSpanCount = math.ceil((panelSize * 1.7) / math.max(1, tilePixel))
-	local worldOffsetX = -viewMath.positiveMod(mapCam.pos[1], tileWorld)
-	local worldOffsetZ = -viewMath.positiveMod(mapCam.pos[3], tileWorld)
+			local function drawMarker(worldX, worldZ, color, radius)
+				local dx = worldX - mapCam.pos[1]
+				local dz = worldZ - mapCam.pos[3]
+				local mapX, mapZ = viewMath.rotateWorldDeltaToMap(dx, dz, mapCam.heading)
+				local sx = panelCenterX + mapX * worldToPixel
+				local sy = panelCenterY - mapZ * worldToPixel
+				if sx < panelX or sx > (panelX + panelSize) or sy < panelY or sy > (panelY + panelSize) then
+					return nil
+				end
+				love.graphics.setColor(color[1], color[2], color[3], color[4] or 1)
+				love.graphics.circle("fill", sx, sy, radius)
+				return sx, sy
+			end
 
-	love.graphics.setScissor(panelX, panelY, panelSize, panelSize)
-	for ix = -tileSpanCount, tileSpanCount do
-		for iz = -tileSpanCount, tileSpanCount do
-			local worldDX = worldOffsetX + ix * tileWorld
-			local worldDZ = worldOffsetZ + iz * tileWorld
-			local mapX, mapZ = viewMath.rotateWorldDeltaToMap(worldDX, worldDZ, mapCam.heading)
-			local sx = panelCenterX + mapX * worldToPixel
-			local sy = panelCenterY - mapZ * worldToPixel
-			love.graphics.setColor(0.72, 0.8, 0.72, 0.24)
-			love.graphics.draw(
-				gridImage,
-				sx,
-				sy,
-				-mapCam.heading,
-				tileScale,
-				tileScale,
-				mapState.gridImageSize * 0.5,
-				mapState.gridImageSize * 0.5
+			if localPlayerObject and localPlayerObject.pos then
+				drawMarker(localPlayerObject.pos[1], localPlayerObject.pos[3], { 0.96, 0.36, 0.12, 0.95 }, localMarkerSize)
+			end
+			for peerId, peerObj in pairs(peers) do
+				if peerObj and peerObj.pos then
+					local sx, sy = drawMarker(peerObj.pos[1], peerObj.pos[3], { 0.22, 0.72, 1.0, 0.92 }, peerMarkerSize)
+					if sx and sy and showPeerLabels then
+						local label = sanitizeCallsign(peerObj.callsign) or ("P" .. tostring(peerId))
+						local textW = love.graphics.getFont():getWidth(label)
+						local tx = clamp(sx + peerMarkerSize + 3, panelX + 2, panelX + panelSize - textW - 2)
+						local ty = clamp(sy - math.floor(love.graphics.getFont():getHeight() * 0.5), panelY + 2,
+							panelY + panelSize - love.graphics.getFont():getHeight() - 2)
+						love.graphics.setColor(0, 0, 0, 0.5)
+						love.graphics.print(label, tx + 1, ty + 1)
+						love.graphics.setColor(0.9, 0.96, 1.0, 0.95)
+						love.graphics.print(label, tx, ty)
+					end
+				end
+			end
+
+			love.graphics.setColor(1, 1, 1, 0.95)
+			love.graphics.circle("line", panelCenterX, panelCenterY, localMarkerSize + 2)
+			love.graphics.polygon(
+				"fill",
+				panelCenterX, panelCenterY - (localMarkerSize + 5),
+				panelCenterX - 3, panelCenterY - (localMarkerSize + 1),
+				panelCenterX + 3, panelCenterY - (localMarkerSize + 1)
+			)
+			love.graphics.setScissor()
+
+			love.graphics.setColor(0.86, 0.92, 1.0, 0.95)
+			love.graphics.rectangle("line", panelX, panelY, panelSize, panelSize, 6, 6)
+			love.graphics.print(
+				string.format("Map %s (M tap/toggle, hold+Up/Down zoom)", zoomLabels[mapState.zoomIndex] or tostring(mapState.zoomIndex)),
+				panelX,
+				panelY + panelSize + 4
 			)
 		end
 	end
 
-	local function drawMarker(worldX, worldZ, color, radius)
-		local dx = worldX - mapCam.pos[1]
-		local dz = worldZ - mapCam.pos[3]
-		local mapX, mapZ = viewMath.rotateWorldDeltaToMap(dx, dz, mapCam.heading)
-		local sx = panelCenterX + mapX * worldToPixel
-		local sy = panelCenterY - mapZ * worldToPixel
-		if sx < panelX or sx > (panelX + panelSize) or sy < panelY or sy > (panelY + panelSize) then
-			return
+	if camera then
+		local lat, lon = worldToGeo(camera.pos[1], camera.pos[3])
+		local metersPerUnit = math.max(1e-6, tonumber(geoConfig.metersPerUnit) or 1.0)
+		local groundY = sampleGroundHeightAtWorld(camera.pos[1], camera.pos[3], activeGroundParams or defaultGroundParams)
+		local altMsl = camera.pos[2] * metersPerUnit
+		local altAgl = (camera.pos[2] - groundY) * metersPerUnit
+		local infoW = 236
+		local infoH = 78
+		local infoX = w - infoW - 12
+		local infoY = 12
+		if mapPanelX and mapPanelY and mapPanelSize then
+			infoX = mapPanelX + math.max(0, mapPanelSize - infoW)
+			infoY = mapPanelY + mapPanelSize + 24
 		end
-
-		love.graphics.setColor(color[1], color[2], color[3], color[4] or 1)
-		love.graphics.circle("fill", sx, sy, radius)
-	end
-
-	if localPlayerObject and localPlayerObject.pos then
-		drawMarker(localPlayerObject.pos[1], localPlayerObject.pos[3], { 0.96, 0.36, 0.12, 0.95 }, localMarkerSize)
-	end
-	for _, peerObj in pairs(peers) do
-		if peerObj and peerObj.pos then
-			drawMarker(peerObj.pos[1], peerObj.pos[3], { 0.22, 0.72, 1.0, 0.92 }, peerMarkerSize)
+		if infoY + infoH > h - 8 then
+			infoY = h - infoH - 8
 		end
+		drawHudPlate(infoX, infoY, infoW, infoH, 6)
+		love.graphics.setColor(hudTheme.text[1], hudTheme.text[2], hudTheme.text[3], hudTheme.text[4])
+		love.graphics.print(string.format("LAT %.6f", lat), infoX + 10, infoY + 8)
+		love.graphics.print(string.format("LON %.6f", lon), infoX + 10, infoY + 24)
+		love.graphics.setColor(hudTheme.textDim[1], hudTheme.textDim[2], hudTheme.textDim[3], hudTheme.textDim[4])
+		love.graphics.print(string.format("ALT MSL %7.1f m", altMsl), infoX + 10, infoY + 42)
+		love.graphics.print(string.format("ALT AGL %7.1f m", altAgl), infoX + 10, infoY + 58)
 	end
-
-	love.graphics.setColor(1, 1, 1, 0.95)
-	love.graphics.circle("line", panelCenterX, panelCenterY, localMarkerSize + 2)
-	love.graphics.polygon(
-		"fill",
-		panelCenterX, panelCenterY - (localMarkerSize + 5),
-		panelCenterX - 3, panelCenterY - (localMarkerSize + 1),
-		panelCenterX + 3, panelCenterY - (localMarkerSize + 1)
-	)
-
-	love.graphics.setScissor()
-	love.graphics.setColor(0.86, 0.92, 1.0, 0.95)
-	love.graphics.rectangle("line", panelX, panelY, panelSize, panelSize, 5, 5)
-	love.graphics.print(
-		string.format("Map %s (M tap/toggle, hold+Up/Down zoom)", zoomLabels[mapState.zoomIndex] or tostring(mapState.zoomIndex)),
-		panelX,
-		panelY + panelSize + 4
-	)
 end
 
 function love.draw()
@@ -4298,7 +4837,7 @@ function love.draw()
 		love.graphics.circle("fill", centerX, centerY, 1)
 	end
 
-	drawHud(screen.w, screen.h, centerX, centerY)
+	drawHud(screen.w, screen.h, centerX, centerY, renderCamera)
 
 	if pauseMenu.active then
 		drawPauseMenu()
@@ -4310,6 +4849,8 @@ function love.resize(w, h)
 	screen.h = h
 	renderer.resize(screen)
 	refreshUiFonts()
+	resetHudCaches()
+	invalidateMapCache()
 
 	zBuffer = {}
 	for i = 1, screen.w * screen.h do

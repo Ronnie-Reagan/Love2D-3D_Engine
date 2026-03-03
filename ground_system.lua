@@ -235,6 +235,56 @@ function ground.sampleGroundHeightAtWorld(worldX, worldZ, params)
 	return baseHeight - ((worldX * worldX + worldZ * worldZ) * curvature)
 end
 
+local function frac(v)
+	return v - math.floor(v)
+end
+
+local function hash01(ix, iz, salt, seed)
+	local h = math.sin(ix * 127.1 + iz * 311.7 + seed * 13.17 + salt * 17.3) * 43758.5453123
+	return frac(h)
+end
+
+local function variedColor(base, var, ix, iz, salt, seed)
+	return {
+		clamp(base[1] + (hash01(ix, iz, salt, seed) * 2 - 1) * var[1], 0, 1),
+		clamp(base[2] + (hash01(ix, iz, salt + 11, seed) * 2 - 1) * var[2], 0, 1),
+		clamp(base[3] + (hash01(ix, iz, salt + 23, seed) * 2 - 1) * var[3], 0, 1)
+	}
+end
+
+function ground.sampleGroundColorAtWorld(worldX, worldZ, params)
+	if not params then
+		return { 0.2, 0.62, 0.22 }
+	end
+
+	local tileSize = tonumber(params.tileSize) or 20
+	local seed = tonumber(params.seed) or 1
+	local tileIndexX = math.floor(worldX / tileSize)
+	local tileIndexZ = math.floor(worldZ / tileSize)
+	local roadWidth = 0.03 + clamp(tonumber(params.roadDensity) or 0, 0, 1) * 0.28
+	local roadFreq = 0.06 + ((tonumber(params.roadCount) or 0) * 0.012)
+	local fieldChance = clamp((tonumber(params.fieldCount) or 0) / 35, 0.08, 0.45)
+
+	local roadSignalX = math.abs(math.sin((tileIndexX + seed * 0.13) * roadFreq))
+	local roadSignalZ = math.abs(math.sin((tileIndexZ - seed * 0.21) * (roadFreq * 1.11)))
+	local regionNoise = hash01(math.floor(tileIndexX / 7), math.floor(tileIndexZ / 7), 41, seed)
+
+	local grass = params.grassColor or { 0.2, 0.62, 0.22 }
+	local road = params.roadColor or { 0.1, 0.1, 0.1 }
+	local field = params.fieldColor or { 0.35, 0.45, 0.2 }
+	local grassVar = params.grassVar or { 0.05, 0.1, 0.05 }
+	local roadVar = params.roadVar or { 0.02, 0.02, 0.02 }
+	local fieldVar = params.fieldVar or { 0.04, 0.06, 0.04 }
+
+	if roadSignalX < roadWidth or roadSignalZ < roadWidth then
+		return variedColor(road, roadVar, tileIndexX, tileIndexZ, 3, seed)
+	end
+	if regionNoise < fieldChance then
+		return variedColor(field, fieldVar, tileIndexX, tileIndexZ, 7, seed)
+	end
+	return variedColor(grass, grassVar, tileIndexX, tileIndexZ, 13, seed)
+end
+
 function ground.generateGroundMeshModel(params, centerX, centerZ)
 	local tileSize = params.tileSize
 	local gridCount = params.gridCount
@@ -242,36 +292,8 @@ function ground.generateGroundMeshModel(params, centerX, centerZ)
 	centerX = centerX or 0
 	centerZ = centerZ or 0
 
-	local grass = params.grassColor
-	local road = params.roadColor
-	local field = params.fieldColor
-
-	local grassVar = params.grassVar
-	local roadVar = params.roadVar
-	local fieldVar = params.fieldVar
-
-	local function frac(v)
-		return v - math.floor(v)
-	end
-
-	local function hash01(ix, iz, salt)
-		local h = math.sin(ix * 127.1 + iz * 311.7 + params.seed * 13.17 + salt * 17.3) * 43758.5453123
-		return frac(h)
-	end
-
-	local function varied(base, var, ix, iz, salt)
-		return {
-			clamp(base[1] + (hash01(ix, iz, salt) * 2 - 1) * var[1], 0, 1),
-			clamp(base[2] + (hash01(ix, iz, salt + 11) * 2 - 1) * var[2], 0, 1),
-			clamp(base[3] + (hash01(ix, iz, salt + 23) * 2 - 1) * var[3], 0, 1)
-		}
-	end
-
 	local vertices, faces = {}, {}
 	local vertexColors, faceColors = {}, {}
-	local roadWidth = 0.03 + clamp(params.roadDensity, 0, 1) * 0.28
-	local roadFreq = 0.06 + (params.roadCount * 0.012)
-	local fieldChance = clamp((params.fieldCount / 35), 0.08, 0.45)
 
 	for gx = 1, gridCount do
 		for gz = 1, gridCount do
@@ -281,20 +303,7 @@ function ground.generateGroundMeshModel(params, centerX, centerZ)
 			local posZ = localTileZ * tileSize + half
 			local worldCenterX = centerX + posX
 			local worldCenterZ = centerZ + posZ
-			local tileIndexX = math.floor(worldCenterX / tileSize)
-			local tileIndexZ = math.floor(worldCenterZ / tileSize)
-
-			local roadSignalX = math.abs(math.sin((tileIndexX + params.seed * 0.13) * roadFreq))
-			local roadSignalZ = math.abs(math.sin((tileIndexZ - params.seed * 0.21) * (roadFreq * 1.11)))
-			local regionNoise = hash01(math.floor(tileIndexX / 7), math.floor(tileIndexZ / 7), 41)
-			local c
-			if roadSignalX < roadWidth or roadSignalZ < roadWidth then
-				c = varied(road, roadVar, tileIndexX, tileIndexZ, 3)
-			elseif regionNoise < fieldChance then
-				c = varied(field, fieldVar, tileIndexX, tileIndexZ, 7)
-			else
-				c = varied(grass, grassVar, tileIndexX, tileIndexZ, 13)
-			end
+			local c = ground.sampleGroundColorAtWorld(worldCenterX, worldCenterZ, params)
 			local rgba = { c[1], c[2], c[3], 1.0 }
 
 			local x0 = posX - half
