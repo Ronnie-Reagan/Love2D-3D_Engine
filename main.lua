@@ -81,12 +81,20 @@ playerModelCache = {}
 modelTransferState = {
 	requestCooldown = 1.4,
 	chunkSize = 720,
-	maxChunksPerTick = 3,
+	maxChunksPerTick = 1,
 	transferTimeout = 15.0,
+	maxRawBytes = 8 * 1024 * 1024,
+	maxEncodedBytes = 12 * 1024 * 1024,
 	requestedAt = {},
 	outgoing = {},
 	incoming = {}
 }
+local stateNet = {
+	sendInterval = 1 / 20,
+	lastSentAt = -math.huge,
+	forceSend = true
+}
+local forceStateSync
 local worldHalfExtent = 1000
 local defaultGroundParams = {
 	seed = math.random(0, 999999),
@@ -1074,6 +1082,13 @@ function cacheModelEntry(raw, sourceLabel)
 	if type(raw) ~= "string" or raw == "" then
 		return nil, "empty STL data"
 	end
+	if #raw > (modelTransferState.maxRawBytes or math.huge) then
+		return nil, string.format(
+			"STL too large for relay transfer (%d bytes > %d).",
+			#raw,
+			modelTransferState.maxRawBytes
+		)
+	end
 
 	local stlModel, loadErr = engine.loadSTLData(raw)
 	if not stlModel then
@@ -1082,6 +1097,13 @@ function cacheModelEntry(raw, sourceLabel)
 	local normalized = engine.normalizeModel(stlModel, normalizedPlayerModelExtent)
 	local hash = hashModelBytes(raw)
 	local encoded = encodeModelBytes(raw)
+	if encoded and encoded ~= "" and #encoded > (modelTransferState.maxEncodedBytes or math.huge) then
+		return nil, string.format(
+			"Encoded STL too large for relay transfer (%d bytes > %d).",
+			#encoded,
+			modelTransferState.maxEncodedBytes
+		)
+	end
 	local chunkSize = modelTransferState.chunkSize
 	local chunks = {}
 	if encoded and encoded ~= "" then
@@ -1123,6 +1145,7 @@ function setActivePlayerModel(entry, sourceLabel, targetRole)
 		syncActivePlayerModelState()
 	end
 	refreshAllPeerModels()
+	forceStateSync()
 
 	logger.log(string.format(
 		"Loaded %s STL '%s' [%s] (%d verts, %d faces).",
@@ -1132,6 +1155,11 @@ function setActivePlayerModel(entry, sourceLabel, targetRole)
 		#(entry.model.vertices or {}),
 		#(entry.model.faces or {})
 	))
+	if entry.chunkCount and entry.chunkCount > 0 then
+		logger.log(string.format("Model %s is shareable (%d bytes, %d chunks).", entry.hash, entry.byteLength or 0, entry.chunkCount))
+	else
+		logger.log("Model " .. tostring(entry.hash) .. " is local-only (transfer payload unavailable).")
+	end
 end
 
 function loadPlayerModelFromRaw(raw, sourceLabel, targetRole)
@@ -1373,6 +1401,7 @@ function syncActivePlayerModelState()
 		applyPlaneVisualToObject(localPlayerObject, playerModelHash, playerModelScale)
 		syncLocalPlayerObject()
 	end
+	forceStateSync()
 end
 
 local function setFlightMode(enabled)
@@ -1481,6 +1510,11 @@ local function formatNetFloat(value)
 	return string.format("%.4f", tonumber(value) or 0)
 end
 
+forceStateSync = function()
+	stateNet.forceSend = true
+	stateNet.lastSentAt = -math.huge
+end
+
 function encodeColor3Token(color)
 	return table.concat({
 		formatNetFloat(color[1]),
@@ -1515,6 +1549,9 @@ end
 function queueModelTransfer(hash)
 	local entry = playerModelCache[hash]
 	if not entry or not entry.encoded or entry.chunkCount <= 0 then
+		if entry and (not entry.encoded or entry.chunkCount <= 0) then
+			logger.log("Model " .. tostring(hash) .. " is local-only (no transferable payload).")
+		end
 		return false
 	end
 	if modelTransferState.outgoing[hash] then
@@ -1633,6 +1670,12 @@ function handleModelMetaPacket(data)
 		return false
 	end
 	if chunkSize > 4096 or chunkCount > 20000 then
+		return false
+	end
+	if byteLength > (modelTransferState.maxRawBytes or math.huge) then
+		return false
+	end
+	if encodedLength > (modelTransferState.maxEncodedBytes or math.huge) then
 		return false
 	end
 	if playerModelCache[hash] then
@@ -2282,6 +2325,7 @@ local function reconnectRelay()
 	relayServer = peerOrErr
 	if relayServer then
 		logger.log("Reconnecting to relay server: " .. hostAddy)
+		forceStateSync()
 		return true
 	end
 
@@ -4290,7 +4334,6 @@ function submitModelLoadPrompt()
 
 	local ok, entryOrErr = loadPlayerModelFromStl(path, modelLoadTargetRole)
 	if ok then
-		queueModelTransfer(entryOrErr.hash)
 		closeModelLoadPrompt("Loaded STL: " .. path, 2.4)
 	else
 		closeModelLoadPrompt("Failed to load STL: " .. tostring(entryOrErr), 2.6)
@@ -4344,7 +4387,7 @@ local function updateNet()
 	local canSend = relayIsConnected()
 	local now = love.timer.getTime()
 
-	if canSend then
+	if canSend and (stateNet.forceSend or (now - stateNet.lastSentAt) >= stateNet.sendInterval) then
 		local activeRole = getActiveModelRole()
 		local activeHash, activeScale = getConfiguredModelForRole(activeRole)
 		local planeHash, planeScale = getConfiguredModelForRole("plane")
@@ -4369,6 +4412,8 @@ local function updateNet()
 		pcall(function()
 			relayServer:send(packet)
 		end)
+		stateNet.lastSentAt = now
+		stateNet.forceSend = false
 
 		sendCloudSnapshot(false)
 	end
@@ -4384,6 +4429,7 @@ local function serviceNetworkEvents()
 	while event do
 		if event.type == "connect" and relayServer and event.peer == relayServer then
 			beginCloudRoleElection("relay handshake complete")
+			forceStateSync()
 		elseif event.type == "receive" then
 			local packetType = type(event.data) == "string" and event.data:match("^([^|]+)")
 			if packetType == "STATE" then
@@ -4424,6 +4470,7 @@ local function serviceNetworkEvents()
 		elseif event.type == "disconnect" and relayServer and event.peer == relayServer then
 			relayServer = nil
 			clearPeerObjects()
+			forceStateSync()
 			cloudNetState.authorityPeerId = nil
 			groundNetState.authorityPeerId = nil
 			groundNetState.lastSnapshotReceivedAt = -math.huge
@@ -4821,7 +4868,6 @@ function love.filedropped(file)
 	local dropRole = modelLoadPrompt.active and (modelLoadTargetRole or getActiveModelRole()) or getActiveModelRole()
 	local ok, entryOrErr = loadPlayerModelFromRaw(raw, name, dropRole)
 	if ok then
-		queueModelTransfer(entryOrErr.hash)
 		modelLoadPrompt.active = false
 		if pauseMenu.active then
 			setPauseStatus("Loaded dropped STL: " .. tostring(name), 2.4)
