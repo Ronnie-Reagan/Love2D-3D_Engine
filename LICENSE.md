@@ -19,6 +19,7 @@ All rights reserved.
    - View and study the Software
    - Use the Software only in its original, unmodified form
    - Modify the Software privately for personal use only
+   - Submit 'Pull Requests' to the original Github Repo
 
    No other rights are granted, whether implied or explicit.
 
