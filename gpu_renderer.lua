@@ -3,8 +3,11 @@ local love = require "love"
 local q = require "quat"
 
 local vertexFormat = {
-    { location = 0, format = "floatvec3" },
-    { location = 2, format = "floatvec4" }
+    { name = "VertexPosition", location = 0, format = "floatvec3" },
+    { name = "aTexCoord0", location = 5, format = "floatvec2" },
+    { name = "VertexColor", location = 2, format = "floatvec4" },
+    { name = "aNormal", location = 3, format = "floatvec3" },
+    { name = "aTangent", location = 4, format = "floatvec4" }
 }
 
 local shaderSource = [[
@@ -24,12 +27,82 @@ uniform float uAspect;
 uniform float uNear;
 uniform float uFar;
 
+uniform vec4 uBaseColorFactor;
+uniform float uMetallicFactor;
+uniform float uRoughnessFactor;
+uniform vec3 uEmissiveFactor;
+uniform float uAlphaCutoff;
+uniform float uAlphaMode; // 0=OPAQUE, 1=MASK, 2=BLEND
+uniform float uDoubleSided;
+
+uniform float uUseBaseColorTex;
+uniform float uUseMetalRoughTex;
+uniform float uUseNormalTex;
+uniform float uUseOcclusionTex;
+uniform float uUseEmissiveTex;
+uniform float uUsePaintTex;
+uniform float uNormalScale;
+uniform float uOcclusionStrength;
+
+uniform Image uBaseColorTex;
+uniform Image uMetalRoughTex;
+uniform Image uNormalTex;
+uniform Image uOcclusionTex;
+uniform Image uEmissiveTex;
+uniform Image uPaintTex;
+
+uniform vec3 uLightDir;
+uniform vec3 uLightColor;
+uniform float uAmbientStrength;
+
+varying vec3 vWorldPos;
+varying vec3 vWorldNormal;
+varying vec3 vWorldTangent;
+varying vec3 vWorldBitangent;
+varying vec2 vUv;
+
+const float PI = 3.14159265359;
+
+vec3 safeNormalize(vec3 v)
+{
+    float len2 = dot(v, v);
+    if (len2 <= 1e-10) {
+        return vec3(0.0, 0.0, 1.0);
+    }
+    return normalize(v);
+}
+
+#ifdef VERTEX
+layout(location = 3) in vec3 aNormal;
+layout(location = 4) in vec4 aTangent;
+layout(location = 5) in vec2 aTexCoord0;
+
 vec4 position(mat4 transform_projection, vec4 vertex_position)
 {
     vec3 worldPos = uObjPos
         + (vertex_position.x * uObjScale.x) * uObjRight
         + (vertex_position.y * uObjScale.y) * uObjUp
         + (vertex_position.z * uObjScale.z) * uObjForward;
+
+    vec3 worldNormal = safeNormalize(
+        aNormal.x * uObjRight +
+        aNormal.y * uObjUp +
+        aNormal.z * uObjForward
+    );
+
+    vec3 worldTangent = safeNormalize(
+        aTangent.x * uObjRight +
+        aTangent.y * uObjUp +
+        aTangent.z * uObjForward
+    );
+
+    vec3 worldBitangent = safeNormalize(cross(worldNormal, worldTangent) * aTangent.w);
+
+    vWorldPos = worldPos;
+    vWorldNormal = worldNormal;
+    vWorldTangent = worldTangent;
+    vWorldBitangent = worldBitangent;
+    vUv = aTexCoord0;
 
     vec3 rel = worldPos - uCamPos;
     vec3 cam = vec3(
@@ -42,7 +115,6 @@ vec4 position(mat4 transform_projection, vec4 vertex_position)
     float a = (uFar + uNear) / (uFar - uNear);
     float b = (-2.0 * uFar * uNear) / (uFar - uNear);
 
-    // Clip-space output with w = z for perspective division and proper depth testing.
     return vec4(
         cam.x * f / uAspect,
         cam.y * f,
@@ -50,11 +122,121 @@ vec4 position(mat4 transform_projection, vec4 vertex_position)
         cam.z
     );
 }
+#endif
+
+#ifdef PIXEL
+float distributionGGX(float NdotH, float roughness)
+{
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float denom = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
+    return a2 / max(PI * denom * denom, 1e-5);
+}
+
+float geometrySchlickGGX(float NdotV, float roughness)
+{
+    float r = roughness + 1.0;
+    float k = (r * r) / 8.0;
+    float denom = NdotV * (1.0 - k) + k;
+    return NdotV / max(denom, 1e-5);
+}
+
+float geometrySmith(float NdotV, float NdotL, float roughness)
+{
+    float ggx1 = geometrySchlickGGX(NdotV, roughness);
+    float ggx2 = geometrySchlickGGX(NdotL, roughness);
+    return ggx1 * ggx2;
+}
+
+vec3 fresnelSchlick(float cosTheta, vec3 F0)
+{
+    return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
+}
 
 vec4 effect(vec4 color, Image texture, vec2 texture_coords, vec2 screen_coords)
 {
-    return vec4(color.rgb * uColor, color.a * uAlpha);
+    vec2 uv = vUv;
+
+    vec4 baseTex = Texel(uBaseColorTex, uv);
+    if (uUseBaseColorTex < 0.5) {
+        baseTex = vec4(1.0);
+    }
+
+    vec4 baseColor = baseTex * uBaseColorFactor * vec4(uColor, uAlpha) * color;
+    float alpha = clamp(baseColor.a, 0.0, 1.0);
+
+    if (uUsePaintTex > 0.5) {
+        vec4 paint = Texel(uPaintTex, uv);
+        baseColor.rgb = mix(baseColor.rgb, paint.rgb, clamp(paint.a, 0.0, 1.0));
+    }
+
+    float metallic = clamp(uMetallicFactor, 0.0, 1.0);
+    float roughness = clamp(uRoughnessFactor, 0.04, 1.0);
+    if (uUseMetalRoughTex > 0.5) {
+        vec4 mr = Texel(uMetalRoughTex, uv);
+        metallic = clamp(metallic * mr.b, 0.0, 1.0);
+        roughness = clamp(roughness * mr.g, 0.04, 1.0);
+    }
+
+    float ao = 1.0;
+    if (uUseOcclusionTex > 0.5) {
+        float occ = Texel(uOcclusionTex, uv).r;
+        ao = mix(1.0, occ, clamp(uOcclusionStrength, 0.0, 1.0));
+    }
+
+    vec3 emissive = uEmissiveFactor;
+    if (uUseEmissiveTex > 0.5) {
+        emissive *= Texel(uEmissiveTex, uv).rgb;
+    }
+
+    vec3 N = safeNormalize(vWorldNormal);
+    if (uUseNormalTex > 0.5) {
+        vec3 tangentNormal = Texel(uNormalTex, uv).xyz * 2.0 - 1.0;
+        tangentNormal.xy *= uNormalScale;
+        mat3 tbn = mat3(
+            safeNormalize(vWorldTangent),
+            safeNormalize(vWorldBitangent),
+            safeNormalize(vWorldNormal)
+        );
+        N = safeNormalize(tbn * tangentNormal);
+    }
+
+    vec3 V = safeNormalize(uCamPos - vWorldPos);
+    if (uDoubleSided > 0.5 && dot(N, V) < 0.0) {
+        N = -N;
+    }
+    vec3 L = safeNormalize(uLightDir);
+    vec3 H = safeNormalize(V + L);
+
+    float NdotL = max(dot(N, L), 0.0);
+    float NdotV = max(dot(N, V), 0.0);
+    float NdotH = max(dot(N, H), 0.0);
+    float VdotH = max(dot(V, H), 0.0);
+
+    vec3 F0 = mix(vec3(0.04), baseColor.rgb, metallic);
+    vec3 F = fresnelSchlick(VdotH, F0);
+    float D = distributionGGX(NdotH, roughness);
+    float G = geometrySmith(NdotV, NdotL, roughness);
+
+    vec3 specular = (D * G * F) / max(4.0 * NdotV * NdotL, 1e-5);
+    vec3 kD = (1.0 - F) * (1.0 - metallic);
+    vec3 diffuse = (kD * baseColor.rgb) / PI;
+
+    vec3 direct = (diffuse + specular) * uLightColor * NdotL;
+    vec3 ambient = baseColor.rgb * (uAmbientStrength * ao);
+    vec3 finalColor = ambient + (direct * ao) + emissive;
+    finalColor = max(finalColor, vec3(0.0));
+    finalColor = pow(finalColor, vec3(1.0 / 2.2));
+
+    if (uAlphaMode > 0.5 && uAlphaMode < 1.5) {
+        alpha = (alpha >= uAlphaCutoff) ? 1.0 : 0.0;
+    } else if (uAlphaMode < 0.5) {
+        alpha = 1.0;
+    }
+
+    return vec4(finalColor, alpha);
 }
+#endif
 ]]
 
 local meshCache = setmetatable({}, { __mode = "k" })
@@ -67,26 +249,58 @@ local state = {
     nearPlane = 0.1,
     farPlane = 5000.0,
     log = function(_) end,
-    loggedFirstFrame = false
+    loggedFirstFrame = false,
+    loggedMaterialDebug = false,
+    whiteTexture = nil,
+    blackTexture = nil,
+    normalTexture = nil
+}
+
+local defaultMaterial = {
+    baseColorFactor = { 1, 1, 1, 1 },
+    metallicFactor = 0,
+    roughnessFactor = 1,
+    emissiveFactor = { 0, 0, 0 },
+    alphaMode = "OPAQUE",
+    alphaCutoff = 0.5,
+    doubleSided = false
 }
 
 local function log(message)
     state.log("[gpu] " .. tostring(message))
 end
 
-local function cloneObjects(objects)
-    local out = {}
-    for i, obj in ipairs(objects) do
-        out[i] = obj
+local function normalize3(v)
+    local x = (v and v[1]) or 0
+    local y = (v and v[2]) or 0
+    local z = (v and v[3]) or 1
+    local len = math.sqrt(x * x + y * y + z * z)
+    if len <= 1e-8 then
+        return { 0, 0, 1 }
     end
-    return out
+    return { x / len, y / len, z / len }
+end
+
+local function cross3(a, b)
+    return {
+        a[2] * b[3] - a[3] * b[2],
+        a[3] * b[1] - a[1] * b[3],
+        a[1] * b[2] - a[2] * b[1]
+    }
+end
+
+local function sub3(a, b)
+    return {
+        (a[1] or 0) - (b[1] or 0),
+        (a[2] or 0) - (b[2] or 0),
+        (a[3] or 0) - (b[3] or 0)
+    }
 end
 
 local function cameraSpaceDepth(worldPos, camera)
     if not worldPos or not camera or not camera.pos or not camera.rot then
         return -math.huge
     end
-
     local rel = {
         worldPos[1] - camera.pos[1],
         worldPos[2] - camera.pos[2],
@@ -97,65 +311,206 @@ local function cameraSpaceDepth(worldPos, camera)
     return cam[3]
 end
 
-local function isTransparent(obj)
-    local color = obj and obj.color
-    local alpha = color and color[4] or 1
-    return alpha < 0.999
+local function buildSolidTexture(r, g, b, a)
+    local imageData = love.image.newImageData(1, 1)
+    imageData:setPixel(0, 0, r, g, b, a or 1)
+    local image = love.graphics.newImage(imageData)
+    image:setFilter("linear", "linear")
+    return image
 end
 
-local function buildMeshForModel(model)
+local function ensureFallbackTextures()
+    if not state.whiteTexture then
+        state.whiteTexture = buildSolidTexture(1, 1, 1, 1)
+    end
+    if not state.blackTexture then
+        state.blackTexture = buildSolidTexture(0, 0, 0, 1)
+    end
+    if not state.normalTexture then
+        state.normalTexture = buildSolidTexture(0.5, 0.5, 1.0, 1)
+    end
+end
+
+local function getMaterial(materials, index)
+    if type(materials) == "table" then
+        local m = materials[index]
+        if type(m) == "table" then
+            return m
+        end
+    end
+    return defaultMaterial
+end
+
+local function materialIsTransparent(material, objectAlpha)
+    if (objectAlpha or 1) < 0.999 then
+        return true
+    end
+    if type(material) ~= "table" then
+        return false
+    end
+    return material.alphaMode == "BLEND"
+end
+
+local function getTextureImage(images, textureRef, fallback)
+    if type(textureRef) == "table" then
+        local imageIndex = tonumber(textureRef.imageIndex)
+        if imageIndex and type(images) == "table" then
+            local imageRecord = images[math.floor(imageIndex)]
+            if imageRecord and imageRecord.image then
+                return imageRecord.image, true
+            end
+        end
+    end
+    return fallback, false
+end
+
+local function computeFaceNormal(a, b, c)
+    local e1 = sub3(b, a)
+    local e2 = sub3(c, a)
+    return normalize3(cross3(e1, e2))
+end
+
+local function fallbackTangentFromNormal(normal)
+    local n = normalize3(normal)
+    local ref = math.abs(n[2]) < 0.99 and { 0, 1, 0 } or { 1, 0, 0 }
+    local tangent = cross3(ref, n)
+    tangent = normalize3(tangent)
+    return { tangent[1], tangent[2], tangent[3], 1 }
+end
+
+local function computeFaceTangent(a, b, c, uvA, uvB, uvC, normal)
+    if not (uvA and uvB and uvC) then
+        return fallbackTangentFromNormal(normal)
+    end
+
+    local edge1 = sub3(b, a)
+    local edge2 = sub3(c, a)
+    local du1 = (uvB[1] or 0) - (uvA[1] or 0)
+    local dv1 = (uvB[2] or 0) - (uvA[2] or 0)
+    local du2 = (uvC[1] or 0) - (uvA[1] or 0)
+    local dv2 = (uvC[2] or 0) - (uvA[2] or 0)
+    local denom = du1 * dv2 - du2 * dv1
+
+    if math.abs(denom) <= 1e-8 then
+        return fallbackTangentFromNormal(normal)
+    end
+
+    local r = 1 / denom
+    local tangent = {
+        (edge1[1] * dv2 - edge2[1] * dv1) * r,
+        (edge1[2] * dv2 - edge2[2] * dv1) * r,
+        (edge1[3] * dv2 - edge2[3] * dv1) * r
+    }
+    tangent = normalize3(tangent)
+    return { tangent[1], tangent[2], tangent[3], 1 }
+end
+
+local function appendVertex(target, pos, uv, color, normal, tangent)
+    target[#target + 1] = {
+        pos[1], pos[2], pos[3],
+        uv[1], uv[2],
+        color[1], color[2], color[3], color[4],
+        normal[1], normal[2], normal[3],
+        tangent[1], tangent[2], tangent[3], tangent[4]
+    }
+end
+
+local function buildMeshSetForModel(model)
     if meshCache[model] ~= nil then
         return meshCache[model] or nil
     end
-
     if not model or not model.vertices or not model.faces then
         meshCache[model] = false
         return nil
     end
 
-    local triangleVertices = {}
+    local byMaterialVertices = {}
+    local faceMaterials = model.faceMaterials
+    local normals = model.vertexNormals
+    local uvs = model.vertexUVs
+    local tangents = model.vertexTangents
+    local colors = model.vertexColors
 
-    for _, face in ipairs(model.faces) do
-        if #face >= 3 then
-            for i = 2, #face - 1 do
-                local ia, ib, ic = face[1], face[i], face[i + 1]
-                local a, b, c = model.vertices[ia], model.vertices[ib], model.vertices[ic]
-                local ca = model.vertexColors and model.vertexColors[ia]
-                local cb = model.vertexColors and model.vertexColors[ib]
-                local cc = model.vertexColors and model.vertexColors[ic]
+    for faceIndex, face in ipairs(model.faces) do
+        if type(face) == "table" and #face >= 3 then
+            local materialIndex = tonumber(faceMaterials and faceMaterials[faceIndex]) or 1
+            materialIndex = math.max(1, math.floor(materialIndex))
+            local bucket = byMaterialVertices[materialIndex]
+            if not bucket then
+                bucket = {}
+                byMaterialVertices[materialIndex] = bucket
+            end
 
+            for tri = 2, #face - 1 do
+                local ia, ib, ic = face[1], face[tri], face[tri + 1]
+                local a = model.vertices[ia]
+                local b = model.vertices[ib]
+                local c = model.vertices[ic]
                 if a and b and c then
-                    triangleVertices[#triangleVertices + 1] = {
-                        a[1], a[2], a[3],
-                        (ca and ca[1]) or 1, (ca and ca[2]) or 1, (ca and ca[3]) or 1, (ca and ca[4]) or 1
-                    }
-                    triangleVertices[#triangleVertices + 1] = {
-                        b[1], b[2], b[3],
-                        (cb and cb[1]) or 1, (cb and cb[2]) or 1, (cb and cb[3]) or 1, (cb and cb[4]) or 1
-                    }
-                    triangleVertices[#triangleVertices + 1] = {
-                        c[1], c[2], c[3],
-                        (cc and cc[1]) or 1, (cc and cc[2]) or 1, (cc and cc[3]) or 1, (cc and cc[4]) or 1
-                    }
+                    local uvA = uvs and uvs[ia] or { 0, 0 }
+                    local uvB = uvs and uvs[ib] or { 0, 0 }
+                    local uvC = uvs and uvs[ic] or { 0, 0 }
+                    local faceNormal = computeFaceNormal(a, b, c)
+
+                    local nA = normalize3(normals and normals[ia] or faceNormal)
+                    local nB = normalize3(normals and normals[ib] or faceNormal)
+                    local nC = normalize3(normals and normals[ic] or faceNormal)
+
+                    local faceTangent = computeFaceTangent(a, b, c, uvA, uvB, uvC, faceNormal)
+                    local tA = tangents and tangents[ia] or faceTangent
+                    local tB = tangents and tangents[ib] or faceTangent
+                    local tC = tangents and tangents[ic] or faceTangent
+
+                    local cA = colors and colors[ia] or { 1, 1, 1, 1 }
+                    local cB = colors and colors[ib] or { 1, 1, 1, 1 }
+                    local cC = colors and colors[ic] or { 1, 1, 1, 1 }
+
+                    appendVertex(bucket, a, uvA, cA, nA, tA)
+                    appendVertex(bucket, b, uvB, cB, nB, tB)
+                    appendVertex(bucket, c, uvC, cC, nC, tC)
                 end
             end
         end
     end
 
-    if #triangleVertices == 0 then
+    local meshSet = { byMaterial = {} }
+    local hasMesh = false
+    for materialIndex, vertices in pairs(byMaterialVertices) do
+        if #vertices > 0 then
+            local ok, meshOrErr = pcall(love.graphics.newMesh, vertexFormat, vertices, "triangles", "static")
+            if ok and meshOrErr then
+                meshSet.byMaterial[materialIndex] = {
+                    mesh = meshOrErr,
+                    triangleCount = #vertices / 3
+                }
+                hasMesh = true
+            else
+                log("mesh creation failed (material " .. tostring(materialIndex) .. "): " .. tostring(meshOrErr))
+            end
+        end
+    end
+
+    if not hasMesh then
         meshCache[model] = false
         return nil
     end
 
-    local ok, meshOrErr = pcall(love.graphics.newMesh, vertexFormat, triangleVertices, "triangles", "static")
-    if not ok then
-        log("mesh creation failed: " .. tostring(meshOrErr))
-        meshCache[model] = false
-        return nil
-    end
+    meshCache[model] = meshSet
+    return meshSet
+end
 
-    meshCache[model] = meshOrErr
-    return meshOrErr
+local function alphaModeCode(mode)
+    if mode == "MASK" then
+        return 1
+    end
+    if mode == "BLEND" then
+        return 2
+    end
+    return 0
+end
+
+local function sortCallsBackToFront(a, b)
+    return a.depth > b.depth
 end
 
 function renderer.isReady()
@@ -165,10 +520,11 @@ end
 function renderer.init(screen, camera, logFn)
     state.log = logFn or state.log
     state.aspect = (screen and screen.h and screen.h ~= 0) and (screen.w / screen.h) or 1
-
     if camera and camera.fov then
         state.fov = camera.fov
     end
+
+    ensureFallbackTextures()
 
     local ok, shaderOrErr = pcall(love.graphics.newShader, shaderSource)
     if not ok then
@@ -213,18 +569,14 @@ function renderer.drawWorld(objects, camera, backgroundColor)
     end
 
     local bg = backgroundColor or { 0.2, 0.2, 0.75, 1.0 }
-    local bgA = bg[4] or 1.0
+    love.graphics.clear(bg[1], bg[2], bg[3], bg[4] or 1.0)
 
     if state.depthSupported then
-        -- clear color (LOVE clears depth for the active target as well)
-        love.graphics.clear(bg[1], bg[2], bg[3], bgA)
         love.graphics.setDepthMode("lequal", true)
-    else
-        love.graphics.clear(bg[1], bg[2], bg[3], bgA)
     end
 
-    pcall(love.graphics.setMeshCullMode, "none")
     love.graphics.setShader(state.shader)
+    pcall(love.graphics.setMeshCullMode, "back")
 
     local camPos = camera.pos or { 0, 0, 0 }
     local camRot = camera.rot or { w = 1, x = 0, y = 0, z = 0 }
@@ -241,74 +593,157 @@ function renderer.drawWorld(objects, camera, backgroundColor)
     state.shader:send("uNear", state.nearPlane)
     state.shader:send("uFar", state.farPlane)
 
-    local function drawSingleObject(obj)
-        local mesh = buildMeshForModel(obj.model)
-        if not mesh then
+    local lightDir = normalize3({ 0.35, 0.85, 0.25 })
+    state.shader:send("uLightDir", lightDir)
+    state.shader:send("uLightColor", { 1.75, 1.72, 1.66 })
+    state.shader:send("uAmbientStrength", 0.24)
+
+    local opaqueCalls = {}
+    local transparentCalls = {}
+
+    for _, obj in ipairs(objects) do
+        local meshSet = buildMeshSetForModel(obj and obj.model)
+        if meshSet then
+            local objectAlpha = ((obj.color and obj.color[4]) or 1)
+            for materialIndex, bundle in pairs(meshSet.byMaterial) do
+                local material = getMaterial(obj.materials, materialIndex)
+                local call = {
+                    obj = obj,
+                    mesh = bundle.mesh,
+                    material = material,
+                    triangleCount = bundle.triangleCount,
+                    depth = cameraSpaceDepth(obj.pos, camera)
+                }
+                if materialIsTransparent(material, objectAlpha) then
+                    transparentCalls[#transparentCalls + 1] = call
+                else
+                    opaqueCalls[#opaqueCalls + 1] = call
+                end
+            end
+        end
+    end
+
+    local function drawCall(call)
+        local obj = call.obj
+        local material = call.material or defaultMaterial
+        local mesh = call.mesh
+        if not obj or not material or not mesh then
             return 0
         end
 
         local rot = obj.rot or { w = 1, x = 0, y = 0, z = 0 }
         local scale = obj.scale or { 1, 1, 1 }
-        local color = obj.color or { 0.5, 0.5, 0.5, 1.0 }
-        local alpha = color[4] or 1.0
         local objRight = q.rotateVector(rot, { 1, 0, 0 })
         local objUp = q.rotateVector(rot, { 0, 1, 0 })
         local objForward = q.rotateVector(rot, { 0, 0, 1 })
+
+        local objectColor = obj.color or { 1, 1, 1, 1 }
+        local hasMaterials = type(obj.materials) == "table" and #obj.materials > 0
+        local tint = hasMaterials and { 1, 1, 1 } or { objectColor[1] or 1, objectColor[2] or 1, objectColor[3] or 1 }
+        local alpha = objectColor[4] or 1
 
         state.shader:send("uObjPos", obj.pos or { 0, 0, 0 })
         state.shader:send("uObjRight", objRight)
         state.shader:send("uObjUp", objUp)
         state.shader:send("uObjForward", objForward)
         state.shader:send("uObjScale", { scale[1] or 1, scale[2] or 1, scale[3] or 1 })
-        state.shader:send("uColor", { color[1] or 0.5, color[2] or 0.5, color[3] or 0.5 })
+        state.shader:send("uColor", tint)
         state.shader:send("uAlpha", alpha)
 
+        local baseColorFactor = material.baseColorFactor or defaultMaterial.baseColorFactor
+        state.shader:send("uBaseColorFactor", {
+            baseColorFactor[1] or 1,
+            baseColorFactor[2] or 1,
+            baseColorFactor[3] or 1,
+            baseColorFactor[4] or 1
+        })
+        state.shader:send("uMetallicFactor", tonumber(material.metallicFactor) or 0)
+        state.shader:send("uRoughnessFactor", tonumber(material.roughnessFactor) or 1)
+        state.shader:send("uEmissiveFactor", {
+            (material.emissiveFactor and material.emissiveFactor[1]) or 0,
+            (material.emissiveFactor and material.emissiveFactor[2]) or 0,
+            (material.emissiveFactor and material.emissiveFactor[3]) or 0
+        })
+        state.shader:send("uAlphaCutoff", tonumber(material.alphaCutoff) or 0.5)
+        state.shader:send("uAlphaMode", alphaModeCode(material.alphaMode))
+        state.shader:send("uDoubleSided", (material.doubleSided and 1) or 0)
+
+        local baseTex, useBase = getTextureImage(obj.images, material.baseColorTexture, state.whiteTexture)
+        local metalTex, useMetal = getTextureImage(obj.images, material.metallicRoughnessTexture, state.whiteTexture)
+        local normalTex, useNormal = getTextureImage(obj.images, material.normalTexture, state.normalTexture)
+        local occlusionTex, useOcc = getTextureImage(obj.images, material.occlusionTexture, state.whiteTexture)
+        local emissiveTex, useEmissive = getTextureImage(obj.images, material.emissiveTexture, state.blackTexture)
+        local paintImage = obj.paintOverlay and obj.paintOverlay.image
+
+        state.shader:send("uBaseColorTex", baseTex)
+        state.shader:send("uMetalRoughTex", metalTex)
+        state.shader:send("uNormalTex", normalTex)
+        state.shader:send("uOcclusionTex", occlusionTex)
+        state.shader:send("uEmissiveTex", emissiveTex)
+        state.shader:send("uPaintTex", paintImage or state.whiteTexture)
+
+        state.shader:send("uUseBaseColorTex", useBase and 1 or 0)
+        state.shader:send("uUseMetalRoughTex", useMetal and 1 or 0)
+        state.shader:send("uUseNormalTex", useNormal and 1 or 0)
+        state.shader:send("uUseOcclusionTex", useOcc and 1 or 0)
+        state.shader:send("uUseEmissiveTex", useEmissive and 1 or 0)
+        state.shader:send("uUsePaintTex", paintImage and 1 or 0)
+
+        if not state.loggedMaterialDebug then
+            log(string.format(
+                "material bind: useBase=%s useMR=%s useNormal=%s useAO=%s useEmissive=%s alphaMode=%s",
+                tostring(useBase),
+                tostring(useMetal),
+                tostring(useNormal),
+                tostring(useOcc),
+                tostring(useEmissive),
+                tostring(material.alphaMode or "OPAQUE")
+            ))
+            state.loggedMaterialDebug = true
+        end
+
+        local normalScale = (material.normalTexture and tonumber(material.normalTexture.scale)) or 1
+        local occlusionStrength = (material.occlusionTexture and tonumber(material.occlusionTexture.strength)) or 1
+        state.shader:send("uNormalScale", normalScale)
+        state.shader:send("uOcclusionStrength", occlusionStrength)
+
+        pcall(love.graphics.setMeshCullMode, material.doubleSided and "none" or "back")
         love.graphics.draw(mesh)
-        return mesh:getVertexCount() / 3
+        return call.triangleCount or (mesh:getVertexCount() / 3)
     end
 
     local triangleCount = 0
 
     if state.depthSupported then
-        local opaqueObjects = {}
-        local transparentObjects = {}
-
-        for _, obj in ipairs(objects) do
-            if isTransparent(obj) then
-                transparentObjects[#transparentObjects + 1] = obj
-            else
-                opaqueObjects[#opaqueObjects + 1] = obj
-            end
-        end
-
         love.graphics.setDepthMode("lequal", true)
-        for _, obj in ipairs(opaqueObjects) do
-            triangleCount = triangleCount + drawSingleObject(obj)
+        for _, call in ipairs(opaqueCalls) do
+            triangleCount = triangleCount + drawCall(call)
         end
 
-        if #transparentObjects > 0 then
-            table.sort(transparentObjects, function(a, b)
-                return cameraSpaceDepth(a and a.pos, camera) > cameraSpaceDepth(b and b.pos, camera)
-            end)
-
+        if #transparentCalls > 0 then
+            table.sort(transparentCalls, sortCallsBackToFront)
             love.graphics.setDepthMode("lequal", false)
-            for _, obj in ipairs(transparentObjects) do
-                triangleCount = triangleCount + drawSingleObject(obj)
+            for _, call in ipairs(transparentCalls) do
+                triangleCount = triangleCount + drawCall(call)
             end
             love.graphics.setDepthMode("lequal", true)
         end
     else
-        local drawList = cloneObjects(objects)
-        table.sort(drawList, function(a, b)
-            return cameraSpaceDepth(a and a.pos, camera) > cameraSpaceDepth(b and b.pos, camera)
-        end)
-
-        for _, obj in ipairs(drawList) do
-            triangleCount = triangleCount + drawSingleObject(obj)
+        local drawCalls = {}
+        for i = 1, #opaqueCalls do
+            drawCalls[#drawCalls + 1] = opaqueCalls[i]
+        end
+        for i = 1, #transparentCalls do
+            drawCalls[#drawCalls + 1] = transparentCalls[i]
+        end
+        table.sort(drawCalls, sortCallsBackToFront)
+        for _, call in ipairs(drawCalls) do
+            triangleCount = triangleCount + drawCall(call)
         end
     end
 
     love.graphics.setShader()
+    pcall(love.graphics.setMeshCullMode, "none")
     if state.depthSupported then
         love.graphics.setDepthMode("always", false)
     end

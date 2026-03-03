@@ -34,6 +34,35 @@ local function sanitizeCallsign(value)
     return text
 end
 
+local function sanitizeAngle(value, fallback)
+    local num = tonumber(value)
+    if num ~= nil then
+        return num
+    end
+    return tonumber(fallback) or 0
+end
+
+local function sanitizeOrientationTable(value, fallback)
+    local source = (type(value) == "table") and value or fallback or {}
+    return {
+        yaw = sanitizeAngle(source.yaw, 0),
+        pitch = sanitizeAngle(source.pitch, 0),
+        roll = sanitizeAngle(source.roll, 0)
+    }
+end
+
+local function buildOrientationOffsetQuat(q, baseOffset, orientation)
+    local orient = sanitizeOrientationTable(orientation, { yaw = 0, pitch = 0, roll = 0 })
+    local yawQuat = q.fromAxisAngle({ 0, 1, 0 }, math.rad(orient.yaw))
+    local pitchQuat = q.fromAxisAngle({ 1, 0, 0 }, math.rad(orient.pitch))
+    local rollQuat = q.fromAxisAngle({ 0, 0, 1 }, math.rad(orient.roll))
+    local userOffset = q.normalize(q.multiply(q.multiply(yawQuat, pitchQuat), rollQuat))
+    if baseOffset then
+        return q.normalize(q.multiply(baseOffset, userOffset))
+    end
+    return userOffset
+end
+
 function networking.createObjectForPeer(peerID, objects, q, playerModel, playerModelRotationOffset, defaults)
     defaults = defaults or {}
     local startScale = sanitizeScale(defaults.scale, 1.35)
@@ -42,14 +71,19 @@ function networking.createObjectForPeer(peerID, objects, q, playerModel, playerM
     local role = sanitizeRole(defaults.role or "plane")
     local planeModelHash = defaults.planeModelHash or defaults.modelHash or "builtin-cube"
     local walkingModelHash = defaults.walkingModelHash or defaults.modelHash or planeModelHash
+    local planeSkinHash = defaults.planeSkinHash or ""
+    local walkingSkinHash = defaults.walkingSkinHash or ""
+    local planeOrientation = sanitizeOrientationTable(defaults.planeOrientation, { yaw = 0, pitch = 0, roll = 0 })
+    local walkingOrientation = sanitizeOrientationTable(defaults.walkingOrientation, { yaw = 0, pitch = 0, roll = 0 })
     local activeScale = (role == "walking") and walkingScale or planeScale
     local activeModelHash = (role == "walking") and walkingModelHash or planeModelHash
+    local activeOrientation = (role == "walking") and walkingOrientation or planeOrientation
     local model = playerModel or cubeModel
     local obj = {
         model = model,
         pos = { 0, 0, 0 },
         basePos = { 0, 0, 0 },
-        rot = playerModelRotationOffset or q.identity(),
+        rot = buildOrientationOffsetQuat(q, playerModelRotationOffset, activeOrientation),
         color = { math.random(), math.random(), math.random() },
         isSolid = true,
         id = peerID,
@@ -60,8 +94,12 @@ function networking.createObjectForPeer(peerID, objects, q, playerModel, playerM
         remoteRole = role,
         planeModelHash = planeModelHash,
         walkingModelHash = walkingModelHash,
+        planeSkinHash = planeSkinHash,
+        walkingSkinHash = walkingSkinHash,
         planeModelScale = planeScale,
         walkingModelScale = walkingScale,
+        planeOrientation = planeOrientation,
+        walkingOrientation = walkingOrientation,
         callsign = sanitizeCallsign(defaults.callsign)
     }
 
@@ -79,7 +117,52 @@ function networking.handlePacket(data, peers, objects, q, playerModel, playerMod
         table.insert(parts, p)
     end
 
-    if parts[1] ~= "STATE" then
+    if parts[1] == "STATE2" then
+        local kv = {}
+        for i = 2, #parts do
+            local key, value = parts[i]:match("^([^=]+)=(.*)$")
+            if key and value then
+                kv[key] = value
+            end
+        end
+        local packetId = kv.id
+        if not packetId then
+            local trailingId = tonumber(parts[#parts])
+            if trailingId then
+                packetId = tostring(math.floor(trailingId))
+            end
+        end
+        if not packetId then
+            return nil
+        end
+        parts = {
+            "STATE",
+            kv.px or kv.x or "0",
+            kv.py or kv.y or "0",
+            kv.pz or kv.z or "0",
+            kv.rw or "1",
+            kv.rx or "0",
+            kv.ry or "0",
+            kv.rz or "0",
+            kv.scale or "",
+            kv.modelHash or "",
+            kv.role or "",
+            kv.planeScale or "",
+            kv.planeModelHash or "",
+            kv.planeYaw or "",
+            kv.planePitch or "",
+            kv.planeRoll or "",
+            kv.walkingScale or "",
+            kv.walkingModelHash or "",
+            kv.walkingYaw or "",
+            kv.walkingPitch or "",
+            kv.walkingRoll or "",
+            kv.planeSkinHash or "",
+            kv.walkingSkinHash or "",
+            kv.callsign or "",
+            packetId
+        }
+    elseif parts[1] ~= "STATE" then
         return nil
     end
 
@@ -100,8 +183,18 @@ function networking.handlePacket(data, peers, objects, q, playerModel, playerMod
     local remoteRole = (#parts >= 12) and sanitizeRole(parts[11]) or nil
     local remotePlaneScale = (#parts >= 13) and tonumber(parts[12]) or nil
     local remotePlaneHash = (#parts >= 14) and parts[13] or nil
-    local remoteWalkingScale = (#parts >= 15) and tonumber(parts[14]) or nil
-    local remoteWalkingHash = (#parts >= 16) and parts[15] or nil
+    local hasExtendedOrientation = #parts >= 23
+    local remotePlaneYaw = hasExtendedOrientation and tonumber(parts[14]) or nil
+    local remotePlanePitch = hasExtendedOrientation and tonumber(parts[15]) or nil
+    local remotePlaneRoll = hasExtendedOrientation and tonumber(parts[16]) or nil
+    local remoteWalkingScale = hasExtendedOrientation and tonumber(parts[17]) or ((#parts >= 15) and tonumber(parts[14]) or nil)
+    local remoteWalkingHash = hasExtendedOrientation and parts[18] or ((#parts >= 16) and parts[15] or nil)
+    local remoteWalkingYaw = hasExtendedOrientation and tonumber(parts[19]) or nil
+    local remoteWalkingPitch = hasExtendedOrientation and tonumber(parts[20]) or nil
+    local remoteWalkingRoll = hasExtendedOrientation and tonumber(parts[21]) or nil
+    local hasSkinHashes = #parts >= 25
+    local remotePlaneSkinHash = hasSkinHashes and parts[22] or nil
+    local remoteWalkingSkinHash = hasSkinHashes and parts[23] or nil
     local remoteCallsign = (#parts >= 17) and sanitizeCallsign(parts[#parts - 1]) or nil
 
     if not (id and px and py and pz and rw and rx and ry and rz) then
@@ -139,10 +232,32 @@ function networking.handlePacket(data, peers, objects, q, playerModel, playerMod
         if remoteCallsign then
             defaults.callsign = remoteCallsign
         end
+        if remotePlaneSkinHash ~= nil then
+            defaults.planeSkinHash = remotePlaneSkinHash
+        end
+        if remoteWalkingSkinHash ~= nil then
+            defaults.walkingSkinHash = remoteWalkingSkinHash
+        end
+        if remotePlaneYaw ~= nil or remotePlanePitch ~= nil or remotePlaneRoll ~= nil then
+            defaults.planeOrientation = {
+                yaw = sanitizeAngle(remotePlaneYaw, 0),
+                pitch = sanitizeAngle(remotePlanePitch, 0),
+                roll = sanitizeAngle(remotePlaneRoll, 0)
+            }
+        end
+        if remoteWalkingYaw ~= nil or remoteWalkingPitch ~= nil or remoteWalkingRoll ~= nil then
+            defaults.walkingOrientation = {
+                yaw = sanitizeAngle(remoteWalkingYaw, 0),
+                pitch = sanitizeAngle(remoteWalkingPitch, 0),
+                roll = sanitizeAngle(remoteWalkingRoll, 0)
+            }
+        end
         peers[id] = networking.createObjectForPeer(id, objects, q, playerModel, playerModelRotationOffset, defaults)
     end
 
     local obj = peers[id]
+    obj.planeOrientation = sanitizeOrientationTable(obj.planeOrientation, { yaw = 0, pitch = 0, roll = 0 })
+    obj.walkingOrientation = sanitizeOrientationTable(obj.walkingOrientation, { yaw = 0, pitch = 0, roll = 0 })
     obj.basePos = { px, py, pz }
     obj.pos = { px, py + (obj.visualOffsetY or 0), pz }
 
@@ -164,6 +279,30 @@ function networking.handlePacket(data, peers, objects, q, playerModel, playerMod
     end
     if remoteCallsign then
         obj.callsign = remoteCallsign
+    end
+    if remotePlaneSkinHash ~= nil then
+        obj.planeSkinHash = remotePlaneSkinHash
+    end
+    if remoteWalkingSkinHash ~= nil then
+        obj.walkingSkinHash = remoteWalkingSkinHash
+    end
+    if remotePlaneYaw ~= nil then
+        obj.planeOrientation.yaw = sanitizeAngle(remotePlaneYaw, obj.planeOrientation.yaw)
+    end
+    if remotePlanePitch ~= nil then
+        obj.planeOrientation.pitch = sanitizeAngle(remotePlanePitch, obj.planeOrientation.pitch)
+    end
+    if remotePlaneRoll ~= nil then
+        obj.planeOrientation.roll = sanitizeAngle(remotePlaneRoll, obj.planeOrientation.roll)
+    end
+    if remoteWalkingYaw ~= nil then
+        obj.walkingOrientation.yaw = sanitizeAngle(remoteWalkingYaw, obj.walkingOrientation.yaw)
+    end
+    if remoteWalkingPitch ~= nil then
+        obj.walkingOrientation.pitch = sanitizeAngle(remoteWalkingPitch, obj.walkingOrientation.pitch)
+    end
+    if remoteWalkingRoll ~= nil then
+        obj.walkingOrientation.roll = sanitizeAngle(remoteWalkingRoll, obj.walkingOrientation.roll)
     end
 
     if remoteModelHash and remoteModelHash ~= "" then
@@ -204,11 +343,9 @@ function networking.handlePacket(data, peers, objects, q, playerModel, playerMod
     obj.modelHash = activeModelHash
 
     local baseRot = { w = rw, x = rx, y = ry, z = rz }
-    if playerModelRotationOffset then
-        obj.rot = q.normalize(q.multiply(baseRot, playerModelRotationOffset))
-    else
-        obj.rot = baseRot
-    end
+    local activeOrientation = (activeRole == "walking") and obj.walkingOrientation or obj.planeOrientation
+    local modelOffset = buildOrientationOffsetQuat(q, playerModelRotationOffset, activeOrientation)
+    obj.rot = q.normalize(q.multiply(baseRot, modelOffset))
 
     return id
 end

@@ -59,7 +59,13 @@ local function buildDefaultControlActions()
 		{ id = "walk_forward", mode = "walking", label = "Walk Forwards", description = "Move forwards on the ground.", bindings = { controls.bindKey("w") } },
 		{ id = "walk_backward", mode = "walking", label = "Walk Backwards", description = "Move backwards on the ground.", bindings = { controls.bindKey("s") } },
 		{ id = "walk_strafe_left", mode = "walking", label = "Strafe Left", description = "Strafe left on the ground.", bindings = { controls.bindKey("a") } },
-		{ id = "walk_strafe_right", mode = "walking", label = "Strafe Right", description = "Strafe right on the ground.", bindings = { controls.bindKey("d") } }
+		{ id = "walk_strafe_right", mode = "walking", label = "Strafe Right", description = "Strafe right on the ground.", bindings = { controls.bindKey("d") } },
+		{ id = "paint_mode_paint", mode = "paint", label = "Paint Mode", description = "Switch paint editor to brush mode.", bindings = { controls.bindKey("1") } },
+		{ id = "paint_mode_erase", mode = "paint", label = "Erase Mode", description = "Switch paint editor to erase mode.", bindings = { controls.bindKey("2") } },
+		{ id = "paint_fill", mode = "paint", label = "Fill", description = "Fill the active paint target.", bindings = { controls.bindKey("f") } },
+		{ id = "paint_undo", mode = "paint", label = "Undo Paint", description = "Undo latest paint action.", bindings = { controls.bindKey("z", { ctrl = true }) } },
+		{ id = "paint_redo", mode = "paint", label = "Redo Paint", description = "Redo latest paint action.", bindings = { controls.bindKey("y", { ctrl = true }) } },
+		{ id = "paint_commit", mode = "paint", label = "Commit Paint", description = "Commit and sync paint overlay.", bindings = { controls.bindKey("p") } }
 	}
 end
 

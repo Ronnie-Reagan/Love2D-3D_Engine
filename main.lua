@@ -5,6 +5,7 @@ local vector3 = require("vector3")
 local love = require "love" -- avoids nil report from intellisense, safe to remove if causes issues (it should be OK)
 local enet = require "enet"
 local engine = require "engine"
+local modelModule = require "model_module"
 local networking = require "networking"
 local renderer = require "gpu_renderer"
 local controls = require "controls"
@@ -25,7 +26,7 @@ local cloudPuffModel = objectDefs.cloudPuffModel or cubeModel
 local playerModel = cubeModel
 -- too many local scope declarations? fuck it, we're global now baby!
 ---@diagnostic disable lowercase-global
-defaultPlayerModelPath = "objects/Dualengine.stl"
+defaultPlayerModelPath = "objects/Dualengine2.glb"
 normalizedPlayerModelExtent = 2.2
 defaultPlayerModelScale = 1.35
 defaultWalkingModelScale = 1.0
@@ -52,6 +53,13 @@ local walkingPitchLimit = math.rad(89)
 local viewState = {
 	mode = "first_person",
 	activeCamera = nil
+}
+local autoSmoke = {
+	enabled = (os.getenv("L2D3D_AUTOSMOKE") == "1"),
+	elapsed = 0,
+	screenshotRequested = false,
+	quitAt = nil,
+	screenshotName = "autosmoke_plane.png"
 }
 local altLookState = {
 	held = false,
@@ -148,17 +156,26 @@ local hudSettings = {
 	speedometerRedlineKph = 850
 }
 
+local characterOrientation = {
+	plane = {
+		yaw = 0,
+		pitch = 0,
+		roll = 0
+	},
+	walking = {
+		yaw = 0,
+		pitch = 0,
+		roll = 0
+	}
+}
+
 local characterPreview = {
 	plane = {
-		yaw = -35,
-		pitch = 14,
 		zoom = 1.0,
 		autoSpin = true,
 		spinRate = 28
 	},
 	walking = {
-		yaw = -35,
-		pitch = 12,
 		zoom = 1.0,
 		autoSpin = true,
 		spinRate = 28
@@ -261,8 +278,34 @@ local playerModelRotationOffset = q.normalize(q.multiply(
 	q.fromAxisAngle({ 1, 0, 0 }, -math.pi * 0.5) -- rotate forward 90 deg
 ))
 
-local function composePlayerModelRotation(baseRot)
-	return q.normalize(q.multiply(baseRot or q.identity(), playerModelRotationOffset))
+function normalizeRoleId(role)
+	return (role == "walking") and "walking" or "plane"
+end
+
+function getRoleOrientation(role)
+	local roleId = normalizeRoleId(role)
+	local orient = characterOrientation[roleId]
+	if type(orient) ~= "table" then
+		orient = { yaw = 0, pitch = 0, roll = 0 }
+		characterOrientation[roleId] = orient
+	end
+	orient.yaw = tonumber(orient.yaw) or 0
+	orient.pitch = tonumber(orient.pitch) or 0
+	orient.roll = tonumber(orient.roll) or 0
+	return orient
+end
+
+function composeRoleOrientationOffset(role)
+	local orient = getRoleOrientation(role)
+	local yawQuat = q.fromAxisAngle({ 0, 1, 0 }, math.rad(orient.yaw))
+	local pitchQuat = q.fromAxisAngle({ 1, 0, 0 }, math.rad(orient.pitch))
+	local rollQuat = q.fromAxisAngle({ 0, 0, 1 }, math.rad(orient.roll))
+	local userOffset = q.normalize(q.multiply(q.multiply(yawQuat, pitchQuat), rollQuat))
+	return q.normalize(q.multiply(playerModelRotationOffset, userOffset))
+end
+
+function composePlayerModelRotation(baseRot, role)
+	return q.normalize(q.multiply(baseRot or q.identity(), composeRoleOrientationOffset(role)))
 end
 
 local pauseMenu = {
@@ -325,18 +368,20 @@ local pauseMenu = {
 	},
 	characterItems = {
 		plane = {
-			{ id = "load_custom_stl",         label = "Load Plane STL", kind = "action", help = "Open a path prompt and load any STL from disk (or drop a file on the window)." },
+			{ id = "load_custom_stl",         label = "Load Plane Model", kind = "action", help = "Open a path prompt and load STL, GLB, or GLTF from disk (or drop STL/GLB on the window)." },
 			{ id = "model_scale",             label = "Plane Scale",    kind = "range",  min = 0.5,                                                                             max = 5.0, step = 0.05, help = "Scale normalized plane models for all clients." },
-			{ id = "plane_preview_yaw",       label = "Preview Yaw",    kind = "range",  min = -180,                                                                            max = 180, step = 5,    help = "Rotate the plane preview model around the vertical axis." },
-			{ id = "plane_preview_pitch",     label = "Preview Pitch",  kind = "range",  min = -70,                                                                             max = 70,  step = 5,    help = "Rotate the plane preview model around the lateral axis." },
+			{ id = "plane_preview_yaw",       label = "Model Yaw",      kind = "range",  min = -180,                                                                            max = 180, step = 5,    help = "Rotate the real plane model (world + preview) around the vertical axis." },
+			{ id = "plane_preview_pitch",     label = "Model Pitch",    kind = "range",  min = -180,                                                                            max = 180, step = 5,    help = "Rotate the real plane model (world + preview) around the lateral axis." },
+			{ id = "plane_preview_roll",      label = "Model Roll",     kind = "range",  min = -180,                                                                            max = 180, step = 5,    help = "Rotate the real plane model (world + preview) around the forward axis." },
 			{ id = "plane_preview_zoom",      label = "Preview Zoom",   kind = "range",  min = 0.5,                                                                             max = 4.0, step = 0.05, help = "Scale only the preview display model." },
 			{ id = "plane_preview_auto_spin", label = "Auto Spin",      kind = "toggle", help = "When enabled, preview yaw rotates automatically." }
 		},
 		walking = {
-			{ id = "load_walking_stl",          label = "Load Walking STL", kind = "action", help = "Load a separate STL used only when not in flight mode." },
+			{ id = "load_walking_stl",          label = "Load Walking Model", kind = "action", help = "Load a separate STL, GLB, or GLTF used only when not in flight mode." },
 			{ id = "walking_model_scale",       label = "Walking Scale",    kind = "range",  min = 0.3,                                                      max = 3.0, step = 0.05, help = "Scale used for walking-mode player model." },
-			{ id = "walking_preview_yaw",       label = "Preview Yaw",      kind = "range",  min = -180,                                                     max = 180, step = 5,    help = "Rotate the walking preview model around the vertical axis." },
-			{ id = "walking_preview_pitch",     label = "Preview Pitch",    kind = "range",  min = -70,                                                      max = 70,  step = 5,    help = "Rotate the walking preview model around the lateral axis." },
+			{ id = "walking_preview_yaw",       label = "Model Yaw",        kind = "range",  min = -180,                                                     max = 180, step = 5,    help = "Rotate the real walking model (world + preview) around the vertical axis." },
+			{ id = "walking_preview_pitch",     label = "Model Pitch",      kind = "range",  min = -180,                                                     max = 180, step = 5,    help = "Rotate the real walking model (world + preview) around the lateral axis." },
+			{ id = "walking_preview_roll",      label = "Model Roll",       kind = "range",  min = -180,                                                     max = 180, step = 5,    help = "Rotate the real walking model (world + preview) around the forward axis." },
 			{ id = "walking_preview_zoom",      label = "Preview Zoom",     kind = "range",  min = 0.5,                                                      max = 2.0, step = 0.05, help = "Scale only the preview display model." },
 			{ id = "walking_preview_auto_spin", label = "Auto Spin",        kind = "toggle", help = "When enabled, preview yaw rotates automatically." }
 		}
@@ -472,7 +517,7 @@ local function drawHudPlate(x, y, w, h, radius)
 	love.graphics.rectangle("line", x, y, w, h, r, r)
 end
 
-local function drawArcLine(cx, cy, radius, a0, a1, segments)
+function drawArcLine(cx, cy, radius, a0, a1, segments)
 	local pts = {}
 	local seg = math.max(4, math.floor(segments or 20))
 	for i = 0, seg do
@@ -486,7 +531,7 @@ local function drawArcLine(cx, cy, radius, a0, a1, segments)
 	end
 end
 
-local function resetHudCaches()
+function resetHudCaches()
 	hudCache.dialCanvas = nil
 	hudCache.dialSize = 0
 	hudCache.dialFontHeight = 0
@@ -496,7 +541,7 @@ local function resetHudCaches()
 	hudCache.controlH = 0
 end
 
-local function invalidateMapCache()
+function invalidateMapCache()
 	mapState.mapImage = nil
 	mapState.mapImageData = nil
 	mapState.mapRes = 0
@@ -508,7 +553,7 @@ local function invalidateMapCache()
 	mapState.lastRefreshAt = -math.huge
 end
 
-local function groundParamsSignature(params)
+function groundParamsSignature(params)
 	if not params then
 		return "none"
 	end
@@ -1070,6 +1115,7 @@ local function syncLocalPlayerObject()
 	if not localPlayerObject or not camera then
 		return
 	end
+	local activeRole = getActiveModelRole and getActiveModelRole() or "plane"
 	localPlayerObject.basePos = localPlayerObject.basePos or { 0, 0, 0 }
 	localPlayerObject.basePos[1] = camera.pos[1]
 	localPlayerObject.basePos[2] = camera.pos[2]
@@ -1077,7 +1123,14 @@ local function syncLocalPlayerObject()
 	localPlayerObject.pos[1] = camera.pos[1]
 	localPlayerObject.pos[2] = camera.pos[2] + (localPlayerObject.visualOffsetY or 0)
 	localPlayerObject.pos[3] = camera.pos[3]
-	localPlayerObject.rot = composePlayerModelRotation(camera.rot)
+	localPlayerObject.rot = composePlayerModelRotation(camera.rot, activeRole)
+end
+
+function onRoleOrientationChanged(role)
+	if getActiveModelRole and getActiveModelRole() == normalizeRoleId(role) then
+		syncLocalPlayerObject()
+	end
+	forceStateSync()
 end
 
 function bytesToHex(raw)
@@ -1169,6 +1222,18 @@ function readFileBytes(path)
 	return bytes
 end
 
+function getPathDirectory(path)
+	if type(path) ~= "string" then
+		return "."
+	end
+	local normalized = path:gsub("\\", "/")
+	local dir = normalized:match("^(.*)/[^/]+$")
+	if not dir or dir == "" then
+		return "."
+	end
+	return dir
+end
+
 function computeModelBounds(model)
 	if not model or not model.vertices or #model.vertices == 0 then
 		return { minY = -1, maxY = 1, bottomDistance = 1, topDistance = 1 }
@@ -1217,6 +1282,11 @@ function applyPlaneVisualToObject(obj, modelHash, scale)
 
 	local entry = playerModelCache[modelHash]
 	obj.model = (entry and entry.model) or cubeModel
+	obj.materials = entry and entry.materials or nil
+	obj.images = entry and entry.images or nil
+	obj.submeshes = entry and entry.submeshes or nil
+	obj.faceMaterials = entry and entry.faceMaterials or nil
+	obj.modelAssetId = entry and entry.assetId or nil
 	local s = math.max(0.05, tonumber(scale) or 1)
 	obj.scale = { s, s, s }
 	obj.halfSize = { x = s, y = s, z = s }
@@ -1237,28 +1307,42 @@ function refreshAllPeerModels()
 	end
 end
 
-function cacheModelEntry(raw, sourceLabel)
+function cacheModelEntry(raw, sourceLabel, loaderOptions)
 	if type(raw) ~= "string" or raw == "" then
-		return nil, "empty STL data"
+		return nil, "empty model data"
 	end
 	if #raw > (modelTransferState.maxRawBytes or math.huge) then
 		return nil, string.format(
-			"STL too large for relay transfer (%d bytes > %d).",
+			"Model too large for relay transfer (%d bytes > %d).",
 			#raw,
 			modelTransferState.maxRawBytes
 		)
 	end
 
-	local stlModel, loadErr = engine.loadSTLData(raw)
-	if not stlModel then
+	local hash = hashModelBytes(raw)
+	if playerModelCache[hash] then
+		return playerModelCache[hash]
+	end
+
+	loaderOptions = loaderOptions or {}
+	local assetId, loadErr = modelModule.loadFromBytes(raw, sourceLabel, {
+		targetExtent = normalizedPlayerModelExtent,
+		chunkSize = modelTransferState.chunkSize,
+		forcedHash = hash,
+		baseDir = loaderOptions.baseDir or "."
+	})
+	if not assetId then
 		return nil, loadErr
 	end
-	local normalized = engine.normalizeModel(stlModel, normalizedPlayerModelExtent)
-	local hash = hashModelBytes(raw)
+	local asset = modelModule.getAsset(assetId)
+	if not asset or not asset.model then
+		return nil, "model loader returned invalid asset"
+	end
+
 	local encoded = encodeModelBytes(raw)
 	if encoded and encoded ~= "" and #encoded > (modelTransferState.maxEncodedBytes or math.huge) then
 		return nil, string.format(
-			"Encoded STL too large for relay transfer (%d bytes > %d).",
+			"Encoded model too large for relay transfer (%d bytes > %d).",
 			#encoded,
 			modelTransferState.maxEncodedBytes
 		)
@@ -1275,8 +1359,14 @@ function cacheModelEntry(raw, sourceLabel)
 		hash = hash,
 		source = sourceLabel or "local",
 		raw = raw,
-		model = normalized,
-		bounds = computeModelBounds(normalized),
+		model = asset.model,
+		bounds = computeModelBounds(asset.model),
+		assetId = assetId,
+		format = asset.sourceFormat or "unknown",
+		materials = asset.materials,
+		images = asset.images,
+		submeshes = asset.geometry and asset.geometry.submeshes or nil,
+		faceMaterials = asset.geometry and asset.geometry.faceMaterials or asset.model.faceMaterials,
 		encoded = encoded,
 		encodedLength = encoded and #encoded or 0,
 		byteLength = #raw,
@@ -1307,23 +1397,55 @@ function setActivePlayerModel(entry, sourceLabel, targetRole)
 	forceStateSync()
 
 	logger.log(string.format(
-		"Loaded %s STL '%s' [%s] (%d verts, %d faces).",
+		"Loaded %s model '%s' [%s] (%d verts, %d faces, format=%s).",
 		role,
 		sourceLabel or entry.source or "unknown",
 		entry.hash,
 		#(entry.model.vertices or {}),
-		#(entry.model.faces or {})
+		#(entry.model.faces or {}),
+		entry.format or "unknown"
 	))
-	if entry.chunkCount and entry.chunkCount > 0 then
-		logger.log(string.format("Model %s is shareable (%d bytes, %d chunks).", entry.hash, entry.byteLength or 0,
-			entry.chunkCount))
+	local shareMeta = modelModule.getBlobMeta("model", entry.hash)
+	if shareMeta and (tonumber(shareMeta.chunkCount) or 0) > 0 then
+		logger.log(string.format(
+			"Model %s is shareable (%d bytes, %d chunks).",
+			entry.hash,
+			tonumber(shareMeta.rawBytes) or (entry.byteLength or 0),
+			tonumber(shareMeta.chunkCount) or 0
+		))
 	else
 		logger.log("Model " .. tostring(entry.hash) .. " is local-only (transfer payload unavailable).")
 	end
+	local materialCount = #(entry.materials or {})
+	local imageCount = #(entry.images or {})
+	local readyImageCount = 0
+	for _, img in ipairs(entry.images or {}) do
+		if img and img.image then
+			readyImageCount = readyImageCount + 1
+		end
+	end
+	logger.log(string.format(
+		"Model resources: materials=%d images=%d (gpu-ready=%d) submeshes=%d",
+		materialCount,
+		imageCount,
+		readyImageCount,
+		#(entry.submeshes or {})
+	))
+	if materialCount > 0 then
+		local m0 = entry.materials[1] or {}
+		local baseTex = m0.baseColorTexture and m0.baseColorTexture.imageIndex or nil
+		local mrTex = m0.metallicRoughnessTexture and m0.metallicRoughnessTexture.imageIndex or nil
+		logger.log(string.format(
+			"Material[1]: alpha=%s baseTexImage=%s mrTexImage=%s",
+			tostring(m0.alphaMode or "OPAQUE"),
+			tostring(baseTex or "nil"),
+			tostring(mrTex or "nil")
+		))
+	end
 end
 
-function loadPlayerModelFromRaw(raw, sourceLabel, targetRole)
-	local entry, err = cacheModelEntry(raw, sourceLabel)
+function loadPlayerModelFromRaw(raw, sourceLabel, targetRole, loaderOptions)
+	local entry, err = cacheModelEntry(raw, sourceLabel, loaderOptions)
 	if not entry then
 		return false, err
 	end
@@ -1331,19 +1453,25 @@ function loadPlayerModelFromRaw(raw, sourceLabel, targetRole)
 	return true, entry
 end
 
-function loadPlayerModelFromStl(path, targetRole)
+function loadPlayerModelFromPath(path, targetRole)
 	local raw, readErr = readFileBytes(path)
 	if not raw then
-		logger.log("Player STL load failed, using fallback: " .. tostring(readErr))
+		logger.log("Player model load failed, using fallback: " .. tostring(readErr))
 		return false, tostring(readErr)
 	end
 
-	local ok, entryOrErr = loadPlayerModelFromRaw(raw, path, targetRole)
+	local ok, entryOrErr = loadPlayerModelFromRaw(raw, path, targetRole, {
+		baseDir = getPathDirectory(path)
+	})
 	if not ok then
-		logger.log("Player STL parse failed, using fallback: " .. tostring(entryOrErr))
+		logger.log("Player model parse failed, using fallback: " .. tostring(entryOrErr))
 		return false, tostring(entryOrErr)
 	end
 	return true, entryOrErr
+end
+
+function loadPlayerModelFromStl(path, targetRole)
+	return loadPlayerModelFromPath(path, targetRole)
 end
 
 do
@@ -1353,6 +1481,11 @@ do
 		raw = nil,
 		model = cubeModel,
 		bounds = computeModelBounds(cubeModel),
+		format = "builtin",
+		materials = nil,
+		images = nil,
+		submeshes = nil,
+		faceMaterials = nil,
 		encoded = nil,
 		encodedLength = 0,
 		byteLength = 0,
@@ -1379,6 +1512,24 @@ function getConfiguredModelForRole(role)
 		return playerWalkingModelHash or "builtin-cube", playerWalkingModelScale or defaultWalkingModelScale
 	end
 	return playerPlaneModelHash or "builtin-cube", playerPlaneModelScale or defaultPlayerModelScale
+end
+
+function getConfiguredSkinHashForRole(role)
+	local roleId = normalizeRoleId(role)
+	local modelHash = (roleId == "walking") and playerWalkingModelHash or playerPlaneModelHash
+	local entry = playerModelCache and playerModelCache[modelHash or "builtin-cube"]
+	if not entry or not entry.assetId then
+		return ""
+	end
+	local asset = modelModule.getAsset(entry.assetId)
+	if not asset or type(asset.paintByRole) ~= "table" then
+		return ""
+	end
+	local overlay = asset.paintByRole[roleId]
+	if overlay and type(overlay.hash) == "string" then
+		return overlay.hash
+	end
+	return ""
 end
 
 function syncActivePlayerModelState()
@@ -1419,7 +1570,7 @@ local function setFlightMode(enabled)
 	syncActivePlayerModelState()
 end
 
-local function cycleViewMode()
+function cycleViewMode()
 	if viewState.mode == "third_person" then
 		viewState.mode = "first_person"
 	else
@@ -1430,7 +1581,7 @@ local function cycleViewMode()
 	logger.log("View mode set to " .. viewState.mode)
 end
 
-local function setRendererPreference(enableGpu)
+function setRendererPreference(enableGpu)
 	local desiredGpu = enableGpu and true or false
 	if desiredGpu and not renderer.isReady() then
 		useGpuRenderer = false
@@ -1448,7 +1599,7 @@ local function setRendererPreference(enableGpu)
 	return useGpuRenderer
 end
 
-local function resetCameraTransform()
+function resetCameraTransform()
 	if not camera then
 		return
 	end
@@ -1472,7 +1623,7 @@ local function resetCameraTransform()
 	logger.log("Camera transform reset.")
 end
 
-local function clearPeerObjects()
+function clearPeerObjects()
 	for i = #objects, 1, -1 do
 		if objects[i].id then
 			table.remove(objects, i)
@@ -1484,7 +1635,7 @@ local function clearPeerObjects()
 	modelTransferState.requestedAt = {}
 end
 
-local function splitPacketFields(data)
+function splitPacketFields(data)
 	local parts = {}
 	if type(data) ~= "string" then
 		return parts
@@ -1494,6 +1645,24 @@ local function splitPacketFields(data)
 		parts[#parts + 1] = part
 	end
 	return parts
+end
+
+local function parsePacketKeyValues(parts, startIndex)
+	local kv = {}
+	if type(parts) ~= "table" then
+		return kv
+	end
+	for i = startIndex or 2, #parts do
+		local key, value = tostring(parts[i] or ""):match("^([^=]+)=(.*)$")
+		if key and value then
+			kv[key] = value
+		end
+	end
+	return kv
+end
+
+local function makeBlobTransferKey(kind, hash)
+	return tostring(kind or "") .. "|" .. tostring(hash or "")
 end
 
 local function formatNetFloat(value)
@@ -1536,20 +1705,25 @@ local function relayIsConnected()
 	return ok and state == "connected"
 end
 
-function queueModelTransfer(hash)
-	local entry = playerModelCache[hash]
-	if not entry or not entry.encoded or entry.chunkCount <= 0 then
-		if entry and (not entry.encoded or entry.chunkCount <= 0) then
+local function queueOutgoingBlobTransfer(kind, hash)
+	if type(kind) ~= "string" or kind == "" or type(hash) ~= "string" or hash == "" then
+		return false
+	end
+	local key = makeBlobTransferKey(kind, hash)
+	if modelTransferState.outgoing[key] then
+		return true
+	end
+	local meta = modelModule.getBlobMeta(kind, hash)
+	if type(meta) ~= "table" or math.max(0, math.floor(tonumber(meta.chunkCount) or -1)) <= 0 then
+		if kind == "model" and playerModelCache[hash] then
 			logger.log("Model " .. tostring(hash) .. " is local-only (no transferable payload).")
 		end
 		return false
 	end
-	if modelTransferState.outgoing[hash] then
-		return true
-	end
-	modelTransferState.outgoing[hash] = {
+	modelTransferState.outgoing[key] = {
+		kind = kind,
 		hash = hash,
-		entry = entry,
+		meta = meta,
 		metaSent = false,
 		nextChunk = 1,
 		lastTouched = love.timer.getTime()
@@ -1557,34 +1731,53 @@ function queueModelTransfer(hash)
 	return true
 end
 
-function requestModelFromPeers(hash, reason)
-	if type(hash) ~= "string" or hash == "" then
+function queueModelTransfer(hash)
+	return queueOutgoingBlobTransfer("model", hash)
+end
+
+local function requestBlobFromPeers(kind, hash, reason)
+	if type(kind) ~= "string" or kind == "" or type(hash) ~= "string" or hash == "" then
 		return false
 	end
-	if playerModelCache[hash] then
-		return false
+	if kind == "model" then
+		if hash == "builtin-cube" then
+			return false
+		end
+		if playerModelCache[hash] then
+			return false
+		end
 	end
 	if not relayIsConnected() then
 		return false
 	end
 
+	local key = makeBlobTransferKey(kind, hash)
 	local now = love.timer.getTime()
-	local lastRequested = modelTransferState.requestedAt[hash] or -math.huge
+	local lastRequested = modelTransferState.requestedAt[key] or -math.huge
 	if (now - lastRequested) < modelTransferState.requestCooldown then
 		return false
 	end
 
-	local packet = string.format("MODEL_REQUEST|%s|%s", hash, formatNetFloat(now))
+	local packet = table.concat({
+		"BLOB_REQUEST",
+		"kind=" .. kind,
+		"hash=" .. hash,
+		"ts=" .. formatNetFloat(now)
+	}, "|")
 	local ok = pcall(function()
 		relayServer:send(packet)
 	end)
 	if ok then
-		modelTransferState.requestedAt[hash] = now
+		modelTransferState.requestedAt[key] = now
 		if reason and reason ~= "" then
-			logger.log("Requested model " .. hash .. " (" .. reason .. ").")
+			logger.log("Requested " .. tostring(kind) .. " blob " .. hash .. " (" .. reason .. ").")
 		end
 	end
 	return ok
+end
+
+function requestModelFromPeers(hash, reason)
+	return requestBlobFromPeers("model", hash, reason)
 end
 
 function updatePeerVisualModel(peerId)
@@ -1630,34 +1823,71 @@ end
 
 function handleModelRequestPacket(data)
 	local parts = splitPacketFields(data)
-	if parts[1] ~= "MODEL_REQUEST" then
+	local packetType = parts[1]
+	local kind
+	local requestedHash
+	if packetType == "MODEL_REQUEST" then
+		kind = "model"
+		requestedHash = parts[2]
+	elseif packetType == "BLOB_REQUEST" then
+		local kv = parsePacketKeyValues(parts, 2)
+		kind = kv.kind or "model"
+		requestedHash = kv.hash
+	else
 		return false
 	end
 
-	local requestedHash = parts[2]
+	if type(kind) ~= "string" or kind == "" then
+		return false
+	end
 	if type(requestedHash) ~= "string" or requestedHash == "" then
 		return false
 	end
 
-	return queueModelTransfer(requestedHash)
+	return queueOutgoingBlobTransfer(kind, requestedHash)
 end
 
 function handleModelMetaPacket(data)
 	local parts = splitPacketFields(data)
-	if parts[1] ~= "MODEL_META" then
+	local packetType = parts[1]
+	local kind
+	local hash
+	local byteLength
+	local encodedLength
+	local chunkSize
+	local chunkCount
+	local ownerId
+	local role
+	local modelHash
+	if packetType == "MODEL_META" then
+		if #parts < 7 then
+			return false
+		end
+		kind = "model"
+		hash = parts[2]
+		byteLength = math.max(0, math.floor(tonumber(parts[3]) or -1))
+		encodedLength = math.max(0, math.floor(tonumber(parts[4]) or -1))
+		chunkSize = math.max(1, math.floor(tonumber(parts[5]) or -1))
+		chunkCount = math.max(0, math.floor(tonumber(parts[6]) or -1))
+	elseif packetType == "BLOB_META" then
+		local kv = parsePacketKeyValues(parts, 2)
+		kind = kv.kind or "model"
+		hash = kv.hash
+		byteLength = math.max(0, math.floor(tonumber(kv.rawBytes) or -1))
+		encodedLength = math.max(0, math.floor(tonumber(kv.encodedBytes) or -1))
+		chunkSize = math.max(1, math.floor(tonumber(kv.chunkSize) or -1))
+		chunkCount = math.max(0, math.floor(tonumber(kv.chunkCount) or -1))
+		ownerId = kv.ownerId
+		role = kv.role
+		modelHash = kv.modelHash
+	else
 		return false
 	end
-	if #parts < 7 then
-		return false
-	end
-
-	local hash = parts[2]
-	local byteLength = math.max(0, math.floor(tonumber(parts[3]) or -1))
-	local encodedLength = math.max(0, math.floor(tonumber(parts[4]) or -1))
-	local chunkSize = math.max(1, math.floor(tonumber(parts[5]) or -1))
-	local chunkCount = math.max(0, math.floor(tonumber(parts[6]) or -1))
 	local senderId = tonumber(parts[#parts])
-	if not hash or hash == "" or byteLength <= 0 or encodedLength <= 0 or chunkCount <= 0 then
+	if type(kind) ~= "string" or kind == "" then
+		return false
+	end
+	if type(hash) ~= "string" or hash == "" or byteLength <= 0 or encodedLength <= 0 or chunkCount <= 0 then
 		return false
 	end
 	if chunkSize > 4096 or chunkCount > 20000 then
@@ -1669,53 +1899,51 @@ function handleModelMetaPacket(data)
 	if encodedLength > (modelTransferState.maxEncodedBytes or math.huge) then
 		return false
 	end
-	if playerModelCache[hash] then
+	if kind == "model" and playerModelCache[hash] then
 		return true
 	end
-
-	modelTransferState.incoming[hash] = {
+	local okMeta, errMeta = modelModule.acceptBlobMeta({
+		kind = kind,
 		hash = hash,
-		byteLength = byteLength,
-		encodedLength = encodedLength,
+		rawBytes = byteLength,
+		encodedBytes = encodedLength,
 		chunkSize = chunkSize,
 		chunkCount = chunkCount,
+		ownerId = ownerId,
+		role = role,
+		modelHash = modelHash
+	})
+	if not okMeta then
+		logger.log("Rejected blob meta " .. tostring(kind) .. ":" .. tostring(hash) .. " - " .. tostring(errMeta))
+		return false
+	end
+
+	local key = makeBlobTransferKey(kind, hash)
+	modelTransferState.incoming[key] = {
+		kind = kind,
+		hash = hash,
 		senderId = senderId,
-		chunks = {},
-		receivedCount = 0,
 		lastTouched = love.timer.getTime()
 	}
 	return true
 end
 
 function finalizeIncomingModelTransfer(hash, transfer)
-	if not transfer then
+	local completed = modelModule.getCompletedBlob("model", hash)
+	if type(completed) ~= "table" or type(completed.raw) ~= "string" or completed.raw == "" then
+		return false
+	end
+	local raw = completed.raw
+	if #raw > (modelTransferState.maxRawBytes or math.huge) then
+		return false
+	end
+	local expectedBytes = math.max(0, math.floor(tonumber(completed.meta and completed.meta.rawBytes) or -1))
+	if expectedBytes > 0 and #raw ~= expectedBytes then
 		return false
 	end
 
-	local ordered = {}
-	for i = 1, transfer.chunkCount do
-		local chunk = transfer.chunks[i]
-		if type(chunk) ~= "string" then
-			return false
-		end
-		ordered[i] = chunk
-	end
-
-	local encoded = table.concat(ordered)
-	if #encoded ~= transfer.encodedLength then
-		return false
-	end
-	local raw = decodeModelBytes(encoded)
-	if not raw or #raw ~= transfer.byteLength then
-		return false
-	end
-
-	local digest = hashModelBytes(raw)
-	if digest ~= hash then
-		return false
-	end
-
-	local entry, err = cacheModelEntry(raw, "peer " .. tostring(transfer.senderId or "?"))
+	local senderLabel = tostring((transfer and transfer.senderId) or "?")
+	local entry, err = cacheModelEntry(raw, "peer " .. senderLabel)
 	if not entry or entry.hash ~= hash then
 		logger.log("Remote model cache failed for " .. tostring(hash) .. ": " .. tostring(err))
 		return false
@@ -1726,49 +1954,82 @@ function finalizeIncomingModelTransfer(hash, transfer)
 			updatePeerVisualModel(peerId)
 		end
 	end
-	logger.log("Cached remote STL " .. hash .. " (" .. tostring(transfer.byteLength) .. " bytes).")
+	logger.log("Cached remote model " .. hash .. " (" .. tostring(#raw) .. " bytes).")
 	return true
 end
 
 function handleModelChunkPacket(data)
 	local parts = splitPacketFields(data)
-	if parts[1] ~= "MODEL_CHUNK" then
+	local packetType = parts[1]
+	local kind
+	local hash
+	local chunkIndex
+	local chunkData
+	if packetType == "MODEL_CHUNK" then
+		if #parts < 5 then
+			return false
+		end
+		kind = "model"
+		hash = parts[2]
+		chunkIndex = math.floor(tonumber(parts[3]) or -1)
+		chunkData = parts[4] or ""
+	elseif packetType == "BLOB_CHUNK" then
+		local kv = parsePacketKeyValues(parts, 2)
+		kind = kv.kind or "model"
+		hash = kv.hash
+		chunkIndex = math.floor(tonumber(kv.idx or kv.chunkIndex) or -1)
+		chunkData = kv.data or kv.chunkData or ""
+	else
 		return false
 	end
-	if #parts < 5 then
+	if type(kind) ~= "string" or kind == "" then
 		return false
 	end
-
-	local hash = parts[2]
-	local chunkIndex = math.floor(tonumber(parts[3]) or -1)
-	local chunkData = parts[4] or ""
+	if type(hash) ~= "string" or hash == "" then
+		return false
+	end
 	local senderId = tonumber(parts[#parts])
 
-	local transfer = modelTransferState.incoming[hash]
+	local key = makeBlobTransferKey(kind, hash)
+	local transfer = modelTransferState.incoming[key]
 	if not transfer then
-		requestModelFromPeers(hash, "chunk without metadata")
+		if kind == "model" then
+			requestModelFromPeers(hash, "chunk without metadata")
+		end
 		return false
 	end
 	if transfer.senderId and senderId and transfer.senderId ~= senderId then
 		return false
 	end
-	if chunkIndex < 1 or chunkIndex > transfer.chunkCount then
+	if chunkIndex < 1 then
 		return false
 	end
-	if #chunkData > transfer.chunkSize then
+	if type(chunkData) ~= "string" or chunkData == "" then
 		return false
 	end
 
-	if not transfer.chunks[chunkIndex] then
-		transfer.chunks[chunkIndex] = chunkData
-		transfer.receivedCount = transfer.receivedCount + 1
-	end
 	transfer.lastTouched = love.timer.getTime()
-
-	if transfer.receivedCount >= transfer.chunkCount then
-		modelTransferState.incoming[hash] = nil
-		if not finalizeIncomingModelTransfer(hash, transfer) then
+	local completeKind, completeHash, chunkErr = modelModule.acceptBlobChunk({
+		kind = kind,
+		hash = hash,
+		chunkIndex = chunkIndex,
+		chunkData = chunkData
+	})
+	if chunkErr then
+		modelTransferState.incoming[key] = nil
+		if kind == "model" then
 			requestModelFromPeers(hash, "validation retry")
+		end
+		return false
+	end
+	if completeKind and completeHash then
+		local completeKey = makeBlobTransferKey(completeKind, completeHash)
+		local completeTransfer = modelTransferState.incoming[completeKey] or transfer
+		modelTransferState.incoming[completeKey] = nil
+		if completeKind == "model" then
+			if not finalizeIncomingModelTransfer(completeHash, completeTransfer) then
+				requestModelFromPeers(completeHash, "validation retry")
+			end
 		end
 	end
 	return true
@@ -1779,14 +2040,14 @@ function pumpModelTransfers(now)
 	if connected then
 		for _, transfer in pairs(modelTransferState.outgoing) do
 			if transfer and (not transfer.metaSent) then
-				local entry = transfer.entry
 				local packet = table.concat({
-					"MODEL_META",
-					entry.hash,
-					tostring(entry.byteLength),
-					tostring(entry.encodedLength),
-					tostring(entry.chunkSize),
-					tostring(entry.chunkCount)
+					"BLOB_META",
+					"kind=" .. tostring(transfer.kind),
+					"hash=" .. tostring(transfer.hash),
+					"rawBytes=" .. tostring(transfer.meta.rawBytes or 0),
+					"encodedBytes=" .. tostring(transfer.meta.encodedBytes or 0),
+					"chunkSize=" .. tostring(transfer.meta.chunkSize or 0),
+					"chunkCount=" .. tostring(transfer.meta.chunkCount or 0)
 				}, "|")
 				pcall(function()
 					relayServer:send(packet)
@@ -1796,20 +2057,27 @@ function pumpModelTransfers(now)
 		end
 
 		local chunkBudget = modelTransferState.maxChunksPerTick
-		for hash, transfer in pairs(modelTransferState.outgoing) do
+		for transferKey, transfer in pairs(modelTransferState.outgoing) do
 			if chunkBudget <= 0 then
 				break
 			end
-			local entry = transfer and transfer.entry
-			if not transfer or not entry then
-				modelTransferState.outgoing[hash] = nil
+			local chunkCount = math.max(0, math.floor(tonumber(transfer and transfer.meta and transfer.meta.chunkCount) or -1))
+			if not transfer or chunkCount <= 0 then
+				modelTransferState.outgoing[transferKey] = nil
 			else
-				while chunkBudget > 0 and transfer.nextChunk <= entry.chunkCount do
-					local chunkPayload = entry.chunks[transfer.nextChunk]
-					if not chunkPayload then
+				while chunkBudget > 0 and transfer.nextChunk <= chunkCount do
+					local chunkPayload = modelModule.getBlobChunk(transfer.kind, transfer.hash, transfer.nextChunk)
+					if type(chunkPayload) ~= "string" then
+						modelTransferState.outgoing[transferKey] = nil
 						break
 					end
-					local packet = string.format("MODEL_CHUNK|%s|%d|%s", entry.hash, transfer.nextChunk, chunkPayload)
+					local packet = table.concat({
+						"BLOB_CHUNK",
+						"kind=" .. tostring(transfer.kind),
+						"hash=" .. tostring(transfer.hash),
+						"idx=" .. tostring(transfer.nextChunk),
+						"data=" .. tostring(chunkPayload)
+					}, "|")
 					pcall(function()
 						relayServer:send(packet)
 					end)
@@ -1818,17 +2086,19 @@ function pumpModelTransfers(now)
 					chunkBudget = chunkBudget - 1
 				end
 
-				if transfer.nextChunk > entry.chunkCount then
-					modelTransferState.outgoing[hash] = nil
+				if transfer.nextChunk > chunkCount then
+					modelTransferState.outgoing[transferKey] = nil
 				end
 			end
 		end
 	end
 
-	for hash, transfer in pairs(modelTransferState.incoming) do
+	for incomingKey, transfer in pairs(modelTransferState.incoming) do
 		if (now - (transfer.lastTouched or now)) > modelTransferState.transferTimeout then
-			modelTransferState.incoming[hash] = nil
-			requestModelFromPeers(hash, "timed out")
+			modelTransferState.incoming[incomingKey] = nil
+			if transfer.kind == "model" then
+				requestModelFromPeers(transfer.hash, "timed out")
+			end
 		end
 	end
 end
@@ -2798,6 +3068,7 @@ function buildRestartSnapshot(targetGraphicsApiPreference)
 				graphicsApiPreference = graphicsApiPreference
 			},
 			hudSettings = deepCopyPrimitiveTable(hudSettings, 3),
+			characterOrientation = deepCopyPrimitiveTable(characterOrientation, 3),
 			camera = deepCopyPrimitiveTable({
 				pos = camera and camera.pos,
 				rot = camera and camera.rot,
@@ -2866,7 +3137,7 @@ function restoreModelFromRestartSnapshot(role, snapshot)
 	end
 
 	if (not loaded) and type(snapshot.source) == "string" and snapshot.source ~= "" and snapshot.source ~= "builtin cube" then
-		local ok = loadPlayerModelFromStl(snapshot.source, targetRole)
+		local ok = loadPlayerModelFromPath(snapshot.source, targetRole)
 		loaded = ok and true or false
 	end
 
@@ -2908,6 +3179,18 @@ function applyRestartSnapshot(snapshot)
 			end
 		end
 		resetHudCaches()
+	end
+
+	if type(snapshot.characterOrientation) == "table" then
+		for _, role in ipairs({ "plane", "walking" }) do
+			local source = snapshot.characterOrientation[role]
+			if type(source) == "table" then
+				local orient = getRoleOrientation(role)
+				orient.yaw = tonumber(source.yaw) or orient.yaw
+				orient.pitch = tonumber(source.pitch) or orient.pitch
+				orient.roll = tonumber(source.roll) or orient.roll
+			end
+		end
 	end
 
 	local desiredGraphics = type(snapshot.graphicsSettings) == "table" and snapshot.graphicsSettings or nil
@@ -3571,10 +3854,13 @@ local function getPauseItemValue(item)
 		return string.format("%.2fx", playerWalkingModelScale)
 	end
 	if item.id == "plane_preview_yaw" then
-		return string.format("%d deg", math.floor((characterPreview.plane.yaw or 0) + 0.5))
+		return string.format("%d deg", math.floor((getRoleOrientation("plane").yaw or 0) + 0.5))
 	end
 	if item.id == "plane_preview_pitch" then
-		return string.format("%d deg", math.floor((characterPreview.plane.pitch or 0) + 0.5))
+		return string.format("%d deg", math.floor((getRoleOrientation("plane").pitch or 0) + 0.5))
+	end
+	if item.id == "plane_preview_roll" then
+		return string.format("%d deg", math.floor((getRoleOrientation("plane").roll or 0) + 0.5))
 	end
 	if item.id == "plane_preview_zoom" then
 		return string.format("%.2fx", characterPreview.plane.zoom or 1.0)
@@ -3583,10 +3869,13 @@ local function getPauseItemValue(item)
 		return characterPreview.plane.autoSpin and "On" or "Off"
 	end
 	if item.id == "walking_preview_yaw" then
-		return string.format("%d deg", math.floor((characterPreview.walking.yaw or 0) + 0.5))
+		return string.format("%d deg", math.floor((getRoleOrientation("walking").yaw or 0) + 0.5))
 	end
 	if item.id == "walking_preview_pitch" then
-		return string.format("%d deg", math.floor((characterPreview.walking.pitch or 0) + 0.5))
+		return string.format("%d deg", math.floor((getRoleOrientation("walking").pitch or 0) + 0.5))
+	end
+	if item.id == "walking_preview_roll" then
+		return string.format("%d deg", math.floor((getRoleOrientation("walking").roll or 0) + 0.5))
 	end
 	if item.id == "walking_preview_zoom" then
 		return string.format("%.2fx", characterPreview.walking.zoom or 1.0)
@@ -3756,16 +4045,26 @@ local function adjustPauseItem(item, direction, multiplier)
 	end
 
 	if item.id == "plane_preview_yaw" then
-		characterPreview.plane.yaw = clamp(characterPreview.plane.yaw + item.step * direction * scale, item.min, item
-			.max)
-		setPauseStatus("Plane Preview Yaw: " .. getPauseItemValue(item), 1.2)
+		local orient = getRoleOrientation("plane")
+		orient.yaw = clamp((orient.yaw or 0) + item.step * direction * scale, item.min, item.max)
+		onRoleOrientationChanged("plane")
+		setPauseStatus("Plane Model Yaw: " .. getPauseItemValue(item), 1.2)
 		return
 	end
 
 	if item.id == "plane_preview_pitch" then
-		characterPreview.plane.pitch = clamp(characterPreview.plane.pitch + item.step * direction * scale, item.min,
-			item.max)
-		setPauseStatus("Plane Preview Pitch: " .. getPauseItemValue(item), 1.2)
+		local orient = getRoleOrientation("plane")
+		orient.pitch = clamp((orient.pitch or 0) + item.step * direction * scale, item.min, item.max)
+		onRoleOrientationChanged("plane")
+		setPauseStatus("Plane Model Pitch: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "plane_preview_roll" then
+		local orient = getRoleOrientation("plane")
+		orient.roll = clamp((orient.roll or 0) + item.step * direction * scale, item.min, item.max)
+		onRoleOrientationChanged("plane")
+		setPauseStatus("Plane Model Roll: " .. getPauseItemValue(item), 1.2)
 		return
 	end
 
@@ -3777,16 +4076,26 @@ local function adjustPauseItem(item, direction, multiplier)
 	end
 
 	if item.id == "walking_preview_yaw" then
-		characterPreview.walking.yaw = clamp(characterPreview.walking.yaw + item.step * direction * scale, item.min,
-			item.max)
-		setPauseStatus("Player Preview Yaw: " .. getPauseItemValue(item), 1.2)
+		local orient = getRoleOrientation("walking")
+		orient.yaw = clamp((orient.yaw or 0) + item.step * direction * scale, item.min, item.max)
+		onRoleOrientationChanged("walking")
+		setPauseStatus("Walking Model Yaw: " .. getPauseItemValue(item), 1.2)
 		return
 	end
 
 	if item.id == "walking_preview_pitch" then
-		characterPreview.walking.pitch = clamp(characterPreview.walking.pitch + item.step * direction * scale, item.min,
-			item.max)
-		setPauseStatus("Player Preview Pitch: " .. getPauseItemValue(item), 1.2)
+		local orient = getRoleOrientation("walking")
+		orient.pitch = clamp((orient.pitch or 0) + item.step * direction * scale, item.min, item.max)
+		onRoleOrientationChanged("walking")
+		setPauseStatus("Walking Model Pitch: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "walking_preview_roll" then
+		local orient = getRoleOrientation("walking")
+		orient.roll = clamp((orient.roll or 0) + item.step * direction * scale, item.min, item.max)
+		onRoleOrientationChanged("walking")
+		setPauseStatus("Walking Model Roll: " .. getPauseItemValue(item), 1.2)
 		return
 	end
 
@@ -3943,14 +4252,14 @@ local function activatePauseItem(item)
 		modelLoadPrompt.mode = "model_path"
 		modelLoadPrompt.text = ""
 		modelLoadPrompt.cursor = 0
-		setPauseStatus("Plane STL path: Enter to load, Esc to cancel.", 4.5)
+		setPauseStatus("Plane model path: Enter to load, Esc to cancel.", 4.5)
 	elseif item.id == "load_walking_stl" then
 		modelLoadTargetRole = "walking"
 		modelLoadPrompt.active = true
 		modelLoadPrompt.mode = "model_path"
 		modelLoadPrompt.text = ""
 		modelLoadPrompt.cursor = 0
-		setPauseStatus("Walking STL path: Enter to load, Esc to cancel.", 4.5)
+		setPauseStatus("Walking model path: Enter to load, Esc to cancel.", 4.5)
 	elseif item.id == "apply_video" then
 		local ok, err = applyGraphicsVideoMode()
 		if ok then
@@ -4733,15 +5042,11 @@ local function drawPauseCharacterPreview(layout)
 	local cy = y + h * 0.54
 	local zoom = (previewState and previewState.zoom) or 1.0
 	local displayScale = math.min(w, h) * 0.28 * zoom * math.max(0.2, tonumber(modelScale) or 1.0)
-	local yawDeg = (previewState and previewState.yaw) or 0
-	local pitchDeg = (previewState and previewState.pitch) or 0
+	local previewRot = composeRoleOrientationOffset(role)
 	if previewState and previewState.autoSpin then
-		yawDeg = yawDeg + love.timer.getTime() * (previewState.spinRate or 22)
+		local spin = q.fromAxisAngle({ 0, 1, 0 }, math.rad(love.timer.getTime() * (previewState.spinRate or 22)))
+		previewRot = q.normalize(q.multiply(spin, previewRot))
 	end
-	local yaw = math.rad(yawDeg)
-	local pitch = math.rad(pitchDeg)
-	local cosY, sinY = math.cos(yaw), math.sin(yaw)
-	local cosP, sinP = math.cos(pitch), math.sin(pitch)
 	local camZ = 5.4
 
 	love.graphics.setColor(0.1, 0.11, 0.14, 0.93)
@@ -4751,14 +5056,14 @@ local function drawPauseCharacterPreview(layout)
 
 	local projected = {}
 	for i, v in ipairs(model.vertices or {}) do
-		local vx = v[1] or 0
-		local vy = v[2] or 0
-		local vz = v[3] or 0
-		local rx = (vx * cosY) - (vz * sinY)
-		local rz = (vx * sinY) + (vz * cosY)
-		local ry = vy
-		local py = (ry * cosP) - (rz * sinP)
-		local pz = (ry * sinP) + (rz * cosP)
+		local rv = q.rotateVector(previewRot, {
+			v[1] or 0,
+			v[2] or 0,
+			v[3] or 0
+		})
+		local rx = rv[1] or 0
+		local py = rv[2] or 0
+		local pz = rv[3] or 0
 		local denom = pz + camZ
 		if denom <= 0.05 then
 			projected[i] = nil
@@ -4846,12 +5151,13 @@ function drawModelLoadPrompt(layout)
 	local promptY = layout.panelY + layout.panelH - promptH - 12
 	local isCallsignPrompt = modelLoadPrompt.mode == "callsign"
 	local targetLabel = isCallsignPrompt and "Callsign" or
-		((modelLoadTargetRole == "walking") and "Walking STL" or "Plane STL")
+		((modelLoadTargetRole == "walking") and "Walking Model" or "Plane Model")
 	local prefix = targetLabel .. ": "
 	local left = modelLoadPrompt.text:sub(1, modelLoadPrompt.cursor)
 	local cursorX = promptX + 10 + love.graphics.getFont():getWidth(prefix .. left)
 	cursorX = clamp(cursorX, promptX + 10, promptX + promptW - 10)
-	local hint = isCallsignPrompt and "Enter=Apply  Esc=Cancel" or "Enter=Load  Esc=Cancel  Drag/drop STL also works"
+	local hint = isCallsignPrompt and "Enter=Apply  Esc=Cancel" or
+		"Enter=Load  Esc=Cancel  Drag/drop STL/GLB (GLTF path load)"
 
 	love.graphics.setColor(0.03, 0.04, 0.05, 0.96)
 	love.graphics.rectangle("fill", promptX, promptY, promptW, promptH, 6, 6)
@@ -5108,7 +5414,7 @@ function love.load()
 		renderer.setClipPlanes(0.1, graphicsSettings.drawDistance)
 	end
 
-	local loadedDefaultModel = loadPlayerModelFromStl(defaultPlayerModelPath, "plane")
+	local loadedDefaultModel = loadPlayerModelFromPath(defaultPlayerModelPath, "plane")
 	if not loadedDefaultModel then
 		local fallback = playerModelCache["builtin-cube"]
 		setActivePlayerModel(fallback, "builtin cube", "plane")
@@ -5120,7 +5426,7 @@ function love.load()
 		model = playerModel,
 		pos = { camera.pos[1], camera.pos[2], camera.pos[3] },
 		basePos = { camera.pos[1], camera.pos[2], camera.pos[3] },
-		rot = composePlayerModelRotation(camera.rot),
+		rot = composePlayerModelRotation(camera.rot, getActiveModelRole()),
 		scale = { playerModelScale, playerModelScale, playerModelScale },
 		color = { 0.9, 0.4, 0.1 },
 		isSolid = false,
@@ -5147,6 +5453,27 @@ function love.load()
 		else
 			logger.log("Restart state restore failed; using default startup state.")
 		end
+	end
+	if autoSmoke.enabled then
+		flightSimMode = true
+		viewState.mode = "third_person"
+		thirdPersonState.offset = { 0.0, 1.4, -3.2 }
+		local smokeModelPath = os.getenv("L2D3D_AUTOSMOKE_MODEL")
+		if type(smokeModelPath) ~= "string" or smokeModelPath == "" then
+			smokeModelPath = defaultPlayerModelPath
+		end
+		local smokeLoadOk, smokeErr = loadPlayerModelFromPath(smokeModelPath, "plane")
+		if smokeLoadOk then
+			logger.log("AutoSmoke loaded model: " .. tostring(smokeModelPath))
+		else
+			logger.log("AutoSmoke model load failed: " .. tostring(smokeErr))
+		end
+		syncActivePlayerModelState()
+		if localPlayerObject then
+			applyPlaneVisualToObject(localPlayerObject, playerModelHash, playerModelScale)
+			syncLocalPlayerObject()
+		end
+		logger.log("AutoSmoke enabled: flight mode ON, third-person camera ON.")
 	end
 	currentGraphicsApiPreference = normalizeGraphicsApiPreference(graphicsSettings.graphicsApiPreference)
 
@@ -5329,11 +5656,11 @@ function submitModelLoadPrompt()
 		closeModelLoadPrompt("Model load cancelled.", 1.2)
 		return
 	end
-	local ok, entryOrErr = loadPlayerModelFromStl(path, modelLoadTargetRole)
+	local ok, entryOrErr = loadPlayerModelFromPath(path, modelLoadTargetRole)
 	if ok then
-		closeModelLoadPrompt("Loaded STL: " .. path, 2.4)
+		closeModelLoadPrompt("Loaded model: " .. path, 2.4)
 	else
-		closeModelLoadPrompt("Failed to load STL: " .. tostring(entryOrErr), 2.6)
+		closeModelLoadPrompt("Failed to load model: " .. tostring(entryOrErr), 2.6)
 	end
 end
 
@@ -5389,24 +5716,36 @@ local function updateNet()
 		local activeHash, activeScale = getConfiguredModelForRole(activeRole)
 		local planeHash, planeScale = getConfiguredModelForRole("plane")
 		local walkingHash, walkingScale = getConfiguredModelForRole("walking")
+		local planeSkinHash = getConfiguredSkinHashForRole("plane")
+		local walkingSkinHash = getConfiguredSkinHashForRole("walking")
+		local planeOrientation = getRoleOrientation("plane")
+		local walkingOrientation = getRoleOrientation("walking")
 		local outboundCallsign = sanitizeCallsign(localCallsign) or "Pilot"
 		local packet = table.concat({
-			"STATE",
-			string.format("%f", camera.pos[1]),
-			string.format("%f", camera.pos[2]),
-			string.format("%f", camera.pos[3]),
-			string.format("%f", camera.rot.w),
-			string.format("%f", camera.rot.x),
-			string.format("%f", camera.rot.y),
-			string.format("%f", camera.rot.z),
-			formatNetFloat(activeScale),
-			activeHash or "builtin-cube",
-			activeRole,
-			formatNetFloat(planeScale),
-			planeHash or "builtin-cube",
-			formatNetFloat(walkingScale),
-			walkingHash or "builtin-cube",
-			outboundCallsign
+			"STATE2",
+			"px=" .. string.format("%f", camera.pos[1]),
+			"py=" .. string.format("%f", camera.pos[2]),
+			"pz=" .. string.format("%f", camera.pos[3]),
+			"rw=" .. string.format("%f", camera.rot.w),
+			"rx=" .. string.format("%f", camera.rot.x),
+			"ry=" .. string.format("%f", camera.rot.y),
+			"rz=" .. string.format("%f", camera.rot.z),
+			"scale=" .. formatNetFloat(activeScale),
+			"modelHash=" .. tostring(activeHash or "builtin-cube"),
+			"role=" .. tostring(activeRole),
+			"planeScale=" .. formatNetFloat(planeScale),
+			"planeModelHash=" .. tostring(planeHash or "builtin-cube"),
+			"planeYaw=" .. formatNetFloat(planeOrientation.yaw),
+			"planePitch=" .. formatNetFloat(planeOrientation.pitch),
+			"planeRoll=" .. formatNetFloat(planeOrientation.roll),
+			"walkingScale=" .. formatNetFloat(walkingScale),
+			"walkingModelHash=" .. tostring(walkingHash or "builtin-cube"),
+			"walkingYaw=" .. formatNetFloat(walkingOrientation.yaw),
+			"walkingPitch=" .. formatNetFloat(walkingOrientation.pitch),
+			"walkingRoll=" .. formatNetFloat(walkingOrientation.roll),
+			"planeSkinHash=" .. tostring(planeSkinHash or ""),
+			"walkingSkinHash=" .. tostring(walkingSkinHash or ""),
+			"callsign=" .. outboundCallsign
 		}, "|")
 		pcall(function()
 			relayServer:send(packet)
@@ -5431,7 +5770,7 @@ local function serviceNetworkEvents()
 			forceStateSync()
 		elseif event.type == "receive" then
 			local packetType = type(event.data) == "string" and event.data:match("^([^|]+)")
-			if packetType == "STATE" then
+			if packetType == "STATE" or packetType == "STATE2" then
 				local peerId = networking.handlePacket(
 					event.data,
 					peers,
@@ -5446,6 +5785,10 @@ local function serviceNetworkEvents()
 						walkingScale = defaultWalkingModelScale,
 						planeModelHash = "builtin-cube",
 						walkingModelHash = "builtin-cube",
+						planeSkinHash = "",
+						walkingSkinHash = "",
+						planeOrientation = { yaw = 0, pitch = 0, roll = 0 },
+						walkingOrientation = { yaw = 0, pitch = 0, roll = 0 },
 						role = "plane"
 					}
 				)
@@ -5459,11 +5802,11 @@ local function serviceNetworkEvents()
 				handleGroundRequestPacket(event.data)
 			elseif packetType == "GROUND_SNAPSHOT" then
 				handleGroundSnapshotPacket(event.data)
-			elseif packetType == "MODEL_REQUEST" then
+			elseif packetType == "MODEL_REQUEST" or packetType == "BLOB_REQUEST" then
 				handleModelRequestPacket(event.data)
-			elseif packetType == "MODEL_META" then
+			elseif packetType == "MODEL_META" or packetType == "BLOB_META" then
 				handleModelMetaPacket(event.data)
-			elseif packetType == "MODEL_CHUNK" then
+			elseif packetType == "MODEL_CHUNK" or packetType == "BLOB_CHUNK" then
 				handleModelChunkPacket(event.data)
 			end
 		elseif event.type == "disconnect" and relayServer and event.peer == relayServer then
@@ -5528,6 +5871,30 @@ function love.update(dt)
 	resolveActiveRenderCamera()
 	serviceNetworkEvents()
 	updateCloudNetworkState(love.timer.getTime())
+
+	if autoSmoke.enabled then
+		autoSmoke.elapsed = autoSmoke.elapsed + dt
+		if (not autoSmoke.screenshotRequested) and autoSmoke.elapsed >= 2.5 then
+			local screenshotName = autoSmoke.screenshotName or "autosmoke_plane.png"
+			local okShot, shotErr = pcall(function()
+				love.graphics.captureScreenshot(screenshotName)
+			end)
+			if okShot then
+				local saveDir = (love.filesystem and love.filesystem.getSaveDirectory and love.filesystem.getSaveDirectory()) or
+					"<save-dir>"
+				logger.log("AutoSmoke screenshot captured: " .. tostring(saveDir) .. "\\" .. tostring(screenshotName))
+			else
+				logger.log("AutoSmoke screenshot failed: " .. tostring(shotErr))
+			end
+			autoSmoke.screenshotRequested = true
+			autoSmoke.quitAt = autoSmoke.elapsed + 1.0
+		end
+		if autoSmoke.quitAt and autoSmoke.elapsed >= autoSmoke.quitAt then
+			logger.log("AutoSmoke complete; quitting.")
+			love.event.quit()
+			return
+		end
+	end
 end
 
 -- === Input Management ===
@@ -5846,16 +6213,25 @@ function love.filedropped(file)
 	end
 	if modelLoadPrompt.active and modelLoadPrompt.mode == "callsign" then
 		if pauseMenu.active then
-			setPauseStatus("Finish callsign edit before dropping STL files.", 1.8)
+			setPauseStatus("Finish callsign edit before dropping model files.", 1.8)
 		end
 		return
 	end
 
-	local name = (file.getFilename and file:getFilename()) or "dropped.stl"
+	local name = (file.getFilename and file:getFilename()) or "dropped.model"
 	local lowerName = string.lower(name or "")
-	if not lowerName:match("%.stl$") then
+	local isStl = lowerName:match("%.stl$") ~= nil
+	local isGlb = lowerName:match("%.glb$") ~= nil
+	local isGltf = lowerName:match("%.gltf$") ~= nil
+	if isGltf then
 		if pauseMenu.active then
-			setPauseStatus("Dropped file is not an STL: " .. tostring(name), 2.2)
+			setPauseStatus("Dropped GLTF requires path load (for sidecar files).", 2.4)
+		end
+		return
+	end
+	if not (isStl or isGlb) then
+		if pauseMenu.active then
+			setPauseStatus("Dropped file is not STL/GLB: " .. tostring(name), 2.2)
 		end
 		return
 	end
@@ -5865,7 +6241,7 @@ function love.filedropped(file)
 	end)
 	if not openOk then
 		if pauseMenu.active then
-			setPauseStatus("Could not open dropped STL.", 2.2)
+			setPauseStatus("Could not open dropped model.", 2.2)
 		end
 		return
 	end
@@ -5889,22 +6265,22 @@ function love.filedropped(file)
 
 	if (not readOk) or (type(raw) ~= "string") or raw == "" then
 		if pauseMenu.active then
-			setPauseStatus("Dropped STL could not be read.", 2.2)
+			setPauseStatus("Dropped model could not be read.", 2.2)
 		end
 		return
 	end
 
 	local dropRole = modelLoadPrompt.active and (modelLoadTargetRole or getActiveModelRole()) or getActiveModelRole()
-	local ok, entryOrErr = loadPlayerModelFromRaw(raw, name, dropRole)
+	local ok, entryOrErr = loadPlayerModelFromRaw(raw, name, dropRole, { baseDir = "." })
 	if ok then
 		modelLoadPrompt.active = false
 		modelLoadPrompt.mode = "model_path"
 		if pauseMenu.active then
-			setPauseStatus("Loaded dropped STL: " .. tostring(name), 2.4)
+			setPauseStatus("Loaded dropped model: " .. tostring(name), 2.4)
 		end
 	else
 		if pauseMenu.active then
-			setPauseStatus("Dropped STL failed: " .. tostring(entryOrErr), 2.6)
+			setPauseStatus("Dropped model failed: " .. tostring(entryOrErr), 2.6)
 		end
 	end
 end
