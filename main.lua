@@ -38,6 +38,7 @@ local screen, camera, groundObject, triangleCount, frameImage, renderMode, gpuEr
 local frameImageW, frameImageH = 0, 0
 local worldRenderCanvas, worldRenderW, worldRenderH = nil, 0, 0
 local useGpuRenderer = true
+local pendingRestartRendererPreference = nil
 local perfElapsed, perfFrames, perfLoggedLowFps = 0, 0, false
 local zBuffer = {}
 local mouseSensitivity = 0.001
@@ -118,8 +119,19 @@ local graphicsSettings = {
 	resolutionIndex = 1,
 	renderScale = 1.0,
 	drawDistance = 1800,
-	vsync = false
+	vsync = false,
+	graphicsApiPreference = "auto"
 }
+currentGraphicsApiPreference = "auto"
+local graphicsBackend = {
+	name = "Unknown",
+	version = "",
+	vendor = "",
+	device = ""
+}
+bootRestartPayload, bootRestartSnapshotState = nil, nil
+RESTART_STATE_VERSION = 1
+RESTART_MODEL_ENCODED_LIMIT = 4 * 1024 * 1024
 
 local hudSettings = {
 	showSpeedometer = true,
@@ -297,6 +309,8 @@ local pauseMenu = {
 			{ id = "draw_distance", label = "Draw Distance",     kind = "range",  min = 300,                                                                              max = 5000,  step = 100,    help = "How far objects remain rendered from the active camera." },
 			{ id = "vsync",         label = "VSync",             kind = "toggle", help = "Toggle vertical sync for display presentation." },
 			{ id = "renderer",      label = "Renderer",          kind = "toggle", help = "Switch between GPU and CPU renderer paths." },
+			{ id = "graphics_api",  label = "Graphics API",      kind = "cycle",  help = "Choose startup graphics API preference. Applying this restarts the game." },
+			{ id = "apply_graphics_api", label = "Apply API", kind = "action", confirm = true, help = "Restart now to apply graphics API changes and restore world/game state." },
 			{ id = "fov",           label = "Field of View",     kind = "range",  min = 60,                                                                               max = 120,   step = 5,      help = "Adjust camera FOV in degrees." },
 			{ id = "speed",         label = "Move Speed",        kind = "range",  min = 2,                                                                                max = 30,    step = 1,      help = "Adjust player movement speed." },
 			{ id = "sensitivity",   label = "Mouse Sensitivity", kind = "range",  min = 0.0004,                                                                           max = 0.004, step = 0.0002, help = "Adjust mouse look sensitivity." },
@@ -2427,6 +2441,64 @@ local function getGraphicsWindowModeLabel(modeId)
 	return "Windowed"
 end
 
+function normalizeGraphicsApiPreference(value)
+	if type(value) ~= "string" then
+		return "auto"
+	end
+	local lowered = value:lower()
+	if lowered == "vulkan" then
+		return "vulkan"
+	end
+	if lowered == "opengl" or lowered == "gl" then
+		return "opengl"
+	end
+	return "auto"
+end
+
+function getGraphicsApiPreferenceLabel(value)
+	local preference = normalizeGraphicsApiPreference(value)
+	if preference == "vulkan" then
+		return "Vulkan"
+	end
+	if preference == "opengl" then
+		return "OpenGL"
+	end
+	return "Auto"
+end
+
+function getEngineRestartPayload()
+	if type(love.restart) ~= "table" then
+		return nil
+	end
+	if tonumber(love.restart._l2d3d_restart_version) ~= RESTART_STATE_VERSION then
+		return nil
+	end
+	return love.restart
+end
+
+local function refreshGraphicsBackendInfo()
+	if not (love.graphics and love.graphics.getRendererInfo) then
+		return
+	end
+	local ok, name, version, vendor, device = pcall(love.graphics.getRendererInfo)
+	if not ok then
+		return
+	end
+	graphicsBackend.name = tostring(name or "Unknown")
+	graphicsBackend.version = tostring(version or "")
+	graphicsBackend.vendor = tostring(vendor or "")
+	graphicsBackend.device = tostring(device or "")
+end
+
+local function getGraphicsBackendLabel()
+	local name = graphicsBackend.name or "Unknown"
+	local device = graphicsBackend.device or ""
+	if device ~= "" then
+		return string.format("%s (%s)", name, device)
+	end
+	return name
+end
+
 local function collectResolutionOptions()
 	local options = {}
 	local seen = {}
@@ -2521,6 +2593,7 @@ local function syncGraphicsSettingsFromWindow()
 	graphicsSettings.resolutionIndex = findClosestResolutionIndex(graphicsSettings.resolutionOptions, w, h)
 	graphicsSettings.renderScale = clamp(graphicsSettings.renderScale or 1.0, 0.5, 1.5)
 	graphicsSettings.drawDistance = clamp(graphicsSettings.drawDistance or 1800, 300, 5000)
+	graphicsSettings.graphicsApiPreference = normalizeGraphicsApiPreference(graphicsSettings.graphicsApiPreference)
 end
 
 local function getSelectedResolutionOption()
@@ -2594,9 +2667,409 @@ local function applyGraphicsVideoMode()
 	end
 
 	syncGraphicsSettingsFromWindow()
+	refreshGraphicsBackendInfo()
 	rebuildCpuBuffersToWindow()
 	if renderer.setClipPlanes then
 		renderer.setClipPlanes(0.1, graphicsSettings.drawDistance)
+	end
+	return true
+end
+
+function deepCopyPrimitiveTable(value, depth, seen)
+	if type(value) ~= "table" then
+		return value
+	end
+	if (depth or 0) <= 0 then
+		return nil
+	end
+
+	seen = seen or {}
+	if seen[value] then
+		return nil
+	end
+	seen[value] = true
+
+	local out = {}
+	for key, entry in pairs(value) do
+		local keyType = type(key)
+		if keyType == "string" or keyType == "number" then
+			local entryType = type(entry)
+			if entryType == "number" or entryType == "string" or entryType == "boolean" then
+				out[key] = entry
+			elseif entryType == "table" then
+				local nested = deepCopyPrimitiveTable(entry, depth - 1, seen)
+				if nested ~= nil then
+					out[key] = nested
+				end
+			end
+		end
+	end
+	return out
+end
+
+function buildRestartModelSnapshot(role, hash, scale)
+	local snapshot = {
+		role = role,
+		hash = tostring(hash or "builtin-cube"),
+		scale = tonumber(scale) or 1
+	}
+	local entry = playerModelCache[snapshot.hash]
+	if not entry then
+		return snapshot
+	end
+
+	if type(entry.source) == "string" and entry.source ~= "" then
+		snapshot.source = entry.source
+	end
+	if type(entry.encoded) == "string" and entry.encoded ~= "" and #entry.encoded <= RESTART_MODEL_ENCODED_LIMIT then
+		snapshot.encoded = entry.encoded
+	end
+	return snapshot
+end
+
+function buildRestartSnapshot(targetGraphicsApiPreference)
+	local selectedResolution = getSelectedResolutionOption()
+	local cloudGroups = {}
+	for i, group in ipairs(cloudState.groups or {}) do
+		local center = group.center or { 0, 0, 0 }
+		cloudGroups[i] = {
+			center = {
+				tonumber(center[1]) or 0,
+				tonumber(center[2]) or 0,
+				tonumber(center[3]) or 0
+			},
+			radius = tonumber(group.radius) or 1,
+			windDrift = tonumber(group.windDrift) or 1
+		}
+	end
+
+	local graphicsApiPreference = normalizeGraphicsApiPreference(targetGraphicsApiPreference or
+		graphicsSettings.graphicsApiPreference)
+
+	return {
+		_l2d3d_restart_version = RESTART_STATE_VERSION,
+		graphicsApiPreference = graphicsApiPreference,
+		state = {
+			flightSimMode = flightSimMode and true or false,
+			viewMode = (viewState.mode == "third_person") and "third_person" or "first_person",
+			useGpuRenderer = useGpuRenderer and true or false,
+			localCallsign = localCallsign or "",
+			mouseSensitivity = tonumber(mouseSensitivity) or 0.001,
+			invertLookY = invertLookY and true or false,
+			showCrosshair = showCrosshair and true or false,
+			showDebugOverlay = showDebugOverlay and true or false,
+			colorCorruptionMode = colorCorruptionMode and true or false,
+			mapState = {
+				visible = mapState.visible and true or false,
+				zoomIndex = tonumber(mapState.zoomIndex) or 2
+			},
+			graphicsSettings = {
+				windowMode = graphicsSettings.windowMode,
+				resolution = selectedResolution and {
+					w = selectedResolution.w,
+					h = selectedResolution.h
+				} or nil,
+				renderScale = tonumber(graphicsSettings.renderScale) or 1.0,
+				drawDistance = tonumber(graphicsSettings.drawDistance) or 1800,
+				vsync = graphicsSettings.vsync and true or false,
+				graphicsApiPreference = graphicsApiPreference
+			},
+			hudSettings = deepCopyPrimitiveTable(hudSettings, 3),
+			camera = deepCopyPrimitiveTable({
+				pos = camera and camera.pos,
+				rot = camera and camera.rot,
+				vel = camera and camera.vel,
+				flightVel = camera and camera.flightVel,
+				flightRotVel = camera and camera.flightRotVel,
+				yoke = camera and camera.yoke,
+				throttle = camera and camera.throttle,
+				speed = camera and camera.speed,
+				baseFov = camera and camera.baseFov,
+				fov = camera and camera.fov,
+				walkYaw = camera and camera.walkYaw,
+				walkPitch = camera and camera.walkPitch
+			}, 4),
+			groundParams = deepCopyPrimitiveTable(activeGroundParams or defaultGroundParams, 3),
+			windState = deepCopyPrimitiveTable({
+				angle = windState.angle,
+				speed = windState.speed,
+				targetAngle = windState.targetAngle,
+				targetSpeed = windState.targetSpeed,
+				retargetIn = windState.retargetIn
+			}, 2),
+			cloudState = {
+				groupCount = tonumber(cloudState.groupCount) or #cloudState.groups,
+				minAltitude = tonumber(cloudState.minAltitude) or 120,
+				maxAltitude = tonumber(cloudState.maxAltitude) or 375,
+				spawnRadius = tonumber(cloudState.spawnRadius) or 1400,
+				despawnRadius = tonumber(cloudState.despawnRadius) or 1900,
+				minGroupSize = tonumber(cloudState.minGroupSize) or 18,
+				maxGroupSize = tonumber(cloudState.maxGroupSize) or 52,
+				minPuffs = tonumber(cloudState.minPuffs) or 5,
+				maxPuffs = tonumber(cloudState.maxPuffs) or 10,
+				groups = cloudGroups
+			},
+			playerModels = {
+				plane = buildRestartModelSnapshot("plane", playerPlaneModelHash, playerPlaneModelScale),
+				walking = buildRestartModelSnapshot("walking", playerWalkingModelHash, playerWalkingModelScale)
+			}
+		}
+	}
+end
+
+function restoreModelFromRestartSnapshot(role, snapshot)
+	if type(snapshot) ~= "table" then
+		return
+	end
+
+	local targetRole = (role == "walking") and "walking" or "plane"
+	local minScale = (targetRole == "walking") and 0.3 or 0.5
+	local maxScale = 3.0
+	local defaultScale = (targetRole == "walking") and defaultWalkingModelScale or defaultPlayerModelScale
+	local restoredScale = clamp(tonumber(snapshot.scale) or defaultScale, minScale, maxScale)
+	if targetRole == "walking" then
+		playerWalkingModelScale = restoredScale
+	else
+		playerPlaneModelScale = restoredScale
+	end
+
+	local loaded = false
+	if type(snapshot.encoded) == "string" and snapshot.encoded ~= "" then
+		local raw = decodeModelBytes(snapshot.encoded)
+		if type(raw) == "string" and raw ~= "" then
+			local ok = loadPlayerModelFromRaw(raw, "restart " .. targetRole, targetRole)
+			loaded = ok and true or false
+		end
+	end
+
+	if (not loaded) and type(snapshot.source) == "string" and snapshot.source ~= "" and snapshot.source ~= "builtin cube" then
+		local ok = loadPlayerModelFromStl(snapshot.source, targetRole)
+		loaded = ok and true or false
+	end
+
+	if (not loaded) and type(snapshot.hash) == "string" then
+		local entry = playerModelCache[snapshot.hash]
+		if entry then
+			setActivePlayerModel(entry, entry.source or ("cache " .. snapshot.hash), targetRole)
+			loaded = true
+		end
+	end
+
+	if not loaded then
+		local fallback = playerModelCache["builtin-cube"]
+		if fallback then
+			setActivePlayerModel(fallback, "builtin cube", targetRole)
+		end
+	end
+end
+
+function applyRestartSnapshot(snapshot)
+	if type(snapshot) ~= "table" then
+		return false
+	end
+
+	if type(snapshot.localCallsign) == "string" then
+		localCallsign = snapshot.localCallsign
+	end
+
+	mouseSensitivity = tonumber(snapshot.mouseSensitivity) or mouseSensitivity
+	invertLookY = snapshot.invertLookY and true or false
+	showCrosshair = snapshot.showCrosshair ~= false
+	showDebugOverlay = snapshot.showDebugOverlay ~= false
+	colorCorruptionMode = snapshot.colorCorruptionMode and true or false
+
+	if type(snapshot.hudSettings) == "table" then
+		for key, value in pairs(snapshot.hudSettings) do
+			if hudSettings[key] ~= nil then
+				hudSettings[key] = value
+			end
+		end
+		resetHudCaches()
+	end
+
+	local desiredGraphics = type(snapshot.graphicsSettings) == "table" and snapshot.graphicsSettings or nil
+	if desiredGraphics then
+		graphicsSettings.windowMode = (desiredGraphics.windowMode == "fullscreen" or desiredGraphics.windowMode == "borderless")
+			and desiredGraphics.windowMode or "windowed"
+		graphicsSettings.renderScale = clamp(tonumber(desiredGraphics.renderScale) or graphicsSettings.renderScale, 0.5, 1.5)
+		graphicsSettings.drawDistance = clamp(tonumber(desiredGraphics.drawDistance) or graphicsSettings.drawDistance, 300, 5000)
+		graphicsSettings.vsync = desiredGraphics.vsync and true or false
+		graphicsSettings.graphicsApiPreference = normalizeGraphicsApiPreference(
+			desiredGraphics.graphicsApiPreference or graphicsSettings.graphicsApiPreference
+		)
+
+		if type(desiredGraphics.resolution) == "table" then
+			graphicsSettings.resolutionOptions = collectResolutionOptions()
+			graphicsSettings.resolutionIndex = findClosestResolutionIndex(
+				graphicsSettings.resolutionOptions,
+				desiredGraphics.resolution.w,
+				desiredGraphics.resolution.h
+			)
+		end
+
+		local ok, err = applyGraphicsVideoMode()
+		if not ok then
+			logger.log("Restart state display restore failed: " .. tostring(err))
+		end
+	end
+
+	local playerModels = type(snapshot.playerModels) == "table" and snapshot.playerModels or {}
+	restoreModelFromRestartSnapshot("plane", playerModels.plane)
+	restoreModelFromRestartSnapshot("walking", playerModels.walking)
+
+	local desiredFlightMode = snapshot.flightSimMode and true or false
+	setFlightMode(desiredFlightMode)
+
+	local cam = type(snapshot.camera) == "table" and snapshot.camera or nil
+	if camera and cam then
+		if type(cam.pos) == "table" then
+			camera.pos[1] = tonumber(cam.pos[1]) or camera.pos[1]
+			camera.pos[2] = tonumber(cam.pos[2]) or camera.pos[2]
+			camera.pos[3] = tonumber(cam.pos[3]) or camera.pos[3]
+		end
+		if type(cam.rot) == "table" then
+			camera.rot = {
+				w = tonumber(cam.rot.w) or 1,
+				x = tonumber(cam.rot.x) or 0,
+				y = tonumber(cam.rot.y) or 0,
+				z = tonumber(cam.rot.z) or 0
+			}
+		end
+		if type(cam.vel) == "table" then
+			camera.vel = {
+				tonumber(cam.vel[1]) or 0,
+				tonumber(cam.vel[2]) or 0,
+				tonumber(cam.vel[3]) or 0
+			}
+		end
+		if type(cam.flightVel) == "table" then
+			camera.flightVel = {
+				tonumber(cam.flightVel[1]) or 0,
+				tonumber(cam.flightVel[2]) or 0,
+				tonumber(cam.flightVel[3]) or 0
+			}
+		end
+		if type(cam.yoke) == "table" then
+			camera.yoke = {
+				pitch = tonumber(cam.yoke.pitch) or 0,
+				yaw = tonumber(cam.yoke.yaw) or 0,
+				roll = tonumber(cam.yoke.roll) or 0
+			}
+		end
+		if type(cam.flightRotVel) == "table" then
+			camera.flightRotVel = {
+				pitch = tonumber(cam.flightRotVel.pitch) or 0,
+				yaw = tonumber(cam.flightRotVel.yaw) or 0,
+				roll = tonumber(cam.flightRotVel.roll) or 0
+			}
+		end
+		camera.throttle = clamp(tonumber(cam.throttle) or camera.throttle, 0, 1)
+		camera.speed = tonumber(cam.speed) or camera.speed
+		camera.baseFov = tonumber(cam.baseFov) or camera.baseFov
+		camera.fov = tonumber(cam.fov) or camera.baseFov
+		if not desiredFlightMode then
+			if cam.walkYaw ~= nil then
+				camera.walkYaw = tonumber(cam.walkYaw) or camera.walkYaw
+			end
+			if cam.walkPitch ~= nil then
+				camera.walkPitch = tonumber(cam.walkPitch) or camera.walkPitch
+			end
+		end
+		if camera.box and camera.box.pos then
+			camera.box.pos[1] = camera.pos[1]
+			camera.box.pos[2] = camera.pos[2]
+			camera.box.pos[3] = camera.pos[3]
+		end
+	end
+
+	local storedMap = type(snapshot.mapState) == "table" and snapshot.mapState or nil
+	if storedMap then
+		mapState.visible = storedMap.visible ~= false
+		mapState.zoomIndex = clamp(math.floor(tonumber(storedMap.zoomIndex) or mapState.zoomIndex), 1, #mapState.zoomExtents)
+		mapState.logicalCamera = nil
+		invalidateMapCache()
+	end
+
+	local desiredViewMode = snapshot.viewMode
+	if desiredViewMode == "third_person" then
+		viewState.mode = "third_person"
+	else
+		viewState.mode = "first_person"
+	end
+	resetAltLookState()
+
+	if type(snapshot.groundParams) == "table" then
+		rebuildGroundFromParams(snapshot.groundParams, "restart restore")
+	end
+
+	local storedWind = type(snapshot.windState) == "table" and snapshot.windState or nil
+	if storedWind then
+		windState.angle = viewMath.wrapAngle(tonumber(storedWind.angle) or windState.angle)
+		windState.speed = math.max(0, tonumber(storedWind.speed) or windState.speed)
+		windState.targetAngle = viewMath.wrapAngle(tonumber(storedWind.targetAngle) or windState.angle)
+		windState.targetSpeed = math.max(0, tonumber(storedWind.targetSpeed) or windState.speed)
+		windState.retargetIn = math.max(0, tonumber(storedWind.retargetIn) or 0)
+	end
+
+	local storedCloud = type(snapshot.cloudState) == "table" and snapshot.cloudState or nil
+	if storedCloud then
+		cloudState.groupCount = math.max(1, math.floor(tonumber(storedCloud.groupCount) or cloudState.groupCount))
+		cloudState.minAltitude = math.min(
+			tonumber(storedCloud.minAltitude) or cloudState.minAltitude,
+			tonumber(storedCloud.maxAltitude) or cloudState.maxAltitude
+		)
+		cloudState.maxAltitude = math.max(
+			tonumber(storedCloud.minAltitude) or cloudState.minAltitude,
+			tonumber(storedCloud.maxAltitude) or cloudState.maxAltitude
+		)
+		cloudState.spawnRadius = math.max(10, tonumber(storedCloud.spawnRadius) or cloudState.spawnRadius)
+		cloudState.despawnRadius = math.max(cloudState.spawnRadius + 10,
+			tonumber(storedCloud.despawnRadius) or cloudState.despawnRadius)
+		cloudState.minGroupSize = math.max(1, tonumber(storedCloud.minGroupSize) or cloudState.minGroupSize)
+		cloudState.maxGroupSize = math.max(cloudState.minGroupSize,
+			tonumber(storedCloud.maxGroupSize) or cloudState.maxGroupSize)
+		cloudState.minPuffs = math.max(1, math.floor(tonumber(storedCloud.minPuffs) or cloudState.minPuffs))
+		cloudState.maxPuffs = math.max(cloudState.minPuffs, math.floor(tonumber(storedCloud.maxPuffs) or cloudState.maxPuffs))
+
+		local now = love.timer.getTime()
+		cloudSim.spawnCloudField(cloudState, objects, camera, windState, cloudPuffModel, q, cloudState.groupCount, now)
+
+		if type(storedCloud.groups) == "table" then
+			for i, groupSnapshot in ipairs(storedCloud.groups) do
+				local group = cloudState.groups[i]
+				if group and type(groupSnapshot) == "table" then
+					local center = groupSnapshot.center or {}
+					group.center[1] = tonumber(center[1]) or group.center[1]
+					group.center[2] = tonumber(center[2]) or group.center[2]
+					group.center[3] = tonumber(center[3]) or group.center[3]
+					group.radius = math.max(1, tonumber(groupSnapshot.radius) or group.radius)
+					group.windDrift = tonumber(groupSnapshot.windDrift) or group.windDrift
+					cloudSim.updateCloudGroupVisuals(group, now)
+				end
+			end
+		end
+	end
+
+	if snapshot.useGpuRenderer ~= nil then
+		pendingRestartRendererPreference = snapshot.useGpuRenderer and true or false
+	end
+
+	syncLocalPlayerObject()
+	resolveActiveRenderCamera()
+	forceStateSync()
+	return true
+end
+
+function requestGraphicsApiRestart(targetGraphicsApiPreference)
+	local targetPreference = normalizeGraphicsApiPreference(targetGraphicsApiPreference)
+	local snapshot = buildRestartSnapshot(targetPreference)
+	logger.log("Applying graphics API preference '" .. targetPreference .. "' via in-process restart.")
+	local ok, err = pcall(function()
+		love.event.restart(snapshot)
+	end)
+	if not ok then
+		logger.log("Restart failed: " .. tostring(err))
+		return false, err
 	end
 	return true
 end
@@ -3015,6 +3488,21 @@ local function getPauseItemValue(item)
 		end
 		return "CPU (GPU unavailable)"
 	end
+	if item.id == "graphics_api" then
+		local prefLabel = getGraphicsApiPreferenceLabel(graphicsSettings.graphicsApiPreference)
+		if normalizeGraphicsApiPreference(graphicsSettings.graphicsApiPreference) ~=
+			normalizeGraphicsApiPreference(currentGraphicsApiPreference) then
+			return prefLabel .. " (pending restart)"
+		end
+		return prefLabel .. " (active)"
+	end
+	if item.id == "apply_graphics_api" then
+		if normalizeGraphicsApiPreference(graphicsSettings.graphicsApiPreference) ~=
+			normalizeGraphicsApiPreference(currentGraphicsApiPreference) then
+			return "Restart Now"
+		end
+		return "No Changes"
+	end
 	if item.id == "crosshair" then
 		return showCrosshair and "On" or "Off"
 	end
@@ -3132,6 +3620,9 @@ local function getPauseItemValue(item)
 	if item.id == "reconnect" then
 		return getRelayStatus()
 	end
+	if item.id == "apply_graphics_api" and isPauseConfirmActive("apply_graphics_api") then
+		return "Are you Sure?"
+	end
 	if item.id == "quit" and isPauseConfirmActive("quit") then
 		return "Are you Sure?"
 	end
@@ -3171,6 +3662,26 @@ local function adjustPauseItem(item, direction, multiplier)
 			graphicsSettings.resolutionIndex = ((graphicsSettings.resolutionIndex - 1 + stepDirection) % #options) + 1
 			setPauseStatus("Resolution: " .. getPauseItemValue(item) .. " (select Apply Display).", 1.8)
 		end
+		return
+	end
+
+	if item.id == "graphics_api" then
+		local options = { "auto", "vulkan", "opengl" }
+		local current = normalizeGraphicsApiPreference(graphicsSettings.graphicsApiPreference)
+		local index = 1
+		for i, option in ipairs(options) do
+			if current == option then
+				index = i
+				break
+			end
+		end
+		local nextIndex = ((index - 1 + stepDirection) % #options) + 1
+		graphicsSettings.graphicsApiPreference = options[nextIndex]
+		setPauseStatus(
+			"Graphics API: " .. getPauseItemValue(item) ..
+			" (select Apply API to restart and switch backend).",
+			2.4
+		)
 		return
 	end
 
@@ -3382,7 +3893,12 @@ local function activatePauseItem(item)
 	if item.confirm and not isPauseConfirmActive(item.id) then
 		pauseMenu.confirmItemId = item.id
 		pauseMenu.confirmUntil = love.timer.getTime() + 2.5
-		setPauseStatus("Confirm to \"" .. item.label .. "\".", 2.5)
+		if item.id == "apply_graphics_api" then
+			setPauseStatus("Warning: this restarts the game, reconnects relay, and reapplies world state. Confirm to continue.",
+				3.2)
+		else
+			setPauseStatus("Confirm to \"" .. item.label .. "\".", 2.5)
+		end
 		return
 	end
 	clearPauseConfirm()
@@ -3426,6 +3942,17 @@ local function activatePauseItem(item)
 	elseif item.id == "renderer" then
 		setRendererPreference(not useGpuRenderer)
 		setPauseStatus("Renderer: " .. getPauseItemValue(item), 1.2)
+	elseif item.id == "apply_graphics_api" then
+		local targetPreference = normalizeGraphicsApiPreference(graphicsSettings.graphicsApiPreference)
+		local currentPreference = normalizeGraphicsApiPreference(currentGraphicsApiPreference)
+		if targetPreference == currentPreference then
+			setPauseStatus("Graphics API already active: " .. getGraphicsApiPreferenceLabel(targetPreference) .. ".", 1.8)
+			return
+		end
+		local ok, err = requestGraphicsApiRestart(targetPreference)
+		if not ok then
+			setPauseStatus("Restart failed: " .. tostring(err), 2.6)
+		end
 	elseif item.id == "crosshair" then
 		showCrosshair = not showCrosshair
 		setPauseStatus("Crosshair: " .. getPauseItemValue(item), 1.2)
@@ -4413,6 +4940,26 @@ function love.load()
 	logger.reset()
 	logger.log("Booting Don's 3D Engine")
 	logger.log("Log file: " .. logger.getPath())
+	refreshGraphicsBackendInfo()
+	logger.log(string.format(
+		"Graphics API: %s | %s | %s | %s",
+		graphicsBackend.name,
+		(graphicsBackend.version ~= "" and graphicsBackend.version or "unknown-version"),
+		(graphicsBackend.vendor ~= "" and graphicsBackend.vendor or "unknown-vendor"),
+		(graphicsBackend.device ~= "" and graphicsBackend.device or "unknown-device")
+	))
+	bootRestartPayload = getEngineRestartPayload()
+	bootRestartSnapshotState = nil
+	if bootRestartPayload then
+		currentGraphicsApiPreference = normalizeGraphicsApiPreference(bootRestartPayload.graphicsApiPreference)
+		graphicsSettings.graphicsApiPreference = currentGraphicsApiPreference
+		if type(bootRestartPayload.state) == "table" then
+			bootRestartSnapshotState = bootRestartPayload.state
+		end
+		logger.log("Restart payload detected; applying preserved world/game state.")
+	else
+		currentGraphicsApiPreference = normalizeGraphicsApiPreference(graphicsSettings.graphicsApiPreference)
+	end
 	if not modeOk then
 		logger.log("Depth buffer mode unavailable, fallback mode set. Detail: " .. tostring(modeErr))
 	end
@@ -4533,6 +5080,7 @@ function love.load()
 	modelLoadPrompt.text = ""
 	modelLoadPrompt.cursor = 0
 	syncGraphicsSettingsFromWindow()
+	graphicsSettings.graphicsApiPreference = normalizeGraphicsApiPreference(graphicsSettings.graphicsApiPreference)
 	if renderer.setClipPlanes then
 		renderer.setClipPlanes(0.1, graphicsSettings.drawDistance)
 	end
@@ -4570,6 +5118,14 @@ function love.load()
 	cloudSim.pickNextWindTarget(windState)
 	cloudSim.spawnCloudField(cloudState, objects, camera, windState, cloudPuffModel, q, nil, love.timer.getTime())
 	logger.log(string.format("Cloud field initialized (%d groups).", #cloudState.groups))
+	if bootRestartSnapshotState then
+		if applyRestartSnapshot(bootRestartSnapshotState) then
+			logger.log("Restart state restored.")
+		else
+			logger.log("Restart state restore failed; using default startup state.")
+		end
+	end
+	currentGraphicsApiPreference = normalizeGraphicsApiPreference(graphicsSettings.graphicsApiPreference)
 
 	zBuffer = {}
 	for i = 1, screen.w * screen.h do
@@ -4595,6 +5151,10 @@ function love.load()
 	end
 	if renderer.setClipPlanes then
 		renderer.setClipPlanes(0.1, graphicsSettings.drawDistance)
+	end
+	if pendingRestartRendererPreference ~= nil then
+		setRendererPreference(pendingRestartRendererPreference)
+		pendingRestartRendererPreference = nil
 	end
 
 	resolveActiveRenderCamera()
@@ -5823,6 +6383,7 @@ function love.draw()
 			"Render: " ..
 			tostring(renderMode) .. " | Triangles: " .. tostring(math.floor(triangleCount)) .. " | FPS: " ..
 			tostring(love.timer.getFPS()) .. "\n" ..
+			"Graphics API: " .. getGraphicsBackendLabel() .. "\n" ..
 			string.format(
 				"View: %s | AltLook: %s | Map: %s (z%d)\n",
 				viewState.mode,
