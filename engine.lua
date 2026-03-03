@@ -6,13 +6,11 @@ extern mat4 modelViewProjection;
 
 vec4 position(mat4 transform_projection, vec4 vertex_position)
 {
-    // transform vertex using our MVP matrix
     return modelViewProjection * vertex_position;
 }
 
 vec4 effect(vec4 color, Image texture, vec2 texCoords, vec2 screenCoords)
 {
-    // pass vertex color to fragment
     return color;
 }
 ]]
@@ -678,6 +676,109 @@ function engine.drawTriangle(v1, v2, v3, color, zBuffer, screen, imageData, writ
     return imageData
 end
 
+local function clamp01(v)
+    if v < 0 then
+        return 0
+    end
+    if v > 1 then
+        return 1
+    end
+    return v
+end
+
+local function sampleTextureAtUv(images, texRef, uv)
+    if type(images) ~= "table" or type(texRef) ~= "table" then
+        return 1, 1, 1, 1
+    end
+    local imageIndex = tonumber(texRef.imageIndex)
+    if not imageIndex then
+        return 1, 1, 1, 1
+    end
+    local imageRecord = images[math.max(1, math.floor(imageIndex))]
+    local imageData = imageRecord and imageRecord.imageData
+    if not imageData then
+        return 1, 1, 1, 1
+    end
+
+    local w, h = imageData:getWidth(), imageData:getHeight()
+    if w <= 0 or h <= 0 then
+        return 1, 1, 1, 1
+    end
+
+    local u = tonumber(uv and uv[1]) or 0.5
+    local v = tonumber(uv and uv[2]) or 0.5
+    u = u - math.floor(u)
+    v = v - math.floor(v)
+
+    local x = math.max(0, math.min(w - 1, math.floor(u * (w - 1) + 0.5)))
+    local y = math.max(0, math.min(h - 1, math.floor((1 - v) * (h - 1) + 0.5)))
+    return imageData:getPixel(x, y)
+end
+
+local function sampleMaterialColorForFace(obj, face, faceIndex)
+    local baseColor = obj.color or { 0.5, 0.5, 0.5, 1.0 }
+    local materials = obj.materials
+    if type(materials) ~= "table" or #materials == 0 then
+        return {
+            baseColor[1] or 0.5,
+            baseColor[2] or 0.5,
+            baseColor[3] or 0.5,
+            baseColor[4] or 1.0
+        }
+    end
+
+    local faceMaterials = obj.faceMaterials or (obj.model and obj.model.faceMaterials)
+    local materialIndex = tonumber(faceMaterials and faceMaterials[faceIndex]) or 1
+    materialIndex = math.max(1, math.floor(materialIndex))
+    local material = materials[materialIndex] or materials[1]
+    if type(material) ~= "table" then
+        return {
+            baseColor[1] or 0.5,
+            baseColor[2] or 0.5,
+            baseColor[3] or 0.5,
+            baseColor[4] or 1.0
+        }
+    end
+
+    local factor = material.baseColorFactor or { 1, 1, 1, 1 }
+    local uv = nil
+    if obj.model and type(obj.model.vertexUVs) == "table" and type(face) == "table" and #face >= 3 then
+        local uvA = obj.model.vertexUVs[face[1]]
+        local uvB = obj.model.vertexUVs[face[2]]
+        local uvC = obj.model.vertexUVs[face[3]]
+        if uvA and uvB and uvC then
+            uv = {
+                ((uvA[1] or 0) + (uvB[1] or 0) + (uvC[1] or 0)) / 3,
+                ((uvA[2] or 0) + (uvB[2] or 0) + (uvC[2] or 0)) / 3
+            }
+        end
+    end
+
+    local tr, tg, tb, ta = sampleTextureAtUv(obj.images, material.baseColorTexture, uv)
+    local r = clamp01((factor[1] or 1) * tr * (baseColor[1] or 1))
+    local g = clamp01((factor[2] or 1) * tg * (baseColor[2] or 1))
+    local b = clamp01((factor[3] or 1) * tb * (baseColor[3] or 1))
+    local a = clamp01((factor[4] or 1) * ta * (baseColor[4] or 1))
+
+    local emissive = material.emissiveFactor
+    if type(emissive) == "table" then
+        r = clamp01(r + (emissive[1] or 0))
+        g = clamp01(g + (emissive[2] or 0))
+        b = clamp01(b + (emissive[3] or 0))
+    end
+
+    if material.alphaMode == "MASK" then
+        if a < (tonumber(material.alphaCutoff) or 0.5) then
+            return nil
+        end
+        a = 1
+    elseif material.alphaMode ~= "BLEND" then
+        a = 1
+    end
+
+    return { r, g, b, a }
+end
+
 function engine.drawObject(obj, skipCulling, camera, vector3, q, screen, zBuffer, imageData, writeDepth)
     if not obj or not obj.model or not obj.model.vertices or not obj.model.faces then
         return imageData
@@ -733,7 +834,10 @@ function engine.drawObject(obj, skipCulling, camera, vector3, q, screen, zBuffer
             projected[i] = { sx, sy, v[3] }
         end
 
-        local triColor = obj.color or { 0.5, 0.5, 0.5, 1.0 }
+        local triColor = sampleMaterialColorForFace(obj, face, faceIndex)
+        if not triColor then
+            goto continue
+        end
         if obj.model.faceColors and obj.model.faceColors[faceIndex] then
             local c = obj.model.faceColors[faceIndex]
             triColor = {
