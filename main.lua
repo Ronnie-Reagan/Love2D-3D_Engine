@@ -1,3 +1,5 @@
+
+local hostAddy = "love.donreagan.ca:1988"
 local q = require("quat")
 local vector3 = require("vector3")
 local love = require "love" -- avoids nil report from intellisense, safe to remove if causes issues (it should be OK)
@@ -11,7 +13,6 @@ local viewMath = require "view_math"
 local cloudSim = require "cloud_sim"
 local logger = require "logger"
 local objectDefs = require "object"
-local hostAddy = "ecosim.donreagan.ca:1988"
 local relay = enet.host_create()
 local relayServer = relay and relay:connect(hostAddy) or nil
 local flightSimMode = false
