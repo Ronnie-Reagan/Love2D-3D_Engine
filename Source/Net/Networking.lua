@@ -1,6 +1,6 @@
 local networking = {}
 
-local objectLib = require "object"
+local objectLib = require "Source.Core.ObjectDefs"
 local cubeModel = objectLib.cubeModel
 
 local function sanitizeScale(value, fallback)

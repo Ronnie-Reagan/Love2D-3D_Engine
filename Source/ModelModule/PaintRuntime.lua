@@ -205,7 +205,7 @@ function paintRuntime.paintStroke(sessionId, strokeCmd)
             local dist = math.sqrt(dx * dx + dy * dy)
             if dist <= radius then
                 local t = 1 - (dist / radius)
-                local falloff = math.pow(t, 1 / hardness)
+                local falloff = t ^ (1 / hardness)
                 local alpha = opacity * falloff * (tonumber(color[4]) or 1)
                 if erase then
                     local r, g, b, a = imageData:getPixel(x, y)

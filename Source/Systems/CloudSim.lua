@@ -1,5 +1,5 @@
 local cloud = {}
-local viewMath = require "view_math"
+local viewMath = require "Source.Math.ViewMath"
 
 local function clamp(value, minValue, maxValue)
 	if value < minValue then

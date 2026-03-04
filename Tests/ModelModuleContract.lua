@@ -1,4 +1,4 @@
-local modelModule = require("model_module")
+local modelModule = require("Source.ModelModule.Init")
 
 local function assertTrue(value, message)
     if not value then
@@ -80,7 +80,7 @@ end
 
 local function run()
     runStlContract()
-    print("model_module contract tests passed")
+    print("ModelModule contract tests passed")
 end
 
 run()

@@ -1,6 +1,6 @@
 local renderer = {}
 local love = require "love"
-local q = require "quat"
+local q = require "Source.Math.Quat"
 
 local vertexFormat = {
     { "VertexPosition", "floatvec3" },
