@@ -53,10 +53,10 @@ local function readF32LE(data, offset)
         if mantissa == 0 then
             return sign * 0
         end
-        return sign * math.ldexp(mantissa, -149)
+        return sign * (mantissa * 2^-149)
     end
 
-    return sign * math.ldexp(1 + (mantissa / 8388608), exponent - 127)
+    return sign * ((1 + (mantissa / 8388608)) * 2^(exponent - 127))
 end
 
 local function parseAsciiSTL(data)
@@ -434,7 +434,7 @@ function engine.processMovement(camera, dt, flightSimMode, vector3, q, objects, 
         local liftWindow = math.max(1, fullLiftSpeed - stallSpeed)
         local liftFactor = math.max(0, math.min((forwardAirspeed - stallSpeed) / liftWindow, 1))
         local verticalAirspeed = vector3.dot(airVel, up)
-        local aoa = math.atan2(-verticalAirspeed, math.max(1e-5, forwardAirspeed))
+        local aoa = math.atan(-verticalAirspeed, math.max(1e-5, forwardAirspeed))
         local zeroLiftAngle = camera.flightZeroLiftAngle or 0
         local maxLiftAngle = camera.flightMaxLiftAngle or math.rad(20)
         local effectiveAoa = math.max(-maxLiftAngle, math.min(aoa - zeroLiftAngle, maxLiftAngle))
@@ -514,7 +514,7 @@ function engine.processMovement(camera, dt, flightSimMode, vector3, q, objects, 
             if camera.flightGroundPitchHoldEnabled ~= false then
                 local holdPitch = camera.flightGroundPitchHoldAngle or math.rad(4.5)
                 local currentForward = q.rotateVector(camera.rot, { 0, 0, 1 })
-                local yaw = math.atan2(currentForward[1], currentForward[3])
+                local yaw = math.atan(currentForward[1], currentForward[3])
                 local yawQuat = q.fromAxisAngle({ 0, 1, 0 }, yaw)
                 local holdRight = q.rotateVector(yawQuat, { 1, 0, 0 })
                 local pitchQuat = q.fromAxisAngle(holdRight, holdPitch)

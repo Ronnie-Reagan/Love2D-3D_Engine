@@ -29,10 +29,10 @@ local function readF32LE(data, offset)
         if mantissa == 0 then
             return sign * 0
         end
-        return sign * math.ldexp(mantissa, -149)
+        return sign * (mantissa * 2^-149)
     end
 
-    return sign * math.ldexp(1 + (mantissa / 8388608), exponent - 127)
+    return sign * ((1 + (mantissa / 8388608)) * 2^(exponent - 127))
 end
 
 local function parseAsciiSTL(data)

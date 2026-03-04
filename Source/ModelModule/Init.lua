@@ -1,12 +1,12 @@
-local stlImporter = require("model_module.importers.stl_importer")
-local gltfImporter = require("model_module.importers.gltf_importer")
-local diagnostics = require("model_module.diagnostics")
-local materialRuntime = require("model_module.material_runtime")
-local paintRuntime = require("model_module.paint_runtime")
-local blobSync = require("model_module.net_blob_sync")
-local persistence = require("model_module.persistence")
-local gpuBridge = require("model_module.render_bridge_gpu")
-local cpuBridge = require("model_module.render_bridge_cpu")
+local stlImporter = require("Source.ModelModule.Importers.StlImporter")
+local gltfImporter = require("Source.ModelModule.Importers.GltfImporter")
+local diagnostics = require("Source.ModelModule.Diagnostics")
+local materialRuntime = require("Source.ModelModule.MaterialRuntime")
+local paintRuntime = require("Source.ModelModule.PaintRuntime")
+local blobSync = require("Source.ModelModule.NetBlobSync")
+local persistence = require("Source.ModelModule.Persistence")
+local gpuBridge = require("Source.ModelModule.RenderBridgeGpu")
+local cpuBridge = require("Source.ModelModule.RenderBridgeCpu")
 
 local ModelModule = {}
 

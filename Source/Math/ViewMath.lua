@@ -19,7 +19,7 @@ end
 function viewMath.getYawFromRotation(rotation, q)
 	local rot = rotation or q.identity()
 	local forward = q.rotateVector(rot, { 0, 0, 1 })
-	return math.atan2(forward[1], forward[3])
+	return math.atan(forward[1], forward[3])
 end
 
 function viewMath.segmentAabbIntersectionT(startPos, endPos, obj)
