@@ -576,6 +576,8 @@ local function buildMaterials(gltf)
     for i = 1, #source do
         local m = source[i] or {}
         local pbr = m.pbrMetallicRoughness or {}
+        local ext = m.extensions or {}
+        local specGloss = ext.KHR_materials_pbrSpecularGlossiness
         materials[#materials + 1] = {
             name = m.name or ("material_" .. tostring(i - 1)),
             baseColorFactor = pbr.baseColorFactor or { 1, 1, 1, 1 },
@@ -589,7 +591,13 @@ local function buildMaterials(gltf)
             emissiveFactor = m.emissiveFactor or { 0, 0, 0 },
             alphaMode = m.alphaMode or "OPAQUE",
             alphaCutoff = m.alphaCutoff or 0.5,
-            doubleSided = m.doubleSided and true or false
+            doubleSided = m.doubleSided and true or false,
+            workflow = specGloss and "specGloss" or "metalRough",
+            diffuseFactor = (specGloss and specGloss.diffuseFactor) or { 1, 1, 1, 1 },
+            specularFactor = (specGloss and specGloss.specularFactor) or { 1, 1, 1 },
+            glossinessFactor = (specGloss and specGloss.glossinessFactor ~= nil) and specGloss.glossinessFactor or 1,
+            diffuseTexture = resolveTextureRef(gltf, specGloss and specGloss.diffuseTexture or nil),
+            specularGlossinessTexture = resolveTextureRef(gltf, specGloss and specGloss.specularGlossinessTexture or nil)
         }
     end
     if #materials == 0 then
@@ -600,7 +608,11 @@ local function buildMaterials(gltf)
             roughnessFactor = 1,
             alphaMode = "OPAQUE",
             alphaCutoff = 0.5,
-            doubleSided = false
+            doubleSided = false,
+            workflow = "metalRough",
+            diffuseFactor = { 1, 1, 1, 1 },
+            specularFactor = { 1, 1, 1 },
+            glossinessFactor = 1
         }
     end
     return materials
@@ -707,7 +719,7 @@ local function parseGltfDocument(gltf, opts)
     end
 
     local vertices, faces = {}, {}
-    local vertexNormals, vertexUVs, vertexTangents, vertexColors = {}, {}, {}, {}
+    local vertexNormals, vertexUVs, vertexUVs1, vertexTangents, vertexColors = {}, {}, {}, {}, {}
     local faceMaterials = {}
     local submeshes = {}
 
@@ -726,6 +738,7 @@ local function parseGltfDocument(gltf, opts)
         end
         local normals = decodeAccessor(gltf, buffers, attrs.NORMAL)
         local uvs = decodeAccessor(gltf, buffers, attrs.TEXCOORD_0)
+        local uvs1 = decodeAccessor(gltf, buffers, attrs.TEXCOORD_1)
         local tangents = decodeAccessor(gltf, buffers, attrs.TANGENT)
         local colors = decodeAccessor(gltf, buffers, attrs.COLOR_0)
         local indices = decodeAccessor(gltf, buffers, primitive.indices)
@@ -764,6 +777,10 @@ local function parseGltfDocument(gltf, opts)
                 if uvs and uvs[srcIndex] then
                     local uv = uvs[srcIndex]
                     vertexUVs[base + v] = { uv[1] or 0, uv[2] or 0 }
+                end
+                if uvs1 and uvs1[srcIndex] then
+                    local uv1 = uvs1[srcIndex]
+                    vertexUVs1[base + v] = { uv1[1] or 0, uv1[2] or 0 }
                 end
                 if tangents and tangents[srcIndex] then
                     local t = tangents[srcIndex]
@@ -868,6 +885,7 @@ local function parseGltfDocument(gltf, opts)
         isSolid = true,
         vertexNormals = (#vertexNormals > 0) and vertexNormals or nil,
         vertexUVs = (#vertexUVs > 0) and vertexUVs or nil,
+        vertexUVs1 = (#vertexUVs1 > 0) and vertexUVs1 or nil,
         vertexTangents = (#vertexTangents > 0) and vertexTangents or nil,
         faceMaterials = faceMaterials
     }
@@ -879,6 +897,7 @@ local function parseGltfDocument(gltf, opts)
             faces = faces,
             vertexNormals = model.vertexNormals,
             vertexUVs = model.vertexUVs,
+            vertexUVs1 = model.vertexUVs1,
             vertexTangents = model.vertexTangents,
             vertexColors = model.vertexColors,
             submeshes = submeshes,

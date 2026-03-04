@@ -63,6 +63,20 @@ local function buildOrientationOffsetQuat(q, baseOffset, orientation)
     return userOffset
 end
 
+local function resolveBaseOffset(baseOffsetOrResolver, role, modelHash)
+    if type(baseOffsetOrResolver) == "function" then
+        local ok, resolved = pcall(baseOffsetOrResolver, role, modelHash)
+        if ok and type(resolved) == "table" then
+            return resolved
+        end
+        return nil
+    end
+    if type(baseOffsetOrResolver) == "table" then
+        return baseOffsetOrResolver
+    end
+    return nil
+end
+
 function networking.createObjectForPeer(peerID, objects, q, playerModel, playerModelRotationOffset, defaults)
     defaults = defaults or {}
     local startScale = sanitizeScale(defaults.scale, 1.35)
@@ -78,12 +92,13 @@ function networking.createObjectForPeer(peerID, objects, q, playerModel, playerM
     local activeScale = (role == "walking") and walkingScale or planeScale
     local activeModelHash = (role == "walking") and walkingModelHash or planeModelHash
     local activeOrientation = (role == "walking") and walkingOrientation or planeOrientation
+    local baseOffset = resolveBaseOffset(playerModelRotationOffset, role, activeModelHash)
     local model = playerModel or cubeModel
     local obj = {
         model = model,
         pos = { 0, 0, 0 },
         basePos = { 0, 0, 0 },
-        rot = buildOrientationOffsetQuat(q, playerModelRotationOffset, activeOrientation),
+        rot = buildOrientationOffsetQuat(q, baseOffset, activeOrientation),
         color = { math.random(), math.random(), math.random() },
         isSolid = true,
         id = peerID,
@@ -344,7 +359,8 @@ function networking.handlePacket(data, peers, objects, q, playerModel, playerMod
 
     local baseRot = { w = rw, x = rx, y = ry, z = rz }
     local activeOrientation = (activeRole == "walking") and obj.walkingOrientation or obj.planeOrientation
-    local modelOffset = buildOrientationOffsetQuat(q, playerModelRotationOffset, activeOrientation)
+    local baseOffset = resolveBaseOffset(playerModelRotationOffset, activeRole, activeModelHash)
+    local modelOffset = buildOrientationOffsetQuat(q, baseOffset, activeOrientation)
     obj.rot = q.normalize(q.multiply(baseRot, modelOffset))
 
     return id

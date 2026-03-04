@@ -146,6 +146,12 @@ local function normalizeModel(model, targetExtent)
             out.vertexUVs[i] = { uv[1] or 0, uv[2] or 0 }
         end
     end
+    if type(model.vertexUVs1) == "table" then
+        out.vertexUVs1 = {}
+        for i, uv in ipairs(model.vertexUVs1) do
+            out.vertexUVs1[i] = { uv[1] or 0, uv[2] or 0 }
+        end
+    end
     if type(model.vertexNormals) == "table" then
         out.vertexNormals = {}
         for i, n in ipairs(model.vertexNormals) do
@@ -350,6 +356,7 @@ function ModelModule.applyToObject(obj, assetId, role)
     obj.images = asset.images
     obj.submeshes = asset.geometry and asset.geometry.submeshes or nil
     obj.faceMaterials = asset.geometry and asset.geometry.faceMaterials or nil
+    obj.uvFlipV = false
     local orient = asset.orientationByRole and asset.orientationByRole[role or "plane"]
     if orient then
         obj.modelOrientation = {

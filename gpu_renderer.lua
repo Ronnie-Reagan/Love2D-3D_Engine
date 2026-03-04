@@ -5,6 +5,7 @@ local q = require "quat"
 local vertexFormat = {
     { name = "VertexPosition", location = 0, format = "floatvec3" },
     { name = "aTexCoord0", location = 5, format = "floatvec2" },
+    { name = "aTexCoord1", location = 6, format = "floatvec2" },
     { name = "VertexColor", location = 2, format = "floatvec4" },
     { name = "aNormal", location = 3, format = "floatvec3" },
     { name = "aTangent", location = 4, format = "floatvec4" }
@@ -41,8 +42,20 @@ uniform float uUseNormalTex;
 uniform float uUseOcclusionTex;
 uniform float uUseEmissiveTex;
 uniform float uUsePaintTex;
+uniform float uUseSpecGlossWorkflow;
+uniform float uUseDiffuseTex;
+uniform float uUseSpecGlossTex;
 uniform float uNormalScale;
 uniform float uOcclusionStrength;
+uniform float uFlipV;
+uniform float uBaseColorTexCoord;
+uniform float uMetalRoughTexCoord;
+uniform float uNormalTexCoord;
+uniform float uOcclusionTexCoord;
+uniform float uEmissiveTexCoord;
+uniform float uPaintTexCoord;
+uniform float uDiffuseTexCoord;
+uniform float uSpecGlossTexCoord;
 
 uniform Image uBaseColorTex;
 uniform Image uMetalRoughTex;
@@ -50,6 +63,11 @@ uniform Image uNormalTex;
 uniform Image uOcclusionTex;
 uniform Image uEmissiveTex;
 uniform Image uPaintTex;
+uniform Image uDiffuseTex;
+uniform Image uSpecGlossTex;
+uniform vec4 uDiffuseFactor;
+uniform vec3 uSpecularFactor;
+uniform float uGlossinessFactor;
 
 uniform vec3 uLightDir;
 uniform vec3 uLightColor;
@@ -59,7 +77,8 @@ varying vec3 vWorldPos;
 varying vec3 vWorldNormal;
 varying vec3 vWorldTangent;
 varying vec3 vWorldBitangent;
-varying vec2 vUv;
+varying vec2 vUv0;
+varying vec2 vUv1;
 
 const float PI = 3.14159265359;
 
@@ -76,6 +95,7 @@ vec3 safeNormalize(vec3 v)
 layout(location = 3) in vec3 aNormal;
 layout(location = 4) in vec4 aTangent;
 layout(location = 5) in vec2 aTexCoord0;
+layout(location = 6) in vec2 aTexCoord1;
 
 vec4 position(mat4 transform_projection, vec4 vertex_position)
 {
@@ -102,7 +122,8 @@ vec4 position(mat4 transform_projection, vec4 vertex_position)
     vWorldNormal = worldNormal;
     vWorldTangent = worldTangent;
     vWorldBitangent = worldBitangent;
-    vUv = aTexCoord0;
+    vUv0 = aTexCoord0;
+    vUv1 = aTexCoord1;
 
     vec3 rel = worldPos - uCamPos;
     vec3 cam = vec3(
@@ -153,45 +174,80 @@ vec3 fresnelSchlick(float cosTheta, vec3 F0)
     return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
 }
 
+vec2 pickUv(float texCoordSet)
+{
+    vec2 uv = (texCoordSet > 0.5) ? vUv1 : vUv0;
+    if (uFlipV > 0.5) {
+        uv.y = 1.0 - uv.y;
+    }
+    return uv;
+}
+
 vec4 effect(vec4 color, Image texture, vec2 texture_coords, vec2 screen_coords)
 {
-    vec2 uv = vUv;
+    vec2 uvBase = pickUv(uBaseColorTexCoord);
+    vec4 baseColor = vec4(1.0);
 
-    vec4 baseTex = Texel(uBaseColorTex, uv);
-    if (uUseBaseColorTex < 0.5) {
-        baseTex = vec4(1.0);
+    if (uUseSpecGlossWorkflow > 0.5) {
+        vec2 uvDiffuse = pickUv(uDiffuseTexCoord);
+        vec4 diffuseTex = Texel(uDiffuseTex, uvDiffuse);
+        if (uUseDiffuseTex < 0.5) {
+            diffuseTex = vec4(1.0);
+        }
+        baseColor = diffuseTex * uDiffuseFactor * vec4(uColor, uAlpha) * color;
+    } else {
+        vec4 baseTex = Texel(uBaseColorTex, uvBase);
+        if (uUseBaseColorTex < 0.5) {
+            baseTex = vec4(1.0);
+        }
+        baseColor = baseTex * uBaseColorFactor * vec4(uColor, uAlpha) * color;
     }
 
-    vec4 baseColor = baseTex * uBaseColorFactor * vec4(uColor, uAlpha) * color;
     float alpha = clamp(baseColor.a, 0.0, 1.0);
 
     if (uUsePaintTex > 0.5) {
-        vec4 paint = Texel(uPaintTex, uv);
+        vec2 uvPaint = pickUv(uPaintTexCoord);
+        vec4 paint = Texel(uPaintTex, uvPaint);
         baseColor.rgb = mix(baseColor.rgb, paint.rgb, clamp(paint.a, 0.0, 1.0));
     }
 
     float metallic = clamp(uMetallicFactor, 0.0, 1.0);
     float roughness = clamp(uRoughnessFactor, 0.04, 1.0);
-    if (uUseMetalRoughTex > 0.5) {
-        vec4 mr = Texel(uMetalRoughTex, uv);
+    vec3 specularColor = vec3(0.04);
+    if (uUseSpecGlossWorkflow > 0.5) {
+        vec2 uvSG = pickUv(uSpecGlossTexCoord);
+        vec4 sg = Texel(uSpecGlossTex, uvSG);
+        if (uUseSpecGlossTex < 0.5) {
+            sg = vec4(1.0);
+        }
+        specularColor = clamp(uSpecularFactor * sg.rgb, 0.0, 1.0);
+        float glossiness = clamp(uGlossinessFactor * sg.a, 0.0, 1.0);
+        roughness = clamp(1.0 - glossiness, 0.04, 1.0);
+        metallic = 0.0;
+    } else if (uUseMetalRoughTex > 0.5) {
+        vec2 uvMR = pickUv(uMetalRoughTexCoord);
+        vec4 mr = Texel(uMetalRoughTex, uvMR);
         metallic = clamp(metallic * mr.b, 0.0, 1.0);
         roughness = clamp(roughness * mr.g, 0.04, 1.0);
     }
 
     float ao = 1.0;
     if (uUseOcclusionTex > 0.5) {
-        float occ = Texel(uOcclusionTex, uv).r;
+        vec2 uvOcc = pickUv(uOcclusionTexCoord);
+        float occ = Texel(uOcclusionTex, uvOcc).r;
         ao = mix(1.0, occ, clamp(uOcclusionStrength, 0.0, 1.0));
     }
 
     vec3 emissive = uEmissiveFactor;
     if (uUseEmissiveTex > 0.5) {
-        emissive *= Texel(uEmissiveTex, uv).rgb;
+        vec2 uvEmissive = pickUv(uEmissiveTexCoord);
+        emissive *= Texel(uEmissiveTex, uvEmissive).rgb;
     }
 
     vec3 N = safeNormalize(vWorldNormal);
     if (uUseNormalTex > 0.5) {
-        vec3 tangentNormal = Texel(uNormalTex, uv).xyz * 2.0 - 1.0;
+        vec2 uvNormal = pickUv(uNormalTexCoord);
+        vec3 tangentNormal = Texel(uNormalTex, uvNormal).xyz * 2.0 - 1.0;
         tangentNormal.xy *= uNormalScale;
         mat3 tbn = mat3(
             safeNormalize(vWorldTangent),
@@ -213,14 +269,20 @@ vec4 effect(vec4 color, Image texture, vec2 texture_coords, vec2 screen_coords)
     float NdotH = max(dot(N, H), 0.0);
     float VdotH = max(dot(V, H), 0.0);
 
-    vec3 F0 = mix(vec3(0.04), baseColor.rgb, metallic);
+    vec3 F0 = (uUseSpecGlossWorkflow > 0.5) ? specularColor : mix(vec3(0.04), baseColor.rgb, metallic);
     vec3 F = fresnelSchlick(VdotH, F0);
     float D = distributionGGX(NdotH, roughness);
     float G = geometrySmith(NdotV, NdotL, roughness);
 
     vec3 specular = (D * G * F) / max(4.0 * NdotV * NdotL, 1e-5);
-    vec3 kD = (1.0 - F) * (1.0 - metallic);
-    vec3 diffuse = (kD * baseColor.rgb) / PI;
+    vec3 diffuse = vec3(0.0);
+    if (uUseSpecGlossWorkflow > 0.5) {
+        float maxSpec = clamp(max(max(F0.r, F0.g), F0.b), 0.0, 1.0);
+        diffuse = (baseColor.rgb * (1.0 - maxSpec)) / PI;
+    } else {
+        vec3 kD = (1.0 - F) * (1.0 - metallic);
+        diffuse = (kD * baseColor.rgb) / PI;
+    }
 
     vec3 direct = (diffuse + specular) * uLightColor * NdotL;
     vec3 ambient = baseColor.rgb * (uAmbientStrength * ao);
@@ -253,13 +315,20 @@ local state = {
     loggedMaterialDebug = false,
     whiteTexture = nil,
     blackTexture = nil,
-    normalTexture = nil
+    normalTexture = nil,
+    lightDir = { 0.35, 0.85, 0.25 },
+    lightColor = { 1.75, 1.72, 1.66 },
+    ambientStrength = 0.24
 }
 
 local defaultMaterial = {
     baseColorFactor = { 1, 1, 1, 1 },
     metallicFactor = 0,
     roughnessFactor = 1,
+    workflow = "metalRough",
+    diffuseFactor = { 1, 1, 1, 1 },
+    specularFactor = { 1, 1, 1 },
+    glossinessFactor = 1,
     emissiveFactor = { 0, 0, 0 },
     alphaMode = "OPAQUE",
     alphaCutoff = 0.5,
@@ -364,6 +433,13 @@ local function getTextureImage(images, textureRef, fallback)
     return fallback, false
 end
 
+local function textureCoordIndex(textureRef)
+    if type(textureRef) == "table" then
+        return math.max(0, math.floor(tonumber(textureRef.texCoord) or 0))
+    end
+    return 0
+end
+
 local function computeFaceNormal(a, b, c)
     local e1 = sub3(b, a)
     local e2 = sub3(c, a)
@@ -405,10 +481,11 @@ local function computeFaceTangent(a, b, c, uvA, uvB, uvC, normal)
     return { tangent[1], tangent[2], tangent[3], 1 }
 end
 
-local function appendVertex(target, pos, uv, color, normal, tangent)
+local function appendVertex(target, pos, uv0, uv1, color, normal, tangent)
     target[#target + 1] = {
         pos[1], pos[2], pos[3],
-        uv[1], uv[2],
+        uv0[1], uv0[2],
+        uv1[1], uv1[2],
         color[1], color[2], color[3], color[4],
         normal[1], normal[2], normal[3],
         tangent[1], tangent[2], tangent[3], tangent[4]
@@ -428,6 +505,7 @@ local function buildMeshSetForModel(model)
     local faceMaterials = model.faceMaterials
     local normals = model.vertexNormals
     local uvs = model.vertexUVs
+    local uvs1 = model.vertexUVs1
     local tangents = model.vertexTangents
     local colors = model.vertexColors
 
@@ -450,6 +528,9 @@ local function buildMeshSetForModel(model)
                     local uvA = uvs and uvs[ia] or { 0, 0 }
                     local uvB = uvs and uvs[ib] or { 0, 0 }
                     local uvC = uvs and uvs[ic] or { 0, 0 }
+                    local uv1A = uvs1 and uvs1[ia] or uvA
+                    local uv1B = uvs1 and uvs1[ib] or uvB
+                    local uv1C = uvs1 and uvs1[ic] or uvC
                     local faceNormal = computeFaceNormal(a, b, c)
 
                     local nA = normalize3(normals and normals[ia] or faceNormal)
@@ -465,9 +546,9 @@ local function buildMeshSetForModel(model)
                     local cB = colors and colors[ib] or { 1, 1, 1, 1 }
                     local cC = colors and colors[ic] or { 1, 1, 1, 1 }
 
-                    appendVertex(bucket, a, uvA, cA, nA, tA)
-                    appendVertex(bucket, b, uvB, cB, nB, tB)
-                    appendVertex(bucket, c, uvC, cC, nC, tC)
+                    appendVertex(bucket, a, uvA, uv1A, cA, nA, tA)
+                    appendVertex(bucket, b, uvB, uv1B, cB, nB, tB)
+                    appendVertex(bucket, c, uvC, uv1C, cC, nC, tC)
                 end
             end
         end
@@ -563,6 +644,32 @@ function renderer.setClipPlanes(nearPlane, farPlane)
     state.farPlane = farValue
 end
 
+function renderer.setLighting(config)
+    if type(config) ~= "table" then
+        return
+    end
+
+    if type(config.direction) == "table" then
+        state.lightDir = normalize3({
+            tonumber(config.direction[1]) or state.lightDir[1],
+            tonumber(config.direction[2]) or state.lightDir[2],
+            tonumber(config.direction[3]) or state.lightDir[3]
+        })
+    end
+
+    if type(config.color) == "table" then
+        state.lightColor = {
+            math.max(0, tonumber(config.color[1]) or state.lightColor[1]),
+            math.max(0, tonumber(config.color[2]) or state.lightColor[2]),
+            math.max(0, tonumber(config.color[3]) or state.lightColor[3])
+        }
+    end
+
+    if config.ambient ~= nil then
+        state.ambientStrength = math.max(0, tonumber(config.ambient) or state.ambientStrength)
+    end
+end
+
 function renderer.drawWorld(objects, camera, backgroundColor)
     if not state.ready or not state.shader then
         return false, "renderer not initialized"
@@ -593,10 +700,9 @@ function renderer.drawWorld(objects, camera, backgroundColor)
     state.shader:send("uNear", state.nearPlane)
     state.shader:send("uFar", state.farPlane)
 
-    local lightDir = normalize3({ 0.35, 0.85, 0.25 })
-    state.shader:send("uLightDir", lightDir)
-    state.shader:send("uLightColor", { 1.75, 1.72, 1.66 })
-    state.shader:send("uAmbientStrength", 0.24)
+    state.shader:send("uLightDir", state.lightDir)
+    state.shader:send("uLightColor", state.lightColor)
+    state.shader:send("uAmbientStrength", state.ambientStrength)
 
     local opaqueCalls = {}
     local transparentCalls = {}
@@ -668,11 +774,15 @@ function renderer.drawWorld(objects, camera, backgroundColor)
         state.shader:send("uAlphaMode", alphaModeCode(material.alphaMode))
         state.shader:send("uDoubleSided", (material.doubleSided and 1) or 0)
 
+        local useSpecGloss = (material.workflow == "specGloss") and true or false
         local baseTex, useBase = getTextureImage(obj.images, material.baseColorTexture, state.whiteTexture)
         local metalTex, useMetal = getTextureImage(obj.images, material.metallicRoughnessTexture, state.whiteTexture)
         local normalTex, useNormal = getTextureImage(obj.images, material.normalTexture, state.normalTexture)
         local occlusionTex, useOcc = getTextureImage(obj.images, material.occlusionTexture, state.whiteTexture)
         local emissiveTex, useEmissive = getTextureImage(obj.images, material.emissiveTexture, state.blackTexture)
+        local diffuseTex, useDiffuse = getTextureImage(obj.images, material.diffuseTexture, state.whiteTexture)
+        local specGlossTex, useSpecGlossTex = getTextureImage(obj.images, material.specularGlossinessTexture,
+            state.whiteTexture)
         local paintImage = obj.paintOverlay and obj.paintOverlay.image
 
         state.shader:send("uBaseColorTex", baseTex)
@@ -681,6 +791,8 @@ function renderer.drawWorld(objects, camera, backgroundColor)
         state.shader:send("uOcclusionTex", occlusionTex)
         state.shader:send("uEmissiveTex", emissiveTex)
         state.shader:send("uPaintTex", paintImage or state.whiteTexture)
+        state.shader:send("uDiffuseTex", diffuseTex)
+        state.shader:send("uSpecGlossTex", specGlossTex)
 
         state.shader:send("uUseBaseColorTex", useBase and 1 or 0)
         state.shader:send("uUseMetalRoughTex", useMetal and 1 or 0)
@@ -688,12 +800,42 @@ function renderer.drawWorld(objects, camera, backgroundColor)
         state.shader:send("uUseOcclusionTex", useOcc and 1 or 0)
         state.shader:send("uUseEmissiveTex", useEmissive and 1 or 0)
         state.shader:send("uUsePaintTex", paintImage and 1 or 0)
+        state.shader:send("uUseSpecGlossWorkflow", useSpecGloss and 1 or 0)
+        state.shader:send("uUseDiffuseTex", useDiffuse and 1 or 0)
+        state.shader:send("uUseSpecGlossTex", useSpecGlossTex and 1 or 0)
+        state.shader:send("uFlipV", obj.uvFlipV and 1 or 0)
+
+        state.shader:send("uBaseColorTexCoord", textureCoordIndex(material.baseColorTexture))
+        state.shader:send("uMetalRoughTexCoord", textureCoordIndex(material.metallicRoughnessTexture))
+        state.shader:send("uNormalTexCoord", textureCoordIndex(material.normalTexture))
+        state.shader:send("uOcclusionTexCoord", textureCoordIndex(material.occlusionTexture))
+        state.shader:send("uEmissiveTexCoord", textureCoordIndex(material.emissiveTexture))
+        state.shader:send("uPaintTexCoord", 0)
+        state.shader:send("uDiffuseTexCoord", textureCoordIndex(material.diffuseTexture))
+        state.shader:send("uSpecGlossTexCoord", textureCoordIndex(material.specularGlossinessTexture))
+
+        local diffuseFactor = material.diffuseFactor or defaultMaterial.diffuseFactor
+        local specularFactor = material.specularFactor or defaultMaterial.specularFactor
+        state.shader:send("uDiffuseFactor", {
+            diffuseFactor[1] or 1,
+            diffuseFactor[2] or 1,
+            diffuseFactor[3] or 1,
+            diffuseFactor[4] or 1
+        })
+        state.shader:send("uSpecularFactor", {
+            specularFactor[1] or 1,
+            specularFactor[2] or 1,
+            specularFactor[3] or 1
+        })
+        state.shader:send("uGlossinessFactor", tonumber(material.glossinessFactor) or 1)
 
         if not state.loggedMaterialDebug then
             log(string.format(
-                "material bind: useBase=%s useMR=%s useNormal=%s useAO=%s useEmissive=%s alphaMode=%s",
+                "material bind: workflow=%s useBase=%s useMR=%s useSG=%s useNormal=%s useAO=%s useEmissive=%s alphaMode=%s",
+                tostring(material.workflow or "metalRough"),
                 tostring(useBase),
                 tostring(useMetal),
+                tostring(useSpecGlossTex),
                 tostring(useNormal),
                 tostring(useOcc),
                 tostring(useEmissive),

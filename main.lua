@@ -169,6 +169,39 @@ local characterOrientation = {
 	}
 }
 
+sunSettings = {
+	yaw = 20,
+	pitch = 50,
+	intensity = 2.4,
+	ambient = 0.36,
+	colorR = 1.0,
+	colorG = 0.95,
+	colorB = 0.86,
+	showMarker = true,
+	markerDistance = 1400,
+	markerSize = 180
+}
+
+sunDebugObject = {
+	model = cubeModel,
+	pos = { 0, 0, 0 },
+	rot = q.identity(),
+	scale = { 1, 1, 1 },
+	halfSize = { x = 1, y = 1, z = 1 },
+	color = { 1.0, 0.95, 0.86, 1.0 },
+	isSolid = false,
+	materials = {
+		{
+			baseColorFactor = { 1.0, 0.95, 0.86, 1.0 },
+			metallicFactor = 0.0,
+			roughnessFactor = 1.0,
+			emissiveFactor = { 8.0, 7.0, 5.5 },
+			alphaMode = "OPAQUE",
+			doubleSided = true
+		}
+	}
+}
+
 local characterPreview = {
 	plane = {
 		zoom = 1.0,
@@ -218,7 +251,7 @@ local defaultGroundParams = {
 	curvature = 0.00000003,
 	recenterStep = 48,
 	roadCount = 6,
-	waterRatio = 0.15,
+	waterRatio = 0.26,
 	roadDensity = 0.10,
 	fieldCount = 10,
 	fieldMinSize = 40,
@@ -243,14 +276,14 @@ local windState = {
 local cloudState = {
 	groups = {},
 	groupCount = 85,
-	minAltitude = 120,
-	maxAltitude = 375,
+	minAltitude = 1200,
+	maxAltitude = 3750,
 	spawnRadius = 1400,
 	despawnRadius = 1900,
-	minGroupSize = 18,
-	maxGroupSize = 52,
-	minPuffs = 5,
-	maxPuffs = 10
+	minGroupSize = 30,
+	maxGroupSize = 100,
+	minPuffs = 8,
+	maxPuffs = 30
 }
 local cloudNetState = {
 	role = "standalone", -- standalone, pending, authority, follower
@@ -272,11 +305,31 @@ local groundNetState = {
 	requestCooldown = 2.0
 }
 
--- Correct imported player STL orientation to engine forward/up axes.
-local playerModelRotationOffset = q.normalize(q.multiply(
-	q.fromAxisAngle({ 0, 1, 0 }, -math.pi * 0.5), -- rotate left 90 deg
-	q.fromAxisAngle({ 1, 0, 0 }, -math.pi * 0.5) -- rotate forward 90 deg
+-- Legacy STL axis correction. Keep this only for STL assets; GLB/GLTF stay in authored axes.
+local identityModelRotationOffset = q.identity()
+local legacyStlModelRotationOffset = q.normalize(q.multiply(
+	q.fromAxisAngle({ 0, 1, 0 }, -math.pi * 0.5),
+	q.fromAxisAngle({ 1, 0, 0 }, -math.pi * 0.5)
 ))
+
+local function getModelRotationOffsetForHash(modelHash)
+	local entry = playerModelCache and playerModelCache[modelHash or ""]
+	if entry and entry.format == "stl" then
+		return legacyStlModelRotationOffset
+	end
+	return identityModelRotationOffset
+end
+
+local function getModelRotationOffsetForRole(role, explicitModelHash)
+	local modelHash = explicitModelHash
+	if (type(modelHash) ~= "string" or modelHash == "") and getConfiguredModelForRole then
+		local configuredHash = select(1, getConfiguredModelForRole(role))
+		if type(configuredHash) == "string" and configuredHash ~= "" then
+			modelHash = configuredHash
+		end
+	end
+	return getModelRotationOffsetForHash(modelHash)
+end
 
 function normalizeRoleId(role)
 	return (role == "walking") and "walking" or "plane"
@@ -295,17 +348,52 @@ function getRoleOrientation(role)
 	return orient
 end
 
-function composeRoleOrientationOffset(role)
+function composeRoleOrientationOffset(role, modelHash)
 	local orient = getRoleOrientation(role)
 	local yawQuat = q.fromAxisAngle({ 0, 1, 0 }, math.rad(orient.yaw))
 	local pitchQuat = q.fromAxisAngle({ 1, 0, 0 }, math.rad(orient.pitch))
 	local rollQuat = q.fromAxisAngle({ 0, 0, 1 }, math.rad(orient.roll))
 	local userOffset = q.normalize(q.multiply(q.multiply(yawQuat, pitchQuat), rollQuat))
-	return q.normalize(q.multiply(playerModelRotationOffset, userOffset))
+	local baseOffset = getModelRotationOffsetForRole(role, modelHash)
+	return q.normalize(q.multiply(baseOffset, userOffset))
 end
 
-function composePlayerModelRotation(baseRot, role)
-	return q.normalize(q.multiply(baseRot or q.identity(), composeRoleOrientationOffset(role)))
+function composePlayerModelRotation(baseRot, role, modelHash)
+	return q.normalize(q.multiply(baseRot or q.identity(), composeRoleOrientationOffset(role, modelHash)))
+end
+
+function getSunDirection()
+	local yaw = math.rad(tonumber(sunSettings.yaw) or 0)
+	local pitch = math.rad(tonumber(sunSettings.pitch) or 45)
+	local cp = math.cos(pitch)
+	local dir = {
+		cp * math.sin(yaw),
+		math.sin(pitch),
+		cp * math.cos(yaw)
+	}
+	local len = math.sqrt(dir[1] * dir[1] + dir[2] * dir[2] + dir[3] * dir[3])
+	if len <= 1e-6 then
+		return { 0, 1, 0 }
+	end
+	return { dir[1] / len, dir[2] / len, dir[3] / len }
+end
+
+function getSunLightColor()
+	local intensity = math.max(0, tonumber(sunSettings.intensity) or 1.0)
+	local r = math.max(0, tonumber(sunSettings.colorR) or 1.0)
+	local g = math.max(0, tonumber(sunSettings.colorG) or 1.0)
+	local b = math.max(0, tonumber(sunSettings.colorB) or 1.0)
+	return { r * intensity, g * intensity, b * intensity }
+end
+
+function applySunSettingsToRenderer()
+	if renderer and renderer.setLighting then
+		renderer.setLighting({
+			direction = getSunDirection(),
+			color = getSunLightColor(),
+			ambient = math.max(0, tonumber(sunSettings.ambient) or 0.25)
+		})
+	end
 end
 
 local pauseMenu = {
@@ -363,16 +451,23 @@ local pauseMenu = {
 			{ id = "sensitivity",   label = "Mouse Sensitivity", kind = "range",  min = 0.0004,                                                                           max = 0.004, step = 0.0002, help = "Adjust mouse look sensitivity." },
 			{ id = "invertY",       label = "Invert Look Y",     kind = "toggle", help = "Invert vertical mouse look direction." },
 			{ id = "crosshair",     label = "Crosshair",         kind = "toggle", help = "Show or hide center crosshair dot." },
-			{ id = "overlay",       label = "Debug Overlay",     kind = "toggle", help = "Toggle top-left help/perf text." }
+			{ id = "overlay",       label = "Debug Overlay",     kind = "toggle", help = "Toggle top-left help/perf text." },
+			{ id = "sun_marker",          label = "Sun Marker",      kind = "toggle", help = "Show a large debug cube at the sun direction." },
+			{ id = "sun_yaw",             label = "Sun Yaw",         kind = "range",  min = -180, max = 180, step = 2, help = "Rotate sun around world up axis." },
+			{ id = "sun_pitch",           label = "Sun Pitch",       kind = "range",  min = -85,  max = 85,  step = 2, help = "Raise/lower sun elevation angle." },
+			{ id = "sun_intensity",       label = "Sun Intensity",   kind = "range",  min = 0.0,  max = 8.0, step = 0.1, help = "Direct light intensity for PBR highlights." },
+			{ id = "sun_ambient",         label = "Sun Ambient",     kind = "range",  min = 0.0,  max = 1.5, step = 0.02, help = "Ambient fill light to lift dark surfaces." },
+			{ id = "sun_marker_distance", label = "Sun Box Dist",    kind = "range",  min = 200,  max = 6000, step = 50, help = "Distance from camera to the sun debug cube." },
+			{ id = "sun_marker_size",     label = "Sun Box Size",    kind = "range",  min = 10,   max = 600,  step = 10, help = "Scale of the debug sun cube." }
 		}
 	},
 	characterItems = {
 		plane = {
 			{ id = "load_custom_stl",         label = "Load Plane Model", kind = "action", help = "Open a path prompt and load STL, GLB, or GLTF from disk (or drop STL/GLB on the window)." },
-			{ id = "model_scale",             label = "Plane Scale",    kind = "range",  min = 0.5,                                                                             max = 5.0, step = 0.05, help = "Scale normalized plane models for all clients." },
-			{ id = "plane_preview_yaw",       label = "Model Yaw",      kind = "range",  min = -180,                                                                            max = 180, step = 5,    help = "Rotate the real plane model (world + preview) around the vertical axis." },
-			{ id = "plane_preview_pitch",     label = "Model Pitch",    kind = "range",  min = -180,                                                                            max = 180, step = 5,    help = "Rotate the real plane model (world + preview) around the lateral axis." },
-			{ id = "plane_preview_roll",      label = "Model Roll",     kind = "range",  min = -180,                                                                            max = 180, step = 5,    help = "Rotate the real plane model (world + preview) around the forward axis." },
+			{ id = "model_scale",             label = "Plane Scale",    kind = "range",  min = -5.0,                                                                             max = 5.0, step = 0.05, help = "Scale normalized plane models for all clients." },
+			{ id = "plane_preview_yaw",       label = "Model Yaw",      kind = "range",  min = -360,                                                                            max = 360, step = 5,    help = "Rotate the real plane model (world + preview) around the vertical axis." },
+			{ id = "plane_preview_pitch",     label = "Model Pitch",    kind = "range",  min = -360,                                                                            max = 360, step = 5,    help = "Rotate the real plane model (world + preview) around the lateral axis." },
+			{ id = "plane_preview_roll",      label = "Model Roll",     kind = "range",  min = -360,                                                                            max = 360, step = 5,    help = "Rotate the real plane model (world + preview) around the forward axis." },
 			{ id = "plane_preview_zoom",      label = "Preview Zoom",   kind = "range",  min = 0.5,                                                                             max = 4.0, step = 0.05, help = "Scale only the preview display model." },
 			{ id = "plane_preview_auto_spin", label = "Auto Spin",      kind = "toggle", help = "When enabled, preview yaw rotates automatically." }
 		},
@@ -957,6 +1052,38 @@ local function shouldRenderObjectForView(obj)
 	return true
 end
 
+function appendSunDebugRenderObject(renderObjects, activeCam, maxDist)
+	if not (sunSettings.showMarker and activeCam and activeCam.pos and renderObjects) then
+		return
+	end
+
+	local dir = getSunDirection()
+	local distance = tonumber(sunSettings.markerDistance) or (maxDist * 0.8)
+	distance = math.max(80, distance)
+	local size = tonumber(sunSettings.markerSize) or 180
+	size = math.max(1, size)
+
+	local marker = sunDebugObject
+	marker.pos[1] = activeCam.pos[1] + dir[1] * distance
+	marker.pos[2] = activeCam.pos[2] + dir[2] * distance
+	marker.pos[3] = activeCam.pos[3] + dir[3] * distance
+	marker.scale[1], marker.scale[2], marker.scale[3] = size, size, size
+	marker.halfSize.x, marker.halfSize.y, marker.halfSize.z = size, size, size
+
+	local tintR = math.max(0, tonumber(sunSettings.colorR) or 1.0)
+	local tintG = math.max(0, tonumber(sunSettings.colorG) or 1.0)
+	local tintB = math.max(0, tonumber(sunSettings.colorB) or 1.0)
+	marker.color[1], marker.color[2], marker.color[3], marker.color[4] = tintR, tintG, tintB, 1.0
+
+	local emissive = marker.materials[1].emissiveFactor
+	local emissiveScale = math.max(2.0, (tonumber(sunSettings.intensity) or 1.0) * 6.0)
+	emissive[1] = tintR * emissiveScale
+	emissive[2] = tintG * emissiveScale
+	emissive[3] = tintB * emissiveScale
+
+	renderObjects[#renderObjects + 1] = marker
+end
+
 local function buildRenderObjectList()
 	local renderObjects = {}
 	local activeCam = viewState.activeCamera or camera
@@ -981,6 +1108,9 @@ local function buildRenderObjectList()
 			end
 		end
 	end
+
+	appendSunDebugRenderObject(renderObjects, activeCam, maxDist)
+
 	return renderObjects
 end
 
@@ -1123,7 +1253,7 @@ local function syncLocalPlayerObject()
 	localPlayerObject.pos[1] = camera.pos[1]
 	localPlayerObject.pos[2] = camera.pos[2] + (localPlayerObject.visualOffsetY or 0)
 	localPlayerObject.pos[3] = camera.pos[3]
-	localPlayerObject.rot = composePlayerModelRotation(camera.rot, activeRole)
+	localPlayerObject.rot = composePlayerModelRotation(camera.rot, activeRole, localPlayerObject.modelHash)
 end
 
 function onRoleOrientationChanged(role)
@@ -1291,6 +1421,8 @@ function applyPlaneVisualToObject(obj, modelHash, scale)
 	obj.scale = { s, s, s }
 	obj.halfSize = { x = s, y = s, z = s }
 	obj.modelHash = modelHash
+	obj.uvFlipV = false
+	obj.modelRotationOffset = getModelRotationOffsetForHash(modelHash)
 	obj.visualOffsetY = computeModelVisualOffsetY(modelHash, s)
 	if obj.basePos then
 		obj.pos = {
@@ -3893,6 +4025,27 @@ local function getPauseItemValue(item)
 	if item.id == "sensitivity" then
 		return string.format("%.4f", mouseSensitivity)
 	end
+	if item.id == "sun_marker" then
+		return sunSettings.showMarker and "On" or "Off"
+	end
+	if item.id == "sun_yaw" then
+		return string.format("%.0f deg", tonumber(sunSettings.yaw) or 0)
+	end
+	if item.id == "sun_pitch" then
+		return string.format("%.0f deg", tonumber(sunSettings.pitch) or 0)
+	end
+	if item.id == "sun_intensity" then
+		return string.format("%.2f", tonumber(sunSettings.intensity) or 0)
+	end
+	if item.id == "sun_ambient" then
+		return string.format("%.2f", tonumber(sunSettings.ambient) or 0)
+	end
+	if item.id == "sun_marker_distance" then
+		return string.format("%dm", math.floor((tonumber(sunSettings.markerDistance) or 0) + 0.5))
+	end
+	if item.id == "sun_marker_size" then
+		return string.format("%du", math.floor((tonumber(sunSettings.markerSize) or 0) + 0.5))
+	end
 	if item.id == "invertY" then
 		return invertLookY and "On" or "Off"
 	end
@@ -4122,6 +4275,60 @@ local function adjustPauseItem(item, direction, multiplier)
 		return
 	end
 
+	if item.id == "sun_yaw" then
+		sunSettings.yaw = clamp((tonumber(sunSettings.yaw) or 0) + item.step * direction * scale, item.min, item.max)
+		applySunSettingsToRenderer()
+		setPauseStatus("Sun Yaw: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "sun_pitch" then
+		sunSettings.pitch = clamp((tonumber(sunSettings.pitch) or 0) + item.step * direction * scale, item.min, item.max)
+		applySunSettingsToRenderer()
+		setPauseStatus("Sun Pitch: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "sun_intensity" then
+		sunSettings.intensity = clamp((tonumber(sunSettings.intensity) or 0) + item.step * direction * scale, item.min,
+			item.max)
+		sunSettings.intensity = math.floor(sunSettings.intensity * 100 + 0.5) / 100
+		applySunSettingsToRenderer()
+		setPauseStatus("Sun Intensity: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "sun_ambient" then
+		sunSettings.ambient = clamp((tonumber(sunSettings.ambient) or 0) + item.step * direction * scale, item.min, item
+			.max)
+		sunSettings.ambient = math.floor(sunSettings.ambient * 100 + 0.5) / 100
+		applySunSettingsToRenderer()
+		setPauseStatus("Sun Ambient: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "sun_marker_distance" then
+		sunSettings.markerDistance = clamp(
+			(tonumber(sunSettings.markerDistance) or 0) + item.step * direction * scale,
+			item.min,
+			item.max
+		)
+		sunSettings.markerDistance = math.floor(sunSettings.markerDistance + 0.5)
+		setPauseStatus("Sun Box Dist: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "sun_marker_size" then
+		sunSettings.markerSize = clamp(
+			(tonumber(sunSettings.markerSize) or 0) + item.step * direction * scale,
+			item.min,
+			item.max
+		)
+		sunSettings.markerSize = math.floor(sunSettings.markerSize + 0.5)
+		setPauseStatus("Sun Box Size: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
 	if item.id == "hud_speedometer_max_kph" then
 		hudSettings.speedometerMaxKph = clamp(
 			hudSettings.speedometerMaxKph + item.step * direction * scale,
@@ -4291,6 +4498,9 @@ local function activatePauseItem(item)
 	elseif item.id == "overlay" then
 		showDebugOverlay = not showDebugOverlay
 		setPauseStatus("Debug Overlay: " .. getPauseItemValue(item), 1.2)
+	elseif item.id == "sun_marker" then
+		sunSettings.showMarker = not sunSettings.showMarker
+		setPauseStatus("Sun Marker: " .. getPauseItemValue(item), 1.2)
 	elseif item.id == "invertY" then
 		invertLookY = not invertLookY
 		setPauseStatus("Invert Look Y: " .. getPauseItemValue(item), 1.2)
@@ -5042,7 +5252,7 @@ local function drawPauseCharacterPreview(layout)
 	local cy = y + h * 0.54
 	local zoom = (previewState and previewState.zoom) or 1.0
 	local displayScale = math.min(w, h) * 0.28 * zoom * math.max(0.2, tonumber(modelScale) or 1.0)
-	local previewRot = composeRoleOrientationOffset(role)
+	local previewRot = composeRoleOrientationOffset(role, modelHash)
 	if previewState and previewState.autoSpin then
 		local spin = q.fromAxisAngle({ 0, 1, 0 }, math.rad(love.timer.getTime() * (previewState.spinRate or 22)))
 		previewRot = q.normalize(q.multiply(spin, previewRot))
@@ -5426,7 +5636,7 @@ function love.load()
 		model = playerModel,
 		pos = { camera.pos[1], camera.pos[2], camera.pos[3] },
 		basePos = { camera.pos[1], camera.pos[2], camera.pos[3] },
-		rot = composePlayerModelRotation(camera.rot, getActiveModelRole()),
+		rot = composePlayerModelRotation(camera.rot, getActiveModelRole(), playerModelHash),
 		scale = { playerModelScale, playerModelScale, playerModelScale },
 		color = { 0.9, 0.4, 0.1 },
 		isSolid = false,
@@ -5499,6 +5709,7 @@ function love.load()
 		renderMode = "CPU"
 		logger.log("GPU renderer failed, using CPU fallback: " .. tostring(gpuErr))
 	end
+	applySunSettingsToRenderer()
 	if renderer.setClipPlanes then
 		renderer.setClipPlanes(0.1, graphicsSettings.drawDistance)
 	end
@@ -5777,7 +5988,7 @@ local function serviceNetworkEvents()
 					objects,
 					q,
 					cubeModel,
-					playerModelRotationOffset,
+					getModelRotationOffsetForHash,
 					{
 						scale = defaultPlayerModelScale,
 						modelHash = "builtin-cube",
