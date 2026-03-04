@@ -149,11 +149,11 @@ local hudSettings = {
 	showMap = true,
 	showGeoInfo = true,
 	showPeerIndicators = true,
-	speedometerMaxKph = 420,
+	speedometerMaxKph = 1000,
 	speedometerMinorStepKph = 20,
-	speedometerMajorStepKph = 50,
-	speedometerLabelStepKph = 20,
-	speedometerRedlineKph = 300
+	speedometerMajorStepKph = 100,
+	speedometerLabelStepKph = 200,
+	speedometerRedlineKph = 850
 }
 
 local characterOrientation = {
@@ -186,7 +186,7 @@ sunSettings = {
 	giSpecular = 0.18,
 	giBounce = 0.10,
 	showMarker = false,
-	markerDistance = 2500,
+	markerDistance = 1400,
 	markerSize = 180
 }
 
@@ -286,8 +286,8 @@ local cloudState = {
 	groupCount = 200,
 	minAltitude = 1200,
 	maxAltitude = 3750,
-	spawnRadius = 5000,
-	despawnRadius = 6000,
+	spawnRadius = 1400,
+	despawnRadius = 1900,
 	minGroupSize = 30,
 	maxGroupSize = 100,
 	minPuffs = 8,
