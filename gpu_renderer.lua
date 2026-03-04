@@ -3,12 +3,21 @@ local love = require "love"
 local q = require "quat"
 
 local vertexFormat = {
-    { name = "VertexPosition", location = 0, format = "floatvec3" },
-    { name = "aTexCoord0", location = 5, format = "floatvec2" },
-    { name = "aTexCoord1", location = 6, format = "floatvec2" },
-    { name = "VertexColor", location = 2, format = "floatvec4" },
-    { name = "aNormal", location = 3, format = "floatvec3" },
-    { name = "aTangent", location = 4, format = "floatvec4" }
+    { "VertexPosition", "floatvec3" },
+    { "aTexCoord0", "floatvec2" },
+    { "aTexCoord1", "floatvec2" },
+    { "VertexColor", "floatvec4" },
+    { "aNormal", "floatvec3" },
+    { "aTangent", "floatvec4" }
+}
+
+local vertexFormatLegacy = {
+    { "VertexPosition", "float", 3 },
+    { "aTexCoord0", "float", 2 },
+    { "aTexCoord1", "float", 2 },
+    { "VertexColor", "float", 4 },
+    { "aNormal", "float", 3 },
+    { "aTangent", "float", 4 }
 }
 
 local shaderSource = [[
@@ -96,10 +105,11 @@ vec3 safeNormalize(vec3 v)
 }
 
 #ifdef VERTEX
-layout(location = 3) in vec3 aNormal;
-layout(location = 4) in vec4 aTangent;
-layout(location = 5) in vec2 aTexCoord0;
-layout(location = 6) in vec2 aTexCoord1;
+attribute vec3 aNormal;
+attribute vec4 aTangent;
+attribute vec2 aTexCoord0;
+attribute vec2 aTexCoord1;
+
 
 vec4 position(mat4 transform_projection, vec4 vertex_position)
 {
@@ -606,10 +616,31 @@ local function buildMeshSetForModel(model)
     local hasMesh = false
     for materialIndex, vertices in pairs(byMaterialVertices) do
         if #vertices > 0 then
-            local ok, meshOrErr = pcall(love.graphics.newMesh, vertexFormat, vertices, "triangles", "static")
-            if ok and meshOrErr then
+            local meshOrErr = nil
+            local mesh = nil
+
+            local okPrimary, primaryOrErr = pcall(love.graphics.newMesh, vertexFormat, vertices, "triangles", "static")
+            if okPrimary and primaryOrErr then
+                mesh = primaryOrErr
+            else
+                meshOrErr = primaryOrErr
+                local okLegacy, legacyOrErr = pcall(
+                    love.graphics.newMesh,
+                    vertexFormatLegacy,
+                    vertices,
+                    "triangles",
+                    "static"
+                )
+                if okLegacy and legacyOrErr then
+                    mesh = legacyOrErr
+                else
+                    meshOrErr = legacyOrErr
+                end
+            end
+
+            if mesh then
                 meshSet.byMaterial[materialIndex] = {
-                    mesh = meshOrErr,
+                    mesh = mesh,
                     triangleCount = #vertices / 3
                 }
                 hasMesh = true
