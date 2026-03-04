@@ -14,7 +14,21 @@ vec4 effect(vec4 color, Image texture, vec2 texCoords, vec2 screenCoords)
     return color;
 }
 ]]
-engine.defaultShader = love.graphics.newShader(engine.defaultShaderCode)
+engine.defaultShader = nil
+
+function engine.ensureDefaultShader()
+    if engine.defaultShader then
+        return true
+    end
+
+    local ok, shaderOrErr = pcall(love.graphics.newShader, engine.defaultShaderCode)
+    if not ok then
+        return false, shaderOrErr
+    end
+
+    engine.defaultShader = shaderOrErr
+    return true
+end
 
 --[[
 Loads an STL obj file and creates vertices/faces for it to be added to the world for rendering and simulation
@@ -59,18 +73,65 @@ local function readF32LE(data, offset)
     return sign * ((1 + (mantissa / 8388608)) * 2^(exponent - 127))
 end
 
+local function shouldFlipFaceByFacetNormal(a, b, c, nx, ny, nz)
+    if nx == nil or ny == nil or nz == nil then
+        return false
+    end
+    local nLenSq = nx * nx + ny * ny + nz * nz
+    if nLenSq <= 1e-16 then
+        return false
+    end
+
+    local e1x = b[1] - a[1]
+    local e1y = b[2] - a[2]
+    local e1z = b[3] - a[3]
+    local e2x = c[1] - a[1]
+    local e2y = c[2] - a[2]
+    local e2z = c[3] - a[3]
+
+    local cx = e1y * e2z - e1z * e2y
+    local cy = e1z * e2x - e1x * e2z
+    local cz = e1x * e2y - e1y * e2x
+    local cLenSq = cx * cx + cy * cy + cz * cz
+    if cLenSq <= 1e-16 then
+        return false
+    end
+
+    return (cx * nx + cy * ny + cz * nz) < 0
+end
+
 local function parseAsciiSTL(data)
     local vertices, faces = {}, {}
+    local facetNx, facetNy, facetNz = nil, nil, nil
 
     for line in data:gmatch("[^\r\n]+") do
+        local nx, ny, nz = line:match(
+            "^%s*facet%s+normal%s+([%+%-]?[%d%.eE]+)%s+([%+%-]?[%d%.eE]+)%s+([%+%-]?[%d%.eE]+)"
+        )
+        if nx and ny and nz then
+            facetNx, facetNy, facetNz = tonumber(nx), tonumber(ny), tonumber(nz)
+        end
+
         local x, y, z = line:match("^%s*vertex%s+([%+%-]?[%d%.eE]+)%s+([%+%-]?[%d%.eE]+)%s+([%+%-]?[%d%.eE]+)")
         if x and y and z then
             vertices[#vertices + 1] = { tonumber(x), tonumber(y), tonumber(z) }
         elseif line:match("^%s*endfacet") then
             local count = #vertices
             if count >= 3 then
-                faces[#faces + 1] = { count - 2, count - 1, count }
+                local i1, i2, i3 = count - 2, count - 1, count
+                if shouldFlipFaceByFacetNormal(
+                        vertices[i1],
+                        vertices[i2],
+                        vertices[i3],
+                        facetNx,
+                        facetNy,
+                        facetNz
+                    ) then
+                    i2, i3 = i3, i2
+                end
+                faces[#faces + 1] = { i1, i2, i3 }
             end
+            facetNx, facetNy, facetNz = nil, nil, nil
         end
     end
 
@@ -104,19 +165,21 @@ local function parseBinarySTL(data)
     local cursor = 85
 
     for _ = 1, triCount do
-        cursor = cursor + 12
+        local nx = readF32LE(data, cursor)
+        local ny = readF32LE(data, cursor + 4)
+        local nz = readF32LE(data, cursor + 8)
 
-        local ax = readF32LE(data, cursor)
-        local ay = readF32LE(data, cursor + 4)
-        local az = readF32LE(data, cursor + 8)
-        local bx = readF32LE(data, cursor + 12)
-        local by = readF32LE(data, cursor + 16)
-        local bz = readF32LE(data, cursor + 20)
-        local cx = readF32LE(data, cursor + 24)
-        local cy = readF32LE(data, cursor + 28)
-        local cz = readF32LE(data, cursor + 32)
+        local ax = readF32LE(data, cursor + 12)
+        local ay = readF32LE(data, cursor + 16)
+        local az = readF32LE(data, cursor + 20)
+        local bx = readF32LE(data, cursor + 24)
+        local by = readF32LE(data, cursor + 28)
+        local bz = readF32LE(data, cursor + 32)
+        local cx = readF32LE(data, cursor + 36)
+        local cy = readF32LE(data, cursor + 40)
+        local cz = readF32LE(data, cursor + 44)
 
-        if not (ax and ay and az and bx and by and bz and cx and cy and cz) then
+        if not (nx and ny and nz and ax and ay and az and bx and by and bz and cx and cy and cz) then
             return nil, "invalid triangle data in binary STL"
         end
 
@@ -124,9 +187,13 @@ local function parseBinarySTL(data)
         vertices[base + 1] = { ax, ay, az }
         vertices[base + 2] = { bx, by, bz }
         vertices[base + 3] = { cx, cy, cz }
-        faces[#faces + 1] = { base + 1, base + 2, base + 3 }
+        local i1, i2, i3 = base + 1, base + 2, base + 3
+        if shouldFlipFaceByFacetNormal(vertices[i1], vertices[i2], vertices[i3], nx, ny, nz) then
+            i2, i3 = i3, i2
+        end
+        faces[#faces + 1] = { i1, i2, i3 }
 
-        cursor = cursor + 36 + 2
+        cursor = cursor + 50
     end
 
     return {
@@ -893,6 +960,10 @@ end
 function engine.drawObjectGPU(obj, camera, q, vector3, screen)
     if not obj.mesh then
         return
+    end
+    local shaderOk, shaderErr = engine.ensureDefaultShader()
+    if not shaderOk then
+        return nil, shaderErr
     end
     local function flattenMat4(m)
         return {

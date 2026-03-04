@@ -68,10 +68,22 @@ function q.rotateVector(quat, v)
     return { res.x, res.y, res.z }
 end
 
+local function normalizeBasisVector(v)
+    local x = tonumber(v and v[1]) or 0
+    local y = tonumber(v and v[2]) or 0
+    local z = tonumber(v and v[3]) or 0
+    local len = math.sqrt(x * x + y * y + z * z)
+    if len <= 1e-12 then
+        return { 0, 0, 0 }
+    end
+    return { x / len, y / len, z / len }
+end
+
 function q.getBasis(rot)
-    return q.normalize(q.rotateVector(rot, {0, 0, -1})),  -- forward
-           q.normalize(q.rotateVector(rot, {1, 0, 0})),  -- right
-           q.normalize(q.rotateVector(rot, {0, 1, 0}))   -- up
+    local basisRot = rot or q.identity()
+    return normalizeBasisVector(q.rotateVector(basisRot, { 0, 0, 1 })), -- forward (+Z)
+           normalizeBasisVector(q.rotateVector(basisRot, { 1, 0, 0 })), -- right
+           normalizeBasisVector(q.rotateVector(basisRot, { 0, 1, 0 }))  -- up
 end
 
 return q

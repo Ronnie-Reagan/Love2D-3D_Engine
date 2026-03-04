@@ -2,22 +2,21 @@ local renderer = {}
 local love = require "love"
 local q = require "Source.Math.Quat"
 
-local vertexFormat = {
-    { "VertexPosition", "floatvec3" },
-    { "aTexCoord0", "floatvec2" },
-    { "aTexCoord1", "floatvec2" },
-    { "VertexColor", "floatvec4" },
-    { "aNormal", "floatvec3" },
-    { "aTangent", "floatvec4" }
-}
+local ATTR_POSITION = 0
+local ATTR_COLOR = 2
+local ATTR_TEXCOORD0 = 6
+local ATTR_TEXCOORD1 = 7
+local ATTR_NORMAL = 4
+local ATTR_TANGENT = 5
 
-local vertexFormatLegacy = {
-    { "VertexPosition", "float", 3 },
-    { "aTexCoord0", "float", 2 },
-    { "aTexCoord1", "float", 2 },
-    { "VertexColor", "float", 4 },
-    { "aNormal", "float", 3 },
-    { "aTangent", "float", 4 }
+-- LOVE 12 custom vertex attributes are bound by location index, not attribute name.
+local vertexFormat = {
+    { format = "floatvec3", location = ATTR_POSITION },
+    { format = "floatvec2", location = ATTR_TEXCOORD0 },
+    { format = "floatvec2", location = ATTR_TEXCOORD1 },
+    { format = "floatvec4", location = ATTR_COLOR },
+    { format = "floatvec3", location = ATTR_NORMAL },
+    { format = "floatvec4", location = ATTR_TANGENT }
 }
 
 local shaderSource = [[
@@ -105,10 +104,10 @@ vec3 safeNormalize(vec3 v)
 }
 
 #ifdef VERTEX
-attribute vec3 aNormal;
-attribute vec4 aTangent;
-attribute vec2 aTexCoord0;
-attribute vec2 aTexCoord1;
+layout (location = 4) in vec3 aNormal;
+layout (location = 5) in vec4 aTangent;
+layout (location = 6) in vec2 aTexCoord0;
+layout (location = 7) in vec2 aTexCoord1;
 
 
 vec4 position(mat4 transform_projection, vec4 vertex_position)
@@ -616,31 +615,10 @@ local function buildMeshSetForModel(model)
     local hasMesh = false
     for materialIndex, vertices in pairs(byMaterialVertices) do
         if #vertices > 0 then
-            local meshOrErr = nil
-            local mesh = nil
-
-            local okPrimary, primaryOrErr = pcall(love.graphics.newMesh, vertexFormat, vertices, "triangles", "static")
-            if okPrimary and primaryOrErr then
-                mesh = primaryOrErr
-            else
-                meshOrErr = primaryOrErr
-                local okLegacy, legacyOrErr = pcall(
-                    love.graphics.newMesh,
-                    vertexFormatLegacy,
-                    vertices,
-                    "triangles",
-                    "static"
-                )
-                if okLegacy and legacyOrErr then
-                    mesh = legacyOrErr
-                else
-                    meshOrErr = legacyOrErr
-                end
-            end
-
-            if mesh then
+            local okMesh, meshOrErr = pcall(love.graphics.newMesh, vertexFormat, vertices, "triangles", "static")
+            if okMesh and meshOrErr then
                 meshSet.byMaterial[materialIndex] = {
-                    mesh = mesh,
+                    mesh = meshOrErr,
                     triangleCount = #vertices / 3
                 }
                 hasMesh = true
@@ -677,15 +655,22 @@ function renderer.isReady()
     return state.ready
 end
 
-function renderer.init(screen, camera, logFn)
+function renderer.init(screen, camera, logFn, statusFn)
     state.log = logFn or state.log
     state.aspect = (screen and screen.h and screen.h ~= 0) and (screen.w / screen.h) or 1
     if camera and camera.fov then
         state.fov = camera.fov
     end
 
+    local status = (type(statusFn) == "function") and statusFn or nil
+    if status then
+        status("Preparing fallback textures", 0.15)
+    end
     ensureFallbackTextures()
 
+    if status then
+        status("Compiling world shader", 0.7)
+    end
     local ok, shaderOrErr = pcall(love.graphics.newShader, shaderSource)
     if not ok then
         state.ready = false
@@ -695,6 +680,9 @@ function renderer.init(screen, camera, logFn)
 
     state.shader = shaderOrErr
 
+    if status then
+        status("Configuring depth state", 0.9)
+    end
     local depthOk = pcall(function()
         love.graphics.setDepthMode("lequal", true)
         love.graphics.setDepthMode("always", false)
@@ -703,6 +691,9 @@ function renderer.init(screen, camera, logFn)
     state.loggedFirstFrame = false
 
     state.ready = true
+    if status then
+        status("Renderer shader pipeline ready", 1.0)
+    end
     log("initialized; depth_supported=" .. tostring(state.depthSupported))
     return true
 end

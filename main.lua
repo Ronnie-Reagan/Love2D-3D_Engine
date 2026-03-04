@@ -71,6 +71,20 @@ local showCrosshair = true
 local showDebugOverlay = true
 local colorCorruptionMode = false
 local pauseTitleFont, pauseItemFont
+local startupUi = {
+	active = false,
+	stage = "Booting",
+	detail = "",
+	progress = 0,
+	startedAt = 0,
+	completedAt = 0,
+	currentEntry = 0,
+	entries = {},
+	fontKey = "",
+	titleFont = nil,
+	bodyFont = nil,
+	smallFont = nil
+}
 local walkingPitchLimit = math.rad(89)
 local defaults = requireContract("Source.Core.GameDefaults", { "create" }).create(cubeModel, q)
 local viewState = defaults.viewState
@@ -235,6 +249,202 @@ local function clamp(value, minValue, maxValue)
 		return maxValue
 	end
 	return value
+end
+
+local function safeNewFont(size)
+	local ok, fontOrErr = pcall(function()
+		return love.graphics.newFont(size)
+	end)
+	if ok and fontOrErr then
+		return fontOrErr
+	end
+	return love.graphics.getFont()
+end
+
+local function ensureStartupUiFonts(width, height)
+	local h = tonumber(height) or 0
+	local key = string.format("%dx%d", tonumber(width) or 0, h)
+	if startupUi.fontKey == key and startupUi.titleFont and startupUi.bodyFont and startupUi.smallFont then
+		return
+	end
+
+	local baseSize = math.max(14, math.floor(h * 0.024))
+	startupUi.titleFont = safeNewFont(math.max(28, baseSize + 12))
+	startupUi.bodyFont = safeNewFont(math.max(14, baseSize))
+	startupUi.smallFont = safeNewFont(math.max(12, baseSize - 2))
+	startupUi.fontKey = key
+end
+
+local function drawStartupUi()
+	local w, h = love.graphics.getDimensions()
+	ensureStartupUiFonts(w, h)
+
+	local now = love.timer.getTime()
+	local pulse = 0.52 + 0.48 * math.sin(now * 3.3)
+	local progress = clamp(tonumber(startupUi.progress) or 0, 0, 1)
+
+	love.graphics.clear(0.03, 0.05, 0.09, 1.0)
+	love.graphics.setColor(0.08, 0.14, 0.24, 0.82)
+	love.graphics.circle("fill", w * 0.82, h * 0.18, math.max(w, h) * 0.58)
+	love.graphics.setColor(0.05, 0.1, 0.16, 0.76)
+	love.graphics.circle("fill", w * 0.12, h * 0.92, math.max(w, h) * 0.44)
+
+	local panelW = math.floor(math.min(820, w * 0.82))
+	local panelH = math.floor(math.min(360, h * 0.68))
+	local panelX = math.floor((w - panelW) * 0.5)
+	local panelY = math.floor((h - panelH) * 0.5)
+
+	love.graphics.setColor(0, 0, 0, 0.36)
+	love.graphics.rectangle("fill", panelX + 4, panelY + 4, panelW, panelH, 12, 12)
+	love.graphics.setColor(0.03, 0.06, 0.1, 0.96)
+	love.graphics.rectangle("fill", panelX, panelY, panelW, panelH, 12, 12)
+	love.graphics.setColor(0.7, 0.86, 1.0, 0.24)
+	love.graphics.rectangle("fill", panelX + 2, panelY + 2, panelW - 4, math.max(16, math.floor(panelH * 0.26)), 10, 10)
+	love.graphics.setColor(0.74, 0.9, 1.0, 0.88)
+	love.graphics.rectangle("line", panelX, panelY, panelW, panelH, 12, 12)
+
+	local spinnerCx = panelX + panelW - 52
+	local spinnerCy = panelY + 58
+	local spinnerOuter = 13
+	local spinnerInner = 7
+	for i = 1, 12 do
+		local angle = ((i - 1) / 12) * math.pi * 2 + now * 2.6
+		local alpha = (i / 12) * (0.35 + 0.65 * pulse)
+		local x0 = spinnerCx + math.cos(angle) * spinnerInner
+		local y0 = spinnerCy + math.sin(angle) * spinnerInner
+		local x1 = spinnerCx + math.cos(angle) * spinnerOuter
+		local y1 = spinnerCy + math.sin(angle) * spinnerOuter
+		love.graphics.setColor(0.78, 0.92, 1.0, alpha)
+		love.graphics.line(x0, y0, x1, y1)
+	end
+
+	love.graphics.setColor(0.93, 0.98, 1.0, 0.98)
+	love.graphics.setFont(startupUi.titleFont or love.graphics.getFont())
+	love.graphics.print(startupUi.stage or "Booting", panelX + 28, panelY + 24)
+
+	love.graphics.setColor(0.72, 0.84, 0.95, 0.96)
+	love.graphics.setFont(startupUi.bodyFont or love.graphics.getFont())
+	love.graphics.printf(startupUi.detail or "", panelX + 28, panelY + 74, panelW - 56, "left")
+
+	local listY = panelY + 118
+	local firstEntry = math.max(1, #startupUi.entries - 5)
+	for i = firstEntry, #startupUi.entries do
+		local row = i - firstEntry
+		local y = listY + row * 24
+		local entry = startupUi.entries[i]
+		local prefix = "[ ]"
+		local cr, cg, cb, ca = 0.58, 0.7, 0.82, 0.75
+		if i < startupUi.currentEntry then
+			prefix = "[x]"
+			cr, cg, cb, ca = 0.36, 0.96, 0.62, 0.96
+		elseif i == startupUi.currentEntry then
+			prefix = "[>]"
+			cr, cg, cb, ca = 0.9, 0.97, 1.0, 0.98
+		end
+		love.graphics.setColor(cr, cg, cb, ca)
+		love.graphics.print(prefix .. " " .. tostring(entry and entry.label or ""), panelX + 30, y)
+	end
+
+	local barX = panelX + 28
+	local barY = panelY + panelH - 72
+	local barW = panelW - 56
+	local barH = 17
+	local fillW = math.floor((barW - 4) * progress + 0.5)
+	fillW = clamp(fillW, 0, barW - 4)
+
+	love.graphics.setColor(0.07, 0.12, 0.19, 0.98)
+	love.graphics.rectangle("fill", barX, barY, barW, barH, 7, 7)
+	love.graphics.setColor(0.74, 0.9, 1.0, 0.74)
+	love.graphics.rectangle("line", barX, barY, barW, barH, 7, 7)
+	love.graphics.setColor(0.24, 0.92, 0.58, 0.92)
+	love.graphics.rectangle("fill", barX + 2, barY + 2, fillW, barH - 4, 6, 6)
+
+	love.graphics.setFont(startupUi.smallFont or love.graphics.getFont())
+	love.graphics.setColor(0.84, 0.94, 1.0, 0.92)
+	love.graphics.print(string.format("%d%%", math.floor(progress * 100 + 0.5)), barX + barW - 48, barY + 1)
+
+	local elapsed = math.max(0, now - (startupUi.startedAt or now))
+	love.graphics.setColor(0.66, 0.8, 0.92, 0.9)
+	love.graphics.print(string.format("Startup %.2fs", elapsed), barX, barY + 24)
+
+	local backendName = tostring((graphicsBackend and graphicsBackend.name) or "Unknown")
+	local backendVersion = tostring((graphicsBackend and graphicsBackend.version) or "")
+	local backendLabel = backendName
+	if backendVersion ~= "" then
+		backendLabel = backendLabel .. " " .. backendVersion
+	end
+	love.graphics.printf("Renderer: " .. backendLabel, barX, barY + 24, barW, "right")
+end
+
+local function presentStartupUi()
+	if not startupUi.active then
+		return
+	end
+
+	pcall(function()
+		love.graphics.push("all")
+		love.graphics.origin()
+		drawStartupUi()
+		love.graphics.pop()
+		love.graphics.present()
+	end)
+
+	if love.event and love.event.pump then
+		pcall(love.event.pump)
+	end
+end
+
+local function beginStartupUi()
+	startupUi.active = true
+	startupUi.stage = "Booting Engine"
+	startupUi.detail = ""
+	startupUi.progress = 0
+	startupUi.startedAt = love.timer.getTime()
+	startupUi.completedAt = 0
+	startupUi.currentEntry = 0
+	startupUi.entries = {}
+	presentStartupUi()
+end
+
+local function setStartupUiStage(stage, progress, detail)
+	if not startupUi.active then
+		return
+	end
+
+	local stageName = tostring(stage or startupUi.stage or "Booting Engine")
+	startupUi.stage = stageName
+
+	local entryIndex = nil
+	for i, entry in ipairs(startupUi.entries) do
+		if entry.label == stageName then
+			entryIndex = i
+			break
+		end
+	end
+	if not entryIndex then
+		startupUi.entries[#startupUi.entries + 1] = { label = stageName }
+		entryIndex = #startupUi.entries
+	end
+	startupUi.currentEntry = entryIndex
+
+	if progress ~= nil then
+		startupUi.progress = clamp(tonumber(progress) or startupUi.progress, 0, 1)
+	end
+	if detail ~= nil then
+		startupUi.detail = tostring(detail)
+	end
+
+	presentStartupUi()
+end
+
+local function finishStartupUi()
+	if not startupUi.active then
+		return
+	end
+	startupUi.progress = 1
+	startupUi.completedAt = love.timer.getTime()
+	presentStartupUi()
+	startupUi.active = false
 end
 
 local function randomRange(minValue, maxValue)
@@ -2898,6 +3108,12 @@ function love.load()
 	end
 	love.keyboard.setKeyRepeat(true)
 	setMouseCapture(true)
+	screen = {
+		w = width,
+		h = height
+	}
+	beginStartupUi()
+	setStartupUiStage("Preparing Window", 0.04, "Applying display mode and input defaults.")
 
 	logger.reset()
 	logger.log("Booting Don's 3D Engine")
@@ -2925,6 +3141,7 @@ function love.load()
 	if not modeOk then
 		logger.log("Depth buffer mode unavailable, fallback mode set. Detail: " .. tostring(modeErr))
 	end
+	setStartupUiStage("Loading Session", 0.14, "Restoring restart payload and runtime preferences.")
 
 	screen = {
 		w = width,
@@ -2934,6 +3151,7 @@ function love.load()
 	resetHudCaches()
 	invalidateMapCache()
 	localCallsign = detectDefaultCallsign()
+	setStartupUiStage("Building World", 0.29, "Creating camera state, gameplay defaults, and UI caches.")
 
 	camera = {
 		pos = { 0, 0, -5 },
@@ -3050,6 +3268,7 @@ function love.load()
 		renderer.setClipPlanes(0.1, graphicsSettings.drawDistance)
 	end
 	syncChunkingWithDrawDistance(false)
+	setStartupUiStage("Loading Player Model", 0.45, "Loading default player model and syncing local avatar.")
 
 	local loadedDefaultModel = loadPlayerModelFromPath(defaultPlayerModelPath, "plane")
 	if not loadedDefaultModel then
@@ -3077,8 +3296,10 @@ function love.load()
 		[1] = localPlayerObject
 	}
 
+	setStartupUiStage("Generating Terrain", 0.57, "Building procedural ground chunks.")
 	rebuildGroundFromParams(defaultGroundParams, "startup")
 
+	setStartupUiStage("Spawning Clouds", 0.66, "Generating cloud groups and initial wind profile.")
 	windState.angle = randomRange(0, math.pi * 2)
 	windState.speed = randomRange(5, 10)
 	cloudSim.pickNextWindTarget(windState)
@@ -3114,11 +3335,13 @@ function love.load()
 	end
 	currentGraphicsApiPreference = normalizeGraphicsApiPreference(graphicsSettings.graphicsApiPreference)
 
+	setStartupUiStage("Allocating Buffers", 0.74, "Preparing CPU render buffers.")
 	zBuffer = {}
 	for i = 1, screen.w * screen.h do
 		zBuffer[i] = math.huge
 	end
 
+	setStartupUiStage("Connecting Relay", 0.82, "Establishing multiplayer relay connection.")
 	if not relay then
 		logger.log("ENet host creation failed; multiplayer disabled for this session.")
 	elseif not relayServer then
@@ -3127,7 +3350,19 @@ function love.load()
 		logger.log("Connected to relay server: " .. hostAddy)
 	end
 
-	local gpuOk, gpuErr = renderer.init(screen, camera, logger.log)
+	setStartupUiStage("Compiling Shaders", 0.88, "Creating GPU shader pipelines.")
+	local defaultShaderOk, defaultShaderErr = engine.ensureDefaultShader()
+	if defaultShaderOk then
+		setStartupUiStage("Compiling Shaders", 0.9, "Compiling compatibility shader.")
+	else
+		logger.log("Compatibility shader compile failed: " .. tostring(defaultShaderErr))
+		setStartupUiStage("Compiling Shaders", 0.9, "Compatibility shader failed; continuing.")
+	end
+	local gpuOk, gpuErr = renderer.init(screen, camera, logger.log, function(statusMessage, phaseProgress)
+		local phase = clamp(tonumber(phaseProgress) or 0, 0, 1)
+		local stagedProgress = 0.88 + phase * 0.09
+		setStartupUiStage("Compiling Shaders", stagedProgress, statusMessage or "Compiling world shader")
+	end)
 	if gpuOk then
 		renderMode = "GPU"
 		logger.log("GPU renderer enabled.")
@@ -3136,6 +3371,7 @@ function love.load()
 		renderMode = "CPU"
 		logger.log("GPU renderer failed, using CPU fallback: " .. tostring(gpuErr))
 	end
+	setStartupUiStage("Finalizing Startup", 0.98, gpuOk and "GPU renderer ready." or "Falling back to CPU renderer.")
 	applySunSettingsToRenderer()
 	if renderer.setClipPlanes then
 		renderer.setClipPlanes(0.1, graphicsSettings.drawDistance)
@@ -3146,6 +3382,8 @@ function love.load()
 	end
 
 	resolveActiveRenderCamera()
+	setStartupUiStage("Ready", 1.0, "Startup complete. Have fun.")
+	finishStartupUi()
 end
 
 -- === Mouse Look ===
@@ -4405,6 +4643,11 @@ drawWorldPeerIndicators = hudSystem.drawWorldPeerIndicators
 drawHud = hudSystem.drawHud
 
 function love.draw()
+	if startupUi.active then
+		drawStartupUi()
+		return
+	end
+
 	triangleCount = 0
 	local centerX, centerY = screen.w / 2, screen.h / 2
 	local renderCamera = viewState.activeCamera or resolveActiveRenderCamera() or camera
@@ -4530,8 +4773,7 @@ function love.draw()
 			rotRollDps * rotRollDps
 		)
 
-		love.graphics.setColor(1, 1, 1)
-		love.graphics.print(
+		local debugText =
 			"Esc = pause menu (see Help/Controls tabs for full controls)\n" ..
 			"Render: " ..
 			tostring(renderMode) .. " | Triangles: " .. tostring(math.floor(triangleCount)) .. " | FPS: " ..
@@ -4559,15 +4801,41 @@ function love.draw()
 				rotPitchDps,
 				rotYawDps,
 				rotRollDps
-			),
-			10,
-			10
-		)
+			)
+
+		local debugFont = love.graphics.getFont()
+		local lineHeight = debugFont and debugFont:getHeight() or 14
+		local panelW = 160
+		local lineCount = 0
+		for line in debugText:gmatch("[^\n]+") do
+			lineCount = lineCount + 1
+			panelW = math.max(panelW, (debugFont and debugFont:getWidth(line) or 0) + 20)
+		end
+		local panelH = math.max(44, lineCount * lineHeight + 16)
+		local panelX, panelY = 10, 10
+		drawHudPlate(panelX, panelY, panelW, panelH, 6)
+		love.graphics.setColor(hudTheme.text[1], hudTheme.text[2], hudTheme.text[3], hudTheme.text[4])
+		love.graphics.printf(debugText, panelX + 10, panelY + 8, panelW - 20, "left")
+
+		local chipText = string.format("%s | %d FPS", tostring(renderMode), love.timer.getFPS())
+		local chipW = (debugFont and debugFont:getWidth(chipText) or 0) + 16
+		local chipH = lineHeight + 10
+		local chipY = panelY + panelH + 6
+		drawHudPlate(panelX, chipY, chipW, chipH, 6)
+		love.graphics.setColor(hudTheme.accent[1], hudTheme.accent[2], hudTheme.accent[3], 0.95)
+		love.graphics.print(chipText, panelX + 8, chipY + 5)
 	end
 
 	if showCrosshair and not pauseMenu.active then
-		love.graphics.setColor(1, 0, 0, 0.5)
-		love.graphics.circle("fill", centerX, centerY, 1)
+		local innerGap = 2
+		local armLength = 7
+		love.graphics.setColor(1.0, 0.3, 0.2, 0.86)
+		love.graphics.setLineWidth(1)
+		love.graphics.line(centerX - armLength, centerY, centerX - innerGap, centerY)
+		love.graphics.line(centerX + innerGap, centerY, centerX + armLength, centerY)
+		love.graphics.line(centerX, centerY - armLength, centerX, centerY - innerGap)
+		love.graphics.line(centerX, centerY + innerGap, centerX, centerY + armLength)
+		love.graphics.rectangle("fill", centerX - 1, centerY - 1, 2, 2)
 	end
 
 	drawHud(screen.w, screen.h, centerX, centerY, renderCamera)

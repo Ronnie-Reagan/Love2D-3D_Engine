@@ -341,6 +341,15 @@ local function transformPosition(m, v)
     }
 end
 
+local function mat3DeterminantFromMat4(m)
+    local a11, a12, a13 = m[1], m[5], m[9]
+    local a21, a22, a23 = m[2], m[6], m[10]
+    local a31, a32, a33 = m[3], m[7], m[11]
+    return a11 * (a22 * a33 - a23 * a32) -
+        a12 * (a21 * a33 - a23 * a31) +
+        a13 * (a21 * a32 - a22 * a31)
+end
+
 local function normalize3(v)
     local len = math.sqrt(v[1] * v[1] + v[2] * v[2] + v[3] * v[3])
     if len <= 1e-8 then
@@ -742,6 +751,7 @@ local function parseGltfDocument(gltf, opts)
         local tangents = decodeAccessor(gltf, buffers, attrs.TANGENT)
         local colors = decodeAccessor(gltf, buffers, attrs.COLOR_0)
         local indices = decodeAccessor(gltf, buffers, primitive.indices)
+        local mirroredTransform = mat3DeterminantFromMat4(worldMatrix) < 0
 
         local triIndices = {}
         if indices and #indices > 0 then
@@ -750,12 +760,20 @@ local function parseGltfDocument(gltf, opts)
                 if c == nil then
                     break
                 end
-                triIndices[#triIndices + 1] = { a + 1, b + 1, c + 1 }
+                if mirroredTransform then
+                    triIndices[#triIndices + 1] = { a + 1, c + 1, b + 1 }
+                else
+                    triIndices[#triIndices + 1] = { a + 1, b + 1, c + 1 }
+                end
             end
         else
             for i = 1, #positions, 3 do
                 if positions[i + 2] then
-                    triIndices[#triIndices + 1] = { i, i + 1, i + 2 }
+                    if mirroredTransform then
+                        triIndices[#triIndices + 1] = { i, i + 2, i + 1 }
+                    else
+                        triIndices[#triIndices + 1] = { i, i + 1, i + 2 }
+                    end
                 end
             end
         end
@@ -784,11 +802,15 @@ local function parseGltfDocument(gltf, opts)
                 end
                 if tangents and tangents[srcIndex] then
                     local t = tangents[srcIndex]
+                    local handedness = t[4] or 1
+                    if mirroredTransform then
+                        handedness = -handedness
+                    end
                     vertexTangents[base + v] = {
                         t[1] or 0,
                         t[2] or 0,
                         t[3] or 0,
-                        t[4] or 1
+                        handedness
                     }
                 end
                 if colors and colors[srcIndex] then

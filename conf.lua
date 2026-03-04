@@ -94,6 +94,9 @@ function love.conf(t)
 	end
 
 	-- In-game API switches use love.event.restart with a restart payload.
-	local restartPreference = getRestartGraphicsApiPreference()
-	t.graphics.renderers = getRendererOrderForPreference(restartPreference)
+	-- Keep explicit environment renderer lists authoritative when supplied.
+	local restartPreference = normalizeGraphicsApiPreference(getRestartGraphicsApiPreference())
+	if #preferred == 0 and restartPreference ~= "auto" then
+		t.graphics.renderers = getRendererOrderForPreference(restartPreference)
+	end
 end

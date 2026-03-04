@@ -1,21 +1,34 @@
 local logger = {}
 local love = require "love"
 
-local LOG_FILE = "runtime.log"
+local activeLogFile = nil
+
+local function buildLogFileName()
+    return os.date("%Y-%m-%d_%H-%M-%S") .. ".log"
+end
+
+local function getActiveLogFile()
+    if type(activeLogFile) ~= "string" or activeLogFile == "" then
+        activeLogFile = buildLogFileName()
+    end
+    return activeLogFile
+end
 
 local function timestamp()
     return os.date("%Y-%m-%d %H:%M:%S")
 end
 
 local function appendLine(line)
+    local logFile = getActiveLogFile()
+
     if love and love.filesystem and love.filesystem.append then
-        local ok = pcall(love.filesystem.append, LOG_FILE, line .. "\n")
+        local ok = pcall(love.filesystem.append, logFile, line .. "\n")
         if ok then
             return true
         end
     end
 
-    local file = io.open(LOG_FILE, "a")
+    local file = io.open(logFile, "a")
     if not file then
         return false
     end
@@ -25,22 +38,15 @@ local function appendLine(line)
 end
 
 function logger.reset()
-    if love and love.filesystem then
-        pcall(love.filesystem.write, LOG_FILE, "")
-        return
-    end
-
-    local file = io.open(LOG_FILE, "w")
-    if file then
-        file:close()
-    end
+    activeLogFile = buildLogFileName()
 end
 
 function logger.getPath()
+    local logFile = getActiveLogFile()
     if love and love.filesystem and love.filesystem.getSaveDirectory then
-        return love.filesystem.getSaveDirectory() .. "/" .. LOG_FILE
+        return love.filesystem.getSaveDirectory() .. "/" .. logFile
     end
-    return LOG_FILE
+    return logFile
 end
 
 function logger.log(message)
