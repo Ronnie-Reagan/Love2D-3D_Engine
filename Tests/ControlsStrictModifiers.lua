@@ -1,12 +1,21 @@
+local keyDown = {}
+local mouseDown = {}
+
 package.loaded["love"] = {
     keyboard = {
-        isDown = function()
+        isDown = function(...)
+            local keys = { ... }
+            for i = 1, #keys do
+                if keyDown[keys[i]] then
+                    return true
+                end
+            end
             return false
         end
     },
     mouse = {
-        isDown = function()
-            return false
+        isDown = function(button)
+            return mouseDown[button] and true or false
         end
     }
 }
@@ -47,6 +56,17 @@ local function run()
         shift = false
     })
     assertTrue(extraAlt == 0, "strict axis binding should reject extra Alt")
+
+    keyDown.rshift = true
+    assertTrue(controls.isActionDown("walk_sprint"), "right shift should activate left-shift sprint binding")
+    keyDown.rshift = nil
+
+    local sprintTriggered = controls.actionTriggeredByKey("walk_sprint", "rshift", {
+        alt = false,
+        ctrl = false,
+        shift = true
+    })
+    assertTrue(sprintTriggered, "right shift keypress should match left-shift binding")
 
     print("Controls strict modifier tests passed")
 end

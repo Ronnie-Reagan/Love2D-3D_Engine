@@ -77,6 +77,7 @@ local function run()
     local altitudeDiff = math.abs(altitude30 - altitude120) / math.max(1, math.abs(altitude120))
     assertTrue(speedDiff < 0.08, "dt robustness: speed divergence should remain bounded")
     assertTrue(altitudeDiff < 0.10, "dt robustness: altitude divergence should remain bounded")
+    assertTrue(speed30 < 120 and speed120 < 120, "speed should not runaway under trimmed cruise throttle")
 
     print("Flight dynamics tests passed")
 end

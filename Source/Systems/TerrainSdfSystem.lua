@@ -23,6 +23,27 @@ local function shallowCopy(src)
 	return out
 end
 
+local function cloneCraterList(list)
+	local out = {}
+	if type(list) ~= "table" then
+		return out
+	end
+	for i = 1, #list do
+		local crater = list[i]
+		if type(crater) == "table" then
+			out[#out + 1] = {
+				x = tonumber(crater.x) or 0,
+				y = tonumber(crater.y) or 0,
+				z = tonumber(crater.z) or 0,
+				radius = math.max(1.0, tonumber(crater.radius) or 8.0),
+				depth = math.max(0.4, tonumber(crater.depth) or 3.0),
+				rim = clamp(tonumber(crater.rim) or 0.12, 0.0, 0.75)
+			}
+		end
+	end
+	return out
+end
+
 local function copyColor3(v, fallback)
 	local src = type(v) == "table" and v or fallback or { 0.3, 0.4, 0.25 }
 	return {
@@ -72,6 +93,37 @@ local function chunkRingDistance(cx, cz, ox, oz)
 	local dx = math.abs(cx - ox)
 	local dz = math.abs(cz - oz)
 	return math.max(dx, dz)
+end
+
+local function craterListsEqual(aList, bList)
+	local a = type(aList) == "table" and aList or {}
+	local b = type(bList) == "table" and bList or {}
+	if #a ~= #b then
+		return false
+	end
+	for i = 1, #a do
+		local ca = a[i] or {}
+		local cb = b[i] or {}
+		if math.abs((tonumber(ca.x) or 0) - (tonumber(cb.x) or 0)) > 1e-4 then
+			return false
+		end
+		if math.abs((tonumber(ca.y) or 0) - (tonumber(cb.y) or 0)) > 1e-4 then
+			return false
+		end
+		if math.abs((tonumber(ca.z) or 0) - (tonumber(cb.z) or 0)) > 1e-4 then
+			return false
+		end
+		if math.abs((tonumber(ca.radius) or 0) - (tonumber(cb.radius) or 0)) > 1e-4 then
+			return false
+		end
+		if math.abs((tonumber(ca.depth) or 0) - (tonumber(cb.depth) or 0)) > 1e-4 then
+			return false
+		end
+		if math.abs((tonumber(ca.rim) or 0) - (tonumber(cb.rim) or 0)) > 1e-4 then
+			return false
+		end
+	end
+	return true
 end
 
 local function removeObjectInstance(objects, objectRef)
@@ -404,9 +456,9 @@ function terrain.normalizeGroundParams(params, defaultGroundParams)
 	merged.chunkSize = tonumber(merged.chunkSize) or tonumber(merged.tileSize) or 64
 	merged.lod0Radius = clamp(math.floor(tonumber(merged.lod0Radius) or 2), 1, 3)
 	merged.lod1Radius = clamp(math.floor(tonumber(merged.lod1Radius) or 4), merged.lod0Radius, 6)
-	merged.lod0CellSize = math.max(1.0, tonumber(merged.lod0CellSize) or 4.0)
-	merged.lod1CellSize = math.max(merged.lod0CellSize, tonumber(merged.lod1CellSize) or 8.0)
-	merged.meshBuildBudget = clamp(math.floor(tonumber(merged.meshBuildBudget) or 2), 1, 2)
+	merged.lod0CellSize = clamp(tonumber(merged.lod0CellSize) or 3.0, 1.0, 6.0)
+	merged.lod1CellSize = clamp(tonumber(merged.lod1CellSize) or 6.0, merged.lod0CellSize, 12.0)
+	merged.meshBuildBudget = clamp(math.floor(tonumber(merged.meshBuildBudget) or 2), 1, 3)
 	merged.workerMaxInflight = clamp(math.floor(tonumber(merged.workerMaxInflight) or 2), 1, 4)
 	merged.chunkCacheLimit = math.max(32, math.floor(tonumber(merged.chunkCacheLimit) or 768))
 	merged.generatorVersion = math.max(1, math.floor(tonumber(merged.generatorVersion) or 1))
@@ -465,6 +517,7 @@ function terrain.groundParamsEqual(a, b)
 		"tunnelCount",
 		"tunnelRadiusMin",
 		"tunnelRadiusMax",
+		"craterHistoryLimit",
 		"lod0Radius",
 		"lod1Radius",
 		"lod0CellSize",
@@ -480,6 +533,9 @@ function terrain.groundParamsEqual(a, b)
 		if a[key] ~= b[key] then
 			return false
 		end
+	end
+	if not craterListsEqual(a.dynamicCraters, b.dynamicCraters) then
+		return false
 	end
 	return true
 end
@@ -990,6 +1046,90 @@ function terrain.rebuildGroundFromParams(params, reason, context)
 		terrainState = terrainState,
 		worldHalfExtent = worldHalfExtent,
 		groundObject = nil
+	}
+end
+
+function terrain.addCrater(craterSpec, context)
+	context = context or {}
+	if type(craterSpec) ~= "table" then
+		return false
+	end
+
+	local terrainState = ensureTerrainState(context)
+	local activeParams = context.activeGroundParams or terrainState.activeGroundParams
+	if type(activeParams) ~= "table" then
+		return false
+	end
+
+	local normalized = terrain.normalizeGroundParams(activeParams, context.defaultGroundParams or activeParams)
+	local radius = math.max(1.0, tonumber(craterSpec.radius) or 8.0)
+	local depth = math.max(0.4, tonumber(craterSpec.depth) or (radius * 0.45))
+	local crater = {
+		x = tonumber(craterSpec.x) or 0,
+		y = tonumber(craterSpec.y) or 0,
+		z = tonumber(craterSpec.z) or 0,
+		radius = radius,
+		depth = depth,
+		rim = clamp(tonumber(craterSpec.rim) or 0.12, 0.0, 0.75)
+	}
+
+	local craterList = cloneCraterList(normalized.dynamicCraters)
+	craterList[#craterList + 1] = crater
+	local limit = math.max(0, math.floor(tonumber(normalized.craterHistoryLimit) or 64))
+	if limit > 0 and #craterList > limit then
+		local trimmed = {}
+		local first = #craterList - limit + 1
+		for i = first, #craterList do
+			trimmed[#trimmed + 1] = craterList[i]
+		end
+		craterList = trimmed
+	end
+
+	normalized.dynamicCraters = craterList
+	normalized.generatorVersion = math.max(1, math.floor(tonumber(normalized.generatorVersion) or 1) + 1)
+
+	terrainState.activeGroundParams = normalized
+	terrainState.fieldContext = sdfField.createContext(normalized)
+	terrainState.generatorVersion = normalized.generatorVersion
+	terrainState.chunkCacheLimit = math.max(32, math.floor(tonumber(normalized.chunkCacheLimit) or terrainState.chunkCacheLimit or 768))
+	if type(context.objects) == "table" then
+		for key, obj in pairs(terrainState.chunkMap or {}) do
+			removeObjectInstance(context.objects, obj)
+			terrainState.chunkMap[key] = nil
+		end
+	end
+	terrainState.buildQueue = {}
+	terrainState.chunkOrder = {}
+	terrainState.requiredSet = {}
+	terrainState.centerChunkX = math.huge
+	terrainState.centerChunkZ = math.huge
+	clearChunkCache(terrainState)
+	resetWorkerGeneration(terrainState)
+
+	if context.camera and context.objects then
+		local changed, nextTerrainState = terrain.updateGroundStreaming(true, {
+			terrainState = terrainState,
+			activeGroundParams = normalized,
+			camera = context.camera,
+			objects = context.objects,
+			q = context.q
+		})
+		if nextTerrainState then
+			terrainState = nextTerrainState
+		end
+		return true, {
+			changed = changed and true or false,
+			crater = crater,
+			activeGroundParams = normalized,
+			terrainState = terrainState
+		}
+	end
+
+	return true, {
+		changed = true,
+		crater = crater,
+		activeGroundParams = normalized,
+		terrainState = terrainState
 	}
 end
 

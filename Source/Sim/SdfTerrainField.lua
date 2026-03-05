@@ -140,8 +140,76 @@ local defaultParams = {
 	tunnelRadiusMax = 18,
 	tunnelLengthMin = 240,
 	tunnelLengthMax = 520,
-	tunnelSegmentLength = 18
+	tunnelSegmentLength = 18,
+	craterHistoryLimit = 64,
+	dynamicCraters = {}
 }
+
+local function sanitizeCraterList(list, historyLimit)
+	local out = {}
+	local limit = math.max(0, math.floor(tonumber(historyLimit) or 0))
+	if type(list) ~= "table" then
+		return out
+	end
+
+	for _, crater in ipairs(list) do
+		if type(crater) == "table" then
+			local radius = math.max(1.0, tonumber(crater.radius) or tonumber(crater.r) or 8.0)
+			local depth = math.max(0.4, tonumber(crater.depth) or (radius * 0.45))
+			local rim = clamp(tonumber(crater.rim) or 0.12, 0.0, 0.75)
+			out[#out + 1] = {
+				x = tonumber(crater.x) or 0,
+				y = tonumber(crater.y) or 0,
+				z = tonumber(crater.z) or 0,
+				radius = radius,
+				depth = depth,
+				rim = rim
+			}
+		end
+	end
+
+	if limit > 0 and #out > limit then
+		local first = #out - limit + 1
+		local trimmed = {}
+		for i = first, #out do
+			trimmed[#trimmed + 1] = out[i]
+		end
+		return trimmed
+	end
+	return out
+end
+
+local function applyDynamicCratersToSurfaceHeight(x, z, height, params)
+	local craters = params and params.dynamicCraters
+	if type(craters) ~= "table" or #craters <= 0 then
+		return height
+	end
+
+	local surface = height
+	for i = 1, #craters do
+		local crater = craters[i]
+		local radius = math.max(1.0, tonumber(crater and crater.radius) or 0)
+		if radius > 0 then
+			local dx = x - (tonumber(crater.x) or 0)
+			local dz = z - (tonumber(crater.z) or 0)
+			local dist = math.sqrt(dx * dx + dz * dz)
+			local t = dist / radius
+			if t < 1.0 then
+				-- Smooth bowl profile that tapers to the outer rim.
+				local bowl = 1.0 - (t * t)
+				local depth = math.max(0.2, tonumber(crater.depth) or (radius * 0.45))
+				surface = surface - depth * bowl * bowl
+			elseif t < 1.24 then
+				-- Slight uplift ring to make the impact shape readable at distance.
+				local rimT = (t - 1.0) / 0.24
+				local rimAmount = math.max(0.0, tonumber(crater.rim) or 0.12)
+				local rim = (1.0 - rimT)
+				surface = surface + (radius * rimAmount * rim * rim)
+			end
+		end
+	end
+	return surface
+end
 
 function field.normalizeParams(params, defaults)
 	local base = {}
@@ -188,6 +256,8 @@ function field.normalizeParams(params, defaults)
 	base.tunnelLengthMin = math.max(32, tonumber(base.tunnelLengthMin) or 240)
 	base.tunnelLengthMax = math.max(base.tunnelLengthMin, tonumber(base.tunnelLengthMax) or 520)
 	base.tunnelSegmentLength = math.max(6, tonumber(base.tunnelSegmentLength) or 18)
+	base.craterHistoryLimit = math.max(0, math.floor(tonumber(base.craterHistoryLimit) or 64))
+	base.dynamicCraters = sanitizeCraterList(base.dynamicCraters, base.craterHistoryLimit)
 	return base
 end
 
@@ -207,7 +277,8 @@ function field.sampleSurfaceHeight(x, z, context)
 	local heightNoise = fbm2(nx, nz, params.heightOctaves, params.heightLacunarity, params.heightGain, params.seed) * 2 - 1
 	local detailNoise = valueNoise2(x * params.surfaceDetailFrequency, z * params.surfaceDetailFrequency, params.seed + 907) * 2
 		- 1
-	return params.baseHeight + (heightNoise * params.heightAmplitude) + (detailNoise * params.surfaceDetailAmplitude)
+	local baseSurface = params.baseHeight + (heightNoise * params.heightAmplitude) + (detailNoise * params.surfaceDetailAmplitude)
+	return applyDynamicCratersToSurfaceHeight(x, z, baseSurface, params)
 end
 
 function field.sampleSdf(x, y, z, context)

@@ -180,6 +180,20 @@ local defaultConfig = {
 	autoTrimWorkerTimeoutSec = 0.35,
 	groundFriction = 0.01,
 	groundAngularDamping = 0.82,
+	stabilityAugmentation = true,
+	pitchRateDampingMoment = 2600,
+	yawRateDampingMoment = 1700,
+	rollRateDampingMoment = 2100,
+	controlAuthoritySpeed = 34.0,
+	minControlAuthority = 0.28,
+	pitchControlScale = 0.78,
+	rollControlScale = 0.72,
+	yawControlScale = 0.65,
+	crashEnabled = true,
+	crashNormalSpeed = 13.0,
+	crashTotalSpeed = 32.0,
+	crashAngularSpeed = math.rad(160),
+	crashCooldownSec = 0.9,
 	maxLinearSpeed = 180.0,
 	maxAngularRateRad = math.rad(240),
 	maxForceNewton = 70000.0,
@@ -327,6 +341,12 @@ local function ensureCameraFlightState(camera, config)
 	simState.trimRequestInFlight = simState.trimRequestInFlight and true or false
 	simState.trimLastRequestTick = math.max(0, math.floor(tonumber(simState.trimLastRequestTick) or 0))
 	simState.trimNextRequestTick = math.max(0, math.floor(tonumber(simState.trimNextRequestTick) or 0))
+	if simState.lastCrashTick == nil then
+		simState.lastCrashTick = -1000000
+	else
+		simState.lastCrashTick = math.floor(tonumber(simState.lastCrashTick) or -1000000)
+	end
+	simState.pendingCrash = simState.pendingCrash
 	simState.bootstrapDone = simState.bootstrapDone and true or false
 	return simState
 end
@@ -345,11 +365,11 @@ local function updatePilotInputs(camera, dt, inputState)
 	local rollAxis = axis(inputState.flightRollLeft, inputState.flightRollRight)
 
 	local yoke = camera.yoke
-	local yokeKeyboardRate = camera.yokeKeyboardRate or 2.8
-	local yokeAutoCenterRate = camera.yokeAutoCenterRate or 1.9
+	local yokeKeyboardRate = camera.yokeKeyboardRate or 1.8
+	local yokeAutoCenterRate = camera.yokeAutoCenterRate or 2.8
 	local centerAlpha = clamp(yokeAutoCenterRate * dt, 0, 1)
 	local now = (loveLib and loveLib.timer and loveLib.timer.getTime and loveLib.timer.getTime()) or 0
-	local yokeMouseHoldDurationSec = math.max(0.0, tonumber(camera.yokeMouseHoldDurationSec) or 0.6)
+	local yokeMouseHoldDurationSec = math.max(0.0, tonumber(camera.yokeMouseHoldDurationSec) or 0.22)
 	local lastMouseInputAt = tonumber(camera.yokeLastMouseInputAt) or -math.huge
 	local holdMouseYoke = (now - lastMouseInputAt) <= yokeMouseHoldDurationSec
 
@@ -388,7 +408,7 @@ local function resolveCollisionRadius(camera, environment)
 	return 1.0
 end
 
-local function applyTerrainContact(camera, environment, config, dt)
+local function applyTerrainContact(camera, environment, config, dt, simState)
 	local pos = camera.pos
 	local vel = camera.flightVel
 	local radius = resolveCollisionRadius(camera, environment)
@@ -415,10 +435,47 @@ local function applyTerrainContact(camera, environment, config, dt)
 					normal = normalize(sampledNormal)
 				end
 			end
+
+			local vn = dot(vel, normal)
+			if simState and config.crashEnabled ~= false and vn < 0 then
+				local impactNormalSpeed = -vn
+				local totalSpeed = length(vel)
+				local angularSpeed = length(camera.flightAngVel or { 0, 0, 0 })
+				local crashNormalSpeed = math.max(0.1, tonumber(config.crashNormalSpeed) or 13.0)
+				local crashTotalSpeed = math.max(0.1, tonumber(config.crashTotalSpeed) or 32.0)
+				local crashAngularSpeed = math.max(0.05, tonumber(config.crashAngularSpeed) or math.rad(160))
+				local shouldCrash = (impactNormalSpeed >= crashNormalSpeed) or
+					(totalSpeed >= crashTotalSpeed) or
+					(angularSpeed >= crashAngularSpeed)
+				if shouldCrash and not simState.pendingCrash then
+					local physicsHz = math.max(1, tonumber(config.physicsHz) or 120)
+					local cooldownTicks = math.max(
+						1,
+						math.floor((math.max(0.1, tonumber(config.crashCooldownSec) or 0.9) * physicsHz) + 0.5)
+					)
+					local lastTick = math.floor(tonumber(simState.lastCrashTick) or -1000000)
+					if simState.tick >= (lastTick + cooldownTicks) then
+						simState.pendingCrash = {
+							position = {
+								(pos[1] or 0) - normal[1] * radius,
+								(pos[2] or 0) - normal[2] * radius,
+								(pos[3] or 0) - normal[3] * radius
+							},
+							normal = { normal[1], normal[2], normal[3] },
+							radius = radius,
+							impactNormalSpeed = impactNormalSpeed,
+							totalSpeed = totalSpeed,
+							angularSpeed = angularSpeed,
+							tick = simState.tick
+						}
+						simState.lastCrashTick = simState.tick
+					end
+				end
+			end
+
 			local penetration = radius - dist
 			pos = add(pos, scale(normal, penetration + 1e-4))
 
-			local vn = dot(vel, normal)
 			if vn < 0 then
 				vel = add(vel, scale(normal, -vn))
 			end
@@ -567,17 +624,33 @@ function flight.step(camera, dt, inputState, environment, userConfig)
 
 		local controls = {
 			elevator = clamp(
-				((camera.yoke.pitch or 0) * config.maxElevatorDeflectionRad) + (simState.elevatorTrim or 0),
+				((camera.yoke.pitch or 0) *
+					clamp(trueAirspeed / math.max(5.0, tonumber(config.controlAuthoritySpeed) or 34.0),
+						clamp(tonumber(config.minControlAuthority) or 0.28, 0.05, 1.0),
+						1.0) *
+					math.max(0.05, tonumber(config.pitchControlScale) or 0.78) *
+					config.maxElevatorDeflectionRad) +
+				(simState.elevatorTrim or 0),
 				-config.maxElevatorDeflectionRad,
 				config.maxElevatorDeflectionRad
 			),
 			aileron = clamp(
-				(camera.yoke.roll or 0) * config.maxAileronDeflectionRad,
+				(camera.yoke.roll or 0) *
+				clamp(trueAirspeed / math.max(5.0, tonumber(config.controlAuthoritySpeed) or 34.0),
+					clamp(tonumber(config.minControlAuthority) or 0.28, 0.05, 1.0),
+					1.0) *
+				math.max(0.05, tonumber(config.rollControlScale) or 0.72) *
+				config.maxAileronDeflectionRad,
 				-config.maxAileronDeflectionRad,
 				config.maxAileronDeflectionRad
 			),
 			rudder = clamp(
-				-(camera.yoke.yaw or 0) * config.maxRudderDeflectionRad,
+				-(camera.yoke.yaw or 0) *
+				clamp(trueAirspeed / math.max(5.0, tonumber(config.controlAuthoritySpeed) or 34.0),
+					clamp(tonumber(config.minControlAuthority) or 0.28, 0.05, 1.0),
+					1.0) *
+				math.max(0.05, tonumber(config.yawControlScale) or 0.65) *
+				config.maxRudderDeflectionRad,
 				-config.maxRudderDeflectionRad,
 				config.maxRudderDeflectionRad
 			)
@@ -593,8 +666,21 @@ function flight.step(camera, dt, inputState, environment, userConfig)
 		}
 		forceBody = clampVecMagnitude(forceBody, math.max(1000, tonumber(config.maxForceNewton) or 70000))
 		local forceWorld = bodyToWorld(camera.rot, forceBody)
-		local momentBody = clampVecMagnitude(
-			aeroState.momentBody,
+		local momentBody = {
+			(aeroState.momentBody and aeroState.momentBody[1]) or 0,
+			(aeroState.momentBody and aeroState.momentBody[2]) or 0,
+			(aeroState.momentBody and aeroState.momentBody[3]) or 0
+		}
+		if config.stabilityAugmentation ~= false then
+			local pitchDamp = math.max(0, tonumber(config.pitchRateDampingMoment) or 2600)
+			local yawDamp = math.max(0, tonumber(config.yawRateDampingMoment) or 1700)
+			local rollDamp = math.max(0, tonumber(config.rollRateDampingMoment) or 2100)
+			momentBody[1] = momentBody[1] - (tonumber(camera.flightAngVel[1]) or 0) * pitchDamp
+			momentBody[2] = momentBody[2] - (tonumber(camera.flightAngVel[2]) or 0) * yawDamp
+			momentBody[3] = momentBody[3] - (tonumber(camera.flightAngVel[3]) or 0) * rollDamp
+		end
+		momentBody = clampVecMagnitude(
+			momentBody,
 			math.max(1000, tonumber(config.maxMomentNewtonMeter) or 120000)
 		)
 
@@ -611,8 +697,19 @@ function flight.step(camera, dt, inputState, environment, userConfig)
 		camera.flightAngVel = rigidBodyState.angVel
 		camera.rot = rigidBodyState.rot
 
-		applyTerrainContact(camera, environment, config, fixedDt)
+		applyTerrainContact(camera, environment, config, fixedDt, simState)
 		applyNumericalGuards(camera, config)
+		if simState.pendingCrash then
+			break
+		end
+	end
+
+	if simState.pendingCrash then
+		camera.flightCrashEvent = simState.pendingCrash
+		simState.pendingCrash = nil
+		camera.flightVel = { 0, 0, 0 }
+		camera.flightAngVel = { 0, 0, 0 }
+		camera.vel = { 0, 0, 0 }
 	end
 
 	camera.vel = { camera.flightVel[1], camera.flightVel[2], camera.flightVel[3] }

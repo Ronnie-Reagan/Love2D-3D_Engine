@@ -1843,7 +1843,7 @@ function ensureFlightSpawnSafety(minGroundClearance, minForwardSpeed)
 	camera.flightVel[3] = vz
 
 	camera.vel = { camera.flightVel[1], camera.flightVel[2], camera.flightVel[3] }
-	camera.throttle = math.max(tonumber(camera.throttle) or 0, 0.58)
+	camera.throttle = math.max(tonumber(camera.throttle) or 0, 0.46)
 	if camera.flightSimState and type(camera.flightSimState.engine) == "table" then
 		camera.flightSimState.engine.throttle = math.max(
 			tonumber(camera.flightSimState.engine.throttle) or 0,
@@ -1907,6 +1907,121 @@ local function setFlightMode(enabled)
 		end
 	end
 	syncActivePlayerModelState()
+end
+
+function addCrashCraterAt(impactX, impactY, impactZ, impactSpeed)
+	local speed = math.max(0, tonumber(impactSpeed) or 0)
+	local radius = clamp(6 + speed * 0.22, 6, 28)
+	local depth = clamp(radius * 0.48, 1.8, 14)
+	local added, craterState = terrainSdfSystem.addCrater({
+		x = impactX,
+		y = impactY,
+		z = impactZ,
+		radius = radius,
+		depth = depth,
+		rim = 0.14
+	}, {
+		defaultGroundParams = defaultGroundParams,
+		activeGroundParams = activeGroundParams,
+		terrainState = terrainState,
+		camera = camera,
+		objects = objects,
+		q = q
+	})
+	if added and craterState then
+		activeGroundParams = craterState.activeGroundParams or activeGroundParams
+		terrainState = craterState.terrainState or terrainState
+		groundObject = nil
+		invalidateMapCache()
+		return craterState.crater or {
+			x = impactX,
+			y = impactY,
+			z = impactZ,
+			radius = radius,
+			depth = depth
+		}
+	end
+	return {
+		x = impactX,
+		y = impactY,
+		z = impactZ,
+		radius = radius,
+		depth = depth
+	}
+end
+
+function handleFlightCrashEvent(crashEvent)
+	if type(crashEvent) ~= "table" or not camera then
+		return
+	end
+
+	local impactPos = crashEvent.position or {}
+	local impactX = tonumber(impactPos[1]) or tonumber(camera.pos and camera.pos[1]) or 0
+	local impactY = tonumber(impactPos[2]) or tonumber(camera.pos and camera.pos[2]) or 0
+	local impactZ = tonumber(impactPos[3]) or tonumber(camera.pos and camera.pos[3]) or 0
+	local impactSpeed = tonumber(crashEvent.totalSpeed) or 0
+
+	local crater = addCrashCraterAt(impactX, impactY, impactZ, impactSpeed)
+	local normal = crashEvent.normal or { 0, 1, 0 }
+	local nx = tonumber(normal[1]) or 0
+	local nz = tonumber(normal[3]) or 0
+	local horizontalLen = math.sqrt(nx * nx + nz * nz)
+	if horizontalLen <= 1e-4 then
+		local vx = tonumber(camera.flightVel and camera.flightVel[1]) or 0
+		local vz = tonumber(camera.flightVel and camera.flightVel[3]) or 0
+		if math.abs(vx) + math.abs(vz) > 1e-4 then
+			nx = -vx
+			nz = -vz
+			horizontalLen = math.sqrt(nx * nx + nz * nz)
+		end
+	end
+	if horizontalLen <= 1e-4 then
+		nx = 1
+		nz = 0
+		horizontalLen = 1
+	end
+	nx = nx / horizontalLen
+	nz = nz / horizontalLen
+
+	setFlightMode(false)
+
+	local spawnOffset = math.max(6, tonumber(crater.radius) or 10) + 4.5
+	local spawnX = impactX + nx * spawnOffset
+	local spawnZ = impactZ + nz * spawnOffset
+	local terrainRef = terrainState or activeGroundParams or defaultGroundParams
+	local groundY = terrainSdfSystem.sampleGroundHeightAtWorld(spawnX, spawnZ, terrainRef) or impactY
+	local halfY = (camera.box and camera.box.halfSize and camera.box.halfSize.y) or localGroundClearance or 1.8
+	local spawnY = groundY + halfY + 0.2
+
+	camera.pos = { spawnX, spawnY, spawnZ }
+	camera.vel = { 0, 0, 0 }
+	camera.flightVel = { 0, 0, 0 }
+	camera.flightAngVel = { 0, 0, 0 }
+	camera.onGround = true
+	camera.throttle = 0
+	camera.flightCrashEvent = nil
+
+	local toCraterX = impactX - spawnX
+	local toCraterZ = impactZ - spawnZ
+	camera.walkYaw = viewMath.wrapAngle(math.atan(toCraterX, toCraterZ))
+	camera.walkPitch = 0
+	camera.rot = composeWalkingRotation(camera.walkYaw, camera.walkPitch)
+	if camera.box and camera.box.pos then
+		camera.box.pos[1] = spawnX
+		camera.box.pos[2] = spawnY
+		camera.box.pos[3] = spawnZ
+	end
+
+	syncLocalPlayerObject()
+	resolveActiveRenderCamera()
+	if cloudNetState and cloudNetState.role == "authority" and type(sendGroundSnapshot) == "function" then
+		sendGroundSnapshot("crash crater")
+	end
+	logger.log(string.format(
+		"Crash detected: speed=%.1f m/s, crater radius=%.1f m, switched to walking mode.",
+		impactSpeed,
+		tonumber(crater.radius) or 0
+	))
 end
 
 function cycleViewMode()
@@ -2020,6 +2135,48 @@ function decodeColor3Token(token, fallback)
 		tonumber(g),
 		tonumber(b)
 	}, fallback)
+end
+
+function encodeCraterListToken(craters)
+	if type(craters) ~= "table" or #craters <= 0 then
+		return ""
+	end
+	local parts = {}
+	for i = 1, #craters do
+		local crater = craters[i]
+		if type(crater) == "table" then
+			parts[#parts + 1] = table.concat({
+				formatNetFloat(crater.x),
+				formatNetFloat(crater.y),
+				formatNetFloat(crater.z),
+				formatNetFloat(crater.radius),
+				formatNetFloat(crater.depth),
+				formatNetFloat(crater.rim)
+			}, ",")
+		end
+	end
+	return table.concat(parts, ";")
+end
+
+function decodeCraterListToken(token)
+	local out = {}
+	if type(token) ~= "string" or token == "" then
+		return out
+	end
+	for entry in token:gmatch("[^;]+") do
+		local x, y, z, radius, depth, rim = entry:match("^([^,]+),([^,]+),([^,]+),([^,]+),([^,]+),([^,]+)$")
+		if x and y and z and radius and depth and rim then
+			out[#out + 1] = {
+				x = tonumber(x) or 0,
+				y = tonumber(y) or 0,
+				z = tonumber(z) or 0,
+				radius = tonumber(radius) or 8.0,
+				depth = tonumber(depth) or 3.0,
+				rim = tonumber(rim) or 0.12
+			}
+		end
+	end
+	return out
 end
 
 local function relayIsConnected()
@@ -2655,6 +2812,8 @@ function buildGroundSnapshotPacket(now)
 		"tunnelLenMin=" .. formatNetFloat(params.tunnelLengthMin or 240),
 		"tunnelLenMax=" .. formatNetFloat(params.tunnelLengthMax or 520),
 		"genVer=" .. tostring(params.generatorVersion or 1),
+		"craterLimit=" .. tostring(params.craterHistoryLimit or 64),
+		"craters=" .. encodeCraterListToken(params.dynamicCraters),
 		"waterRatio=" .. formatNetFloat(params.waterRatio or defaultGroundParams.waterRatio),
 		"grassColor=" .. encodeColor3Token(params.grassColor),
 		"roadColor=" .. encodeColor3Token(params.roadColor),
@@ -2729,7 +2888,7 @@ function applyGroundSnapshotParts(parts, senderId)
 end
 
 local function applyGroundSnapshot2Parts(parts, senderId, idFieldIndex)
-	local kv = parseKeyValueFields(parts, 2)
+	local kv = parsePacketKeyValues(parts, 2)
 	if type(kv) ~= "table" then
 		return false
 	end
@@ -2769,6 +2928,8 @@ local function applyGroundSnapshot2Parts(parts, senderId, idFieldIndex)
 		tunnelLengthMin = tonumber(kv.tunnelLenMin),
 		tunnelLengthMax = tonumber(kv.tunnelLenMax),
 		generatorVersion = tonumber(kv.genVer),
+		craterHistoryLimit = tonumber(kv.craterLimit),
+		dynamicCraters = decodeCraterListToken(kv.craters),
 		waterRatio = tonumber(kv.waterRatio),
 		grassColor = decodeColor3Token(kv.grassColor, defaultGroundParams.grassColor),
 		roadColor = decodeColor3Token(kv.roadColor, defaultGroundParams.roadColor),
@@ -4294,6 +4455,9 @@ function love.update(dt)
 				movementEnv,
 				frameFlightModel
 			)
+			if camera and camera.flightCrashEvent then
+				handleFlightCrashEvent(camera.flightCrashEvent)
+			end
 		else
 			camera = engine.processMovement(
 				camera,

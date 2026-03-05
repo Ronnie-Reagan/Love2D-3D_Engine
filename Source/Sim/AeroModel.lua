@@ -14,6 +14,26 @@ local function length3(v)
 	return math.sqrt((v[1] or 0) ^ 2 + (v[2] or 0) ^ 2 + (v[3] or 0) ^ 2)
 end
 
+local function cross3(a, b)
+	return {
+		(a[2] or 0) * (b[3] or 0) - (a[3] or 0) * (b[2] or 0),
+		(a[3] or 0) * (b[1] or 0) - (a[1] or 0) * (b[3] or 0),
+		(a[1] or 0) * (b[2] or 0) - (a[2] or 0) * (b[1] or 0)
+	}
+end
+
+local function normalize3(v, fallback)
+	local len = length3(v)
+	if len <= 1e-8 then
+		return fallback or { 0, 1, 0 }
+	end
+	return {
+		(v[1] or 0) / len,
+		(v[2] or 0) / len,
+		(v[3] or 0) / len
+	}
+end
+
 local function isFiniteNumber(value)
 	return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
 end
@@ -125,10 +145,24 @@ function aero.compute(airVelBody, angVelBody, controls, atmosphereSample, config
 	cPitch = clamp(cPitch, -cMomentMax, cMomentMax)
 	cYaw = clamp(cYaw, -cMomentMax, cMomentMax)
 
-	-- Aerodynamic forces in conventional axes.
-	local forceForward = qbar * wingArea * ((-cd * math.cos(alpha)) + (cl * math.sin(alpha)))
-	local forceRight = qbar * wingArea * cy
-	local forceUp = qbar * wingArea * ((cl * math.cos(alpha)) + (cd * math.sin(alpha)))
+	-- Force decomposition in wind axes (physically robust):
+	-- drag opposes air velocity, lift is perpendicular to flow, side force is lateral.
+	local vHat = normalize3({ velRight * invSpeed, velUp * invSpeed, velForward * invSpeed }, { 0, 0, 1 })
+	local dragDir = { -vHat[1], -vHat[2], -vHat[3] }
+	local liftSeed = cross3(vHat, { 1, 0, 0 })
+	if length3(liftSeed) <= 1e-5 then
+		liftSeed = cross3(vHat, { 0, 0, 1 })
+	end
+	local liftDir = normalize3(liftSeed, { 0, 1, 0 })
+	local sideDir = normalize3(cross3(liftDir, vHat), { 1, 0, 0 })
+
+	local dragMag = qbar * wingArea * cd
+	local liftMag = qbar * wingArea * cl
+	local sideMag = qbar * wingArea * cy
+
+	local forceRight = dragDir[1] * dragMag + liftDir[1] * liftMag + sideDir[1] * sideMag
+	local forceUp = dragDir[2] * dragMag + liftDir[2] * liftMag + sideDir[2] * sideMag
+	local forceForward = dragDir[3] * dragMag + liftDir[3] * liftMag + sideDir[3] * sideMag
 
 	-- Conventional moments: roll (forward axis), pitch (right axis, nose-up positive), yaw (up axis).
 	local momentRoll = qbar * wingArea * wingSpan * cRoll
