@@ -186,6 +186,12 @@ local function bindingModifiersMatch(required, current, strict)
 		if current.alt and not required.alt then
 			return false
 		end
+		if current.ctrl and not required.ctrl then
+			return false
+		end
+		if current.shift and not required.shift then
+			return false
+		end
 	end
 
 	return true

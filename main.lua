@@ -17,6 +17,48 @@ local function requireContract(modulePath, requiredKeys)
 	return loaded
 end
 
+function love.run()
+	if love.load then love.load(love.arg.parseGameArguments(arg), arg) end
+
+	-- We don't want the first frame's dt to include time taken by love.load.
+	if love.timer then love.timer.step() end
+
+	local dt = 0
+
+	-- Main loop time.
+	return function()
+		-- Process events.
+		if love.event then
+			love.event.pump()
+			for name, a,b,c,d,e,f in love.event.poll() do
+				if name == "quit" then
+					if not love.quit or not love.quit() then
+						return a or 0
+					end
+				end
+				love.handlers[name](a,b,c,d,e,f)
+			end
+		end
+
+		-- Update dt, as we'll be passing it to update
+		if love.timer then dt = love.timer.step() end
+
+		-- Call update and draw
+		if love.update then love.update(dt) end -- will pass 0 if love.timer is disabled
+
+		if love.graphics and love.graphics.isActive() then
+			love.graphics.origin()
+			love.graphics.clear(love.graphics.getBackgroundColor())
+
+			if love.draw then love.draw() end
+
+			love.graphics.present()
+		end
+
+		if love.timer then love.timer.sleep(0.0000001) end -- this is why this function is delcared, default is 0.001
+	end
+end
+
 local q = require("Source.Math.Quat")
 local vector3 = require("Source.Math.Vector3")
 local love = require "love" -- avoids nil report from intellisense, safe to remove if causes issues (it should be OK)
@@ -24,17 +66,19 @@ local enet = require "enet"
 local engine = require "Source.Core.Engine"
 local modelModule = require "Source.ModelModule.Init"
 local networking = require "Source.Net.Networking"
+local packetCodec = require "Source.Net.PacketCodec"
 local renderer = require "Source.Render.GpuRenderer"
+local cpuRenderClassifier = require "Source.Render.CpuRenderClassifier"
 local controls = require "Source.Input.Controls"
 local groundSystem = require "Source.Systems.GroundSystem"
+local terrainSdfSystem = require "Source.Systems.TerrainSdfSystem"
+local flightDynamics = require "Source.Systems.FlightDynamicsSystem"
 local viewMath = require "Source.Math.ViewMath"
 local cloudSim = require "Source.Systems.CloudSim"
 local logger = require "Source.Core.Logger"
 local objectDefs = require "Source.Core.ObjectDefs"
+local appStateModule = requireContract("Source.Core.AppState", { "create" })
 local viewSystemModule = requireContract("Source.Systems.ViewSystem", { "create" })
-local hudSystemModule = requireContract("Source.Ui.HudSystem", { "create" })
-local modelSystemModule = requireContract("Source.Systems.ModelSystem", { "create" })
-local syncSystemModule = requireContract("Source.Net.SyncSystem", { "create" })
 local inputSystemModule = requireContract("Source.Input.InputSystem", { "create" })
 local relay = enet.host_create()
 local relayServer = relay and relay:connect(hostAddy) or nil
@@ -48,6 +92,7 @@ local cloudPuffModel = objectDefs.cloudPuffModel or cubeModel
 local playerModel = cubeModel
 -- too many local scope declarations? fuck it, we're global now baby!
 ---@diagnostic disable lowercase-global
+local MIN_MODEL_SCALE = 0.1
 defaultPlayerModelPath = "Assets/Models/DualEngine2.glb"
 normalizedPlayerModelExtent = 2.2
 defaultPlayerModelScale = 1.35
@@ -58,7 +103,7 @@ playerWalkingModelScale = defaultWalkingModelScale
 playerWalkingModelHash = "builtin-cube"
 playerModelScale = playerWalkingModelScale
 playerModelHash = playerWalkingModelHash
-local screen, camera, groundObject, triangleCount, frameImage, renderMode, gpuErrorLogged --, zBuffer
+local screen, camera, groundObject, terrainState, triangleCount, frameImage, renderMode, gpuErrorLogged --, zBuffer
 local frameImageW, frameImageH = 0, 0
 local worldRenderCanvas, worldRenderW, worldRenderH = nil, 0, 0
 local useGpuRenderer = true
@@ -123,13 +168,25 @@ local stateNet = {
 }
 local forceStateSync
 local worldHalfExtent = defaults.worldHalfExtent
-local defaultGroundParams = defaults.defaultGroundParams
+local flightModelConfig = defaults.flightModel or flightDynamics.defaultConfig()
+local terrainSdfDefaults = defaults.terrainSdf or {}
+local lightingModel = defaults.lightingModel or {}
+local defaultGroundParams = terrainSdfSystem.normalizeGroundParams(defaults.defaultGroundParams, terrainSdfDefaults)
 local activeGroundParams = nil
 local windState = defaults.windState
 local cloudState = defaults.cloudState
 local drawDistanceChunkingTuning = defaults.drawDistanceChunkingTuning
 local cloudNetState = defaults.cloudNetState
 local groundNetState = defaults.groundNetState
+local appState = appStateModule.create({
+	graphicsSettings = graphicsSettings,
+	viewState = viewState,
+	mapState = mapState,
+	modelTransferState = modelTransferState,
+	cloudNetState = cloudNetState,
+	groundNetState = groundNetState,
+	stateNet = stateNet
+})
 
 -- Legacy STL axis correction. Keep this only for STL assets; GLB/GLTF stay in authored axes.
 local identityModelRotationOffset = q.identity()
@@ -214,9 +271,20 @@ end
 
 function applySunSettingsToRenderer()
 	if renderer and renderer.setLighting then
+		local fogDensity = tonumber(sunSettings.fogDensity) or tonumber(lightingModel.fogDensity) or 0.00055
+		local fogHeightFalloff = tonumber(sunSettings.fogHeightFalloff) or tonumber(lightingModel.fogHeightFalloff) or 0.0017
+		local exposureEV = tonumber(sunSettings.exposureEV) or tonumber(lightingModel.exposureEV) or 0.0
+		local turbidity = tonumber(sunSettings.turbidity) or tonumber(lightingModel.turbidity) or 2.4
+		local shadowEnabled = (sunSettings.shadowEnabled ~= nil) and (sunSettings.shadowEnabled and true or false) or
+			(lightingModel.shadowEnabled and true or false)
+		local shadowSoftness = tonumber(sunSettings.shadowSoftness) or tonumber(lightingModel.shadowSoftness) or 1.6
+		local shadowDistance = tonumber(sunSettings.shadowDistance) or tonumber(lightingModel.shadowDistance) or
+			(tonumber(graphicsSettings.drawDistance) or 1800)
 		renderer.setLighting({
 			direction = getSunDirection(),
 			color = getSunLightColor(),
+			useAnalyticSky = true,
+			sunIntensity = math.max(0, tonumber(sunSettings.intensity) or 1.0),
 			ambient = math.max(0, tonumber(sunSettings.ambient) or 0.25),
 			skyColor = {
 				math.max(0, tonumber(sunSettings.skyR) or 0.42),
@@ -229,7 +297,19 @@ function applySunSettingsToRenderer()
 				math.max(0, tonumber(sunSettings.groundB) or 0.11)
 			},
 			specularAmbient = math.max(0, tonumber(sunSettings.giSpecular) or 0.35),
-			bounce = math.max(0, tonumber(sunSettings.giBounce) or 0.24)
+			bounce = math.max(0, tonumber(sunSettings.giBounce) or 0.24),
+			fogDensity = math.max(0, fogDensity),
+			fogHeightFalloff = math.max(0, fogHeightFalloff),
+			fogColor = {
+				math.max(0, tonumber(sunSettings.fogR) or tonumber(lightingModel.fogR) or 0.64),
+				math.max(0, tonumber(sunSettings.fogG) or tonumber(lightingModel.fogG) or 0.73),
+				math.max(0, tonumber(sunSettings.fogB) or tonumber(lightingModel.fogB) or 0.84)
+			},
+			exposureEV = exposureEV,
+			turbidity = turbidity,
+			shadowEnabled = shadowEnabled,
+			shadowSoftness = shadowSoftness,
+			shadowDistance = shadowDistance
 		})
 	end
 end
@@ -249,6 +329,36 @@ local function clamp(value, minValue, maxValue)
 		return maxValue
 	end
 	return value
+end
+
+local function sanitizePositiveScale(value, fallback)
+	local scale = tonumber(value)
+	if scale then
+		scale = math.abs(scale)
+	end
+	if not scale or scale < MIN_MODEL_SCALE then
+		local fallbackScale = tonumber(fallback)
+		if fallbackScale then
+			fallbackScale = math.abs(fallbackScale)
+		end
+		scale = fallbackScale
+	end
+	if not scale or scale < MIN_MODEL_SCALE then
+		scale = MIN_MODEL_SCALE
+	end
+	return scale
+end
+
+local function syncAppStateReferences()
+	appState:merge({
+		screen = screen,
+		camera = camera,
+		objects = objects,
+		peers = peers,
+		localPlayerObject = localPlayerObject,
+		useGpuRenderer = useGpuRenderer,
+		renderMode = renderMode
+	})
 end
 
 local function safeNewFont(size)
@@ -532,6 +642,7 @@ end
 function invalidateMapCache()
 	mapState.mapImage = nil
 	mapState.mapImageData = nil
+	mapState.mapBuildJob = nil
 	mapState.mapRes = 0
 	mapState.lastCenterX = nil
 	mapState.lastCenterZ = nil
@@ -556,9 +667,17 @@ function groundParamsSignature(params)
 	local wr = clamp(tonumber(params.waterRatio) or 0, 0, 1)
 	return table.concat({
 		tostring(params.seed or 0),
+		string.format("%.3f", tonumber(params.chunkSize) or 0),
+		tostring(params.lod0Radius or 0),
+		tostring(params.lod1Radius or 0),
 		string.format("%.5f", tonumber(params.tileSize) or 0),
 		tostring(params.gridCount or 0),
 		tostring(params.roadCount or 0),
+		string.format("%.5f", tonumber(params.heightAmplitude) or 0),
+		string.format("%.6f", tonumber(params.heightFrequency) or 0),
+		tostring((params.caveEnabled ~= false) and 1 or 0),
+		tostring(params.tunnelCount or 0),
+		tostring(params.generatorVersion or 0),
 		string.format("%.5f", wr),
 		string.format("%.5f", tonumber(params.roadDensity) or 0),
 		tostring(params.fieldCount or 0),
@@ -983,10 +1102,11 @@ local function buildRenderObjectList()
 	local maxDist = math.max(300, tonumber(graphicsSettings.drawDistance) or 1800)
 	for _, obj in ipairs(objects) do
 		if shouldRenderObjectForView(obj) then
-			if activeCam and activeCam.pos and obj.pos then
-				local dx = obj.pos[1] - activeCam.pos[1]
-				local dy = obj.pos[2] - activeCam.pos[2]
-				local dz = obj.pos[3] - activeCam.pos[3]
+			local cullPos = obj.terrainCenter or obj.pos
+			if activeCam and activeCam.pos and cullPos then
+				local dx = (cullPos[1] or 0) - activeCam.pos[1]
+				local dy = (cullPos[2] or 0) - activeCam.pos[2]
+				local dz = (cullPos[3] or 0) - activeCam.pos[3]
 				local distSq = dx * dx + dy * dy + dz * dz
 				local radius = 0
 				if obj.halfSize then
@@ -1068,8 +1188,121 @@ local function ensureMapGroundImage(panelSize, mapCam)
 		return nil
 	end
 
+	local function beginMapBuild(targetRes, groundSig)
+		if (not mapState.mapImageData) or mapState.mapRes ~= targetRes then
+			local okData, dataOrErr = pcall(function()
+				return love.image.newImageData(targetRes, targetRes)
+			end)
+			if not okData or not dataOrErr then
+				mapState.mapImage = nil
+				mapState.mapImageData = nil
+				mapState.mapBuildJob = nil
+				mapState.mapRes = 0
+				return false
+			end
+			mapState.mapImageData = dataOrErr
+			mapState.mapRes = targetRes
+		end
+
+		local centerX = (mapCam.pos and mapCam.pos[1]) or 0
+		local centerZ = (mapCam.pos and mapCam.pos[3]) or 0
+		local heading = tonumber(mapCam.heading) or 0
+		mapState.mapBuildJob = {
+			targetRes = targetRes,
+			nextRow = 0,
+			worldPerPixel = (mapCam.extent * 2) / targetRes,
+			cosHeading = math.cos(heading),
+			sinHeading = math.sin(heading),
+			centerX = centerX,
+			centerZ = centerZ,
+			heading = heading,
+			extent = mapCam.extent,
+			groundSig = groundSig
+		}
+		return true
+	end
+
+	local function stepMapBuild()
+		local job = mapState.mapBuildJob
+		local data = mapState.mapImageData
+		if type(job) ~= "table" or not data then
+			mapState.mapBuildJob = nil
+			return false
+		end
+
+		local targetRes = job.targetRes
+		local halfRes = targetRes * 0.5
+		local worldPerPixel = job.worldPerPixel
+		local cosH = job.cosHeading
+		local sinH = job.sinHeading
+		local colorParams = activeGroundParams or defaultGroundParams
+		local terrainRef = terrainState or colorParams
+		local rowsPerStep = clamp(math.floor(targetRes * 0.08), 6, 24)
+		local startRow = math.floor(tonumber(job.nextRow) or 0)
+		local endRow = math.min(targetRes - 1, startRow + rowsPerStep - 1)
+
+		for y = startRow, endRow do
+			for x = 0, targetRes - 1 do
+				local mapX = (x + 0.5 - halfRes) * worldPerPixel
+				local mapZ = (halfRes - (y + 0.5)) * worldPerPixel
+				local worldDX = cosH * mapX + sinH * mapZ
+				local worldDZ = -sinH * mapX + cosH * mapZ
+				local worldX = job.centerX + worldDX
+				local worldZ = job.centerZ + worldDZ
+				local c = terrainSdfSystem.sampleGroundColorAtWorld(worldX, worldZ, terrainRef)
+				local edgeX = math.abs((x + 0.5) / targetRes * 2 - 1)
+				local edgeY = math.abs((y + 0.5) / targetRes * 2 - 1)
+				local vignette = 1 - (math.max(edgeX, edgeY) * 0.09)
+				vignette = clamp(vignette, 0.78, 1.0)
+				data:setPixel(
+					x,
+					y,
+					clamp(c[1] * vignette, 0, 1),
+					clamp(c[2] * vignette, 0, 1),
+					clamp(c[3] * vignette, 0, 1),
+					0.98
+				)
+			end
+		end
+
+		job.nextRow = endRow + 1
+		if job.nextRow < targetRes then
+			return false
+		end
+
+		if mapState.mapImage then
+			local okReplace = pcall(function()
+				mapState.mapImage:replacePixels(data)
+			end)
+			if not okReplace then
+				mapState.mapImage = nil
+			end
+		end
+		if not mapState.mapImage then
+			local okImage, imageOrErr = pcall(function()
+				return love.graphics.newImage(data)
+			end)
+			if not okImage or not imageOrErr then
+				mapState.mapImage = nil
+				mapState.mapBuildJob = nil
+				return false
+			end
+			mapState.mapImage = imageOrErr
+			mapState.mapImage:setFilter("linear", "linear")
+		end
+
+		mapState.lastCenterX = job.centerX
+		mapState.lastCenterZ = job.centerZ
+		mapState.lastHeading = job.heading
+		mapState.lastExtent = job.extent
+		mapState.lastGroundSignature = job.groundSig
+		mapState.lastRefreshAt = love.timer.getTime()
+		mapState.mapBuildJob = nil
+		return true
+	end
+
 	local now = love.timer.getTime()
-	local targetRes = clamp(math.floor(panelSize), 96, 320)
+	local targetRes = clamp(math.floor(panelSize), 96, 224)
 	local groundSig = groundParamsSignature(activeGroundParams or defaultGroundParams)
 	local needRefresh = false
 	if not mapState.mapImage then
@@ -1080,92 +1313,33 @@ local function ensureMapGroundImage(panelSize, mapCam)
 		needRefresh = true
 	elseif math.abs((mapState.lastExtent or 0) - mapCam.extent) > 1e-6 then
 		needRefresh = true
-	elseif (now - (mapState.lastRefreshAt or -math.huge)) >= 0.05 then
+	elseif (now - (mapState.lastRefreshAt or -math.huge)) >= 0.2 then
 		local dx = math.abs((mapState.lastCenterX or mapCam.pos[1]) - mapCam.pos[1])
 		local dz = math.abs((mapState.lastCenterZ or mapCam.pos[3]) - mapCam.pos[3])
 		local headingDelta = math.abs(viewMath.shortestAngleDelta(mapState.lastHeading or mapCam.heading, mapCam.heading))
-		local moveThreshold = math.max(2.0, mapCam.extent * 0.02)
-		if dx > moveThreshold or dz > moveThreshold or headingDelta > math.rad(1.4) then
+		local moveThreshold = math.max(3.0, mapCam.extent * 0.03)
+		if dx > moveThreshold or dz > moveThreshold or headingDelta > math.rad(2.0) then
 			needRefresh = true
 		end
+	end
+
+	local activeJob = type(mapState.mapBuildJob) == "table"
+	if activeJob then
+		local job = mapState.mapBuildJob
+		if job.targetRes ~= targetRes or job.groundSig ~= groundSig or math.abs((job.extent or 0) - mapCam.extent) > 1e-6 then
+			beginMapBuild(targetRes, groundSig)
+		end
+		stepMapBuild()
+		return mapState.mapImage
 	end
 
 	if not needRefresh then
 		return mapState.mapImage
 	end
 
-	if (not mapState.mapImageData) or mapState.mapRes ~= targetRes then
-		local okData, dataOrErr = pcall(function()
-			return love.image.newImageData(targetRes, targetRes)
-		end)
-		if not okData or not dataOrErr then
-			mapState.mapImage = nil
-			mapState.mapImageData = nil
-			mapState.mapRes = 0
-			return nil
-		end
-		mapState.mapImageData = dataOrErr
-		mapState.mapRes = targetRes
-		mapState.mapImage = nil
+	if beginMapBuild(targetRes, groundSig) then
+		stepMapBuild()
 	end
-
-	local data = mapState.mapImageData
-	local worldPerPixel = (mapCam.extent * 2) / targetRes
-	local cosH = math.cos(mapCam.heading)
-	local sinH = math.sin(mapCam.heading)
-	local colorParams = activeGroundParams or defaultGroundParams
-	local halfRes = targetRes * 0.5
-
-	for y = 0, targetRes - 1 do
-		for x = 0, targetRes - 1 do
-			local mapX = (x + 0.5 - halfRes) * worldPerPixel
-			local mapZ = (halfRes - (y + 0.5)) * worldPerPixel
-			local worldDX = cosH * mapX + sinH * mapZ
-			local worldDZ = -sinH * mapX + cosH * mapZ
-			local worldX = mapCam.pos[1] + worldDX
-			local worldZ = mapCam.pos[3] + worldDZ
-			local c = groundSystem.sampleGroundColorAtWorld(worldX, worldZ, colorParams)
-			local edgeX = math.abs((x + 0.5) / targetRes * 2 - 1)
-			local edgeY = math.abs((y + 0.5) / targetRes * 2 - 1)
-			local vignette = 1 - (math.max(edgeX, edgeY) * 0.09)
-			vignette = clamp(vignette, 0.78, 1.0)
-			data:setPixel(
-				x,
-				y,
-				clamp(c[1] * vignette, 0, 1),
-				clamp(c[2] * vignette, 0, 1),
-				clamp(c[3] * vignette, 0, 1),
-				0.98
-			)
-		end
-	end
-
-	if mapState.mapImage then
-		local okReplace = pcall(function()
-			mapState.mapImage:replacePixels(data)
-		end)
-		if not okReplace then
-			mapState.mapImage = nil
-		end
-	end
-	if not mapState.mapImage then
-		local okImage, imageOrErr = pcall(function()
-			return love.graphics.newImage(data)
-		end)
-		if not okImage or not imageOrErr then
-			mapState.mapImage = nil
-			return nil
-		end
-		mapState.mapImage = imageOrErr
-		mapState.mapImage:setFilter("linear", "linear")
-	end
-
-	mapState.lastCenterX = mapCam.pos[1]
-	mapState.lastCenterZ = mapCam.pos[3]
-	mapState.lastHeading = mapCam.heading
-	mapState.lastExtent = mapCam.extent
-	mapState.lastGroundSignature = groundSig
-	mapState.lastRefreshAt = now
 	return mapState.mapImage
 end
 
@@ -1366,7 +1540,7 @@ function applyPlaneVisualToObject(obj, modelHash, scale)
 	obj.submeshes = entry and entry.submeshes or nil
 	obj.faceMaterials = entry and entry.faceMaterials or nil
 	obj.modelAssetId = entry and entry.assetId or nil
-	local s = scale and tonumber(scale) or 1
+	local s = sanitizePositiveScale(scale, 1)
 	obj.scale = { s, s, s }
 	obj.halfSize = { x = s, y = s, z = s }
 	obj.modelHash = modelHash
@@ -1555,40 +1729,6 @@ function loadPlayerModelFromStl(path, targetRole)
 	return loadPlayerModelFromPath(path, targetRole)
 end
 
-local modelSystem = modelSystemModule.create({
-	hashModelBytes = hashModelBytes,
-	encodeModelBytes = encodeModelBytes,
-	decodeModelBytes = decodeModelBytes,
-	readFileBytes = readFileBytes,
-	getPathDirectory = getPathDirectory,
-	computeModelBounds = computeModelBounds,
-	getGroundClearance = getGroundClearance,
-	computeModelVisualOffsetY = computeModelVisualOffsetY,
-	applyPlaneVisualToObject = applyPlaneVisualToObject,
-	refreshAllPeerModels = refreshAllPeerModels,
-	cacheModelEntry = cacheModelEntry,
-	setActivePlayerModel = setActivePlayerModel,
-	loadPlayerModelFromRaw = loadPlayerModelFromRaw,
-	loadPlayerModelFromPath = loadPlayerModelFromPath,
-	loadPlayerModelFromStl = loadPlayerModelFromStl
-})
-
-hashModelBytes = modelSystem.hashModelBytes
-encodeModelBytes = modelSystem.encodeModelBytes
-decodeModelBytes = modelSystem.decodeModelBytes
-readFileBytes = modelSystem.readFileBytes
-getPathDirectory = modelSystem.getPathDirectory
-computeModelBounds = modelSystem.computeModelBounds
-getGroundClearance = modelSystem.getGroundClearance
-computeModelVisualOffsetY = modelSystem.computeModelVisualOffsetY
-applyPlaneVisualToObject = modelSystem.applyPlaneVisualToObject
-refreshAllPeerModels = modelSystem.refreshAllPeerModels
-cacheModelEntry = modelSystem.cacheModelEntry
-setActivePlayerModel = modelSystem.setActivePlayerModel
-loadPlayerModelFromRaw = modelSystem.loadPlayerModelFromRaw
-loadPlayerModelFromPath = modelSystem.loadPlayerModelFromPath
-loadPlayerModelFromStl = modelSystem.loadPlayerModelFromStl
-
 do
 	local fallbackEntry = {
 		hash = "builtin-cube",
@@ -1624,9 +1764,10 @@ end
 
 function getConfiguredModelForRole(role)
 	if role == "walking" then
-		return playerWalkingModelHash or "builtin-cube", playerWalkingModelScale or defaultWalkingModelScale
+		return playerWalkingModelHash or "builtin-cube",
+			sanitizePositiveScale(playerWalkingModelScale, defaultWalkingModelScale)
 	end
-	return playerPlaneModelHash or "builtin-cube", playerPlaneModelScale or defaultPlayerModelScale
+	return playerPlaneModelHash or "builtin-cube", sanitizePositiveScale(playerPlaneModelScale, defaultPlayerModelScale)
 end
 
 function getConfiguredSkinHashForRole(role)
@@ -1648,6 +1789,8 @@ function getConfiguredSkinHashForRole(role)
 end
 
 function syncActivePlayerModelState()
+	playerPlaneModelScale = sanitizePositiveScale(playerPlaneModelScale, defaultPlayerModelScale)
+	playerWalkingModelScale = sanitizePositiveScale(playerWalkingModelScale, defaultWalkingModelScale)
 	local modelHash, modelScale = getConfiguredModelForRole(getActiveModelRole())
 	playerModelHash = modelHash
 	playerModelScale = modelScale
@@ -1660,18 +1803,97 @@ function syncActivePlayerModelState()
 	forceStateSync()
 end
 
+function ensureFlightSpawnSafety(minGroundClearance, minForwardSpeed)
+	if not camera then
+		return
+	end
+
+	local clearance = math.max(8, tonumber(minGroundClearance) or 45)
+	local launchSpeed = math.max(8, tonumber(minForwardSpeed) or 34)
+	local halfY = (camera.box and camera.box.halfSize and camera.box.halfSize.y) or 1.8
+	local terrainRef = terrainState or activeGroundParams or defaultGroundParams
+	local groundY = terrainSdfSystem.sampleGroundHeightAtWorld(camera.pos[1], camera.pos[3], terrainRef) or 0
+	local minY = groundY + halfY + clearance
+	if (camera.pos[2] or 0) < minY then
+		camera.pos[2] = minY
+	end
+
+	camera.flightVel = camera.flightVel or { 0, 0, 0 }
+	local vx = tonumber(camera.flightVel[1]) or 0
+	local vy = tonumber(camera.flightVel[2]) or 0
+	local vz = tonumber(camera.flightVel[3]) or 0
+	local forward = q.rotateVector(camera.rot or q.identity(), { 0, 0, 1 })
+	local fx = tonumber(forward[1]) or 0
+	local fz = tonumber(forward[3]) or 0
+	local fLen = math.sqrt(fx * fx + fz * fz)
+	if fLen <= 1e-6 then
+		fx, fz = 0, 1
+	else
+		fx, fz = fx / fLen, fz / fLen
+	end
+
+	local planarSpeed = math.sqrt(vx * vx + vz * vz)
+	if planarSpeed < launchSpeed then
+		vx = fx * launchSpeed
+		vz = fz * launchSpeed
+	end
+	vy = math.max(vy, 0)
+	camera.flightVel[1] = vx
+	camera.flightVel[2] = vy
+	camera.flightVel[3] = vz
+
+	camera.vel = { camera.flightVel[1], camera.flightVel[2], camera.flightVel[3] }
+	camera.throttle = math.max(tonumber(camera.throttle) or 0, 0.58)
+	if camera.flightSimState and type(camera.flightSimState.engine) == "table" then
+		camera.flightSimState.engine.throttle = math.max(
+			tonumber(camera.flightSimState.engine.throttle) or 0,
+			camera.throttle
+		)
+	end
+	camera.onGround = false
+	if camera.box and camera.box.pos then
+		camera.box.pos[1] = camera.pos[1]
+		camera.box.pos[2] = camera.pos[2]
+		camera.box.pos[3] = camera.pos[3]
+	end
+end
+
+local function buildFlightEntryRotation(sourceCamera)
+	local yaw = tonumber(sourceCamera and sourceCamera.walkYaw)
+	if yaw == nil then
+		yaw = viewMath.getYawFromRotation((sourceCamera and sourceCamera.rot) or q.identity(), q)
+	end
+	yaw = viewMath.wrapAngle(yaw or 0)
+	local yawQuat = q.fromAxisAngle({ 0, 1, 0 }, yaw)
+	local right = q.rotateVector(yawQuat, { 1, 0, 0 })
+	local pitchUp = math.rad(6)
+	local pitchQuat = q.fromAxisAngle(right, -pitchUp)
+	return q.normalize(q.multiply(pitchQuat, yawQuat))
+end
+
 local function setFlightMode(enabled)
 	flightSimMode = enabled and true or false
 	if camera then
 		camera.yoke = camera.yoke or { pitch = 0, yaw = 0, roll = 0 }
 		camera.flightRotVel = camera.flightRotVel or { pitch = 0, yaw = 0, roll = 0 }
 		if flightSimMode then
+			camera.rot = buildFlightEntryRotation(camera)
 			camera.walkYaw = nil
 			camera.walkPitch = nil
-			camera.flightVel = camera.flightVel or { 0, 0, 0 }
+			camera.flightVel = { 0, 0, 0 }
+			camera.flightAngVel = { 0, 0, 0 }
+			camera.flightRotVel.pitch = 0
+			camera.flightRotVel.yaw = 0
+			camera.flightRotVel.roll = 0
+			camera.yoke.pitch = 0
+			camera.yoke.yaw = 0
+			camera.yoke.roll = 0
+			camera.flightSimState = nil
+			ensureFlightSpawnSafety(45, 32)
 		else
 			camera.throttle = 0
 			camera.flightVel = { 0, 0, 0 }
+			camera.flightAngVel = { 0, 0, 0 }
 			camera.vel = { 0, 0, 0 }
 			camera.yoke.pitch = 0
 			camera.yoke.yaw = 0
@@ -1748,32 +1970,20 @@ function clearPeerObjects()
 	modelTransferState.incoming = {}
 	modelTransferState.outgoing = {}
 	modelTransferState.requestedAt = {}
+	modelTransferState.lastRequestedPruneAt = love.timer.getTime()
+	syncAppStateReferences()
 end
 
 function splitPacketFields(data)
-	local parts = {}
-	if type(data) ~= "string" then
-		return parts
-	end
-
-	for part in string.gmatch(data, "([^|]+)") do
-		parts[#parts + 1] = part
-	end
-	return parts
+	return packetCodec.splitFields(data, "|")
 end
 
 local function parsePacketKeyValues(parts, startIndex)
-	local kv = {}
-	if type(parts) ~= "table" then
-		return kv
-	end
-	for i = startIndex or 2, #parts do
-		local key, value = tostring(parts[i] or ""):match("^([^=]+)=(.*)$")
-		if key and value then
-			kv[key] = value
-		end
-	end
-	return kv
+	return packetCodec.parseKeyValueFields(parts, startIndex or 2)
+end
+
+local function readTrailingPacketInteger(parts, startIndex)
+	return packetCodec.readTrailingInteger(parts, startIndex or 2)
 end
 
 local function makeBlobTransferKey(kind, hash)
@@ -1818,6 +2028,48 @@ local function relayIsConnected()
 		return relayServer:state()
 	end)
 	return ok and state == "connected"
+end
+
+local function pruneRequestedTransferMap(now)
+	now = tonumber(now) or love.timer.getTime()
+	local requestedAt = modelTransferState.requestedAt
+	if type(requestedAt) ~= "table" then
+		modelTransferState.requestedAt = {}
+		modelTransferState.lastRequestedPruneAt = now
+		return
+	end
+
+	local pruneInterval = math.max(1, tonumber(modelTransferState.requestedPruneInterval) or 8)
+	local lastPruneAt = tonumber(modelTransferState.lastRequestedPruneAt) or -math.huge
+	if (now - lastPruneAt) < pruneInterval then
+		return
+	end
+	modelTransferState.lastRequestedPruneAt = now
+
+	local expiry = math.max(pruneInterval, tonumber(modelTransferState.requestedExpiry) or 120)
+	local survivors = {}
+	local survivorCount = 0
+	for key, requestedTime in pairs(requestedAt) do
+		local stamp = tonumber(requestedTime)
+		if stamp and (now - stamp) <= expiry then
+			survivorCount = survivorCount + 1
+			survivors[survivorCount] = { key = key, requestedAt = stamp }
+		else
+			requestedAt[key] = nil
+		end
+	end
+
+	local maxEntries = math.max(32, math.floor(tonumber(modelTransferState.maxRequestedEntries) or 512))
+	if survivorCount <= maxEntries then
+		return
+	end
+
+	table.sort(survivors, function(a, b)
+		return a.requestedAt < b.requestedAt
+	end)
+	for i = 1, survivorCount - maxEntries do
+		requestedAt[survivors[i].key] = nil
+	end
 end
 
 local function queueOutgoingBlobTransfer(kind, hash)
@@ -1868,6 +2120,7 @@ local function requestBlobFromPeers(kind, hash, reason)
 
 	local key = makeBlobTransferKey(kind, hash)
 	local now = love.timer.getTime()
+	pruneRequestedTransferMap(now)
 	local lastRequested = modelTransferState.requestedAt[key] or -math.huge
 	if (now - lastRequested) < modelTransferState.requestCooldown then
 		return false
@@ -1904,9 +2157,11 @@ function updatePeerVisualModel(peerId)
 	local role = (peer.remoteRole == "walking") and "walking" or "plane"
 	local planeHash = peer.planeModelHash or peer.modelHash or "builtin-cube"
 	local walkingHash = peer.walkingModelHash or peer.modelHash or planeHash or "builtin-cube"
-	local planeScale = math.max(0.05,
-		tonumber(peer.planeModelScale) or ((peer.scale and peer.scale[1]) or defaultPlayerModelScale))
-	local walkingScale = math.max(0.05, tonumber(peer.walkingModelScale) or planeScale or defaultWalkingModelScale)
+	local planeScale = sanitizePositiveScale(
+		peer.planeModelScale,
+		(peer.scale and peer.scale[1]) or defaultPlayerModelScale
+	)
+	local walkingScale = sanitizePositiveScale(peer.walkingModelScale, planeScale or defaultWalkingModelScale)
 	local wantedHash = (role == "walking") and walkingHash or planeHash
 	local peerScale = (role == "walking") and walkingScale or planeScale
 
@@ -1998,7 +2253,10 @@ function handleModelMetaPacket(data)
 	else
 		return false
 	end
-	local senderId = tonumber(parts[#parts])
+	local senderId = readTrailingPacketInteger(parts, 2)
+	if senderId == nil and packetType == "MODEL_META" then
+		return false
+	end
 	if type(kind) ~= "string" or kind == "" then
 		return false
 	end
@@ -2103,7 +2361,10 @@ function handleModelChunkPacket(data)
 	if type(hash) ~= "string" or hash == "" then
 		return false
 	end
-	local senderId = tonumber(parts[#parts])
+	local senderId = readTrailingPacketInteger(parts, 2)
+	if senderId == nil and packetType == "MODEL_CHUNK" then
+		return false
+	end
 
 	local key = makeBlobTransferKey(kind, hash)
 	local transfer = modelTransferState.incoming[key]
@@ -2151,6 +2412,7 @@ function handleModelChunkPacket(data)
 end
 
 function pumpModelTransfers(now)
+	pruneRequestedTransferMap(now)
 	local connected = relayIsConnected()
 	if connected then
 		for _, transfer in pairs(modelTransferState.outgoing) do
@@ -2352,31 +2614,53 @@ function requestGroundSnapshot(reason)
 end
 
 function buildGroundSnapshotPacket(now)
-	local params = activeGroundParams or groundSystem.normalizeGroundParams(defaultGroundParams, defaultGroundParams)
+	local params = activeGroundParams or terrainSdfSystem.normalizeGroundParams(defaultGroundParams, terrainSdfDefaults)
 	local parts = {
-		"GROUND_SNAPSHOT",
-		formatNetFloat(now),
-		tostring(params.seed),
-		formatNetFloat(params.tileSize),
-		tostring(params.gridCount),
-		formatNetFloat(params.baseHeight),
-		formatNetFloat(params.tileThickness),
-		formatNetFloat(params.curvature),
-		formatNetFloat(params.recenterStep),
-		tostring(params.roadCount),
-		formatNetFloat(params.roadDensity),
-		tostring(params.fieldCount),
-		tostring(params.fieldMinSize),
-		tostring(params.fieldMaxSize),
-		encodeColor3Token(params.grassColor),
-		encodeColor3Token(params.roadColor),
-		encodeColor3Token(params.fieldColor),
-		encodeColor3Token(params.grassVar),
-		encodeColor3Token(params.roadVar),
-		encodeColor3Token(params.fieldVar),
-		formatNetFloat(params.waterRatio or defaultGroundParams.waterRatio),
-		encodeColor3Token(params.waterColor or defaultGroundParams.waterColor),
-		encodeColor3Token(params.waterVar or defaultGroundParams.waterVar)
+		"GROUND_SNAPSHOT2",
+		"ts=" .. formatNetFloat(now),
+		"seed=" .. tostring(params.seed),
+		"chunkSize=" .. formatNetFloat(params.chunkSize or 64),
+		"lod0=" .. tostring(params.lod0Radius or 2),
+		"lod1=" .. tostring(params.lod1Radius or 4),
+		"lod0Cell=" .. formatNetFloat(params.lod0CellSize or 4),
+		"lod1Cell=" .. formatNetFloat(params.lod1CellSize or 8),
+		"meshBudget=" .. tostring(params.meshBuildBudget or 2),
+		"inflight=" .. tostring(params.workerMaxInflight or 2),
+		"cache=" .. tostring(params.chunkCacheLimit or 768),
+		"surfaceOnly=" .. tostring((params.surfaceOnlyMeshing ~= false) and 1 or 0),
+		"threaded=" .. tostring((params.threadedMeshing ~= false) and 1 or 0),
+		"minY=" .. formatNetFloat(params.minY or -180),
+		"maxY=" .. formatNetFloat(params.maxY or 320),
+		"baseHeight=" .. formatNetFloat(params.baseHeight or 0),
+		"heightAmp=" .. formatNetFloat(params.heightAmplitude or 120),
+		"heightFreq=" .. formatNetFloat(params.heightFrequency or 0.0018),
+		"heightOct=" .. tostring(params.heightOctaves or 5),
+		"heightLac=" .. formatNetFloat(params.heightLacunarity or 2.05),
+		"heightGain=" .. formatNetFloat(params.heightGain or 0.52),
+		"detailAmp=" .. formatNetFloat(params.surfaceDetailAmplitude or 14),
+		"detailFreq=" .. formatNetFloat(params.surfaceDetailFrequency or 0.013),
+		"waterLevel=" .. formatNetFloat(params.waterLevel or -12),
+		"caveEnabled=" .. tostring((params.caveEnabled ~= false) and 1 or 0),
+		"caveFreq=" .. formatNetFloat(params.caveFrequency or 0.018),
+		"caveThr=" .. formatNetFloat(params.caveThreshold or 0.68),
+		"caveStr=" .. formatNetFloat(params.caveStrength or 42),
+		"caveMinY=" .. formatNetFloat(params.caveMinY or -120),
+		"caveMaxY=" .. formatNetFloat(params.caveMaxY or 220),
+		"tunnelCount=" .. tostring(params.tunnelCount or 12),
+		"tunnelRMin=" .. formatNetFloat(params.tunnelRadiusMin or 9),
+		"tunnelRMax=" .. formatNetFloat(params.tunnelRadiusMax or 18),
+		"tunnelLenMin=" .. formatNetFloat(params.tunnelLengthMin or 240),
+		"tunnelLenMax=" .. formatNetFloat(params.tunnelLengthMax or 520),
+		"genVer=" .. tostring(params.generatorVersion or 1),
+		"waterRatio=" .. formatNetFloat(params.waterRatio or defaultGroundParams.waterRatio),
+		"grassColor=" .. encodeColor3Token(params.grassColor),
+		"roadColor=" .. encodeColor3Token(params.roadColor),
+		"fieldColor=" .. encodeColor3Token(params.fieldColor),
+		"waterColor=" .. encodeColor3Token(params.waterColor),
+		"grassVar=" .. encodeColor3Token(params.grassVar),
+		"roadVar=" .. encodeColor3Token(params.roadVar),
+		"fieldVar=" .. encodeColor3Token(params.fieldVar),
+		"waterVar=" .. encodeColor3Token(params.waterVar)
 	}
 	return table.concat(parts, "|")
 end
@@ -2441,13 +2725,71 @@ function applyGroundSnapshotParts(parts, senderId)
 	return true
 end
 
-function handleGroundSnapshotPacket(data)
-	local parts = splitPacketFields(data)
-	if parts[1] ~= "GROUND_SNAPSHOT" then
+local function applyGroundSnapshot2Parts(parts, senderId, idFieldIndex)
+	local kv = parseKeyValueFields(parts, 2)
+	if type(kv) ~= "table" then
 		return false
 	end
 
-	local senderId = tonumber(parts[#parts])
+	local params = terrainSdfSystem.normalizeGroundParams({
+		seed = tonumber(kv.seed),
+		chunkSize = tonumber(kv.chunkSize),
+		lod0Radius = tonumber(kv.lod0),
+		lod1Radius = tonumber(kv.lod1),
+		lod0CellSize = tonumber(kv.lod0Cell),
+		lod1CellSize = tonumber(kv.lod1Cell),
+		meshBuildBudget = tonumber(kv.meshBudget),
+		workerMaxInflight = tonumber(kv.inflight),
+		chunkCacheLimit = tonumber(kv.cache),
+		surfaceOnlyMeshing = (kv.surfaceOnly ~= nil) and (tonumber(kv.surfaceOnly) ~= 0) or nil,
+		threadedMeshing = (kv.threaded ~= nil) and (tonumber(kv.threaded) ~= 0) or nil,
+		minY = tonumber(kv.minY),
+		maxY = tonumber(kv.maxY),
+		baseHeight = tonumber(kv.baseHeight),
+		heightAmplitude = tonumber(kv.heightAmp),
+		heightFrequency = tonumber(kv.heightFreq),
+		heightOctaves = tonumber(kv.heightOct),
+		heightLacunarity = tonumber(kv.heightLac),
+		heightGain = tonumber(kv.heightGain),
+		surfaceDetailAmplitude = tonumber(kv.detailAmp),
+		surfaceDetailFrequency = tonumber(kv.detailFreq),
+		waterLevel = tonumber(kv.waterLevel),
+		caveEnabled = (kv.caveEnabled ~= nil) and (tonumber(kv.caveEnabled) ~= 0) or nil,
+		caveFrequency = tonumber(kv.caveFreq),
+		caveThreshold = tonumber(kv.caveThr),
+		caveStrength = tonumber(kv.caveStr),
+		caveMinY = tonumber(kv.caveMinY),
+		caveMaxY = tonumber(kv.caveMaxY),
+		tunnelCount = tonumber(kv.tunnelCount),
+		tunnelRadiusMin = tonumber(kv.tunnelRMin),
+		tunnelRadiusMax = tonumber(kv.tunnelRMax),
+		tunnelLengthMin = tonumber(kv.tunnelLenMin),
+		tunnelLengthMax = tonumber(kv.tunnelLenMax),
+		generatorVersion = tonumber(kv.genVer),
+		waterRatio = tonumber(kv.waterRatio),
+		grassColor = decodeColor3Token(kv.grassColor, defaultGroundParams.grassColor),
+		roadColor = decodeColor3Token(kv.roadColor, defaultGroundParams.roadColor),
+		fieldColor = decodeColor3Token(kv.fieldColor, defaultGroundParams.fieldColor),
+		waterColor = decodeColor3Token(kv.waterColor, defaultGroundParams.waterColor),
+		grassVar = decodeColor3Token(kv.grassVar, defaultGroundParams.grassVar),
+		roadVar = decodeColor3Token(kv.roadVar, defaultGroundParams.roadVar),
+		fieldVar = decodeColor3Token(kv.fieldVar, defaultGroundParams.fieldVar),
+		waterVar = decodeColor3Token(kv.waterVar, defaultGroundParams.waterVar)
+	}, terrainSdfDefaults)
+
+	rebuildGroundFromParams(params, "network peer " .. tostring(senderId))
+	groundNetState.authorityPeerId = senderId
+	groundNetState.lastSnapshotReceivedAt = love.timer.getTime()
+	return true
+end
+
+function handleGroundSnapshotPacket(data)
+	local parts = splitPacketFields(data)
+	if parts[1] ~= "GROUND_SNAPSHOT" and parts[1] ~= "GROUND_SNAPSHOT2" then
+		return false
+	end
+
+	local senderId, idFieldIndex = readTrailingPacketInteger(parts, 2)
 	if not senderId then
 		return false
 	end
@@ -2466,6 +2808,9 @@ function handleGroundSnapshotPacket(data)
 	if cloudNetState.role == "pending" then
 		cloudNetState.sawPeerOnJoin = true
 	end
+	if parts[1] == "GROUND_SNAPSHOT2" then
+		return applyGroundSnapshot2Parts(parts, senderId, idFieldIndex)
+	end
 	return applyGroundSnapshotParts(parts, senderId)
 end
 
@@ -2475,7 +2820,7 @@ function handleGroundRequestPacket(data)
 		return false
 	end
 
-	local senderId = tonumber(parts[#parts])
+	local senderId = readTrailingPacketInteger(parts, 2)
 	if not senderId then
 		return false
 	end
@@ -2562,7 +2907,7 @@ local function handleCloudSnapshotPacket(data)
 		return false
 	end
 
-	local senderId = tonumber(parts[#parts])
+	local senderId = readTrailingPacketInteger(parts, 2)
 	if not senderId then
 		return false
 	end
@@ -2588,7 +2933,7 @@ local function handleCloudRequestPacket(data)
 		return false
 	end
 
-	local senderId = tonumber(parts[#parts])
+	local senderId = readTrailingPacketInteger(parts, 2)
 	if not senderId then
 		return false
 	end
@@ -2752,6 +3097,9 @@ local pauseExports = pauseMenuSystem.create({
 		cloudNetState = cloudNetState,
 		groundNetState = groundNetState,
 		defaultGroundParams = defaultGroundParams,
+		flightModelConfig = flightModelConfig,
+		terrainSdfDefaults = terrainSdfDefaults,
+		lightingModel = lightingModel,
 		defaultPlayerModelScale = defaultPlayerModelScale,
 		defaultWalkingModelScale = defaultWalkingModelScale,
 		windState = windState,
@@ -2767,6 +3115,7 @@ local pauseExports = pauseMenuSystem.create({
 		setActivePlayerModel = setActivePlayerModel,
 		onRoleOrientationChanged = onRoleOrientationChanged,
 		setMouseCapture = setMouseCapture,
+		ensureFlightSpawnSafety = ensureFlightSpawnSafety,
 		setFlightMode = setFlightMode,
 		resetCameraTransform = resetCameraTransform,
 		resetAltLookState = resetAltLookState,
@@ -2874,6 +3223,12 @@ local pauseExports = pauseMenuSystem.create({
 		end,
 		playerWalkingModelScale = function()
 			return playerWalkingModelScale
+		end,
+		pauseTitleFont = function()
+			return pauseTitleFont
+		end,
+		pauseItemFont = function()
+			return pauseItemFont
 		end
 	},
 	setters = {
@@ -2936,6 +3291,12 @@ local pauseExports = pauseMenuSystem.create({
 		end,
 		playerWalkingModelScale = function(value)
 			playerWalkingModelScale = value
+		end,
+		pauseTitleFont = function(value)
+			pauseTitleFont = value
+		end,
+		pauseItemFont = function(value)
+			pauseItemFont = value
 		end
 	}
 })
@@ -3047,37 +3408,40 @@ CELL_FIELD = groundSystem.CELL_FIELD
 -- Ensures that the projection call doesnt use a nil map param table, passes back the module's function called
 local function sampleGroundHeightAtWorld(worldX, worldZ, params)
 	local groundParams = params or activeGroundParams or defaultGroundParams
-	return groundSystem.sampleGroundHeightAtWorld(worldX, worldZ, groundParams)
+	if terrainState then
+		return terrainSdfSystem.sampleGroundHeightAtWorld(worldX, worldZ, terrainState) or 0
+	end
+	return terrainSdfSystem.sampleGroundHeightAtWorld(worldX, worldZ, groundParams) or 0
 end
 
 function updateGroundStreaming(forceRebuild)
-	local changed, updatedObject = groundSystem.updateGroundStreaming(forceRebuild, {
-		groundObject = groundObject,
+	local changed, nextTerrainState = terrainSdfSystem.updateGroundStreaming(forceRebuild, {
+		terrainState = terrainState,
 		activeGroundParams = activeGroundParams,
 		camera = camera,
-		drawDistance = graphicsSettings and graphicsSettings.drawDistance
+		drawDistance = graphicsSettings and graphicsSettings.drawDistance,
+		objects = objects,
+		q = q
 	})
-	if changed and updatedObject then
-		groundObject = updatedObject
-		local halfExtent = math.max(
-			tonumber(updatedObject.halfSize and updatedObject.halfSize.x) or 0,
-			tonumber(updatedObject.halfSize and updatedObject.halfSize.z) or 0
-		)
-		if halfExtent > 0 and math.abs((worldHalfExtent or 0) - halfExtent) > 1e-6 then
-			worldHalfExtent = halfExtent
-			mapState.zoomExtents = { 160, 420, math.max(worldHalfExtent, 420) }
-			mapState.logicalCamera = nil
-			invalidateMapCache()
-		end
+	if nextTerrainState then
+		terrainState = nextTerrainState
+	end
+	local params = activeGroundParams or defaultGroundParams
+	local halfExtent = (params.chunkSize or 64) * ((params.lod1Radius or 4) + 1)
+	if halfExtent > 0 and math.abs((worldHalfExtent or 0) - halfExtent) > 1e-6 then
+		worldHalfExtent = halfExtent
+		mapState.zoomExtents = { 160, 420, math.max(worldHalfExtent, 420) }
+		mapState.logicalCamera = nil
+		invalidateMapCache()
 	end
 	return changed
 end
 
 rebuildGroundFromParams = function(params, reason)
-	local changed, nextState = groundSystem.rebuildGroundFromParams(params, reason, {
+	local changed, nextState = terrainSdfSystem.rebuildGroundFromParams(params, reason, {
 		defaultGroundParams = defaultGroundParams,
 		activeGroundParams = activeGroundParams,
-		groundObject = groundObject,
+		terrainState = terrainState,
 		camera = camera,
 		drawDistance = graphicsSettings and graphicsSettings.drawDistance,
 		objects = objects,
@@ -3088,11 +3452,79 @@ rebuildGroundFromParams = function(params, reason)
 	})
 	if changed and nextState then
 		activeGroundParams = nextState.activeGroundParams
+		terrainState = nextState.terrainState or terrainState
 		groundObject = nextState.groundObject
 		worldHalfExtent = nextState.worldHalfExtent or worldHalfExtent
 		invalidateMapCache()
 	end
 	return changed
+end
+
+function getTerrainStreamingStats()
+	local state = terrainState or {}
+	local loaded = 0
+	for _ in pairs(state.chunkMap or {}) do
+		loaded = loaded + 1
+	end
+	local queued = #(state.chunkOrder or {})
+	local pendingBuild = 0
+	for _ in pairs(state.buildQueue or {}) do
+		pendingBuild = pendingBuild + 1
+	end
+	local inflight = 0
+	for _ in pairs(state.workerInflight or {}) do
+		inflight = inflight + 1
+	end
+	return {
+		loaded = loaded,
+		queued = queued,
+		pendingBuild = pendingBuild,
+		inflight = inflight,
+		pendingTotal = queued + pendingBuild + inflight
+	}
+end
+
+function preGenerateTerrainChunks(maxSeconds, minCoverage)
+	local maxWait = math.max(0.1, tonumber(maxSeconds) or 2.5)
+	local coverage = clamp(tonumber(minCoverage) or 0.9, 0.2, 1.0)
+	local params = activeGroundParams or defaultGroundParams or {}
+	local lod1 = math.max(1, math.floor(tonumber(params.lod1Radius) or 2))
+	local expected = math.max(1, (lod1 * 2 + 1) * (lod1 * 2 + 1))
+	local targetReady = math.max(1, math.floor(expected * coverage + 0.5))
+	local startTime = love.timer.getTime()
+	local lastUiUpdate = -math.huge
+
+	while true do
+		updateGroundStreaming(false)
+		local stats = getTerrainStreamingStats()
+		local elapsed = love.timer.getTime() - startTime
+		local targetReached = stats.loaded >= targetReady
+		if (targetReached and stats.pendingTotal <= 0) or elapsed >= maxWait then
+			logger.log(string.format(
+				"Terrain pre-generation complete: loaded=%d target=%d pending=%d elapsed=%.2fs",
+				stats.loaded,
+				targetReady,
+				stats.pendingTotal,
+				elapsed
+			))
+			break
+		end
+
+		if startupUi and startupUi.active and (elapsed - lastUiUpdate) >= 0.05 then
+			local phase = clamp(elapsed / maxWait, 0, 1)
+			local progress = 0.57 + phase * 0.06
+			setStartupUiStage(
+				"Generating Terrain",
+				progress,
+				string.format("Pre-generating chunks %d/%d", math.min(stats.loaded, targetReady), targetReady)
+			)
+			lastUiUpdate = elapsed
+		end
+
+		if love.timer and love.timer.sleep then
+			love.timer.sleep(0)
+		end
+	end
 end
 
 -- === Initial Configuration ===
@@ -3102,7 +3534,8 @@ function love.load()
 	width, height = math.floor(width * 0.8), math.floor(height * 0.8)
 
 	love.window.setTitle("Don's 3D Engine")
-	local modeOk, modeErr = love.window.setMode(width, height, { vsync = false, depth = true })
+	love.window.setIcon(love.image.newImageData("Assets/Icons/WindowIcon.png"))
+	local modeOk, modeErr = love.window.setMode(width, height, { vsync = false, depth = true})
 	if not modeOk then
 		love.window.setMode(width, height, { vsync = false })
 	end
@@ -3134,6 +3567,12 @@ function love.load()
 		if type(bootRestartPayload.state) == "table" then
 			bootRestartSnapshotState = bootRestartPayload.state
 		end
+		if tonumber(bootRestartPayload._l2d3d_restart_migrated_from) then
+			logger.log(string.format(
+				"Restart payload migrated from version %d.",
+				tonumber(bootRestartPayload._l2d3d_restart_migrated_from)
+			))
+		end
 		logger.log("Restart payload detected; applying preserved world/game state.")
 	else
 		currentGraphicsApiPreference = normalizeGraphicsApiPreference(graphicsSettings.graphicsApiPreference)
@@ -3163,13 +3602,13 @@ function love.load()
 		zoomLerpSpeed = 12,
 		vel = { 0, 0, 0 }, -- current velocity
 		onGround = false, -- contacting
-		gravity = -9.81, -- units/sec^2
+		gravity = -9.80665, -- units/sec^2
 		jumpSpeed = 5, -- initial jump
 		throttle = 0,
 		throttleAccel = 0.55,
-		flightMass = 1.0,
-		flightThrustForce = 36,
-		flightThrustAccel = 36,
+		flightMass = tonumber(flightModelConfig.massKg) or 1150,
+		flightThrustForce = tonumber(flightModelConfig.maxThrustSeaLevel) or 3200,
+		flightThrustAccel = tonumber(flightModelConfig.maxThrustSeaLevel) or 3200,
 		flightDragCoefficient = 0.018,
 		flightAirBrakeDrag = 0.11,
 		flightLiftCoefficient = 0.11,
@@ -3179,20 +3618,21 @@ function love.load()
 		flightStallSpeed = 8,
 		flightFullLiftSpeed = 24,
 		flightInducedDragCoefficient = 0.0075,
-		flightGravity = -9.81,
-		flightGroundFriction = 0.94,
+		flightGravity = -9.80665,
+		flightGroundFriction = tonumber(flightModelConfig.groundFriction) or 0.92,
 		flightGroundPitchHoldEnabled = true,
 		flightGroundPitchHoldAngle = math.rad(-20),
 		flightVel = { 0, 0, 0 },
+		flightAngVel = { 0, 0, 0 }, -- body rates in local axes: +X right, +Y up, +Z forward
 		flightRotVel = { pitch = 0, yaw = 0, roll = 0 },
 		flightRotResponse = 6.0,
 		yoke = { pitch = 0, yaw = 0, roll = 0 },
 		yokeKeyboardRate = 2.8,
-		yokeAutoCenterRate = 1.9,
-		yokeMousePitchGain = 16,
-		yokeMouseYawGain = 14,
-		yokeMouseRollGain = 12,
-		afterburnerMultiplier = 1.45,
+		yokeAutoCenterRate = 2.8,
+		yokeMousePitchGain = 8,
+		yokeMouseYawGain = 7,
+		yokeMouseRollGain = 6,
+		afterburnerMultiplier = 1.0,
 		airBrakeStrength = 1.2,
 		flightThrottleDamping = 5,
 		wheelThrottleStep = 0.06,
@@ -3298,6 +3738,7 @@ function love.load()
 
 	setStartupUiStage("Generating Terrain", 0.57, "Building procedural ground chunks.")
 	rebuildGroundFromParams(defaultGroundParams, "startup")
+	preGenerateTerrainChunks(2.8, 0.92)
 
 	setStartupUiStage("Spawning Clouds", 0.66, "Generating cloud groups and initial wind profile.")
 	windState.angle = randomRange(0, math.pi * 2)
@@ -3308,12 +3749,13 @@ function love.load()
 	if bootRestartSnapshotState then
 		if applyRestartSnapshot(bootRestartSnapshotState) then
 			logger.log("Restart state restored.")
+			preGenerateTerrainChunks(1.8, 0.88)
 		else
 			logger.log("Restart state restore failed; using default startup state.")
 		end
 	end
 	if autoSmoke.enabled then
-		flightSimMode = true
+		setFlightMode(true)
 		viewState.mode = "third_person"
 		thirdPersonState.offset = { 0.0, 1.4, -3.2 }
 		local smokeModelPath = os.getenv("L2D3D_AUTOSMOKE_MODEL")
@@ -3382,6 +3824,7 @@ function love.load()
 	end
 
 	resolveActiveRenderCamera()
+	syncAppStateReferences()
 	setStartupUiStage("Ready", 1.0, "Startup complete. Have fun.")
 	finishStartupUi()
 end
@@ -3616,18 +4059,6 @@ function submitModelLoadPrompt()
 	end
 end
 
-local lastProjectileTriggerAt = -999
-
-local function triggerProjectileAction()
-	local now = love.timer.getTime()
-	if (now - lastProjectileTriggerAt) >= 0.2 then
-		lastProjectileTriggerAt = now
-		logger.log("Projectile fire input received (projectile spawning not implemented yet).")
-	end
-end
-
-triggerProjectileAction = inputSystem.triggerProjectileAction
-
 function love.mousemoved(x, y, dx, dy)
 	if pauseMenu.active then
 		if modelLoadPrompt.active then
@@ -3661,7 +4092,7 @@ function love.mousemoved(x, y, dx, dy)
 	end
 end
 
-local function updateNet()
+function updateNet()
 	local canSend = relayIsConnected()
 	local now = love.timer.getTime()
 
@@ -3675,8 +4106,16 @@ local function updateNet()
 		local planeOrientation = getRoleOrientation("plane")
 		local walkingOrientation = getRoleOrientation("walking")
 		local outboundCallsign = sanitizeCallsign(localCallsign) or "Pilot"
+		local activeVelocity = camera.flightVel or camera.vel or { 0, 0, 0 }
+		local activeAngVel = camera.flightAngVel or {
+			(camera.flightRotVel and camera.flightRotVel.pitch) or 0,
+			(camera.flightRotVel and camera.flightRotVel.yaw) or 0,
+			(camera.flightRotVel and camera.flightRotVel.roll) or 0
+		}
+		local activeYoke = camera.yoke or { pitch = 0, yaw = 0, roll = 0 }
+		local flightTick = (camera.flightSimState and camera.flightSimState.tick) or 0
 		local packet = table.concat({
-			"STATE2",
+			"STATE3",
 			"px=" .. string.format("%f", camera.pos[1]),
 			"py=" .. string.format("%f", camera.pos[2]),
 			"pz=" .. string.format("%f", camera.pos[3]),
@@ -3684,6 +4123,18 @@ local function updateNet()
 			"rx=" .. string.format("%f", camera.rot.x),
 			"ry=" .. string.format("%f", camera.rot.y),
 			"rz=" .. string.format("%f", camera.rot.z),
+			"vx=" .. formatNetFloat(activeVelocity[1] or 0),
+			"vy=" .. formatNetFloat(activeVelocity[2] or 0),
+			"vz=" .. formatNetFloat(activeVelocity[3] or 0),
+			"wx=" .. formatNetFloat(activeAngVel[1] or 0),
+			"wy=" .. formatNetFloat(activeAngVel[2] or 0),
+			"wz=" .. formatNetFloat(activeAngVel[3] or 0),
+			"thr=" .. formatNetFloat(camera.throttle or 0),
+			"elev=" .. formatNetFloat(-(activeYoke.pitch or 0)),
+			"ail=" .. formatNetFloat(-(activeYoke.roll or 0)),
+			"rud=" .. formatNetFloat(activeYoke.yaw or 0),
+			"tick=" .. tostring(math.floor(flightTick)),
+			"ts=" .. formatNetFloat(now),
 			"scale=" .. formatNetFloat(activeScale),
 			"modelHash=" .. tostring(activeHash or "builtin-cube"),
 			"role=" .. tostring(activeRole),
@@ -3712,7 +4163,7 @@ local function updateNet()
 	pumpModelTransfers(now)
 end
 
-local function serviceNetworkEvents()
+function serviceNetworkEvents()
 	if not relay then
 		return
 	end
@@ -3723,15 +4174,19 @@ local function serviceNetworkEvents()
 			beginCloudRoleElection("relay handshake complete")
 			forceStateSync()
 		elseif event.type == "receive" then
-			local packetType = type(event.data) == "string" and event.data:match("^([^|]+)")
-			if packetType == "STATE" or packetType == "STATE2" then
+			local packetType = nil
+			if type(event.data) == "string" then
+				packetType = splitPacketFields(event.data)[1]
+			end
+			if packetType == "STATE" or packetType == "STATE2" or packetType == "STATE3" then
+				local receivedAt = love.timer.getTime()
 				local peerId = networking.handlePacket(
 					event.data,
 					peers,
 					objects,
 					q,
 					cubeModel,
-					getModelRotationOffsetForHash,
+					getModelRotationOffsetForRole,
 					{
 						scale = defaultPlayerModelScale,
 						modelHash = "builtin-cube",
@@ -3744,7 +4199,8 @@ local function serviceNetworkEvents()
 						planeOrientation = { yaw = 0, pitch = 0, roll = 0 },
 						walkingOrientation = { yaw = 0, pitch = 0, roll = 0 },
 						role = "plane"
-					}
+					},
+					receivedAt
 				)
 				updatePeerVisualModel(peerId)
 				notePeerStateReceived(peerId)
@@ -3754,7 +4210,7 @@ local function serviceNetworkEvents()
 				handleCloudSnapshotPacket(event.data)
 			elseif packetType == "GROUND_REQUEST" then
 				handleGroundRequestPacket(event.data)
-			elseif packetType == "GROUND_SNAPSHOT" then
+			elseif packetType == "GROUND_SNAPSHOT" or packetType == "GROUND_SNAPSHOT2" then
 				handleGroundSnapshotPacket(event.data)
 			elseif packetType == "MODEL_REQUEST" or packetType == "BLOB_REQUEST" then
 				handleModelRequestPacket(event.data)
@@ -3779,36 +4235,10 @@ local function serviceNetworkEvents()
 	end
 end
 
-local syncSystem = syncSystemModule.create({
-	splitPacketFields = splitPacketFields,
-	makeBlobTransferKey = makeBlobTransferKey,
-	queueModelTransfer = queueModelTransfer,
-	requestModelFromPeers = requestModelFromPeers,
-	updatePeerVisualModel = updatePeerVisualModel,
-	handleModelRequestPacket = handleModelRequestPacket,
-	handleModelMetaPacket = handleModelMetaPacket,
-	handleModelChunkPacket = handleModelChunkPacket,
-	pumpModelTransfers = pumpModelTransfers,
-	updateNet = updateNet,
-	serviceNetworkEvents = serviceNetworkEvents,
-	updateCloudNetworkState = updateCloudNetworkState
-})
-
-splitPacketFields = syncSystem.splitPacketFields
-makeBlobTransferKey = syncSystem.makeBlobTransferKey
-queueModelTransfer = syncSystem.queueModelTransfer
-requestModelFromPeers = syncSystem.requestModelFromPeers
-updatePeerVisualModel = syncSystem.updatePeerVisualModel
-handleModelRequestPacket = syncSystem.handleModelRequestPacket
-handleModelMetaPacket = syncSystem.handleModelMetaPacket
-handleModelChunkPacket = syncSystem.handleModelChunkPacket
-pumpModelTransfers = syncSystem.pumpModelTransfers
-updateNet = syncSystem.updateNet
-serviceNetworkEvents = syncSystem.serviceNetworkEvents
-updateCloudNetworkState = syncSystem.updateCloudNetworkState
-
 -- === Camera Movement ===
 function love.update(dt)
+	syncAppStateReferences()
+	local runtimeState = appState.values
 	local now = love.timer.getTime()
 	updateCloudNetworkState(now)
 
@@ -3823,13 +4253,55 @@ function love.update(dt)
 	if not pauseMenu.active then
 		updateGroundStreaming(false)
 		local movementInput = buildMovementInputState()
-		camera = engine.processMovement(camera, dt, flightSimMode, vector3, q, objects, movementInput, {
+		local terrainRef = terrainState or activeGroundParams or defaultGroundParams
+		local movementEnv = {
 			wind = cloudSim.getWindVector3(windState),
 			groundHeightAt = function(x, z)
 				return sampleGroundHeightAtWorld(x, z, activeGroundParams)
 			end,
-			groundClearance = (camera.box and camera.box.halfSize and camera.box.halfSize.y) or 1.0
-		})
+			queryGroundHeight = function(x, z)
+				return terrainSdfSystem.queryGroundHeight(x, z, terrainRef)
+			end,
+			sampleSdf = function(x, y, z)
+				return terrainSdfSystem.sampleSdfAtWorld(x, y, z, terrainRef)
+			end,
+			sampleNormal = function(x, y, z)
+				return terrainSdfSystem.sampleNormalAtWorld(x, y, z, terrainRef)
+			end,
+			groundClearance = (camera.box and camera.box.halfSize and camera.box.halfSize.y) or 1.0,
+			collisionRadius = math.max(
+				(camera.box and camera.box.halfSize and camera.box.halfSize.x) or 0,
+				(camera.box and camera.box.halfSize and camera.box.halfSize.y) or 0,
+				(camera.box and camera.box.halfSize and camera.box.halfSize.z) or 0,
+				1.0
+			)
+		}
+		if flightSimMode then
+			local frameFlightModel = {}
+			for key, value in pairs(flightModelConfig or {}) do
+				frameFlightModel[key] = value
+			end
+			frameFlightModel.metersPerUnit = tonumber(geoConfig and geoConfig.metersPerUnit) or
+				tonumber(frameFlightModel.metersPerUnit) or 1.0
+			camera = flightDynamics.step(
+				camera,
+				dt,
+				movementInput,
+				movementEnv,
+				frameFlightModel
+			)
+		else
+			camera = engine.processMovement(
+				camera,
+				dt,
+				false,
+				vector3,
+				q,
+				runtimeState.objects or objects,
+				movementInput,
+				movementEnv
+			)
+		end
 		syncLocalPlayerObject()
 		cloudSim.updateClouds(dt, cloudState, cloudNetState, camera, windState, love.timer.getTime(), q)
 		updateZoomFov(dt)
@@ -3852,6 +4324,11 @@ function love.update(dt)
 	updateNet()
 	resolveActiveRenderCamera()
 	serviceNetworkEvents()
+	networking.updateRemoteInterpolation(peers, love.timer.getTime(), {
+		interpolationDelay = 0.120,
+		extrapolationCap = 0.200,
+		qOps = q
+	})
 	updateCloudNetworkState(love.timer.getTime())
 
 	if autoSmoke.enabled then
@@ -4051,7 +4528,7 @@ function love.keypressed(key, scancode, isrepeat)
 	end
 
 	if flightSimMode and controls.actionTriggeredByKey("flight_fire_projectile", key, controls.getCurrentModifiers()) then
-		triggerProjectileAction()
+		inputSystem.triggerProjectileAction()
 	end
 
 	-- debugging position/rotation and relating variables
@@ -4118,7 +4595,7 @@ function love.mousepressed(x, y, button)
 	end
 
 	if flightSimMode and controls.actionTriggeredByMouseButton("flight_fire_projectile", button, controls.getCurrentModifiers()) then
-		triggerProjectileAction()
+		inputSystem.triggerProjectileAction()
 	end
 
 	if not love.mouse.getRelativeMode() then
@@ -4266,7 +4743,7 @@ function love.focus(focused)
 	end
 end
 
-local function projectWorldToScreen(worldPos, viewCamera, w, h)
+function projectWorldToScreen(worldPos, viewCamera, w, h)
 	if not viewCamera or not worldPos then
 		return nil
 	end
@@ -4347,8 +4824,9 @@ function drawHud(w, h, cx, cy, renderCamera)
 		local clampedKph = clamp(airSpeedKph, 0, maxDialKph)
 		local throttleRatio = clamp(camera.throttle or 0, 0, 1)
 		local throttlePct = math.floor((throttleRatio * 100) + 0.5)
-		local thrustNow = throttleRatio * (camera.flightThrustForce or camera.flightThrustAccel or 0)
-		if controls.isActionDown("flight_afterburner") then
+		local thrustNow = (camera.flightDebug and camera.flightDebug.thrust) or
+			(throttleRatio * (camera.flightThrustForce or camera.flightThrustAccel or 0))
+		if controls.isActionDown("flight_afterburner") and not (camera.flightDebug and camera.flightDebug.thrust) then
 			thrustNow = thrustNow * (camera.afterburnerMultiplier or 1.45)
 		end
 
@@ -4618,39 +5096,18 @@ function drawHud(w, h, cx, cy, renderCamera)
 	end
 end
 
-local hudSystem = hudSystemModule.create({
-	drawHudPlate = drawHudPlate,
-	drawArcLine = drawArcLine,
-	resetHudCaches = resetHudCaches,
-	invalidateMapCache = invalidateMapCache,
-	groundParamsSignature = groundParamsSignature,
-	updateLogicalMapCamera = updateLogicalMapCamera,
-	ensureMapGroundImage = ensureMapGroundImage,
-	projectWorldToScreen = projectWorldToScreen,
-	drawWorldPeerIndicators = drawWorldPeerIndicators,
-	drawHud = drawHud
-})
-
-drawHudPlate = hudSystem.drawHudPlate
-drawArcLine = hudSystem.drawArcLine
-resetHudCaches = hudSystem.resetHudCaches
-invalidateMapCache = hudSystem.invalidateMapCache
-groundParamsSignature = hudSystem.groundParamsSignature
-updateLogicalMapCamera = hudSystem.updateLogicalMapCamera
-ensureMapGroundImage = hudSystem.ensureMapGroundImage
-projectWorldToScreen = hudSystem.projectWorldToScreen
-drawWorldPeerIndicators = hudSystem.drawWorldPeerIndicators
-drawHud = hudSystem.drawHud
-
 function love.draw()
 	if startupUi.active then
 		drawStartupUi()
 		return
 	end
 
+	syncAppStateReferences()
+	local runtimeState = appState.values
 	triangleCount = 0
 	local centerX, centerY = screen.w / 2, screen.h / 2
-	local renderCamera = viewState.activeCamera or resolveActiveRenderCamera() or camera
+	local renderCamera = (runtimeState.viewState and runtimeState.viewState.activeCamera) or
+		resolveActiveRenderCamera() or camera
 	local renderObjects = buildRenderObjectList()
 	local worldTintR, worldTintG, worldTintB = 1, 1, 1
 	if colorCorruptionMode then
@@ -4659,8 +5116,9 @@ function love.draw()
 		worldTintG = 0.52 + 0.48 * math.sin(t * 2.71 + 2.0)
 		worldTintB = 0.52 + 0.48 * math.sin(t * 3.19 + 4.1)
 	end
-	local renderScale = 1  -- clamp(graphicsSettings.renderScale or 1.0, 0.5, 1.5)
-	local scaledWorld = false -- math.abs(renderScale - 1.0) > 0.001
+	local renderScale = clamp(tonumber(runtimeState.graphicsSettings and runtimeState.graphicsSettings.renderScale) or 1.0, 0.5, 1.5)
+	graphicsSettings.renderScale = renderScale
+	local scaledWorld = math.abs(renderScale - 1.0) > 0.001
 	local worldW = math.max(320, math.floor(screen.w * renderScale + 0.5))
 	local worldH = math.max(180, math.floor(screen.h * renderScale + 0.5))
 	local worldScreen = { w = worldW, h = worldH }
@@ -4722,8 +5180,7 @@ function love.draw()
 		local opaqueObjects = {}
 		local transparentObjects = {}
 		for _, obj in ipairs(renderObjects) do
-			local alpha = (obj.color and obj.color[4]) or 1
-			if alpha < 0.999 then
+			if cpuRenderClassifier.isObjectTransparent(obj) then
 				transparentObjects[#transparentObjects + 1] = obj
 			else
 				opaqueObjects[#opaqueObjects + 1] = obj
@@ -4731,7 +5188,17 @@ function love.draw()
 		end
 
 		for _, obj in ipairs(opaqueObjects) do
-			imageData = engine.drawObject(obj, false, renderCamera, vector3, q, drawScreen, zBuffer, imageData, true)
+			imageData = engine.drawObject(
+				obj,
+				cpuRenderClassifier.shouldCullBackfaces(obj),
+				renderCamera,
+				vector3,
+				q,
+				drawScreen,
+				zBuffer,
+				imageData,
+				true
+			)
 		end
 
 		table.sort(transparentObjects, function(a, b)
@@ -4739,7 +5206,17 @@ function love.draw()
 				viewMath.cameraSpaceDepthForObject(b, renderCamera, q)
 		end)
 		for _, obj in ipairs(transparentObjects) do
-			imageData = engine.drawObject(obj, false, renderCamera, vector3, q, drawScreen, zBuffer, imageData, false)
+			imageData = engine.drawObject(
+				obj,
+				cpuRenderClassifier.shouldCullBackfaces(obj),
+				renderCamera,
+				vector3,
+				q,
+				drawScreen,
+				zBuffer,
+				imageData,
+				false
+			)
 		end
 		if frameImage and frameImageW == drawScreen.w and frameImageH == drawScreen.h then
 			frameImage:replacePixels(imageData)

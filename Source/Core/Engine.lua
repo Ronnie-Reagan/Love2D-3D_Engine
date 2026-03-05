@@ -322,16 +322,50 @@ Only use this if you need to know if theyre colliding right now
 objectA, objectB → true on hit, false on miss
 ]]
 function engine.checkCollision(objA, objB)
+    if type(objA) ~= "table" or type(objB) ~= "table" then
+        return false
+    end
     if not objA.isSolid or not objB.isSolid then
         return false
     end
-    local ax, ay, az = table.unpack(objA.pos)
-    local bx, by, bz = table.unpack(objB.pos)
-    local dx = ax - bx
-    local dy = ay - by
-    local dz = az - bz
-    local distSq = dx * dx + dy * dy + dz * dz
-    return distSq < (objA.radius + objB.radius) ^ 2
+
+    local posA = objA.pos
+    local posB = objB.pos
+    if type(posA) ~= "table" or type(posB) ~= "table" then
+        return false
+    end
+
+    local function readHalfSize(obj)
+        if type(obj.halfSize) == "table" then
+            local x = math.abs(tonumber(obj.halfSize.x or obj.halfSize[1]) or 0)
+            local y = math.abs(tonumber(obj.halfSize.y or obj.halfSize[2]) or 0)
+            local z = math.abs(tonumber(obj.halfSize.z or obj.halfSize[3]) or 0)
+            if x > 0 or y > 0 or z > 0 then
+                return { x = x, y = y, z = z }
+            end
+        end
+
+        local legacyRadius = tonumber(obj.radius)
+        if legacyRadius and legacyRadius > 0 then
+            local r = math.abs(legacyRadius)
+            return { x = r, y = r, z = r }
+        end
+        return nil
+    end
+
+    local hsA = readHalfSize(objA)
+    local hsB = readHalfSize(objB)
+    if not hsA or not hsB then
+        return false
+    end
+
+    local dx = math.abs((tonumber(posA[1]) or 0) - (tonumber(posB[1]) or 0))
+    local dy = math.abs((tonumber(posA[2]) or 0) - (tonumber(posB[2]) or 0))
+    local dz = math.abs((tonumber(posA[3]) or 0) - (tonumber(posB[3]) or 0))
+
+    return dx <= (hsA.x + hsB.x) and
+        dy <= (hsA.y + hsB.y) and
+        dz <= (hsA.z + hsB.z)
 end
 
 function engine.getCameraBasis(camera, q, vector3)
@@ -369,8 +403,8 @@ end
 function engine.project(x, y, z, camera, screen)
     z = math.max(0.01, z)
     local f = 1 / math.tan(camera.fov / 2)
-    -- local aspect = screen.w / screen.h -- unsure why this is here still
-    local px = x * f / z
+    local aspect = math.max(1e-6, (screen.w or 1) / math.max(1, (screen.h or 1)))
+    local px = x * (f / aspect) / z
     local py = y * f / z
     return screen.w / 2 + px * screen.w / 2, screen.h / 2 - py * screen.h / 2
 end
@@ -402,208 +436,11 @@ function engine.processMovement(camera, dt, flightSimMode, vector3, q, objects, 
         return value
     end
 
-    local function clamp(value, minValue, maxValue)
-        if value < minValue then
-            return minValue
-        end
-        if value > maxValue then
-            return maxValue
-        end
-        return value
-    end
-
     local speed = camera.speed * dt
     local forward, right, up = engine.getCameraBasis(camera, q, vector3)
 
     if flightSimMode then
-        local throttleAxis = axis(inputState.flightThrottleUp, inputState.flightThrottleDown)
-        local throttleAccel = camera.throttleAccel or 0.55
-        camera.throttle = clamp((camera.throttle or 0) + throttleAxis * throttleAccel * dt, 0, 1)
-        if inputState.flightAirBrakes then
-            local brakeStrength = camera.airBrakeStrength or 1.2
-            camera.throttle = clamp(camera.throttle - brakeStrength * dt, 0, 1)
-        end
-
-        local pitchAxis = axis(inputState.flightPitchDown, inputState.flightPitchUp)
-        local yawAxis = axis(inputState.flightYawRight, inputState.flightYawLeft)
-        local rollAxis = axis(inputState.flightRollLeft, inputState.flightRollRight)
-
-        camera.yoke = camera.yoke or { pitch = 0, yaw = 0, roll = 0 }
-        local yoke = camera.yoke
-        local yokeKeyboardRate = camera.yokeKeyboardRate or 2.8
-        local yokeAutoCenterRate = camera.yokeAutoCenterRate or 1.9
-        local centerAlpha = clamp(yokeAutoCenterRate * dt, 0, 1)
-
-        yoke.pitch = clamp(yoke.pitch + pitchAxis * yokeKeyboardRate * dt, -1, 1)
-        yoke.yaw = clamp(yoke.yaw + yawAxis * yokeKeyboardRate * dt, -1, 1)
-        yoke.roll = clamp(yoke.roll + rollAxis * yokeKeyboardRate * dt, -1, 1)
-
-        yoke.pitch = yoke.pitch + (0 - yoke.pitch) * centerAlpha
-        yoke.yaw = yoke.yaw + (0 - yoke.yaw) * centerAlpha
-        yoke.roll = yoke.roll + (0 - yoke.roll) * centerAlpha
-
-        camera.flightRotVel = camera.flightRotVel or { pitch = 0, yaw = 0, roll = 0 }
-        local rotVel = camera.flightRotVel
-        local rotResponse = camera.flightRotResponse or 6.0
-        local responseAlpha = clamp(rotResponse * dt, 0, 1)
-
-        local targetPitchRate = yoke.pitch * math.rad(camera.flightPitchRate or 60)
-        local targetYawRate = yoke.yaw * math.rad(camera.flightYawRate or 70)
-        local targetRollRate = yoke.roll * math.rad(camera.flightRollRate or 90)
-
-        rotVel.pitch = rotVel.pitch + (targetPitchRate - rotVel.pitch) * responseAlpha
-        rotVel.yaw = rotVel.yaw + (targetYawRate - rotVel.yaw) * responseAlpha
-        rotVel.roll = rotVel.roll + (targetRollRate - rotVel.roll) * responseAlpha
-
-        if math.abs(rotVel.pitch) > 1e-6 then
-            local pitchQuat = q.fromAxisAngle(right, rotVel.pitch * dt)
-            camera.rot = q.normalize(q.multiply(pitchQuat, camera.rot))
-        end
-        if math.abs(rotVel.yaw) > 1e-6 then
-            local yawQuat = q.fromAxisAngle(up, rotVel.yaw * dt)
-            camera.rot = q.normalize(q.multiply(yawQuat, camera.rot))
-        end
-        if math.abs(rotVel.roll) > 1e-6 then
-            local rollQuat = q.fromAxisAngle(forward, rotVel.roll * dt)
-            camera.rot = q.normalize(q.multiply(rollQuat, camera.rot))
-        end
-
-        forward = vector3.normalizeVec(q.rotateVector(camera.rot, { 0, 0, 1 }))
-        right = vector3.normalizeVec(q.rotateVector(camera.rot, { 1, 0, 0 }))
-        up = vector3.normalizeVec(q.rotateVector(camera.rot, { 0, 1, 0 }))
-
-        local wind = (flightEnvironment and flightEnvironment.wind) or { 0, 0, 0 }
-        camera.flightVel = camera.flightVel or { 0, 0, 0 }
-
-        local airVel = {
-            camera.flightVel[1] - (wind[1] or 0),
-            camera.flightVel[2] - (wind[2] or 0),
-            camera.flightVel[3] - (wind[3] or 0)
-        }
-        local airSpeed = vector3.length(airVel)
-        local airDir = (airSpeed > 1e-5) and {
-            airVel[1] / airSpeed,
-            airVel[2] / airSpeed,
-            airVel[3] / airSpeed
-        } or { 0, 0, 0 }
-
-        local throttleRatio = clamp(camera.throttle or 0, 0, 1)
-        local afterburnerScale = inputState.flightAfterburner and (camera.afterburnerMultiplier or 1.45) or 1
-        local mass = math.max(0.1, camera.flightMass or 1.0)
-        local thrustForce = throttleRatio * (camera.flightThrustForce or camera.flightThrustAccel or 32) * afterburnerScale
-        local dragCoeff = camera.flightDragCoefficient or 0.018
-        local airBrakeDrag = (inputState.flightAirBrakes and (camera.flightAirBrakeDrag or 0.11)) or 0
-        local forwardAirspeed = math.max(0, vector3.dot(airVel, forward))
-        local liftCoeff = camera.flightLiftCoefficient or 0.11
-        local camberLiftCoeff = camera.flightCamberLiftCoefficient or 0.014
-        local stallSpeed = camera.flightStallSpeed or 8
-        local fullLiftSpeed = camera.flightFullLiftSpeed or 24
-        local liftWindow = math.max(1, fullLiftSpeed - stallSpeed)
-        local liftFactor = math.max(0, math.min((forwardAirspeed - stallSpeed) / liftWindow, 1))
-        local verticalAirspeed = vector3.dot(airVel, up)
-        local aoa = math.atan(-verticalAirspeed, math.max(1e-5, forwardAirspeed))
-        local zeroLiftAngle = camera.flightZeroLiftAngle or 0
-        local maxLiftAngle = camera.flightMaxLiftAngle or math.rad(20)
-        local effectiveAoa = math.max(-maxLiftAngle, math.min(aoa - zeroLiftAngle, maxLiftAngle))
-        local dynamicPressure = forwardAirspeed * forwardAirspeed
-        local liftMagnitude = (liftCoeff * dynamicPressure * effectiveAoa + camberLiftCoeff * dynamicPressure) * liftFactor
-        local inducedDragMagnitude = (camera.flightInducedDragCoefficient or 0.0035) * math.abs(liftMagnitude)
-        local dragMagnitude = (dragCoeff + airBrakeDrag) * airSpeed * airSpeed
-        local gravityAccel = math.abs(camera.flightGravity or camera.gravity or -9.81)
-
-        local liftDir = up
-        if airSpeed > 1e-5 then
-            local lx = airDir[2] * right[3] - airDir[3] * right[2]
-            local ly = airDir[3] * right[1] - airDir[1] * right[3]
-            local lz = airDir[1] * right[2] - airDir[2] * right[1]
-            local ll = math.sqrt(lx * lx + ly * ly + lz * lz)
-            if ll > 1e-5 then
-                liftDir = { lx / ll, ly / ll, lz / ll }
-            end
-        end
-
-        local force = {
-            forward[1] * thrustForce + liftDir[1] * liftMagnitude,
-            forward[2] * thrustForce + liftDir[2] * liftMagnitude,
-            forward[3] * thrustForce + liftDir[3] * liftMagnitude
-        }
-        if airSpeed > 1e-5 then
-            local totalDrag = dragMagnitude + inducedDragMagnitude
-            force[1] = force[1] - airDir[1] * totalDrag
-            force[2] = force[2] - airDir[2] * totalDrag
-            force[3] = force[3] - airDir[3] * totalDrag
-        end
-        force[2] = force[2] - (mass * gravityAccel)
-
-        local accel = { force[1] / mass, force[2] / mass, force[3] / mass }
-        for i = 1, 3 do
-            camera.flightVel[i] = camera.flightVel[i] + accel[i] * dt
-        end
-
-        for i = 1, 3 do
-            camera.pos[i] = camera.pos[i] + camera.flightVel[i] * dt
-        end
-
-        local groundHeight = nil
-        if flightEnvironment and type(flightEnvironment.groundHeightAt) == "function" then
-            groundHeight = flightEnvironment.groundHeightAt(camera.pos[1], camera.pos[3])
-        else
-            local highestY = -math.huge
-            for _, obj in ipairs(objects) do
-                if obj.isSolid and obj.halfSize then
-                    local dx = math.abs(camera.pos[1] - obj.pos[1])
-                    local dz = math.abs(camera.pos[3] - obj.pos[3])
-                    if dx <= obj.halfSize.x and dz <= obj.halfSize.z then
-                        local topY = obj.pos[2] + obj.halfSize.y
-                        if topY > highestY then
-                            highestY = topY
-                        end
-                    end
-                end
-            end
-            if highestY > -math.huge then
-                groundHeight = highestY
-            end
-        end
-
-        local flightGroundClearance = (flightEnvironment and flightEnvironment.groundClearance) or
-            ((camera.box and camera.box.halfSize and camera.box.halfSize.y) or 1.0)
-        if groundHeight and camera.pos[2] <= (groundHeight + flightGroundClearance) then
-            camera.pos[2] = groundHeight + flightGroundClearance
-            if camera.flightVel[2] < 0 then
-                camera.flightVel[2] = 0
-            end
-            local groundFriction = camera.flightGroundFriction or 0.94
-            camera.flightVel[1] = camera.flightVel[1] * groundFriction
-            camera.flightVel[3] = camera.flightVel[3] * groundFriction
-            camera.onGround = true
-
-            if camera.flightGroundPitchHoldEnabled ~= false then
-                local holdPitch = camera.flightGroundPitchHoldAngle or math.rad(4.5)
-                local currentForward = q.rotateVector(camera.rot, { 0, 0, 1 })
-                local yaw = math.atan(currentForward[1], currentForward[3])
-                local yawQuat = q.fromAxisAngle({ 0, 1, 0 }, yaw)
-                local holdRight = q.rotateVector(yawQuat, { 1, 0, 0 })
-                local pitchQuat = q.fromAxisAngle(holdRight, holdPitch)
-                camera.rot = q.normalize(q.multiply(pitchQuat, yawQuat))
-
-                if camera.flightRotVel then
-                    camera.flightRotVel.pitch = 0
-                    camera.flightRotVel.roll = 0
-                end
-                if camera.yoke then
-                    camera.yoke.pitch = math.max(0, camera.yoke.pitch or 0)
-                    camera.yoke.roll = 0
-                end
-            end
-        else
-            camera.onGround = false
-        end
-
-        if camera.box and camera.box.pos then
-            camera.box.pos = { camera.pos[1], camera.pos[2], camera.pos[3] }
-        end
-        camera.vel = { camera.flightVel[1], camera.flightVel[2], camera.flightVel[3] }
+        -- Flight simulation is owned by Source.Systems.FlightDynamicsSystem.
         return camera
     end
 
@@ -846,10 +683,11 @@ local function sampleMaterialColorForFace(obj, face, faceIndex)
     return { r, g, b, a }
 end
 
-function engine.drawObject(obj, skipCulling, camera, vector3, q, screen, zBuffer, imageData, writeDepth)
+function engine.drawObject(obj, cullBackfaces, camera, vector3, q, screen, zBuffer, imageData, writeDepth)
     if not obj or not obj.model or not obj.model.vertices or not obj.model.faces then
         return imageData
     end
+    local useBackfaceCulling = (cullBackfaces ~= false)
 
     local transformedVerts = {}
 
@@ -880,8 +718,7 @@ function engine.drawObject(obj, skipCulling, camera, vector3, q, screen, zBuffer
             goto continue
         end
 
-        -- Optional backface culling
-        if skipCulling then
+        if useBackfaceCulling then
             local v1, v2, v3 = transformedVerts[face[1]], transformedVerts[face[2]], transformedVerts[face[3]]
             local edge1 = vector3.sub(v2, v1)
             local edge2 = vector3.sub(v3, v1)

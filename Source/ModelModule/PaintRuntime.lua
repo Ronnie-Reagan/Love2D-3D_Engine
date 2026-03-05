@@ -13,6 +13,11 @@ end
 
 local loveLib = maybeRequireLove()
 
+local DEFAULT_WIDTH = 1024
+local DEFAULT_HEIGHT = 1024
+local DEFAULT_MAX_HISTORY = 8
+local DEFAULT_HISTORY_BUDGET_BYTES = 128 * 1024 * 1024
+
 local function clamp(v, minValue, maxValue)
     if v < minValue then
         return minValue
@@ -113,22 +118,124 @@ end
 local sessions = {}
 local sessionCounter = 0
 
-local function snapshotPush(session)
-    local clone = cloneImageData(session.overlay.imageData)
-    if not clone then
+local function notifySession(session, message)
+    if type(session) ~= "table" or type(message) ~= "string" or message == "" then
         return
     end
-    session.undo[#session.undo + 1] = clone
-    if #session.undo > (session.maxHistory or 32) then
-        table.remove(session.undo, 1)
+    session.lastError = message
+    if type(session.onWarning) == "function" then
+        pcall(session.onWarning, message)
+    else
+        print("[paint] " .. message)
     end
+end
+
+local function snapshotBytesForSession(session)
+    if not session or not session.overlay then
+        return 0
+    end
+    local w = math.max(1, math.floor(tonumber(session.overlay.width) or 1))
+    local h = math.max(1, math.floor(tonumber(session.overlay.height) or 1))
+    return w * h * 4
+end
+
+local function removeOldestEntry(stack, bytesField, session)
+    local entry = table.remove(stack, 1)
+    if not entry then
+        return
+    end
+    session[bytesField] = math.max(0, (session[bytesField] or 0) - (tonumber(entry.bytes) or 0))
+end
+
+local function pushEntryWithBudget(session, stackName, bytesField, imageData, entryBytes)
+    if type(session) ~= "table" then
+        return false, "paint session not found"
+    end
+    if not imageData then
+        return false, "snapshot unavailable"
+    end
+
+    local stack = session[stackName]
+    if type(stack) ~= "table" then
+        return false, "invalid paint history stack"
+    end
+
+    local bytes = math.max(0, math.floor(tonumber(entryBytes) or 0))
+    if bytes <= 0 then
+        bytes = snapshotBytesForSession(session)
+    end
+
+    local budget = math.max(1024 * 1024, math.floor(tonumber(session.historyBudgetBytes) or DEFAULT_HISTORY_BUDGET_BYTES))
+    if bytes > budget then
+        return false, string.format("paint snapshot (%d bytes) exceeds budget (%d bytes)", bytes, budget)
+    end
+
+    local maxHistory = math.max(1, math.floor(tonumber(session.maxHistory) or DEFAULT_MAX_HISTORY))
+    while #stack >= maxHistory do
+        removeOldestEntry(stack, bytesField, session)
+    end
+
+    local function historyBytes()
+        return (session.undoBytes or 0) + (session.redoBytes or 0)
+    end
+
+    while (historyBytes() + bytes) > budget do
+        if #session.undo > 0 then
+            removeOldestEntry(session.undo, "undoBytes", session)
+        elseif #session.redo > 0 then
+            removeOldestEntry(session.redo, "redoBytes", session)
+        else
+            break
+        end
+    end
+
+    if (historyBytes() + bytes) > budget then
+        return false, string.format("paint history budget exceeded (%d / %d bytes)", historyBytes() + bytes, budget)
+    end
+
+    stack[#stack + 1] = {
+        imageData = imageData,
+        bytes = bytes
+    }
+    session[bytesField] = (session[bytesField] or 0) + bytes
+    return true
+end
+
+local function clearRedoHistory(session)
     session.redo = {}
+    session.redoBytes = 0
+end
+
+local function snapshotPush(session)
+    local bytes = snapshotBytesForSession(session)
+    local budget = math.max(1024 * 1024, math.floor(tonumber(session.historyBudgetBytes) or DEFAULT_HISTORY_BUDGET_BYTES))
+    if bytes > budget then
+        local reason = string.format("paint snapshot (%d bytes) exceeds session budget (%d bytes)", bytes, budget)
+        notifySession(session, reason)
+        return false, reason
+    end
+
+    local clone = cloneImageData(session.overlay.imageData)
+    if not clone then
+        local reason = "failed to create paint snapshot clone"
+        notifySession(session, reason)
+        return false, reason
+    end
+
+    local ok, err = pushEntryWithBudget(session, "undo", "undoBytes", clone, bytes)
+    if not ok then
+        notifySession(session, err)
+        return false, err
+    end
+
+    clearRedoHistory(session)
+    return true
 end
 
 function paintRuntime.beginSession(assetId, role, ownerId, modelHash, opts, existingOverlay)
     opts = opts or {}
-    local width = math.floor(tonumber(opts.width) or 2048)
-    local height = math.floor(tonumber(opts.height) or 2048)
+    local width = math.floor(tonumber(opts.width) or DEFAULT_WIDTH)
+    local height = math.floor(tonumber(opts.height) or DEFAULT_HEIGHT)
     width = clamp(width, 256, 4096)
     height = clamp(height, 256, 4096)
 
@@ -152,7 +259,15 @@ function paintRuntime.beginSession(assetId, role, ownerId, modelHash, opts, exis
         overlay = overlay,
         undo = {},
         redo = {},
-        maxHistory = math.max(4, math.floor(tonumber(opts.maxHistory) or 32))
+        undoBytes = 0,
+        redoBytes = 0,
+        maxHistory = math.max(1, math.floor(tonumber(opts.maxHistory) or DEFAULT_MAX_HISTORY)),
+        historyBudgetBytes = math.max(
+            1024 * 1024,
+            math.floor(tonumber(opts.maxUndoBytes or opts.historyBudgetBytes) or DEFAULT_HISTORY_BUDGET_BYTES)
+        ),
+        onWarning = opts.onWarning,
+        lastError = nil
     }
     return sessionId
 end
@@ -181,7 +296,10 @@ function paintRuntime.paintStroke(sessionId, strokeCmd)
         return false, "overlay image unavailable"
     end
 
-    snapshotPush(session)
+    local okSnapshot, snapshotErr = snapshotPush(session)
+    if not okSnapshot then
+        return false, snapshotErr
+    end
 
     local u = clamp(tonumber(strokeCmd.u) or 0.5, 0, 1)
     local v = clamp(tonumber(strokeCmd.v) or 0.5, 0, 1)
@@ -235,7 +353,10 @@ function paintRuntime.paintFill(sessionId, fillCmd)
         return false, "overlay image unavailable"
     end
 
-    snapshotPush(session)
+    local okSnapshot, snapshotErr = snapshotPush(session)
+    if not okSnapshot then
+        return false, snapshotErr
+    end
 
     local color = fillCmd.color or { 1, 1, 1, 1 }
     local r = clamp(tonumber(color[1]) or 1, 0, 1)
@@ -257,14 +378,32 @@ function paintRuntime.paintUndo(sessionId)
     if not session or #session.undo == 0 then
         return false, "nothing to undo"
     end
+
     local current = cloneImageData(session.overlay.imageData)
-    if current then
-        session.redo[#session.redo + 1] = current
+    if not current then
+        return false, "failed to clone current paint state"
     end
+
     local prev = table.remove(session.undo)
-    session.overlay.imageData = prev
+    session.undoBytes = math.max(0, (session.undoBytes or 0) - (tonumber(prev.bytes) or 0))
+
+    local okPush, pushErr = pushEntryWithBudget(
+        session,
+        "redo",
+        "redoBytes",
+        current,
+        snapshotBytesForSession(session)
+    )
+    if not okPush then
+        session.undo[#session.undo + 1] = prev
+        session.undoBytes = (session.undoBytes or 0) + (tonumber(prev.bytes) or 0)
+        notifySession(session, pushErr)
+        return false, pushErr
+    end
+
+    session.overlay.imageData = prev.imageData
     if session.overlay.image and session.overlay.image.replacePixels then
-        session.overlay.image:replacePixels(prev)
+        session.overlay.image:replacePixels(prev.imageData)
     end
     return true
 end
@@ -274,14 +413,29 @@ function paintRuntime.paintRedo(sessionId)
     if not session or #session.redo == 0 then
         return false, "nothing to redo"
     end
+
     local current = cloneImageData(session.overlay.imageData)
-    if current then
-        session.undo[#session.undo + 1] = current
+    if not current then
+        return false, "failed to clone current paint state"
     end
+
+    local okPush, pushErr = pushEntryWithBudget(
+        session,
+        "undo",
+        "undoBytes",
+        current,
+        snapshotBytesForSession(session)
+    )
+    if not okPush then
+        notifySession(session, pushErr)
+        return false, pushErr
+    end
+
     local nextState = table.remove(session.redo)
-    session.overlay.imageData = nextState
+    session.redoBytes = math.max(0, (session.redoBytes or 0) - (tonumber(nextState.bytes) or 0))
+    session.overlay.imageData = nextState.imageData
     if session.overlay.image and session.overlay.image.replacePixels then
-        session.overlay.image:replacePixels(nextState)
+        session.overlay.image:replacePixels(nextState.imageData)
     end
     return true
 end

@@ -537,11 +537,19 @@ local function decodeImageRecord(imageRecord, buffers, baseDir)
             out.height = imageData:getHeight()
             out.imageData = imageData
             local okImage, image = pcall(function()
-                return loveLib.graphics.newImage(imageData)
+                return loveLib.graphics.newImage(imageData, { mipmaps = true, linear = true })
             end)
+            if (not okImage or not image) then
+                okImage, image = pcall(function()
+                    return loveLib.graphics.newImage(imageData)
+                end)
+            end
             if okImage then
                 pcall(function()
-                    image:setFilter("linear", "linear")
+                    image:setFilter("linear", "linear", 8)
+                end)
+                pcall(function()
+                    image:setMipmapFilter("linear", 0.2)
                 end)
                 out.image = image
             end
@@ -882,10 +890,42 @@ local function parseGltfDocument(gltf, opts)
         return true
     end
 
-    local roots = (scene and scene.nodes) or {}
+    local roots = {}
+    local seenRoot = {}
+    if scene and type(scene.nodes) == "table" then
+        for _, rootIndex in ipairs(scene.nodes) do
+            local asNum = tonumber(rootIndex)
+            if asNum then
+                asNum = math.floor(asNum)
+                if asNum >= 0 and asNum < #nodes and not seenRoot[asNum] then
+                    seenRoot[asNum] = true
+                    roots[#roots + 1] = asNum
+                end
+            end
+        end
+    end
     if #roots == 0 and #nodes > 0 then
+        local hasParent = {}
+        for _, node in ipairs(nodes) do
+            for _, childIndex in ipairs(node.children or {}) do
+                local childNum = tonumber(childIndex)
+                if childNum then
+                    childNum = math.floor(childNum)
+                    if childNum >= 0 and childNum < #nodes then
+                        hasParent[childNum] = true
+                    end
+                end
+            end
+        end
         for i = 0, #nodes - 1 do
-            roots[#roots + 1] = i
+            if not hasParent[i] then
+                roots[#roots + 1] = i
+            end
+        end
+        if #roots == 0 then
+            for i = 0, #nodes - 1 do
+                roots[#roots + 1] = i
+            end
         end
     end
 

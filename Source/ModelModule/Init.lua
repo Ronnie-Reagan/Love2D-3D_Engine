@@ -395,9 +395,10 @@ function ModelModule.beginPaintSession(assetId, role, ownerId)
     role = (role == "walking") and "walking" or "plane"
     local existing = materialRuntime.getPaintOverlay(asset, role)
     return paintRuntime.beginSession(assetId, role, ownerId, asset.modelHash, {
-        width = 2048,
-        height = 2048,
-        maxHistory = 32
+        width = 1024,
+        height = 1024,
+        maxHistory = 8,
+        maxUndoBytes = 128 * 1024 * 1024
     }, existing)
 end
 

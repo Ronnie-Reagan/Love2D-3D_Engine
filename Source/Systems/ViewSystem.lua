@@ -258,19 +258,47 @@ function M.create(bindings)
 		local renderObjects = {}
 		local activeCam = viewState.activeCamera or camera
 		local maxDist = math.max(300, tonumber(graphicsSettings.drawDistance) or 1800)
+		local camConj = nil
+		local tanHalfVertical = math.tan((activeCam and activeCam.fov or math.rad(90)) * 0.5)
+		local tanHalfHorizontal = tanHalfVertical
+		if activeCam and activeCam.rot then
+			camConj = q.conjugate(activeCam.rot)
+			if type(love) == "table" and type(love.graphics) == "table" and type(love.graphics.getDimensions) == "function" then
+				local w, h = love.graphics.getDimensions()
+				local aspect = (h and h > 0) and (w / h) or 1.0
+				tanHalfHorizontal = tanHalfVertical * math.max(0.25, aspect)
+			end
+		end
+
 		for _, obj in ipairs(objects) do
 			if shouldRenderObjectForView(obj) then
-				if activeCam and activeCam.pos and obj.pos then
-					local dx = obj.pos[1] - activeCam.pos[1]
-					local dy = obj.pos[2] - activeCam.pos[2]
-					local dz = obj.pos[3] - activeCam.pos[3]
+				local cullPos = obj.terrainCenter or obj.pos
+				if activeCam and activeCam.pos and cullPos then
+					local dx = (cullPos[1] or 0) - activeCam.pos[1]
+					local dy = (cullPos[2] or 0) - activeCam.pos[2]
+					local dz = (cullPos[3] or 0) - activeCam.pos[3]
 					local distSq = dx * dx + dy * dy + dz * dz
 					local radius = 0
 					if obj.halfSize then
 						radius = math.max(obj.halfSize.x or 0, obj.halfSize.y or 0, obj.halfSize.z or 0)
 					end
 					local limit = maxDist + radius
-					if distSq <= (limit * limit) then
+					local inRange = distSq <= (limit * limit)
+					local inFrustum = true
+					if inRange and camConj then
+						local cam = q.rotateVector(camConj, { dx, dy, dz })
+						local z = cam[3] or 0
+						if (z + radius) < 0.05 then
+							inFrustum = false
+						else
+							local xLimit = z * tanHalfHorizontal + radius
+							local yLimit = z * tanHalfVertical + radius
+							if math.abs(cam[1] or 0) > xLimit or math.abs(cam[2] or 0) > yLimit then
+								inFrustum = false
+							end
+						end
+					end
+					if inRange and inFrustum then
 						renderObjects[#renderObjects + 1] = obj
 					end
 				else

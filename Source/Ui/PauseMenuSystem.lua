@@ -1,4 +1,5 @@
 local M = {}
+local restartSnapshotCompat = require("Source.Ui.RestartSnapshotCompat")
 
 local STANDARD_GLOBALS = {
 	_G = true,
@@ -57,9 +58,13 @@ local REQUIRED_READ_BINDINGS = {
 	"currentGraphicsApiPreference",
 	"decodeModelBytes",
 	"defaultGroundParams",
+	"flightModelConfig",
+	"terrainSdfDefaults",
+	"lightingModel",
 	"defaultPlayerModelScale",
 	"defaultWalkingModelScale",
 	"flightSimMode",
+	"ensureFlightSpawnSafety",
 	"forceStateSync",
 	"frameImage",
 	"frameImageH",
@@ -193,7 +198,9 @@ local function buildEnvironment(bindings)
 	local getters = bindings.getters or {}
 	local setters = bindings.setters or {}
 	local allowGlobalReads = bindings.allowGlobalReads or {}
+	local allowedValueWrites = bindings.allowedValueWrites or {}
 	local hasValue = {}
+	local strictWrites = false
 
 	for key in pairs(values) do
 		hasValue[key] = true
@@ -235,11 +242,23 @@ local function buildEnvironment(bindings)
 				return
 			end
 
+			if strictWrites and (not hasValue[key]) and (not allowedValueWrites[key]) then
+				error(
+					"PauseMenuSystem attempted to write undeclared key '" .. tostring(key) ..
+					"'. Add a setter or whitelist via bindings.allowedValueWrites.",
+					2
+				)
+			end
+
 			hasValue[key] = true
 			values[key] = value
 		end
 	})
-	return env
+	return env, {
+		lockWrites = function()
+			strictWrites = true
+		end
+	}
 end
 
 local function bindEnvironment(fn, env)
@@ -281,7 +300,7 @@ end
 function M.create(bindings)
 	bindings = bindings or {}
 	assertRequiredBindings(bindings)
-	local environment = buildEnvironment(bindings)
+	local environment, envControl = buildEnvironment(bindings)
 
 	local function bootstrap()
 		local pauseMenu = {
@@ -317,15 +336,15 @@ function M.create(bindings)
 	confirmUntil = 0,
 	mainItems = {
 		{ id = "resume",    label = "Resume",          kind = "action", help = "Close pause menu and continue playing." },
-		{ id = "flight",    label = "Flight Mode",     kind = "toggle", help = "Toggle no-gravity flight movement mode." },
+		{ id = "flight",    label = "Flight Mode",     kind = "toggle", help = "Toggle between rigid-body prop flight and walking mode." },
 		{ id = "callsign",  label = "Callsign",        kind = "action", help = "Set your multiplayer callsign label shown over your player." },
 		{ id = "reset",     label = "Reset Camera",    kind = "action", help = "Reset camera position and orientation." },
 		{ id = "reconnect", label = "Reconnect Relay", kind = "action", help = "Reconnect to multiplayer relay server." },
 		{ id = "quit",      label = "Quit Game",       kind = "action", confirm = true,                                                      help = "Exit the game client." }
 	},
-	settingsItems = {
-		graphics = {
-			{ id = "window_mode",   label = "Window Mode",       kind = "cycle",  help = "Switch between windowed, borderless fullscreen, and exclusive fullscreen." },
+		settingsItems = {
+			graphics = {
+				{ id = "window_mode",   label = "Window Mode",       kind = "cycle",  help = "Switch between windowed, borderless fullscreen, and exclusive fullscreen." },
 			{ id = "resolution",    label = "Resolution",        kind = "cycle",  help = "Target display resolution. In borderless mode this follows desktop resolution." },
 			{ id = "apply_video",   label = "Apply Display",     kind = "action", help = "Apply the selected window mode and resolution now." },
 			{ id = "render_scale",  label = "Render Scale",      kind = "range",  min = 0.5,                                                                              max = 1.5,   step = 0.05,   help = "Internal 3D render scale separate from display resolution." },
@@ -346,13 +365,45 @@ function M.create(bindings)
 			{ id = "sun_intensity",       label = "Sun Intensity",   kind = "range",  min = 0.0,  max = 8.0, step = 0.1, help = "Direct light intensity for PBR highlights." },
 			{ id = "sun_ambient",         label = "Sun Ambient",     kind = "range",  min = 0.0,  max = 1.5, step = 0.02, help = "Ambient fill light to lift dark surfaces." },
 			{ id = "sun_marker_distance", label = "Sun Box Dist",    kind = "range",  min = 200,  max = 6000, step = 50, help = "Distance from camera to the sun debug cube." },
-			{ id = "sun_marker_size",     label = "Sun Box Size",    kind = "range",  min = 10,   max = 600,  step = 10, help = "Scale of the debug sun cube." }
-		}
-	},
+				{ id = "sun_marker_size",     label = "Sun Box Size",    kind = "range",  min = 10,   max = 600,  step = 10, help = "Scale of the debug sun cube." }
+			},
+			flight = {
+				{ id = "fm_mass",            label = "Mass (kg)",         kind = "range", min = 450, max = 4000, step = 10, help = "Aircraft mass used by the 6-DoF rigid-body integrator." },
+				{ id = "fm_thrust",          label = "Max Thrust (N)",    kind = "range", min = 800, max = 12000, step = 50, help = "Sea-level maximum prop thrust." },
+				{ id = "fm_cl_alpha",        label = "CLalpha",           kind = "range", min = 2.0, max = 8.5, step = 0.05, help = "Lift slope per radian; higher values increase lift responsiveness." },
+				{ id = "fm_cd0",             label = "CD0",               kind = "range", min = 0.01, max = 0.12, step = 0.002, help = "Zero-lift drag coefficient." },
+				{ id = "fm_induced_drag",    label = "Induced Drag K",    kind = "range", min = 0.01, max = 0.18, step = 0.002, help = "Quadratic induced drag term." },
+				{ id = "fm_cm_alpha",        label = "CmAlpha",           kind = "range", min = -2.8, max = -0.1, step = 0.02, help = "Pitch static stability derivative (negative is stable)." },
+				{ id = "fm_trim_auto",       label = "Auto Trim",         kind = "toggle", help = "Enable automatic trim assist for near-level cruise." },
+				{ id = "fm_ground_friction", label = "Ground Friction",    kind = "range", min = 0.20, max = 0.995, step = 0.01, help = "Tangential damping applied on SDF contact." }
+			},
+			terrain = {
+				{ id = "terrain_seed",            label = "Seed",               kind = "range", min = 1, max = 999999, step = 1, help = "Deterministic world seed shared across peers." },
+				{ id = "terrain_height_amp",      label = "Height Amp",         kind = "range", min = 5, max = 420, step = 5, help = "Macro terrain height amplitude." },
+				{ id = "terrain_height_freq",     label = "Height Freq",        kind = "range", min = 0.0002, max = 0.01, step = 0.0001, help = "Macro terrain frequency." },
+				{ id = "terrain_cave_enabled",    label = "Caves",              kind = "toggle", help = "Enable volumetric cave carving noise." },
+				{ id = "terrain_cave_strength",   label = "Cave Strength",      kind = "range", min = 2, max = 96, step = 1, help = "Carving strength for cave density subtraction." },
+				{ id = "terrain_tunnel_count",    label = "Tunnel Count",       kind = "range", min = 0, max = 64, step = 1, help = "Number of deterministic tunnel worms." },
+				{ id = "terrain_tunnel_radius_min", label = "Tunnel R Min",     kind = "range", min = 2, max = 40, step = 1, help = "Minimum tunnel radius." },
+				{ id = "terrain_tunnel_radius_max", label = "Tunnel R Max",     kind = "range", min = 2, max = 60, step = 1, help = "Maximum tunnel radius." },
+				{ id = "terrain_lod0_radius",     label = "LOD0 Radius",        kind = "range", min = 1, max = 6, step = 1, help = "High-detail chunk radius around the player." },
+				{ id = "terrain_lod1_radius",     label = "LOD1 Radius",        kind = "range", min = 2, max = 10, step = 1, help = "Coarse-detail chunk radius around the player." },
+				{ id = "terrain_mesh_budget",     label = "Mesh Budget",        kind = "range", min = 1, max = 8, step = 1, help = "Maximum chunk builds finalized per frame." }
+			},
+			lighting = {
+				{ id = "light_shadow_enabled",  label = "Shadows",            kind = "toggle", help = "Enable directional shadow attenuation in GPU path." },
+				{ id = "light_shadow_softness", label = "Shadow Softness",    kind = "range", min = 0.4, max = 4.0, step = 0.1, help = "Shadow filtering softness." },
+				{ id = "light_shadow_distance", label = "Shadow Distance",    kind = "range", min = 200, max = 6000, step = 50, help = "Maximum shadowed distance from camera." },
+				{ id = "light_fog_density",     label = "Fog Density",        kind = "range", min = 0.0, max = 0.01, step = 0.0001, help = "Distance fog density." },
+				{ id = "light_fog_height",      label = "Fog Height Falloff", kind = "range", min = 0.0, max = 0.02, step = 0.0001, help = "Vertical fog attenuation coefficient." },
+				{ id = "light_exposure_ev",     label = "Exposure EV",        kind = "range", min = -4.0, max = 4.0, step = 0.1, help = "Scene exposure offset in EV stops." },
+				{ id = "light_turbidity",       label = "Turbidity",          kind = "range", min = 1.0, max = 10.0, step = 0.1, help = "Analytic sky haze factor." }
+			}
+		},
 	characterItems = {
 		plane = {
 			{ id = "load_custom_stl",         label = "Load Plane Model", kind = "action", help = "Open a path prompt and load STL, GLB, or GLTF from disk (or drop STL/GLB on the window)." },
-			{ id = "model_scale",             label = "Plane Scale",    kind = "range",  min = -5.0,                                                                             max = 5.0, step = 0.05, help = "Scale normalized plane models for all clients." },
+			{ id = "model_scale",             label = "Plane Scale",    kind = "range",  min = 0.1,                                                                              max = 5.0, step = 0.05, help = "Scale normalized plane models for all clients (positive only)." },
 			{ id = "plane_preview_yaw",       label = "Model Yaw",      kind = "range",  min = -360,                                                                            max = 360, step = 5,    help = "Rotate the real plane model (world + preview) around the vertical axis." },
 			{ id = "plane_preview_pitch",     label = "Model Pitch",    kind = "range",  min = -360,                                                                            max = 360, step = 5,    help = "Rotate the real plane model (world + preview) around the lateral axis." },
 			{ id = "plane_preview_roll",      label = "Model Roll",     kind = "range",  min = -360,                                                                            max = 360, step = 5,    help = "Rotate the real plane model (world + preview) around the forward axis." },
@@ -361,7 +412,7 @@ function M.create(bindings)
 		},
 		walking = {
 			{ id = "load_walking_stl",          label = "Load Walking Model", kind = "action", help = "Load a separate STL, GLB, or GLTF used only when not in flight mode." },
-			{ id = "walking_model_scale",       label = "Walking Scale",    kind = "range",  min = 0.3,                                                      max = 3.0, step = 0.05, help = "Scale used for walking-mode player model." },
+			{ id = "walking_model_scale",       label = "Walking Scale",    kind = "range",  min = 0.1,                                                      max = 3.0, step = 0.05, help = "Scale used for walking-mode player model." },
 			{ id = "walking_preview_yaw",       label = "Model Yaw",        kind = "range",  min = -180,                                                     max = 180, step = 5,    help = "Rotate the real walking model (world + preview) around the vertical axis." },
 			{ id = "walking_preview_pitch",     label = "Model Pitch",      kind = "range",  min = -180,                                                     max = 180, step = 5,    help = "Rotate the real walking model (world + preview) around the lateral axis." },
 			{ id = "walking_preview_roll",      label = "Model Roll",       kind = "range",  min = -180,                                                     max = 180, step = 5,    help = "Rotate the real walking model (world + preview) around the forward axis." },
@@ -435,7 +486,7 @@ local function getPauseHelpSections()
 			title = "Pause Menu",
 			items = {
 				{ keys = "Tab / H",           text = "Cycle top tabs: Main, Settings, Characters, HUD, Controls, Help." },
-				{ keys = "[ / ]",             text = "Cycle sub-pages when available (Characters and HUD)." },
+				{ keys = "[ / ]",             text = "Cycle sub-pages when available (Settings, Characters, and HUD)." },
 				{ keys = "W/S or Up/Down",    text = "Move selection in list pages or Controls tab." },
 				{ keys = "A/D or Left/Right", text = "Adjust selected values or select controls binding slot." },
 				{ keys = "Enter",             text = "Activate item or start binding capture in Controls." },
@@ -504,7 +555,10 @@ end
 local function getPauseSubTabs(tabId)
 	if tabId == "settings" then
 		return {
-			{ id = "graphics", label = "Graphics" }
+			{ id = "graphics", label = "Graphics" },
+			{ id = "flight",   label = "Flight Tuning" },
+			{ id = "terrain",  label = "Terrain" },
+			{ id = "lighting", label = "Lighting" }
 		}
 	end
 	if tabId == "characters" then
@@ -608,10 +662,38 @@ function getEngineRestartPayload()
 	if type(love.restart) ~= "table" then
 		return nil
 	end
-	if tonumber(love.restart._l2d3d_restart_version) ~= RESTART_STATE_VERSION then
-		return nil
+
+	local sourceVersion = tonumber(love.restart._l2d3d_restart_version)
+	if sourceVersion == RESTART_STATE_VERSION then
+		return love.restart
 	end
-	return love.restart
+
+	local migrated, migratedFromOrErr = restartSnapshotCompat.migrate(love.restart, RESTART_STATE_VERSION, {
+		defaultPlaneScale = defaultPlayerModelScale,
+		defaultWalkingScale = defaultWalkingModelScale
+	})
+	if migrated then
+		if logger and logger.log then
+			logger.log(string.format(
+				"Migrated restart snapshot version %s -> %d.",
+				tostring(sourceVersion),
+				RESTART_STATE_VERSION
+			))
+		end
+		return migrated
+	end
+
+	if logger and logger.log then
+		logger.log(string.format(
+			"Dropped restart snapshot: unsupported version '%s' (expected %d).",
+			tostring(sourceVersion),
+			RESTART_STATE_VERSION
+		))
+		if migratedFromOrErr and migratedFromOrErr ~= "" then
+			logger.log("Restart payload migration detail: " .. tostring(migratedFromOrErr))
+		end
+	end
+	return nil
 end
 
 function refreshGraphicsBackendInfo()
@@ -849,7 +931,7 @@ function buildRestartModelSnapshot(role, hash, scale)
 	local snapshot = {
 		role = role,
 		hash = tostring(hash or "builtin-cube"),
-		scale = tonumber(scale) or 1
+		scale = math.max(0.1, math.abs(tonumber(scale) or 1))
 	}
 	local entry = playerModelCache[snapshot.hash]
 	if not entry then
@@ -913,13 +995,19 @@ function buildRestartSnapshot(targetGraphicsApiPreference)
 				graphicsApiPreference = graphicsApiPreference
 			},
 			hudSettings = deepCopyPrimitiveTable(hudSettings, 3),
+			sunSettings = deepCopyPrimitiveTable(sunSettings, 3),
+			flightModelConfig = deepCopyPrimitiveTable(flightModelConfig, 4),
+			terrainSdfDefaults = deepCopyPrimitiveTable(terrainSdfDefaults, 4),
+			lightingModel = deepCopyPrimitiveTable(lightingModel, 3),
 			characterOrientation = deepCopyPrimitiveTable(characterOrientation, 3),
 			camera = deepCopyPrimitiveTable({
 				pos = camera and camera.pos,
 				rot = camera and camera.rot,
 				vel = camera and camera.vel,
 				flightVel = camera and camera.flightVel,
+				flightAngVel = camera and camera.flightAngVel,
 				flightRotVel = camera and camera.flightRotVel,
+				flightSimState = camera and camera.flightSimState,
 				yoke = camera and camera.yoke,
 				throttle = camera and camera.throttle,
 				speed = camera and camera.speed,
@@ -962,7 +1050,7 @@ function restoreModelFromRestartSnapshot(role, snapshot)
 	end
 
 	local targetRole = (role == "walking") and "walking" or "plane"
-	local minScale = (targetRole == "walking") and 0.3 or 0.5
+	local minScale = 0.1
 	local maxScale = 3.0
 	local defaultScale = (targetRole == "walking") and defaultWalkingModelScale or defaultPlayerModelScale
 	local restoredScale = clamp(tonumber(snapshot.scale) or defaultScale, minScale, maxScale)
@@ -1024,6 +1112,32 @@ function applyRestartSnapshot(snapshot)
 			end
 		end
 		resetHudCaches()
+	end
+
+	if type(snapshot.sunSettings) == "table" then
+		for key, value in pairs(snapshot.sunSettings) do
+			sunSettings[key] = value
+		end
+		applySunSettingsToRenderer()
+	end
+
+	if type(snapshot.flightModelConfig) == "table" then
+		for key, value in pairs(snapshot.flightModelConfig) do
+			flightModelConfig[key] = value
+		end
+	end
+
+	if type(snapshot.terrainSdfDefaults) == "table" then
+		for key, value in pairs(snapshot.terrainSdfDefaults) do
+			terrainSdfDefaults[key] = value
+		end
+	end
+
+	if type(snapshot.lightingModel) == "table" then
+		for key, value in pairs(snapshot.lightingModel) do
+			lightingModel[key] = value
+		end
+		applySunSettingsToRenderer()
 	end
 
 	if type(snapshot.characterOrientation) == "table" then
@@ -1100,6 +1214,13 @@ function applyRestartSnapshot(snapshot)
 				tonumber(cam.flightVel[3]) or 0
 			}
 		end
+		if type(cam.flightAngVel) == "table" then
+			camera.flightAngVel = {
+				tonumber(cam.flightAngVel[1]) or 0,
+				tonumber(cam.flightAngVel[2]) or 0,
+				tonumber(cam.flightAngVel[3]) or 0
+			}
+		end
 		if type(cam.yoke) == "table" then
 			camera.yoke = {
 				pitch = tonumber(cam.yoke.pitch) or 0,
@@ -1114,10 +1235,17 @@ function applyRestartSnapshot(snapshot)
 				roll = tonumber(cam.flightRotVel.roll) or 0
 			}
 		end
+		if type(cam.flightSimState) == "table" then
+			camera.flightSimState = deepCopyPrimitiveTable(cam.flightSimState, 5)
+		end
 		camera.throttle = clamp(tonumber(cam.throttle) or camera.throttle, 0, 1)
 		camera.speed = tonumber(cam.speed) or camera.speed
 		camera.baseFov = tonumber(cam.baseFov) or camera.baseFov
 		camera.fov = tonumber(cam.fov) or camera.baseFov
+		camera.flightMass = tonumber(flightModelConfig.massKg) or camera.flightMass
+		camera.flightThrustForce = tonumber(flightModelConfig.maxThrustSeaLevel) or camera.flightThrustForce
+		camera.flightThrustAccel = tonumber(flightModelConfig.maxThrustSeaLevel) or camera.flightThrustAccel
+		camera.flightGroundFriction = tonumber(flightModelConfig.groundFriction) or camera.flightGroundFriction
 		if not desiredFlightMode then
 			if cam.walkYaw ~= nil then
 				camera.walkYaw = tonumber(cam.walkYaw) or camera.walkYaw
@@ -1205,6 +1333,10 @@ function applyRestartSnapshot(snapshot)
 
 	if snapshot.useGpuRenderer ~= nil then
 		pendingRestartRendererPreference = snapshot.useGpuRenderer and true or false
+	end
+
+	if desiredFlightMode and type(ensureFlightSpawnSafety) == "function" then
+		ensureFlightSpawnSafety(45, 32)
 	end
 
 	syncLocalPlayerObject()
@@ -1761,6 +1893,86 @@ local function getPauseItemValue(item)
 	if item.id == "sun_marker_size" then
 		return string.format("%du", math.floor((tonumber(sunSettings.markerSize) or 0) + 0.5))
 	end
+	if item.id == "fm_mass" then
+		return string.format("%.0f", tonumber(flightModelConfig.massKg) or 0)
+	end
+	if item.id == "fm_thrust" then
+		return string.format("%.0f", tonumber(flightModelConfig.maxThrustSeaLevel) or 0)
+	end
+	if item.id == "fm_cl_alpha" then
+		return string.format("%.2f", tonumber(flightModelConfig.CLalpha) or 0)
+	end
+	if item.id == "fm_cd0" then
+		return string.format("%.3f", tonumber(flightModelConfig.CD0) or 0)
+	end
+	if item.id == "fm_induced_drag" then
+		return string.format("%.3f", tonumber(flightModelConfig.inducedDragK) or 0)
+	end
+	if item.id == "fm_cm_alpha" then
+		return string.format("%.2f", tonumber(flightModelConfig.CmAlpha) or 0)
+	end
+	if item.id == "fm_trim_auto" then
+		return (flightModelConfig.enableAutoTrim ~= false) and "On" or "Off"
+	end
+	if item.id == "fm_ground_friction" then
+		return string.format("%.2f", tonumber(flightModelConfig.groundFriction) or 0)
+	end
+	local terrainParams = activeGroundParams or defaultGroundParams
+	if item.id == "terrain_seed" then
+		return string.format("%d", math.floor(tonumber(terrainParams.seed) or 0))
+	end
+	if item.id == "terrain_height_amp" then
+		return string.format("%.1f", tonumber(terrainParams.heightAmplitude) or 0)
+	end
+	if item.id == "terrain_height_freq" then
+		return string.format("%.4f", tonumber(terrainParams.heightFrequency) or 0)
+	end
+	if item.id == "terrain_cave_enabled" then
+		return (terrainParams.caveEnabled ~= false) and "On" or "Off"
+	end
+	if item.id == "terrain_cave_strength" then
+		return string.format("%.1f", tonumber(terrainParams.caveStrength) or 0)
+	end
+	if item.id == "terrain_tunnel_count" then
+		return string.format("%d", math.floor(tonumber(terrainParams.tunnelCount) or 0))
+	end
+	if item.id == "terrain_tunnel_radius_min" then
+		return string.format("%.1f", tonumber(terrainParams.tunnelRadiusMin) or 0)
+	end
+	if item.id == "terrain_tunnel_radius_max" then
+		return string.format("%.1f", tonumber(terrainParams.tunnelRadiusMax) or 0)
+	end
+	if item.id == "terrain_lod0_radius" then
+		return string.format("%d", math.floor(tonumber(terrainParams.lod0Radius) or 0))
+	end
+	if item.id == "terrain_lod1_radius" then
+		return string.format("%d", math.floor(tonumber(terrainParams.lod1Radius) or 0))
+	end
+	if item.id == "terrain_mesh_budget" then
+		return string.format("%d", math.floor(tonumber(terrainParams.meshBuildBudget) or 0))
+	end
+	if item.id == "light_shadow_enabled" then
+		local enabled = (sunSettings.shadowEnabled ~= nil and sunSettings.shadowEnabled) or lightingModel.shadowEnabled
+		return enabled and "On" or "Off"
+	end
+	if item.id == "light_shadow_softness" then
+		return string.format("%.2f", tonumber(sunSettings.shadowSoftness) or tonumber(lightingModel.shadowSoftness) or 0)
+	end
+	if item.id == "light_shadow_distance" then
+		return string.format("%dm", math.floor((tonumber(sunSettings.shadowDistance) or tonumber(lightingModel.shadowDistance) or 0) + 0.5))
+	end
+	if item.id == "light_fog_density" then
+		return string.format("%.4f", tonumber(sunSettings.fogDensity) or tonumber(lightingModel.fogDensity) or 0)
+	end
+	if item.id == "light_fog_height" then
+		return string.format("%.4f", tonumber(sunSettings.fogHeightFalloff) or tonumber(lightingModel.fogHeightFalloff) or 0)
+	end
+	if item.id == "light_exposure_ev" then
+		return string.format("%.1f", tonumber(sunSettings.exposureEV) or tonumber(lightingModel.exposureEV) or 0)
+	end
+	if item.id == "light_turbidity" then
+		return string.format("%.1f", tonumber(sunSettings.turbidity) or tonumber(lightingModel.turbidity) or 0)
+	end
 	if item.id == "invertY" then
 		return invertLookY and "On" or "Off"
 	end
@@ -2045,6 +2257,168 @@ local function adjustPauseItem(item, direction, multiplier)
 		return
 	end
 
+	if item.id == "fm_mass" then
+		flightModelConfig.massKg = clamp((tonumber(flightModelConfig.massKg) or 1150) + item.step * direction * scale, item.min, item.max)
+		if camera then
+			camera.flightMass = flightModelConfig.massKg
+		end
+		setPauseStatus("Mass (kg): " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "fm_thrust" then
+		flightModelConfig.maxThrustSeaLevel = clamp((tonumber(flightModelConfig.maxThrustSeaLevel) or 3200) + item.step * direction * scale, item.min, item.max)
+		if camera then
+			camera.flightThrustForce = flightModelConfig.maxThrustSeaLevel
+			camera.flightThrustAccel = flightModelConfig.maxThrustSeaLevel
+		end
+		setPauseStatus("Max Thrust: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "fm_cl_alpha" then
+		flightModelConfig.CLalpha = clamp((tonumber(flightModelConfig.CLalpha) or 5.5) + item.step * direction * scale, item.min, item.max)
+		setPauseStatus("CLalpha: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "fm_cd0" then
+		flightModelConfig.CD0 = clamp((tonumber(flightModelConfig.CD0) or 0.03) + item.step * direction * scale, item.min, item.max)
+		setPauseStatus("CD0: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "fm_induced_drag" then
+		flightModelConfig.inducedDragK = clamp((tonumber(flightModelConfig.inducedDragK) or 0.045) + item.step * direction * scale, item.min, item.max)
+		setPauseStatus("Induced Drag K: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "fm_cm_alpha" then
+		flightModelConfig.CmAlpha = clamp((tonumber(flightModelConfig.CmAlpha) or -1.2) + item.step * direction * scale, item.min, item.max)
+		setPauseStatus("CmAlpha: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "fm_ground_friction" then
+		flightModelConfig.groundFriction = clamp((tonumber(flightModelConfig.groundFriction) or 0.92) + item.step * direction * scale, item.min, item.max)
+		if camera then
+			camera.flightGroundFriction = flightModelConfig.groundFriction
+		end
+		setPauseStatus("Ground Friction: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "terrain_seed" or
+		item.id == "terrain_height_amp" or
+		item.id == "terrain_height_freq" or
+		item.id == "terrain_cave_strength" or
+		item.id == "terrain_tunnel_count" or
+		item.id == "terrain_tunnel_radius_min" or
+		item.id == "terrain_tunnel_radius_max" or
+		item.id == "terrain_lod0_radius" or
+		item.id == "terrain_lod1_radius" or
+		item.id == "terrain_mesh_budget" then
+		local params = deepCopyPrimitiveTable(activeGroundParams or defaultGroundParams, 4) or {}
+		local delta = item.step * direction * scale
+		if item.id == "terrain_seed" then
+			params.seed = math.floor(clamp((tonumber(params.seed) or 1) + delta, item.min, item.max))
+			terrainSdfDefaults.seed = params.seed
+		elseif item.id == "terrain_height_amp" then
+			params.heightAmplitude = clamp((tonumber(params.heightAmplitude) or 120) + delta, item.min, item.max)
+			terrainSdfDefaults.heightAmplitude = params.heightAmplitude
+		elseif item.id == "terrain_height_freq" then
+			params.heightFrequency = clamp((tonumber(params.heightFrequency) or 0.0018) + delta, item.min, item.max)
+			terrainSdfDefaults.heightFrequency = params.heightFrequency
+		elseif item.id == "terrain_cave_strength" then
+			params.caveStrength = clamp((tonumber(params.caveStrength) or 42) + delta, item.min, item.max)
+			terrainSdfDefaults.caveStrength = params.caveStrength
+		elseif item.id == "terrain_tunnel_count" then
+			params.tunnelCount = math.floor(clamp((tonumber(params.tunnelCount) or 12) + delta, item.min, item.max))
+			terrainSdfDefaults.tunnelCount = params.tunnelCount
+		elseif item.id == "terrain_tunnel_radius_min" then
+			params.tunnelRadiusMin = clamp((tonumber(params.tunnelRadiusMin) or 9) + delta, item.min, item.max)
+			params.tunnelRadiusMax = math.max(params.tunnelRadiusMin, tonumber(params.tunnelRadiusMax) or params.tunnelRadiusMin)
+			terrainSdfDefaults.tunnelRadiusMin = params.tunnelRadiusMin
+			terrainSdfDefaults.tunnelRadiusMax = params.tunnelRadiusMax
+		elseif item.id == "terrain_tunnel_radius_max" then
+			params.tunnelRadiusMax = clamp((tonumber(params.tunnelRadiusMax) or 18) + delta, item.min, item.max)
+			params.tunnelRadiusMin = math.min(params.tunnelRadiusMax, tonumber(params.tunnelRadiusMin) or params.tunnelRadiusMax)
+			terrainSdfDefaults.tunnelRadiusMin = params.tunnelRadiusMin
+			terrainSdfDefaults.tunnelRadiusMax = params.tunnelRadiusMax
+		elseif item.id == "terrain_lod0_radius" then
+			params.lod0Radius = math.floor(clamp((tonumber(params.lod0Radius) or 2) + delta, item.min, item.max))
+			params.lod1Radius = math.max(params.lod0Radius, tonumber(params.lod1Radius) or params.lod0Radius)
+			terrainSdfDefaults.lod0Radius = params.lod0Radius
+			terrainSdfDefaults.lod1Radius = params.lod1Radius
+		elseif item.id == "terrain_lod1_radius" then
+			params.lod1Radius = math.floor(clamp((tonumber(params.lod1Radius) or 4) + delta, item.min, item.max))
+			params.lod0Radius = math.min(params.lod1Radius, tonumber(params.lod0Radius) or params.lod1Radius)
+			terrainSdfDefaults.lod0Radius = params.lod0Radius
+			terrainSdfDefaults.lod1Radius = params.lod1Radius
+		elseif item.id == "terrain_mesh_budget" then
+			params.meshBuildBudget = math.floor(clamp((tonumber(params.meshBuildBudget) or 2) + delta, item.min, item.max))
+			terrainSdfDefaults.meshBuildBudget = params.meshBuildBudget
+		end
+		rebuildGroundFromParams(params, "pause terrain tuning")
+		setPauseStatus(item.label .. ": " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "light_shadow_softness" then
+		local v = clamp((tonumber(sunSettings.shadowSoftness) or tonumber(lightingModel.shadowSoftness) or 1.6) + item.step * direction * scale, item.min, item.max)
+		sunSettings.shadowSoftness = v
+		lightingModel.shadowSoftness = v
+		applySunSettingsToRenderer()
+		setPauseStatus("Shadow Softness: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "light_shadow_distance" then
+		local v = clamp((tonumber(sunSettings.shadowDistance) or tonumber(lightingModel.shadowDistance) or 1800) + item.step * direction * scale, item.min, item.max)
+		sunSettings.shadowDistance = math.floor(v + 0.5)
+		lightingModel.shadowDistance = sunSettings.shadowDistance
+		applySunSettingsToRenderer()
+		setPauseStatus("Shadow Distance: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "light_fog_density" then
+		local v = clamp((tonumber(sunSettings.fogDensity) or tonumber(lightingModel.fogDensity) or 0.00055) + item.step * direction * scale, item.min, item.max)
+		sunSettings.fogDensity = v
+		lightingModel.fogDensity = v
+		applySunSettingsToRenderer()
+		setPauseStatus("Fog Density: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "light_fog_height" then
+		local v = clamp((tonumber(sunSettings.fogHeightFalloff) or tonumber(lightingModel.fogHeightFalloff) or 0.0017) + item.step * direction * scale, item.min, item.max)
+		sunSettings.fogHeightFalloff = v
+		lightingModel.fogHeightFalloff = v
+		applySunSettingsToRenderer()
+		setPauseStatus("Fog Height: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "light_exposure_ev" then
+		local v = clamp((tonumber(sunSettings.exposureEV) or tonumber(lightingModel.exposureEV) or 0) + item.step * direction * scale, item.min, item.max)
+		sunSettings.exposureEV = math.floor(v * 10 + 0.5) / 10
+		lightingModel.exposureEV = sunSettings.exposureEV
+		applySunSettingsToRenderer()
+		setPauseStatus("Exposure EV: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "light_turbidity" then
+		local v = clamp((tonumber(sunSettings.turbidity) or tonumber(lightingModel.turbidity) or 2.4) + item.step * direction * scale, item.min, item.max)
+		sunSettings.turbidity = math.floor(v * 10 + 0.5) / 10
+		lightingModel.turbidity = sunSettings.turbidity
+		applySunSettingsToRenderer()
+		setPauseStatus("Turbidity: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
 	if item.id == "hud_speedometer_max_kph" then
 		hudSettings.speedometerMaxKph = clamp(
 			hudSettings.speedometerMaxKph + item.step * direction * scale,
@@ -2220,6 +2594,22 @@ local function activatePauseItem(item)
 	elseif item.id == "sun_marker" then
 		sunSettings.showMarker = not sunSettings.showMarker
 		setPauseStatus("Sun Marker: " .. getPauseItemValue(item), 1.2)
+	elseif item.id == "fm_trim_auto" then
+		flightModelConfig.enableAutoTrim = not (flightModelConfig.enableAutoTrim ~= false)
+		setPauseStatus("Auto Trim: " .. getPauseItemValue(item), 1.2)
+	elseif item.id == "terrain_cave_enabled" then
+		local params = deepCopyPrimitiveTable(activeGroundParams or defaultGroundParams, 4) or {}
+		params.caveEnabled = not (params.caveEnabled ~= false)
+		terrainSdfDefaults.caveEnabled = params.caveEnabled
+		rebuildGroundFromParams(params, "pause terrain tuning")
+		setPauseStatus("Caves: " .. getPauseItemValue(item), 1.2)
+	elseif item.id == "light_shadow_enabled" then
+		local enabled = (sunSettings.shadowEnabled ~= nil and sunSettings.shadowEnabled) or lightingModel.shadowEnabled
+		enabled = not enabled
+		sunSettings.shadowEnabled = enabled
+		lightingModel.shadowEnabled = enabled
+		applySunSettingsToRenderer()
+		setPauseStatus("Shadows: " .. getPauseItemValue(item), 1.2)
 	elseif item.id == "invertY" then
 		invertLookY = not invertLookY
 		setPauseStatus("Invert Look Y: " .. getPauseItemValue(item), 1.2)
@@ -3193,7 +3583,11 @@ end
 	end
 
 	bindEnvironment(bootstrap, environment)
-	return bootstrap()
+	local exports = bootstrap()
+	if envControl and envControl.lockWrites then
+		envControl.lockWrites()
+	end
+	return exports
 end
 
 return M
