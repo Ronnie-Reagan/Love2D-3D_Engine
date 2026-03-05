@@ -814,17 +814,26 @@ local function queueChunkBuild(terrainState, key)
 	terrainState.chunkOrder[#terrainState.chunkOrder + 1] = key
 end
 
-local function computeRequiredChunkSet(params, camera)
+local function computeRequiredChunkSet(params, camera, drawDistance)
 	local chunkSize = params.chunkSize
 	local centerCx = math.floor((camera.pos[1] or 0) / chunkSize)
 	local centerCz = math.floor((camera.pos[3] or 0) / chunkSize)
+	local lod0Radius = math.max(1, math.floor(tonumber(params.lod0Radius) or 2))
+	local lod1Radius = math.max(lod0Radius, math.floor(tonumber(params.lod1Radius) or 4))
+	local desiredDrawDistance = tonumber(drawDistance)
+	if desiredDrawDistance then
+		local derived = math.ceil(desiredDrawDistance / math.max(8.0, chunkSize * 2.8))
+		local maxAdaptive = math.max(lod1Radius, math.floor(tonumber(params.maxAdaptiveLod1Radius) or 24))
+		lod1Radius = clamp(derived, lod1Radius, maxAdaptive)
+	end
+
 	local required = {}
-	for dx = -params.lod1Radius, params.lod1Radius do
-		for dz = -params.lod1Radius, params.lod1Radius do
+	for dx = -lod1Radius, lod1Radius do
+		for dz = -lod1Radius, lod1Radius do
 			local cx = centerCx + dx
 			local cz = centerCz + dz
 			local ring = chunkRingDistance(cx, cz, centerCx, centerCz)
-			local lod = (ring <= params.lod0Radius) and 0 or 1
+			local lod = (ring <= lod0Radius) and 0 or 1
 			local key = buildChunkKey(cx, cz, lod, params.generatorVersion, params.seed)
 			required[key] = {
 				cx = cx,
@@ -833,7 +842,7 @@ local function computeRequiredChunkSet(params, camera)
 			}
 		end
 	end
-	return required, centerCx, centerCz
+	return required, centerCx, centerCz, lod1Radius
 end
 
 local function flushChunkQueueSync(terrainState, params, objects, qModule)
@@ -978,8 +987,9 @@ function terrain.updateGroundStreaming(forceRebuild, context)
 		forceRebuild = true
 	end
 
-	local required, centerCx, centerCz = computeRequiredChunkSet(params, camera)
+	local required, centerCx, centerCz, requiredRadius = computeRequiredChunkSet(params, camera, context.drawDistance)
 	terrainState.requiredSet = required
+	terrainState.lastRequiredRadius = requiredRadius
 	local centerChanged = (centerCx ~= terrainState.centerChunkX) or (centerCz ~= terrainState.centerChunkZ)
 	terrainState.centerChunkX = centerCx
 	terrainState.centerChunkZ = centerCz

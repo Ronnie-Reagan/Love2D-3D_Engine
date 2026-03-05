@@ -108,6 +108,14 @@ function M.create(cubeModel, q)
 			speedometerLabelStepKph = 200,
 			speedometerRedlineKph = 850
 		},
+		audioSettings = {
+			enabled = true,
+			masterVolume = 0.80,
+			engineVolume = 0.85,
+			ambienceVolume = 0.70,
+			enginePitch = 1.00,
+			ambiencePitch = 1.00
+		},
 		characterOrientation = {
 			plane = {
 				yaw = 0,

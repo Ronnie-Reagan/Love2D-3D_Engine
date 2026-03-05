@@ -138,7 +138,8 @@ function audio.create(opts)
 
 	function state:update(frame)
 		frame = frame or {}
-		local active = frame.active and true or false
+		local enabled = frame.audioEnabled ~= false
+		local active = (frame.active and true or false) and enabled
 		if not active then
 			state.running = false
 			if state.engineSource then
@@ -157,6 +158,11 @@ function audio.create(opts)
 		end
 
 		local dt = clamp(tonumber(frame.dt) or 1 / 60, 0, 0.25)
+		local masterVolume = clamp(tonumber(frame.masterVolume) or 1.0, 0.0, 1.5)
+		local engineVolume = clamp(tonumber(frame.engineVolume) or 1.0, 0.0, 1.5)
+		local ambienceVolume = clamp(tonumber(frame.ambienceVolume) or 1.0, 0.0, 1.5)
+		local enginePitch = clamp(tonumber(frame.enginePitch) or 1.0, 0.3, 2.5)
+		local ambiencePitch = clamp(tonumber(frame.ambiencePitch) or 1.0, 0.3, 2.5)
 		local blend = clamp(dt * 4.5, 0, 1)
 		state.throttle = lerp(state.throttle, clamp(tonumber(frame.throttle) or 0, 0, 1), blend)
 		state.afterburner = lerp(state.afterburner, frame.afterburner and 1 or 0, blend)
@@ -165,8 +171,14 @@ function audio.create(opts)
 		state.pausedBlend = lerp(state.pausedBlend, frame.paused and 1 or 0, clamp(dt * 7.5, 0, 1))
 
 		local master = clamp(1.0 - state.pausedBlend * 0.84, 0.03, 1.0)
-		state.engineSource:setVolume((0.62 + state.afterburner * 0.26) * master)
-		state.ambienceSource:setVolume((0.44 + state.speedNorm * 0.22 + state.waterProximity * 0.16) * master)
+		state.engineSource:setVolume((0.62 + state.afterburner * 0.26) * master * masterVolume * engineVolume)
+		state.ambienceSource:setVolume((0.44 + state.speedNorm * 0.22 + state.waterProximity * 0.16) * master * masterVolume * ambienceVolume)
+		if type(state.engineSource.setPitch) == "function" then
+			state.engineSource:setPitch(enginePitch)
+		end
+		if type(state.ambienceSource.setPitch) == "function" then
+			state.ambienceSource:setPitch(ambiencePitch)
+		end
 
 		queueGeneratedBuffer(state.engineSource, stepEngineSample)
 		queueGeneratedBuffer(state.ambienceSource, stepAmbienceSample)

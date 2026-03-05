@@ -42,6 +42,7 @@ local REQUIRED_READ_BINDINGS = {
 	"RESTART_MODEL_ENCODED_LIMIT",
 	"RESTART_STATE_VERSION",
 	"activeGroundParams",
+	"audioSettings",
 	"applySunSettingsToRenderer",
 	"camera",
 	"characterOrientation",
@@ -345,27 +346,30 @@ function M.create(bindings)
 		settingsItems = {
 			graphics = {
 				{ id = "window_mode",   label = "Window Mode",       kind = "cycle",  help = "Switch between windowed, borderless fullscreen, and exclusive fullscreen." },
-			{ id = "resolution",    label = "Resolution",        kind = "cycle",  help = "Target display resolution. In borderless mode this follows desktop resolution." },
-			{ id = "apply_video",   label = "Apply Display",     kind = "action", help = "Apply the selected window mode and resolution now." },
-			{ id = "render_scale",  label = "Render Scale",      kind = "range",  min = 0.5,                                                                              max = 1.5,   step = 0.05,   help = "Internal 3D render scale separate from display resolution." },
-			{ id = "draw_distance", label = "Draw Distance",     kind = "range",  min = 300,                                                                              max = 5000,  step = 100,    help = "How far objects remain rendered from the active camera." },
-			{ id = "vsync",         label = "VSync",             kind = "toggle", help = "Toggle vertical sync for display presentation." },
-			{ id = "renderer",      label = "Renderer",          kind = "toggle", help = "Switch between GPU and CPU renderer paths." },
-			{ id = "graphics_api",  label = "Graphics API",      kind = "cycle",  help = "Choose startup graphics API preference. Applying this restarts the game." },
-			{ id = "apply_graphics_api", label = "Apply API", kind = "action", confirm = true, help = "Restart now to apply graphics API changes and restore world/game state." },
-			{ id = "fov",           label = "Field of View",     kind = "range",  min = 60,                                                                               max = 120,   step = 5,      help = "Adjust camera FOV in degrees." },
-			{ id = "speed",         label = "Move Speed",        kind = "range",  min = 2,                                                                                max = 30,    step = 1,      help = "Adjust player movement speed." },
-			{ id = "sensitivity",   label = "Mouse Sensitivity", kind = "range",  min = 0.0004,                                                                           max = 0.004, step = 0.0002, help = "Adjust mouse look sensitivity." },
-			{ id = "invertY",       label = "Invert Look Y",     kind = "toggle", help = "Invert vertical mouse look direction." },
-			{ id = "crosshair",     label = "Crosshair",         kind = "toggle", help = "Show or hide center crosshair dot." },
-			{ id = "overlay",       label = "Debug Overlay",     kind = "toggle", help = "Toggle top-left help/perf text." },
-			{ id = "sun_marker",          label = "Sun Marker",      kind = "toggle", help = "Show a large debug cube at the sun direction." },
-			{ id = "sun_yaw",             label = "Sun Yaw",         kind = "range",  min = -180, max = 180, step = 2, help = "Rotate sun around world up axis." },
-			{ id = "sun_pitch",           label = "Sun Pitch",       kind = "range",  min = -85,  max = 85,  step = 2, help = "Raise/lower sun elevation angle." },
-			{ id = "sun_intensity",       label = "Sun Intensity",   kind = "range",  min = 0.0,  max = 8.0, step = 0.1, help = "Direct light intensity for PBR highlights." },
-			{ id = "sun_ambient",         label = "Sun Ambient",     kind = "range",  min = 0.0,  max = 1.5, step = 0.02, help = "Ambient fill light to lift dark surfaces." },
-			{ id = "sun_marker_distance", label = "Sun Box Dist",    kind = "range",  min = 200,  max = 6000, step = 50, help = "Distance from camera to the sun debug cube." },
-				{ id = "sun_marker_size",     label = "Sun Box Size",    kind = "range",  min = 10,   max = 600,  step = 10, help = "Scale of the debug sun cube." }
+				{ id = "resolution",    label = "Resolution",        kind = "cycle",  help = "Target display resolution. In borderless mode this follows desktop resolution." },
+				{ id = "apply_video",   label = "Apply Display",     kind = "action", help = "Apply the selected window mode and resolution now." },
+				{ id = "render_scale",  label = "Render Scale",      kind = "range",  min = 0.5, max = 1.5, step = 0.05, help = "Internal 3D render scale separate from display resolution." },
+				{ id = "draw_distance", label = "Draw Distance",     kind = "range",  min = 300, max = 5000, step = 100, help = "Controls object culling and terrain streaming radius." },
+				{ id = "vsync",         label = "VSync",             kind = "toggle", help = "Toggle vertical sync for display presentation." },
+				{ id = "renderer",      label = "Renderer",          kind = "toggle", help = "Switch between GPU and CPU renderer paths." },
+				{ id = "graphics_api",  label = "Graphics API",      kind = "cycle",  help = "Choose startup graphics API preference. Applying this restarts the game." },
+				{ id = "apply_graphics_api", label = "Apply API", kind = "action", confirm = true, help = "Restart now to apply graphics API changes and restore world/game state." }
+			},
+			camera = {
+				{ id = "fov",         label = "Field of View",     kind = "range",  min = 60, max = 120, step = 5, help = "Adjust camera FOV in degrees." },
+				{ id = "speed",       label = "Move Speed",        kind = "range",  min = 2, max = 30, step = 1, help = "Adjust player movement speed." },
+				{ id = "sensitivity", label = "Mouse Sensitivity", kind = "range",  min = 0.0004, max = 0.004, step = 0.0002, help = "Adjust mouse look sensitivity." },
+				{ id = "invertY",     label = "Invert Look Y",     kind = "toggle", help = "Invert vertical mouse look direction." },
+				{ id = "crosshair",   label = "Crosshair",         kind = "toggle", help = "Show or hide center crosshair dot." },
+				{ id = "overlay",     label = "Debug Overlay",     kind = "toggle", help = "Toggle top-left help/perf text." }
+			},
+			sound = {
+				{ id = "audio_enabled",        label = "Audio",             kind = "toggle", help = "Enable or disable procedural in-flight audio." },
+				{ id = "audio_master_volume",  label = "Master Volume",     kind = "range",  min = 0.0, max = 1.5, step = 0.05, help = "Overall audio gain." },
+				{ id = "audio_engine_volume",  label = "Engine Volume",     kind = "range",  min = 0.0, max = 1.5, step = 0.05, help = "Engine synth layer volume." },
+				{ id = "audio_ambient_volume", label = "Ambient Volume",    kind = "range",  min = 0.0, max = 1.5, step = 0.05, help = "Wind/water ambience volume." },
+				{ id = "audio_engine_pitch",   label = "Engine Pitch",      kind = "range",  min = 0.3, max = 2.2, step = 0.05, help = "Pitch multiplier for engine layer." },
+				{ id = "audio_ambient_pitch",  label = "Ambient Pitch",     kind = "range",  min = 0.3, max = 2.2, step = 0.05, help = "Pitch multiplier for ambience layer." }
 			},
 			flight = {
 				{ id = "fm_mass",            label = "Mass (kg)",         kind = "range", min = 450, max = 4000, step = 10, help = "Aircraft mass used by the 6-DoF rigid-body integrator." },
@@ -391,6 +395,13 @@ function M.create(bindings)
 				{ id = "terrain_mesh_budget",     label = "Mesh Budget",        kind = "range", min = 1, max = 8, step = 1, help = "Maximum chunk builds finalized per frame." }
 			},
 			lighting = {
+				{ id = "sun_marker",          label = "Sun Marker",      kind = "toggle", help = "Show a large debug cube at the sun direction." },
+				{ id = "sun_yaw",             label = "Sun Yaw",         kind = "range",  min = -180, max = 180, step = 2, help = "Rotate sun around world up axis." },
+				{ id = "sun_pitch",           label = "Sun Pitch",       kind = "range",  min = -85, max = 85, step = 2, help = "Raise/lower sun elevation angle." },
+				{ id = "sun_intensity",       label = "Sun Intensity",   kind = "range",  min = 0.0, max = 8.0, step = 0.1, help = "Direct light intensity for PBR highlights." },
+				{ id = "sun_ambient",         label = "Sun Ambient",     kind = "range",  min = 0.0, max = 1.5, step = 0.02, help = "Ambient fill light to lift dark surfaces." },
+				{ id = "sun_marker_distance", label = "Sun Box Dist",    kind = "range",  min = 200, max = 6000, step = 50, help = "Distance from camera to the sun debug cube." },
+				{ id = "sun_marker_size",     label = "Sun Box Size",    kind = "range",  min = 10,   max = 600,  step = 10, help = "Scale of the debug sun cube." },
 				{ id = "light_shadow_enabled",  label = "Shadows",            kind = "toggle", help = "Enable directional shadow attenuation in GPU path." },
 				{ id = "light_shadow_softness", label = "Shadow Softness",    kind = "range", min = 0.4, max = 4.0, step = 0.1, help = "Shadow filtering softness." },
 				{ id = "light_shadow_distance", label = "Shadow Distance",    kind = "range", min = 200, max = 6000, step = 50, help = "Maximum shadowed distance from camera." },
@@ -556,6 +567,8 @@ local function getPauseSubTabs(tabId)
 	if tabId == "settings" then
 		return {
 			{ id = "graphics", label = "Graphics" },
+			{ id = "camera",   label = "Camera" },
+			{ id = "sound",    label = "Sound" },
 			{ id = "flight",   label = "Flight Tuning" },
 			{ id = "terrain",  label = "Terrain" },
 			{ id = "lighting", label = "Lighting" }
@@ -995,6 +1008,7 @@ function buildRestartSnapshot(targetGraphicsApiPreference)
 				graphicsApiPreference = graphicsApiPreference
 			},
 			hudSettings = deepCopyPrimitiveTable(hudSettings, 3),
+			audioSettings = deepCopyPrimitiveTable(audioSettings, 3),
 			sunSettings = deepCopyPrimitiveTable(sunSettings, 3),
 			flightModelConfig = deepCopyPrimitiveTable(flightModelConfig, 4),
 			terrainSdfDefaults = deepCopyPrimitiveTable(terrainSdfDefaults, 4),
@@ -1112,6 +1126,14 @@ function applyRestartSnapshot(snapshot)
 			end
 		end
 		resetHudCaches()
+	end
+
+	if type(snapshot.audioSettings) == "table" then
+		for key, value in pairs(snapshot.audioSettings) do
+			if audioSettings[key] ~= nil then
+				audioSettings[key] = value
+			end
+		end
 	end
 
 	if type(snapshot.sunSettings) == "table" then
@@ -1814,6 +1836,24 @@ local function getPauseItemValue(item)
 	if item.id == "draw_distance" then
 		return string.format("%dm", math.floor((graphicsSettings.drawDistance or 1800) + 0.5))
 	end
+	if item.id == "audio_enabled" then
+		return (audioSettings.enabled ~= false) and "On" or "Off"
+	end
+	if item.id == "audio_master_volume" then
+		return string.format("%d%%", math.floor(clamp((tonumber(audioSettings.masterVolume) or 0) * 100, 0, 150) + 0.5))
+	end
+	if item.id == "audio_engine_volume" then
+		return string.format("%d%%", math.floor(clamp((tonumber(audioSettings.engineVolume) or 0) * 100, 0, 150) + 0.5))
+	end
+	if item.id == "audio_ambient_volume" then
+		return string.format("%d%%", math.floor(clamp((tonumber(audioSettings.ambienceVolume) or 0) * 100, 0, 150) + 0.5))
+	end
+	if item.id == "audio_engine_pitch" then
+		return string.format("%.2fx", tonumber(audioSettings.enginePitch) or 1.0)
+	end
+	if item.id == "audio_ambient_pitch" then
+		return string.format("%.2fx", tonumber(audioSettings.ambiencePitch) or 1.0)
+	end
 	if item.id == "vsync" then
 		return graphicsSettings.vsync and "On" or "Off"
 	end
@@ -2096,6 +2136,61 @@ local function adjustPauseItem(item, direction, multiplier)
 		end
 		syncChunkingWithDrawDistance(true)
 		setPauseStatus("Draw Distance: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "audio_master_volume" then
+		audioSettings.masterVolume = clamp(
+			(tonumber(audioSettings.masterVolume) or 1.0) + item.step * direction * scale,
+			item.min,
+			item.max
+		)
+		audioSettings.masterVolume = math.floor(audioSettings.masterVolume * 100 + 0.5) / 100
+		setPauseStatus("Master Volume: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "audio_engine_volume" then
+		audioSettings.engineVolume = clamp(
+			(tonumber(audioSettings.engineVolume) or 1.0) + item.step * direction * scale,
+			item.min,
+			item.max
+		)
+		audioSettings.engineVolume = math.floor(audioSettings.engineVolume * 100 + 0.5) / 100
+		setPauseStatus("Engine Volume: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "audio_ambient_volume" then
+		audioSettings.ambienceVolume = clamp(
+			(tonumber(audioSettings.ambienceVolume) or 1.0) + item.step * direction * scale,
+			item.min,
+			item.max
+		)
+		audioSettings.ambienceVolume = math.floor(audioSettings.ambienceVolume * 100 + 0.5) / 100
+		setPauseStatus("Ambient Volume: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "audio_engine_pitch" then
+		audioSettings.enginePitch = clamp(
+			(tonumber(audioSettings.enginePitch) or 1.0) + item.step * direction * scale,
+			item.min,
+			item.max
+		)
+		audioSettings.enginePitch = math.floor(audioSettings.enginePitch * 100 + 0.5) / 100
+		setPauseStatus("Engine Pitch: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "audio_ambient_pitch" then
+		audioSettings.ambiencePitch = clamp(
+			(tonumber(audioSettings.ambiencePitch) or 1.0) + item.step * direction * scale,
+			item.min,
+			item.max
+		)
+		audioSettings.ambiencePitch = math.floor(audioSettings.ambiencePitch * 100 + 0.5) / 100
+		setPauseStatus("Ambient Pitch: " .. getPauseItemValue(item), 1.2)
 		return
 	end
 
@@ -2637,6 +2732,9 @@ local function activatePauseItem(item)
 	elseif item.id == "hud_show_peer_indicators" then
 		hudSettings.showPeerIndicators = not hudSettings.showPeerIndicators
 		setPauseStatus("Peer Indicators: " .. getPauseItemValue(item), 1.2)
+	elseif item.id == "audio_enabled" then
+		audioSettings.enabled = not (audioSettings.enabled ~= false)
+		setPauseStatus("Audio: " .. getPauseItemValue(item), 1.2)
 	elseif item.id == "reset" then
 		resetCameraTransform()
 		setPauseStatus("Camera reset.", 1.2)

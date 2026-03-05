@@ -151,6 +151,14 @@ RESTART_STATE_VERSION = defaults.restartStateVersion
 RESTART_MODEL_ENCODED_LIMIT = defaults.restartModelEncodedLimit
 
 local hudSettings = defaults.hudSettings
+local audioSettings = defaults.audioSettings or {
+	enabled = true,
+	masterVolume = 0.8,
+	engineVolume = 0.85,
+	ambienceVolume = 0.7,
+	enginePitch = 1.0,
+	ambiencePitch = 1.0
+}
 local characterOrientation = defaults.characterOrientation
 sunSettings = defaults.sunSettings
 sunDebugObject = defaults.sunDebugObject
@@ -3255,6 +3263,7 @@ local pauseExports = pauseMenuSystem.create({
 		graphicsSettings = graphicsSettings,
 		graphicsBackend = graphicsBackend,
 		hudSettings = hudSettings,
+		audioSettings = audioSettings,
 		sunSettings = sunSettings,
 		characterOrientation = characterOrientation,
 		characterPreview = characterPreview,
@@ -4524,6 +4533,12 @@ function love.update(dt)
 		startupUi.audioRuntime:update({
 			dt = dt,
 			active = flightSimMode,
+			audioEnabled = audioSettings.enabled ~= false,
+			masterVolume = audioSettings.masterVolume,
+			engineVolume = audioSettings.engineVolume,
+			ambienceVolume = audioSettings.ambienceVolume,
+			enginePitch = audioSettings.enginePitch,
+			ambiencePitch = audioSettings.ambiencePitch,
 			throttle = flightSimMode and (camera.throttle or 0) or 0,
 			afterburner = flightSimMode and controls.isActionDown("flight_afterburner"),
 			airspeed = airspeed,
