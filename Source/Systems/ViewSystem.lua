@@ -249,6 +249,29 @@ function M.create(bindings)
 		renderObjects[#renderObjects + 1] = marker
 	end
 
+	local function estimateCullRadius(obj)
+		if type(obj) ~= "table" then
+			return 0
+		end
+		local halfSize = obj.halfSize
+		if type(halfSize) ~= "table" then
+			return 0
+		end
+
+		local hx = math.abs(tonumber(halfSize.x or halfSize[1]) or 0)
+		local hy = math.abs(tonumber(halfSize.y or halfSize[2]) or 0)
+		local hz = math.abs(tonumber(halfSize.z or halfSize[3]) or 0)
+		local radius = math.sqrt((hx * hx) + (hy * hy) + (hz * hz))
+
+		-- Terrain chunks are wide and flat; use extra slack so small corner visibility does not pop.
+		if obj.isTerrainChunk or obj.isGround then
+			local edgeSpan = math.max(hx, hz)
+			radius = radius + math.max(8.0, math.min(56.0, edgeSpan * 0.45))
+		end
+
+		return radius
+	end
+
 	local function buildRenderObjectList()
 		local viewState = resolve(getViewState)
 		local camera = resolve(getCamera)
@@ -278,10 +301,7 @@ function M.create(bindings)
 					local dy = (cullPos[2] or 0) - activeCam.pos[2]
 					local dz = (cullPos[3] or 0) - activeCam.pos[3]
 					local distSq = dx * dx + dy * dy + dz * dz
-					local radius = 0
-					if obj.halfSize then
-						radius = math.max(obj.halfSize.x or 0, obj.halfSize.y or 0, obj.halfSize.z or 0)
-					end
+					local radius = estimateCullRadius(obj)
 					local limit = maxDist + radius
 					local inRange = distSq <= (limit * limit)
 					local inFrustum = true
@@ -291,8 +311,9 @@ function M.create(bindings)
 						if (z + radius) < 0.05 then
 							inFrustum = false
 						else
-							local xLimit = z * tanHalfHorizontal + radius
-							local yLimit = z * tanHalfVertical + radius
+							local zForExtent = math.max(0, z)
+							local xLimit = zForExtent * tanHalfHorizontal + radius
+							local yLimit = zForExtent * tanHalfVertical + radius
 							if math.abs(cam[1] or 0) > xLimit or math.abs(cam[2] or 0) > yLimit then
 								inFrustum = false
 							end
