@@ -6,8 +6,8 @@ local quat = require "Source.Math.Quat"
 local cubeModel = objectLib.cubeModel
 
 local MIN_MODEL_SCALE = 0.1
-local DEFAULT_INTERPOLATION_DELAY = 0.120
-local DEFAULT_EXTRAPOLATION_CAP = 0.200
+local DEFAULT_INTERPOLATION_DELAY = 0.080
+local DEFAULT_EXTRAPOLATION_CAP = 0.180
 local SNAPSHOT_BUFFER_LIMIT = 48
 
 local function sanitizeScale(value, fallback)
@@ -199,6 +199,27 @@ local function integrateQuaternion(rot, angVel, dt, qOps)
     return qOps.normalize(nextRot)
 end
 
+local function copyOffset3(value, fallback)
+    local source = type(value) == "table" and value or fallback or { 0, 0, 0 }
+    local x = tonumber(source[1] or source.x) or 0
+    local y = tonumber(source[2] or source.y) or 0
+    local z = tonumber(source[3] or source.z) or 0
+    return { x, y, z }
+end
+
+local function applyVisualOffset(basePos, baseRot, offset, qOps)
+    local pos = basePos or { 0, 0, 0 }
+    local visual = copyOffset3(offset)
+    local rotated = (qOps and type(qOps.rotateVector) == "function")
+        and qOps.rotateVector(baseRot or quatIdentity(qOps), visual)
+        or visual
+    return {
+        (pos[1] or 0) + (rotated[1] or 0),
+        (pos[2] or 0) + (rotated[2] or 0),
+        (pos[3] or 0) + (rotated[3] or 0)
+    }
+end
+
 local function hermiteVec3(p0, v0, p1, v1, dt, t)
     local t2 = t * t
     local t3 = t2 * t
@@ -302,6 +323,7 @@ function networking.createObjectForPeer(peerID, objects, qOps, playerModel, play
         id = peerID,
         scale = { activeScale, activeScale, activeScale },
         halfSize = makeHalfSize(activeScale),
+        visualOffset = copyOffset3(defaults.visualOffset, { 0, tonumber(defaults.visualOffsetY) or 0, 0 }),
         visualOffsetY = tonumber(defaults.visualOffsetY) or 0,
         modelHash = activeModelHash,
         remoteRole = role,
@@ -322,6 +344,7 @@ function networking.createObjectForPeer(peerID, objects, qOps, playerModel, play
         netReceivedAt = 0,
         stateBuffer = {}
     }
+    obj.visualOffsetY = obj.visualOffset[2]
 
     table.insert(objects, obj)
     return obj
@@ -601,7 +624,7 @@ function networking.handlePacket(data, peers, objects, qOps, playerModel, player
 
     local now = tonumber(receiveTime) or os.clock()
     obj.basePos = { px, py, pz }
-    obj.pos = { px, py + (obj.visualOffsetY or 0), pz }
+    obj.pos = applyVisualOffset(obj.basePos, obj.baseRot, obj.visualOffset, qOps)
 
     if dynamic then
         obj.netVel = copyVec3(dynamic.velocity, obj.netVel)
@@ -695,11 +718,7 @@ function networking.updateRemoteInterpolation(peers, now, opts)
             local sampled = samplePeerSnapshot(peer, sampleTime, qOps, extrapolationCap)
             if sampled then
                 peer.basePos = sampled.pos
-                peer.pos = {
-                    sampled.pos[1],
-                    sampled.pos[2] + (peer.visualOffsetY or 0),
-                    sampled.pos[3]
-                }
+                peer.pos = applyVisualOffset(sampled.pos, sampled.rot, peer.visualOffset, qOps)
                 peer.baseRot = sampled.rot
                 peer.netVel = sampled.vel
                 peer.netAngVel = sampled.angVel

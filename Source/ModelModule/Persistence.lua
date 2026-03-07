@@ -24,10 +24,6 @@ function persistence.buildModelSnapshot(asset, role, scale)
             roll = tonumber(orient.roll) or 0
         }
     end
-    local paint = asset.paintByRole and asset.paintByRole[role]
-    if paint and type(paint.hash) == "string" then
-        snapshot.paintHash = paint.hash
-    end
     return snapshot
 end
 

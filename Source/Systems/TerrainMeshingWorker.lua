@@ -11,6 +11,14 @@ local requestChannel = love.thread.getChannel(requestChannelName)
 local responseChannel = love.thread.getChannel(responseChannelName)
 local cachedContextKey = nil
 local cachedFieldContext = nil
+local activeParams = nil
+
+local function nowSeconds()
+	if type(love) == "table" and type(love.timer) == "table" and type(love.timer.getTime) == "function" then
+		return love.timer.getTime()
+	end
+	return os.clock()
+end
 
 local function clamp(value, minValue, maxValue)
 	if value < minValue then
@@ -101,11 +109,15 @@ local function buildSurfaceChunkModel(bounds, cellSize, fieldContext)
 		isSolid = true
 	}
 
+	local params = fieldContext and fieldContext.params or {}
 	local spanX = math.max(1.0, (bounds.x1 or 0) - (bounds.x0 or 0))
 	local spanZ = math.max(1.0, (bounds.z1 or 0) - (bounds.z0 or 0))
-	local step = math.max(1.0, tonumber(cellSize) or 4.0)
-	local nx = math.max(2, math.floor(spanX / step))
-	local nz = math.max(2, math.floor(spanZ / step))
+	local requestedStep = math.max(1.0, tonumber(cellSize) or 4.0)
+	local maxCellsPerAxis = clamp(math.floor(tonumber(params.maxChunkCellsPerAxis) or 48), 24, 128)
+	local stepX = math.max(requestedStep, spanX / maxCellsPerAxis)
+	local stepZ = math.max(requestedStep, spanZ / maxCellsPerAxis)
+	local nx = math.max(2, math.floor(spanX / stepX))
+	local nz = math.max(2, math.floor(spanZ / stepZ))
 	local xStep = spanX / nx
 	local zStep = spanZ / nz
 
@@ -154,7 +166,6 @@ local function buildSurfaceChunkModel(bounds, cellSize, fieldContext)
 		end
 	end
 
-	local params = fieldContext and fieldContext.params or {}
 	local waterLevel = tonumber(params.waterLevel)
 	local shorelineBand = math.max(0.2, tonumber(params.shorelineBand) or 5.0)
 	if waterLevel then
@@ -233,7 +244,12 @@ local function buildChunkMesh(cx, cz, lod, params, fieldContext)
 	local x1 = x0 + chunkSize
 	local z0 = cz * chunkSize
 	local z1 = z0 + chunkSize
-	local cellSize = (lod == 0) and params.lod0CellSize or params.lod1CellSize
+	local cellSize = params.lod2CellSize
+	if lod == 0 then
+		cellSize = params.lod0CellSize
+	elseif lod == 1 then
+		cellSize = params.lod1CellSize
+	end
 	local useSurfaceOnlyMeshing = params.surfaceOnlyMeshing ~= false
 
 	local model
@@ -287,6 +303,124 @@ local function buildChunkMesh(cx, cz, lod, params, fieldContext)
 	return model, meshMinY, meshMaxY
 end
 
+local function encodeChunkModelBinary(model)
+	if type(model) ~= "table" then
+		return nil
+	end
+	if not (type(love.data) == "table" and type(love.data.pack) == "function" and type(love.data.compress) == "function") then
+		return nil
+	end
+	local vertices = type(model.vertices) == "table" and model.vertices or {}
+	local normals = type(model.vertexNormals) == "table" and model.vertexNormals or {}
+	local colors = type(model.vertexColors) == "table" and model.vertexColors or {}
+	local faces = type(model.faces) == "table" and model.faces or {}
+	local vertexCount = #vertices
+	local normalCount = #normals
+	local colorCount = #colors
+	local faceCount = #faces
+	if vertexCount <= 0 or faceCount <= 0 then
+		return nil
+	end
+	if vertexCount > 262144 or normalCount > 262144 or colorCount > 262144 or faceCount > 262144 then
+		return nil
+	end
+
+	local parts = {}
+	parts[#parts + 1] = love.data.pack(
+		"string",
+		"<iiiii",
+		math.floor(vertexCount),
+		math.floor(normalCount),
+		math.floor(colorCount),
+		math.floor(faceCount),
+		1
+	)
+	for i = 1, vertexCount do
+		local v = vertices[i] or {}
+		parts[#parts + 1] = love.data.pack(
+			"string",
+			"<fff",
+			tonumber(v[1]) or 0,
+			tonumber(v[2]) or 0,
+			tonumber(v[3]) or 0
+		)
+	end
+	for i = 1, normalCount do
+		local n = normals[i] or {}
+		parts[#parts + 1] = love.data.pack(
+			"string",
+			"<fff",
+			tonumber(n[1]) or 0,
+			tonumber(n[2]) or 1,
+			tonumber(n[3]) or 0
+		)
+	end
+	for i = 1, colorCount do
+		local c = colors[i] or {}
+		parts[#parts + 1] = love.data.pack(
+			"string",
+			"<ffff",
+			tonumber(c[1]) or 1,
+			tonumber(c[2]) or 1,
+			tonumber(c[3]) or 1,
+			tonumber(c[4]) or 1
+		)
+	end
+	for i = 1, faceCount do
+		local f = faces[i] or {}
+		parts[#parts + 1] = love.data.pack(
+			"string",
+			"<iii",
+			math.max(1, math.floor(tonumber(f[1]) or 1)),
+			math.max(1, math.floor(tonumber(f[2]) or 1)),
+			math.max(1, math.floor(tonumber(f[3]) or 1))
+		)
+	end
+	local raw = table.concat(parts)
+	if raw == "" then
+		return nil
+	end
+	local compressed = love.data.compress("string", "lz4", raw)
+	if type(compressed) == "string" and compressed ~= "" then
+		return compressed
+	end
+	return nil
+end
+
+local function pushChunkDone(key, cx, cz, lod, generation, meshMinY, meshMaxY, buildMs, model)
+	local binaryPayload = nil
+	local okBinary = pcall(function()
+		binaryPayload = encodeChunkModelBinary(model)
+	end)
+	if okBinary and type(binaryPayload) == "string" and binaryPayload ~= "" then
+		responseChannel:push({
+			type = "build_chunk_done_bin",
+			key = key,
+			cx = cx,
+			cz = cz,
+			lod = lod,
+			generation = generation,
+			meshMinY = meshMinY,
+			meshMaxY = meshMaxY,
+			buildMs = buildMs,
+			payload = binaryPayload
+		})
+		return
+	end
+	responseChannel:push({
+		type = "build_chunk_done",
+		key = key,
+		cx = cx,
+		cz = cz,
+		lod = lod,
+		generation = generation,
+		meshMinY = meshMinY,
+		meshMaxY = meshMaxY,
+		buildMs = buildMs,
+		model = model
+	})
+end
+
 local function paramsSignature(params)
 	params = params or {}
 	return table.concat({
@@ -312,14 +446,17 @@ while true do
 	if type(job) == "table" then
 		if job.type == "quit" then
 			break
+		elseif job.type == "set_params" then
+			activeParams = type(job.params) == "table" and job.params or activeParams
 		elseif job.type == "build_chunk" then
-			local params = type(job.params) == "table" and job.params or {}
+			local params = type(activeParams) == "table" and activeParams or {}
 			local cx = tonumber(job.cx) or 0
 			local cz = tonumber(job.cz) or 0
 			local lod = clamp(math.floor(tonumber(job.lod) or 0), 0, 8)
 			local generation = math.floor(tonumber(job.generation) or 0)
 			local key = tostring(job.key or "")
 			local contextKey = paramsSignature(params)
+			local startedAt = nowSeconds()
 
 			local ok, model, meshMinY, meshMaxY = pcall(function()
 				if cachedContextKey ~= contextKey or not cachedFieldContext then
@@ -328,19 +465,10 @@ while true do
 				end
 				return buildChunkMesh(cx, cz, lod, params, cachedFieldContext)
 			end)
+			local buildMs = math.max(0, (nowSeconds() - startedAt) * 1000.0)
 
 			if ok then
-				responseChannel:push({
-					type = "build_chunk_done",
-					key = key,
-					cx = cx,
-					cz = cz,
-					lod = lod,
-					generation = generation,
-					meshMinY = meshMinY,
-					meshMaxY = meshMaxY,
-					model = model
-				})
+				pushChunkDone(key, cx, cz, lod, generation, meshMinY, meshMaxY, buildMs, model)
 			else
 				responseChannel:push({
 					type = "build_chunk_failed",
@@ -348,7 +476,44 @@ while true do
 					cx = cx,
 					cz = cz,
 					lod = lod,
-					generation = generation
+					generation = generation,
+					buildMs = buildMs
+				})
+			end
+		elseif job.type == "build_chunk_bin" then
+			local params = type(activeParams) == "table" and activeParams or {}
+			local key = tostring(job.key or "")
+			local cx, cz, lod, generation = 0, 0, 0, 0
+			if type(love.data) == "table" and type(love.data.unpack) == "function" and type(job.payload) == "string" then
+				local ux, uz, ulod, ugeneration = love.data.unpack("<iiii", job.payload)
+				cx = tonumber(ux) or 0
+				cz = tonumber(uz) or 0
+				lod = clamp(math.floor(tonumber(ulod) or 0), 0, 8)
+				generation = math.floor(tonumber(ugeneration) or 0)
+			end
+			local contextKey = paramsSignature(params)
+			local startedAt = nowSeconds()
+
+			local ok, model, meshMinY, meshMaxY = pcall(function()
+				if cachedContextKey ~= contextKey or not cachedFieldContext then
+					cachedFieldContext = sdfField.createContext(params)
+					cachedContextKey = contextKey
+				end
+				return buildChunkMesh(cx, cz, lod, params, cachedFieldContext)
+			end)
+			local buildMs = math.max(0, (nowSeconds() - startedAt) * 1000.0)
+
+			if ok then
+				pushChunkDone(key, cx, cz, lod, generation, meshMinY, meshMaxY, buildMs, model)
+			else
+				responseChannel:push({
+					type = "build_chunk_failed",
+					key = key,
+					cx = cx,
+					cz = cz,
+					lod = lod,
+					generation = generation,
+					buildMs = buildMs
 				})
 			end
 		end

@@ -28,6 +28,20 @@ function M.create(bindings)
 	local getMouseSensitivity = bindings.mouseSensitivity
 	local getInvertLookY = bindings.invertLookY
 	local getWalkingPitchLimit = bindings.walkingPitchLimit
+	local sampleGroundHeightAt = bindings.sampleGroundHeightAt
+
+	local function safeClamp(value, minValue, maxValue)
+		if clamp then
+			return clamp(value, minValue, maxValue)
+		end
+		if value < minValue then
+			return minValue
+		end
+		if value > maxValue then
+			return maxValue
+		end
+		return value
+	end
 
 	local function composeWalkingRotation(yaw, pitch)
 		local yawQuat = q.fromAxisAngle({ 0, 1, 0 }, yaw)
@@ -320,6 +334,56 @@ function M.create(bindings)
 		return radius
 	end
 
+	local function terrainOccludesObject(obj, activeCam, radius)
+		if type(sampleGroundHeightAt) ~= "function" then
+			return false
+		end
+		if type(obj) ~= "table" or type(activeCam) ~= "table" then
+			return false
+		end
+		if obj.isTerrainChunk or obj.isGround or obj.isCloud or obj.noTerrainOcclusion then
+			return false
+		end
+		local cullPos = obj.terrainCenter or obj.pos
+		if not (cullPos and activeCam.pos) then
+			return false
+		end
+
+		local camX = tonumber(activeCam.pos[1]) or 0
+		local camY = tonumber(activeCam.pos[2]) or 0
+		local camZ = tonumber(activeCam.pos[3]) or 0
+		local targetX = tonumber(cullPos[1]) or 0
+		local targetY = tonumber(cullPos[2]) or 0
+		local targetZ = tonumber(cullPos[3]) or 0
+		local dx = targetX - camX
+		local dz = targetZ - camZ
+		local distXZ = math.sqrt(dx * dx + dz * dz)
+		if distXZ < 120 then
+			return false
+		end
+
+		local projectedTargetY = targetY + radius * 0.35
+		local sampleCount = safeClamp(math.floor(distXZ / 90), 2, 14)
+		local blockedRun = 0
+		for i = 1, sampleCount - 1 do
+			local t = i / sampleCount
+			local sx = camX + dx * t
+			local sz = camZ + dz * t
+			local terrainY = sampleGroundHeightAt(sx, sz)
+			local sightY = camY + (projectedTargetY - camY) * t - radius * 0.15
+			if terrainY and (terrainY > (sightY + 1.5)) then
+				blockedRun = blockedRun + 1
+				if blockedRun >= 2 then
+					return true
+				end
+			else
+				blockedRun = 0
+			end
+		end
+
+		return false
+	end
+
 	local function buildRenderObjectList()
 		local viewState = resolve(getViewState)
 		local camera = resolve(getCamera)
@@ -332,12 +396,14 @@ function M.create(bindings)
 		local camConj = nil
 		local tanHalfVertical = math.tan((activeCam and activeCam.fov or math.rad(90)) * 0.5)
 		local tanHalfHorizontal = tanHalfVertical
+		local screenHeight = 1080
 		if activeCam and activeCam.rot then
 			camConj = q.conjugate(activeCam.rot)
 			if type(love) == "table" and type(love.graphics) == "table" and type(love.graphics.getDimensions) == "function" then
 				local w, h = love.graphics.getDimensions()
 				local aspect = (h and h > 0) and (w / h) or 1.0
 				tanHalfHorizontal = tanHalfVertical * math.max(0.25, aspect)
+				screenHeight = (h and h > 0) and h or screenHeight
 			end
 		end
 
@@ -361,14 +427,16 @@ function M.create(bindings)
 							inFrustum = false
 						else
 							local zForExtent = math.max(0, z)
-							local xLimit = zForExtent * tanHalfHorizontal + radius
-							local yLimit = zForExtent * tanHalfVertical + radius
+							local worldPerPixel = (zForExtent * tanHalfVertical * 2.0) / math.max(1.0, screenHeight)
+							local pixelSlack = math.max(worldPerPixel * 3.0, 0.02)
+							local xLimit = zForExtent * tanHalfHorizontal + radius + pixelSlack
+							local yLimit = zForExtent * tanHalfVertical + radius + pixelSlack
 							if math.abs(cam[1] or 0) > xLimit or math.abs(cam[2] or 0) > yLimit then
 								inFrustum = false
 							end
 						end
 					end
-					if inRange and inFrustum then
+					if inRange and inFrustum and (not terrainOccludesObject(obj, activeCam, radius)) then
 						renderObjects[#renderObjects + 1] = obj
 					end
 				else

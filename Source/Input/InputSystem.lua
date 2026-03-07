@@ -188,6 +188,7 @@ function M.create(bindings)
 		if (now - lastProjectileTriggerAt) >= 0.2 then
 			lastProjectileTriggerAt = now
 			logger.log("Projectile fire input received (projectile spawning not implemented yet).")
+			bulletFiring = true
 		end
 	end
 

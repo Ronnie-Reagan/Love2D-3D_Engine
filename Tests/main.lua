@@ -115,7 +115,9 @@ local function runSelectedOrAll()
 	end
 
 	if failures > 0 then
-		error(string.format("%d test file(s) failed.", failures))
+		print(string.format("[summary] %d test file(s) failed.", failures))
+		love.event.quit(1)
+		return
 	end
 	love.event.quit(0)
 end

@@ -44,6 +44,7 @@ local REQUIRED_READ_BINDINGS = {
 	"activeGroundParams",
 	"audioSettings",
 	"applySunSettingsToRenderer",
+	"buildConfiguredPaintSnapshotForRole",
 	"camera",
 	"characterOrientation",
 	"characterPreview",
@@ -72,6 +73,7 @@ local REQUIRED_READ_BINDINGS = {
 	"frameImageW",
 	"getActiveModelRole",
 	"getConfiguredModelForRole",
+	"getConfiguredSkinHashForRole",
 	"getRelayStatus",
 	"getRoleOrientation",
 	"graphicsBackend",
@@ -86,8 +88,10 @@ local REQUIRED_READ_BINDINGS = {
 	"logger",
 	"love",
 	"mapState",
+	"radioState",
 	"modelLoadPrompt",
 	"modelLoadTargetRole",
+	"modelModule",
 	"modelTransferState",
 	"mouseSensitivity",
 	"normalizeRoleId",
@@ -107,9 +111,11 @@ local REQUIRED_READ_BINDINGS = {
 	"resetAltLookState",
 	"resetCameraTransform",
 	"resolveActiveRenderCamera",
+	"restoreConfiguredPaintSnapshotForRole",
 	"screen",
 	"setFlightMode",
 	"setActivePlayerModel",
+	"setConfiguredSkinHashForRole",
 	"setMouseCapture",
 	"setRendererPreference",
 	"showCrosshair",
@@ -310,6 +316,7 @@ function M.create(bindings)
 	subTab = {
 		settings = "graphics",
 		characters = "plane",
+		paint = "plane",
 		hud = "speedometer"
 	},
 	selected = 1,
@@ -335,6 +342,27 @@ function M.create(bindings)
 	statusUntil = 0,
 	confirmItemId = nil,
 	confirmUntil = 0,
+	paint = {
+		sessionId = nil,
+		role = "plane",
+		assetId = nil,
+		modelHash = nil,
+		mode = "paint",
+		brushSize = 28,
+		brushOpacity = 0.92,
+		brushHardness = 0.75,
+		colorIndex = 1,
+		canvasBounds = nil,
+		actionBounds = {},
+		swatchBounds = {},
+		sliderBounds = {},
+		draggingCanvas = false,
+		draggingSlider = nil,
+		lastCanvasU = nil,
+		lastCanvasV = nil,
+		lastPaintAt = -math.huge,
+		helpText = "Open the Paint tab, drag on the canvas, then commit to sync your skin."
+	},
 	mainItems = {
 		{ id = "resume",    label = "Resume",          kind = "action", help = "Close pause menu and continue playing." },
 		{ id = "flight",    label = "Flight Mode",     kind = "toggle", help = "Toggle between rigid-body prop flight and walking mode." },
@@ -349,7 +377,9 @@ function M.create(bindings)
 				{ id = "resolution",    label = "Resolution",        kind = "cycle",  help = "Target display resolution. In borderless mode this follows desktop resolution." },
 				{ id = "apply_video",   label = "Apply Display",     kind = "action", help = "Apply the selected window mode and resolution now." },
 				{ id = "render_scale",  label = "Render Scale",      kind = "range",  min = 0.5, max = 1.5, step = 0.05, help = "Internal 3D render scale separate from display resolution." },
-				{ id = "draw_distance", label = "Draw Distance",     kind = "range",  min = 300, max = 5000, step = 100, help = "Controls object culling and terrain streaming radius." },
+				{ id = "draw_distance", label = "Draw Distance",     kind = "range",  min = 300, max = 20000, step = 100, help = "Controls object culling and terrain streaming radius." },
+				{ id = "horizon_fog",   label = "Horizon Fog",       kind = "toggle", help = "Enable atmospheric distance fog for horizon occlusion and depth cueing." },
+				{ id = "texture_mipmaps", label = "Texture Mipmaps", kind = "toggle", help = "Use mipmap filtering for distant textures to reduce shimmer and aliasing." },
 				{ id = "vsync",         label = "VSync",             kind = "toggle", help = "Toggle vertical sync for display presentation." },
 				{ id = "renderer",      label = "Renderer",          kind = "toggle", help = "Switch between GPU and CPU renderer paths." },
 				{ id = "graphics_api",  label = "Graphics API",      kind = "cycle",  help = "Choose startup graphics API preference. Applying this restarts the game." },
@@ -368,8 +398,12 @@ function M.create(bindings)
 				{ id = "audio_master_volume",  label = "Master Volume",     kind = "range",  min = 0.0, max = 1.5, step = 0.05, help = "Overall audio gain." },
 				{ id = "audio_engine_volume",  label = "Engine Volume",     kind = "range",  min = 0.0, max = 1.5, step = 0.05, help = "Engine synth layer volume." },
 				{ id = "audio_ambient_volume", label = "Ambient Volume",    kind = "range",  min = 0.0, max = 1.5, step = 0.05, help = "Wind/water ambience volume." },
-				{ id = "audio_engine_pitch",   label = "Engine Pitch",      kind = "range",  min = 0.3, max = 2.2, step = 0.05, help = "Pitch multiplier for engine layer." },
-				{ id = "audio_ambient_pitch",  label = "Ambient Pitch",     kind = "range",  min = 0.3, max = 2.2, step = 0.05, help = "Pitch multiplier for ambience layer." }
+				{ id = "audio_engine_pitch",   label = "Engine Pitch",      kind = "range",  min = 0.6, max = 1.4, step = 0.05, help = "Pitch trim for the engine layer after the audio retune." },
+				{ id = "audio_ambient_pitch",  label = "Ambient Pitch",     kind = "range",  min = 0.6, max = 1.4, step = 0.05, help = "Pitch trim for ambience after the audio retune." }
+			},
+			radio = {
+				{ id = "radio_channel",    label = "Radio Channel",   kind = "range", min = 1, max = 8, step = 1, help = "Tune the active radio frequency/channel used for ENet voice routing." },
+				{ id = "map_orientation", label = "Map Orientation", kind = "cycle", help = "Switch the mini-map between heading-up and north-up modes." }
 			},
 			flight = {
 				{ id = "fm_mass",            label = "Mass (kg)",         kind = "range", min = 450, max = 4000, step = 10, help = "Aircraft mass used by the 6-DoF rigid-body integrator." },
@@ -391,7 +425,8 @@ function M.create(bindings)
 				{ id = "terrain_tunnel_radius_min", label = "Tunnel R Min",     kind = "range", min = 2, max = 40, step = 1, help = "Minimum tunnel radius." },
 				{ id = "terrain_tunnel_radius_max", label = "Tunnel R Max",     kind = "range", min = 2, max = 60, step = 1, help = "Maximum tunnel radius." },
 				{ id = "terrain_lod0_radius",     label = "LOD0 Radius",        kind = "range", min = 1, max = 6, step = 1, help = "High-detail chunk radius around the player." },
-				{ id = "terrain_lod1_radius",     label = "LOD1 Radius",        kind = "range", min = 2, max = 10, step = 1, help = "Coarse-detail chunk radius around the player." },
+				{ id = "terrain_lod1_radius",     label = "LOD1 Radius",        kind = "range", min = 2, max = 12, step = 1, help = "Coarse-detail chunk radius around the player." },
+				{ id = "terrain_quality",         label = "Terrain Quality",    kind = "range", min = 0.8, max = 4.0, step = 0.2, help = "Scales terrain mesh density. Higher costs much more CPU/GPU time." },
 				{ id = "terrain_mesh_budget",     label = "Mesh Budget",        kind = "range", min = 1, max = 8, step = 1, help = "Maximum chunk builds finalized per frame." }
 			},
 			lighting = {
@@ -414,19 +449,25 @@ function M.create(bindings)
 	characterItems = {
 		plane = {
 			{ id = "load_custom_stl",         label = "Load Plane Model", kind = "action", help = "Open a path prompt and load STL, GLB, or GLTF from disk (or drop STL/GLB on the window)." },
-			{ id = "model_scale",             label = "Plane Scale",    kind = "range",  min = 0.1,                                                                              max = 5.0, step = 0.05, help = "Scale normalized plane models for all clients (positive only)." },
+			{ id = "model_scale",             label = "Plane Scale",    kind = "range",  min = 0.1,                                                                              max = 40.0, step = 0.05, help = "Scale normalized plane models for all clients (positive only)." },
 			{ id = "plane_preview_yaw",       label = "Model Yaw",      kind = "range",  min = -360,                                                                            max = 360, step = 5,    help = "Rotate the real plane model (world + preview) around the vertical axis." },
 			{ id = "plane_preview_pitch",     label = "Model Pitch",    kind = "range",  min = -360,                                                                            max = 360, step = 5,    help = "Rotate the real plane model (world + preview) around the lateral axis." },
 			{ id = "plane_preview_roll",      label = "Model Roll",     kind = "range",  min = -360,                                                                            max = 360, step = 5,    help = "Rotate the real plane model (world + preview) around the forward axis." },
+			{ id = "plane_model_offset_x",    label = "Model Offset X", kind = "range",  min = -20.0,                                                                           max = 20.0, step = 0.05, help = "Local X visual offset applied to the plane model mesh." },
+			{ id = "plane_model_offset_y",    label = "Model Offset Y", kind = "range",  min = -20.0,                                                                           max = 20.0, step = 0.05, help = "Local Y visual offset applied to the plane model mesh." },
+			{ id = "plane_model_offset_z",    label = "Model Offset Z", kind = "range",  min = -20.0,                                                                           max = 20.0, step = 0.05, help = "Local Z visual offset applied to the plane model mesh." },
 			{ id = "plane_preview_zoom",      label = "Preview Zoom",   kind = "range",  min = 0.5,                                                                             max = 4.0, step = 0.05, help = "Scale only the preview display model." },
 			{ id = "plane_preview_auto_spin", label = "Auto Spin",      kind = "toggle", help = "When enabled, preview yaw rotates automatically." }
 		},
 		walking = {
 			{ id = "load_walking_stl",          label = "Load Walking Model", kind = "action", help = "Load a separate STL, GLB, or GLTF used only when not in flight mode." },
-			{ id = "walking_model_scale",       label = "Walking Scale",    kind = "range",  min = 0.1,                                                      max = 3.0, step = 0.05, help = "Scale used for walking-mode player model." },
+			{ id = "walking_model_scale",       label = "Walking Scale",    kind = "range",  min = 0.1,                                                      max = 20.0, step = 0.05, help = "Scale used for walking-mode player model." },
 			{ id = "walking_preview_yaw",       label = "Model Yaw",        kind = "range",  min = -180,                                                     max = 180, step = 5,    help = "Rotate the real walking model (world + preview) around the vertical axis." },
 			{ id = "walking_preview_pitch",     label = "Model Pitch",      kind = "range",  min = -180,                                                     max = 180, step = 5,    help = "Rotate the real walking model (world + preview) around the lateral axis." },
 			{ id = "walking_preview_roll",      label = "Model Roll",       kind = "range",  min = -180,                                                     max = 180, step = 5,    help = "Rotate the real walking model (world + preview) around the forward axis." },
+			{ id = "walking_model_offset_x",    label = "Model Offset X",   kind = "range",  min = -20.0,                                                    max = 20.0, step = 0.05, help = "Local X visual offset applied to the walking model mesh." },
+			{ id = "walking_model_offset_y",    label = "Model Offset Y",   kind = "range",  min = -20.0,                                                    max = 20.0, step = 0.05, help = "Local Y visual offset applied to the walking model mesh." },
+			{ id = "walking_model_offset_z",    label = "Model Offset Z",   kind = "range",  min = -20.0,                                                    max = 20.0, step = 0.05, help = "Local Z visual offset applied to the walking model mesh." },
 			{ id = "walking_preview_zoom",      label = "Preview Zoom",     kind = "range",  min = 0.5,                                                      max = 2.0, step = 0.05, help = "Scale only the preview display model." },
 			{ id = "walking_preview_auto_spin", label = "Auto Spin",        kind = "toggle", help = "When enabled, preview yaw rotates automatically." }
 		}
@@ -451,6 +492,16 @@ function M.create(bindings)
 }
 
 local controlActions = controls.getActions()
+local PAINT_COLOR_PRESETS = {
+	{ label = "Porcelain", color = { 0.96, 0.96, 0.94, 1.0 } },
+	{ label = "Coal", color = { 0.08, 0.09, 0.10, 1.0 } },
+	{ label = "Signal", color = { 0.88, 0.18, 0.16, 1.0 } },
+	{ label = "Marigold", color = { 0.92, 0.68, 0.16, 1.0 } },
+	{ label = "Lime", color = { 0.40, 0.74, 0.22, 1.0 } },
+	{ label = "Sky", color = { 0.20, 0.56, 0.92, 1.0 } },
+	{ label = "Violet", color = { 0.54, 0.34, 0.88, 1.0 } },
+	{ label = "Rose", color = { 0.88, 0.34, 0.54, 1.0 } }
+}
 
 local function resetControlBindingsToDefaults()
 	controlActions = controls.resetToDefaults()
@@ -496,13 +547,22 @@ local function getPauseHelpSections()
 		{
 			title = "Pause Menu",
 			items = {
-				{ keys = "Tab / H",           text = "Cycle top tabs: Main, Settings, Characters, HUD, Controls, Help." },
-				{ keys = "[ / ]",             text = "Cycle sub-pages when available (Settings, Characters, and HUD)." },
+				{ keys = "Tab / H",           text = "Cycle top tabs: Main, Settings, Characters, Paint, HUD, Controls, Help." },
+				{ keys = "[ / ]",             text = "Cycle sub-pages when available (Settings, Characters, Paint, and HUD)." },
 				{ keys = "W/S or Up/Down",    text = "Move selection in list pages or Controls tab." },
 				{ keys = "A/D or Left/Right", text = "Adjust selected values or select controls binding slot." },
 				{ keys = "Enter",             text = "Activate item or start binding capture in Controls." },
 				{ keys = "Mouse Wheel",       text = "Adjust ranges (list pages) or scroll (Help/Controls)." },
 				{ keys = "Esc",               text = "Resume game, or cancel bind capture first." }
+			}
+		},
+		{
+			title = "Painting",
+			items = {
+				{ keys = "Paint Tab", text = "Use the Paint tab to edit plane or player skins on a 2D texture canvas." },
+				{ keys = "Drag Mouse", text = "Paint or erase on the active overlay." },
+				{ keys = "1 / 2", text = "Switch between brush and eraser while the Paint tab is open." },
+				{ keys = "F / Z / Y / P", text = "Fill, undo, redo, and commit paint changes using the bound paint controls." }
 			}
 		}
 	}
@@ -557,6 +617,7 @@ local function getPauseTopTabs()
 		{ id = "main",       label = "Main" },
 		{ id = "settings",   label = "Settings" },
 		{ id = "characters", label = "Characters" },
+		{ id = "paint",      label = "Paint" },
 		{ id = "hud",        label = "HUD" },
 		{ id = "controls",   label = "Controls" },
 		{ id = "help",       label = "Help" }
@@ -569,12 +630,19 @@ local function getPauseSubTabs(tabId)
 			{ id = "graphics", label = "Graphics" },
 			{ id = "camera",   label = "Camera" },
 			{ id = "sound",    label = "Sound" },
+			{ id = "radio",    label = "Radio" },
 			{ id = "flight",   label = "Flight Tuning" },
 			{ id = "terrain",  label = "Terrain" },
 			{ id = "lighting", label = "Lighting" }
 		}
 	end
 	if tabId == "characters" then
+		return {
+			{ id = "plane",   label = "Plane" },
+			{ id = "walking", label = "Player" }
+		}
+	end
+	if tabId == "paint" then
 		return {
 			{ id = "plane",   label = "Plane" },
 			{ id = "walking", label = "Player" }
@@ -825,7 +893,9 @@ local function syncGraphicsSettingsFromWindow()
 	graphicsSettings.resolutionOptions = collectResolutionOptions()
 	graphicsSettings.resolutionIndex = findClosestResolutionIndex(graphicsSettings.resolutionOptions, w, h)
 	graphicsSettings.renderScale = clamp(graphicsSettings.renderScale or 1.0, 0.5, 1.5)
-	graphicsSettings.drawDistance = clamp(graphicsSettings.drawDistance or 1800, 300, 5000)
+	graphicsSettings.drawDistance = clamp(graphicsSettings.drawDistance or 5000, 300, 20000)
+	graphicsSettings.horizonFog = graphicsSettings.horizonFog ~= false
+	graphicsSettings.textureMipmaps = graphicsSettings.textureMipmaps ~= false
 	graphicsSettings.graphicsApiPreference = normalizeGraphicsApiPreference(graphicsSettings.graphicsApiPreference)
 end
 
@@ -957,6 +1027,11 @@ function buildRestartModelSnapshot(role, hash, scale)
 	if type(entry.encoded) == "string" and entry.encoded ~= "" and #entry.encoded <= RESTART_MODEL_ENCODED_LIMIT then
 		snapshot.encoded = entry.encoded
 	end
+	local paintSnapshot = buildConfiguredPaintSnapshotForRole(role)
+	if type(paintSnapshot) == "table" then
+		snapshot.skinHash = paintSnapshot.paintHash
+		snapshot.skinEncoded = paintSnapshot.paintEncoded
+	end
 	return snapshot
 end
 
@@ -994,7 +1069,15 @@ function buildRestartSnapshot(targetGraphicsApiPreference)
 			colorCorruptionMode = colorCorruptionMode and true or false,
 			mapState = {
 				visible = mapState.visible and true or false,
-				zoomIndex = tonumber(mapState.zoomIndex) or 2
+				zoomIndex = tonumber(mapState.zoomIndex) or 2,
+				orientationMode = (mapState.orientationMode == "north_up") and "north_up" or "heading_up",
+				qualityScale = tonumber(mapState.qualityScale) or 2.0,
+				maxResolution = tonumber(mapState.maxResolution) or 1024,
+				workerEnabled = mapState.workerEnabled == true
+			},
+			radioState = {
+				channel = tonumber(radioState and radioState.channel) or 1,
+				channelCount = tonumber(radioState and radioState.channelCount) or 8
 			},
 			graphicsSettings = {
 				windowMode = graphicsSettings.windowMode,
@@ -1004,6 +1087,8 @@ function buildRestartSnapshot(targetGraphicsApiPreference)
 				} or nil,
 				renderScale = tonumber(graphicsSettings.renderScale) or 1.0,
 				drawDistance = tonumber(graphicsSettings.drawDistance) or 1800,
+				horizonFog = graphicsSettings.horizonFog ~= false,
+				textureMipmaps = graphicsSettings.textureMipmaps ~= false,
 				vsync = graphicsSettings.vsync and true or false,
 				graphicsApiPreference = graphicsApiPreference
 			},
@@ -1065,7 +1150,7 @@ function restoreModelFromRestartSnapshot(role, snapshot)
 
 	local targetRole = (role == "walking") and "walking" or "plane"
 	local minScale = 0.1
-	local maxScale = 3.0
+	local maxScale = (targetRole == "walking") and 20.0 or 40.0
 	local defaultScale = (targetRole == "walking") and defaultWalkingModelScale or defaultPlayerModelScale
 	local restoredScale = clamp(tonumber(snapshot.scale) or defaultScale, minScale, maxScale)
 	if targetRole == "walking" then
@@ -1102,6 +1187,8 @@ function restoreModelFromRestartSnapshot(role, snapshot)
 			setActivePlayerModel(fallback, "builtin cube", targetRole)
 		end
 	end
+
+	restoreConfiguredPaintSnapshotForRole(targetRole, snapshot)
 end
 
 function applyRestartSnapshot(snapshot)
@@ -1134,6 +1221,8 @@ function applyRestartSnapshot(snapshot)
 				audioSettings[key] = value
 			end
 		end
+		audioSettings.enginePitch = clamp(tonumber(audioSettings.enginePitch) or 1.0, 0.6, 1.4)
+		audioSettings.ambiencePitch = clamp(tonumber(audioSettings.ambiencePitch) or 1.0, 0.6, 1.4)
 	end
 
 	if type(snapshot.sunSettings) == "table" then
@@ -1170,6 +1259,12 @@ function applyRestartSnapshot(snapshot)
 				orient.yaw = tonumber(source.yaw) or orient.yaw
 				orient.pitch = tonumber(source.pitch) or orient.pitch
 				orient.roll = tonumber(source.roll) or orient.roll
+				local sourceOffset = type(source.offset) == "table" and source.offset or { 0, tonumber(source.offsetY) or 0, 0 }
+				orient.offset = orient.offset or { 0, 0, 0 }
+				orient.offset[1] = tonumber(sourceOffset[1] or sourceOffset.x) or orient.offset[1] or 0
+				orient.offset[2] = tonumber(sourceOffset[2] or sourceOffset.y) or orient.offset[2] or 0
+				orient.offset[3] = tonumber(sourceOffset[3] or sourceOffset.z) or orient.offset[3] or 0
+				orient.offsetY = orient.offset[2]
 			end
 		end
 	end
@@ -1179,7 +1274,9 @@ function applyRestartSnapshot(snapshot)
 		graphicsSettings.windowMode = (desiredGraphics.windowMode == "fullscreen" or desiredGraphics.windowMode == "borderless")
 			and desiredGraphics.windowMode or "windowed"
 		graphicsSettings.renderScale = clamp(tonumber(desiredGraphics.renderScale) or graphicsSettings.renderScale, 0.5, 1.5)
-		graphicsSettings.drawDistance = clamp(tonumber(desiredGraphics.drawDistance) or graphicsSettings.drawDistance, 300, 5000)
+		graphicsSettings.drawDistance = clamp(tonumber(desiredGraphics.drawDistance) or graphicsSettings.drawDistance, 300, 20000)
+		graphicsSettings.horizonFog = desiredGraphics.horizonFog ~= false
+		graphicsSettings.textureMipmaps = desiredGraphics.textureMipmaps ~= false
 		graphicsSettings.vsync = desiredGraphics.vsync and true or false
 		graphicsSettings.graphicsApiPreference = normalizeGraphicsApiPreference(
 			desiredGraphics.graphicsApiPreference or graphicsSettings.graphicsApiPreference
@@ -1197,6 +1294,12 @@ function applyRestartSnapshot(snapshot)
 		local ok, err = applyGraphicsVideoMode()
 		if not ok then
 			logger.log("Restart state display restore failed: " .. tostring(err))
+		end
+		applySunSettingsToRenderer()
+		if renderer and type(renderer.setTextureSampling) == "function" then
+			renderer.setTextureSampling({
+				textureMipmaps = graphicsSettings.textureMipmaps ~= false
+			})
 		end
 	end
 
@@ -1287,8 +1390,20 @@ function applyRestartSnapshot(snapshot)
 	if storedMap then
 		mapState.visible = storedMap.visible ~= false
 		mapState.zoomIndex = clamp(math.floor(tonumber(storedMap.zoomIndex) or mapState.zoomIndex), 1, #mapState.zoomExtents)
+		mapState.orientationMode = (storedMap.orientationMode == "north_up") and "north_up" or "heading_up"
+		mapState.qualityScale = clamp(tonumber(storedMap.qualityScale) or mapState.qualityScale or 2.0, 0.75, 3.0)
+		mapState.maxResolution = math.max(160, math.floor(tonumber(storedMap.maxResolution) or mapState.maxResolution or 1024))
+		mapState.workerEnabled = storedMap.workerEnabled == true
 		mapState.logicalCamera = nil
 		invalidateMapCache()
+	end
+
+	local storedRadio = type(snapshot.radioState) == "table" and snapshot.radioState or nil
+	if storedRadio and type(radioState) == "table" then
+		local maxChannel = math.max(1, math.floor(tonumber(storedRadio.channelCount) or tonumber(radioState.channelCount) or 8))
+		radioState.channelCount = maxChannel
+		radioState.channel = clamp(math.floor(tonumber(storedRadio.channel) or tonumber(radioState.channel) or 1), 1, maxChannel)
+		radioState.lastSentAt = -math.huge
 	end
 
 	local desiredViewMode = snapshot.viewMode
@@ -1371,6 +1486,11 @@ function requestGraphicsApiRestart(targetGraphicsApiPreference)
 	local targetPreference = normalizeGraphicsApiPreference(targetGraphicsApiPreference)
 	local snapshot = buildRestartSnapshot(targetPreference)
 	logger.log("Applying graphics API preference '" .. targetPreference .. "' via in-process restart.")
+	if not (love and love.event and type(love.event.restart) == "function") then
+		local err = "love.event.restart is unavailable on this runtime"
+		logger.log("Restart failed: " .. err)
+		return false, err
+	end
 	local ok, err = pcall(function()
 		love.event.restart(snapshot)
 	end)
@@ -1380,6 +1500,9 @@ function requestGraphicsApiRestart(targetGraphicsApiPreference)
 	end
 	return true
 end
+
+local resetPausePaintInteraction
+local endPausePaintSession
 
 local function cyclePauseSubTab(direction)
 	local tabs = getPauseSubTabs(pauseMenu.tab)
@@ -1406,6 +1529,7 @@ local function cyclePauseSubTab(direction)
 	pauseMenu.dragRange.moved = false
 	pauseMenu.confirmItemId = nil
 	pauseMenu.confirmUntil = 0
+	endPausePaintSession()
 end
 
 local function getSelectedControlAction()
@@ -1556,14 +1680,388 @@ local function captureBindingFromMouseMotion(dx, dy)
 	return commitControlBindingCapture(binding)
 end
 
+local function getPausePaintRole()
+	local sub = getPauseActiveSubTab("paint")
+	return (sub == "walking") and "walking" or "plane"
+end
+
+local function pointInBounds(bounds, x, y)
+	return bounds and x >= bounds.x and x <= (bounds.x + bounds.w) and y >= bounds.y and y <= (bounds.y + bounds.h)
+end
+
+local function shortHash(value)
+	local text = tostring(value or "")
+	if #text <= 10 then
+		return text
+	end
+	return text:sub(1, 10) .. "..."
+end
+
+resetPausePaintInteraction = function()
+	pauseMenu.paint.draggingCanvas = false
+	pauseMenu.paint.draggingSlider = nil
+	pauseMenu.paint.lastCanvasU = nil
+	pauseMenu.paint.lastCanvasV = nil
+end
+
+local function resolvePausePaintTarget(role)
+	role = (role == "walking") and "walking" or "plane"
+	local modelHash, modelScale = getConfiguredModelForRole(role)
+	local entry = playerModelCache[modelHash or "builtin-cube"]
+	local asset = entry and entry.assetId and modelModule.getAsset(entry.assetId) or nil
+	local model = asset and asset.model or (entry and entry.model) or nil
+	local hasUvs = model and type(model.vertexUVs) == "table" and #model.vertexUVs > 0
+	return {
+		role = role,
+		modelHash = modelHash or "builtin-cube",
+		modelScale = tonumber(modelScale) or 1.0,
+		entry = entry,
+		assetId = entry and entry.assetId or nil,
+		asset = asset,
+		hasUvs = hasUvs and true or false
+	}
+end
+
+endPausePaintSession = function()
+	local sessionId = pauseMenu.paint.sessionId
+	if sessionId and type(modelModule.endPaintSession) == "function" then
+		modelModule.endPaintSession(sessionId)
+	end
+	pauseMenu.paint.sessionId = nil
+	pauseMenu.paint.assetId = nil
+	pauseMenu.paint.modelHash = nil
+	resetPausePaintInteraction()
+end
+
+local function getPausePaintColor()
+	local index = clamp(pauseMenu.paint.colorIndex or 1, 1, #PAINT_COLOR_PRESETS)
+	local preset = PAINT_COLOR_PRESETS[index] or PAINT_COLOR_PRESETS[1]
+	return {
+		preset.color[1],
+		preset.color[2],
+		preset.color[3],
+		preset.color[4]
+	}, preset
+end
+
+local function syncPausePaintCommit(role)
+	if role == getActiveModelRole() then
+		syncActivePlayerModelState()
+	else
+		forceStateSync()
+	end
+end
+
+local function ensurePausePaintSession(role, showStatus)
+	role = (role == "walking") and "walking" or "plane"
+	local target = resolvePausePaintTarget(role)
+	pauseMenu.paint.role = role
+	if not target.assetId then
+		if showStatus then
+			setPauseStatus("Painting requires a loaded GLB/GLTF/STL model asset.", 2.2)
+		end
+		return nil, "paint target unavailable", target
+	end
+
+	if pauseMenu.paint.sessionId and pauseMenu.paint.assetId == target.assetId and pauseMenu.paint.role == role and
+		pauseMenu.paint.modelHash == target.modelHash then
+		return pauseMenu.paint.sessionId, nil, target
+	end
+
+	endPausePaintSession()
+	local sessionId, err = modelModule.beginPaintSession(
+		target.assetId,
+		role,
+		localCallsign or "local",
+		getConfiguredSkinHashForRole(role)
+	)
+	if not sessionId then
+		if showStatus then
+			setPauseStatus("Paint session failed: " .. tostring(err), 2.4)
+		end
+		return nil, err, target
+	end
+
+	pauseMenu.paint.sessionId = sessionId
+	pauseMenu.paint.assetId = target.assetId
+	pauseMenu.paint.modelHash = target.modelHash
+	resetPausePaintInteraction()
+	if target.hasUvs then
+		pauseMenu.paint.helpText = "Drag on the canvas to paint. Commit to save and sync the current overlay."
+	elseif showStatus then
+		setPauseStatus("Warning: this model has no UV map, so paint may not appear on the mesh.", 2.4)
+		pauseMenu.paint.helpText = "This model has no UV map. You can still edit the overlay, but it may not render on the mesh."
+	end
+	return sessionId, nil, target
+end
+
+local function getPausePaintSession(role, showStatus)
+	local sessionId, err, target = ensurePausePaintSession(role, showStatus)
+	if not sessionId then
+		return nil, err, target
+	end
+	local session = type(modelModule.getPaintSession) == "function" and modelModule.getPaintSession(sessionId) or nil
+	if not session then
+		if showStatus then
+			setPauseStatus("Paint session disappeared; reopen the tab and try again.", 2.0)
+		end
+		return nil, "paint session missing", target
+	end
+	return session, nil, target
+end
+
+local function applyPausePaintStrokeAt(x, y)
+	local bounds = pauseMenu.paint.canvasBounds
+	if not pointInBounds(bounds, x, y) then
+		return false
+	end
+
+	local role = getPausePaintRole()
+	local session, err = getPausePaintSession(role, true)
+	if not session then
+		return false, err
+	end
+
+	local u = clamp((x - bounds.x) / math.max(1, bounds.w), 0, 1)
+	local v = 1.0 - clamp((y - bounds.y) / math.max(1, bounds.h), 0, 1)
+	local now = love.timer.getTime()
+	local du = pauseMenu.paint.lastCanvasU and math.abs(u - pauseMenu.paint.lastCanvasU) or math.huge
+	local dv = pauseMenu.paint.lastCanvasV and math.abs(v - pauseMenu.paint.lastCanvasV) or math.huge
+	local minStep = clamp((pauseMenu.paint.brushSize or 28) / 1024.0 * 0.35, 0.006, 0.05)
+	if pauseMenu.paint.lastCanvasU and pauseMenu.paint.lastCanvasV and du < minStep and dv < minStep and
+		(now - (pauseMenu.paint.lastPaintAt or -math.huge)) < 0.035 then
+		return false
+	end
+
+	local color = getPausePaintColor()
+	local ok, paintErr = modelModule.paintStroke(session.id or pauseMenu.paint.sessionId, {
+		u = u,
+		v = v,
+		size = pauseMenu.paint.brushSize,
+		opacity = pauseMenu.paint.brushOpacity,
+		hardness = pauseMenu.paint.brushHardness,
+		color = color,
+		mode = pauseMenu.paint.mode
+	})
+	if not ok then
+		setPauseStatus("Paint stroke failed: " .. tostring(paintErr), 2.0)
+		return false, paintErr
+	end
+
+	pauseMenu.paint.lastCanvasU = u
+	pauseMenu.paint.lastCanvasV = v
+	pauseMenu.paint.lastPaintAt = now
+	return true
+end
+
+local function performPausePaintAction(actionId)
+	local role = getPausePaintRole()
+	local session, err, target = getPausePaintSession(role, true)
+	if not session then
+		return false, err
+	end
+
+	if actionId == "mode_paint" then
+		pauseMenu.paint.mode = "paint"
+		pauseMenu.paint.helpText = "Brush mode active."
+		return true
+	end
+	if actionId == "mode_erase" then
+		pauseMenu.paint.mode = "erase"
+		pauseMenu.paint.helpText = "Eraser mode active."
+		return true
+	end
+	if actionId == "fill" then
+		local color = getPausePaintColor()
+		local ok, fillErr = modelModule.paintFill(session.id or pauseMenu.paint.sessionId, { color = color })
+		if ok then
+			setPauseStatus("Paint fill applied.", 1.4)
+			return true
+		end
+		setPauseStatus("Paint fill failed: " .. tostring(fillErr), 2.0)
+		return false, fillErr
+	end
+	if actionId == "clear" then
+		local ok, clearErr = modelModule.paintFill(session.id or pauseMenu.paint.sessionId, {
+			color = { 0, 0, 0, 0 }
+		})
+		if ok then
+			setPauseStatus("Overlay cleared.", 1.4)
+			return true
+		end
+		setPauseStatus("Clear failed: " .. tostring(clearErr), 2.0)
+		return false, clearErr
+	end
+	if actionId == "undo" then
+		local ok, undoErr = modelModule.paintUndo(session.id or pauseMenu.paint.sessionId)
+		if ok then
+			setPauseStatus("Paint undo.", 1.2)
+			return true
+		end
+		setPauseStatus("Undo unavailable: " .. tostring(undoErr), 1.8)
+		return false, undoErr
+	end
+	if actionId == "redo" then
+		local ok, redoErr = modelModule.paintRedo(session.id or pauseMenu.paint.sessionId)
+		if ok then
+			setPauseStatus("Paint redo.", 1.2)
+			return true
+		end
+		setPauseStatus("Redo unavailable: " .. tostring(redoErr), 1.8)
+		return false, redoErr
+	end
+	if actionId == "commit" then
+		local paintHash, commitErr = modelModule.paintCommit(session.id or pauseMenu.paint.sessionId)
+		if not paintHash then
+			setPauseStatus("Commit failed: " .. tostring(commitErr), 2.0)
+			return false, commitErr
+		end
+		setConfiguredSkinHashForRole(role, paintHash)
+		syncPausePaintCommit(role)
+		setPauseStatus("Paint committed and queued for multiplayer sync.", 1.8)
+		pauseMenu.paint.helpText = "Committed overlay " .. shortHash(paintHash) .. ". Keep painting or switch roles."
+		endPausePaintSession()
+		return true
+	end
+	return false
+end
+
+local function setPausePaintSliderValue(sliderId, mouseX)
+	local bounds = pauseMenu.paint.sliderBounds[sliderId]
+	if not bounds then
+		return false
+	end
+
+	local t = clamp((mouseX - bounds.x) / math.max(1, bounds.w), 0, 1)
+	if sliderId == "size" then
+		pauseMenu.paint.brushSize = math.floor(6 + t * 90 + 0.5)
+		pauseMenu.paint.helpText = "Brush size " .. tostring(pauseMenu.paint.brushSize) .. "px."
+	elseif sliderId == "opacity" then
+		pauseMenu.paint.brushOpacity = 0.05 + t * 0.95
+		pauseMenu.paint.helpText = string.format("Brush opacity %.0f%%.", pauseMenu.paint.brushOpacity * 100)
+	elseif sliderId == "hardness" then
+		pauseMenu.paint.brushHardness = 0.05 + t * 0.95
+		pauseMenu.paint.helpText = string.format("Brush hardness %.0f%%.", pauseMenu.paint.brushHardness * 100)
+	else
+		return false
+	end
+	return true
+end
+
+local function handlePausePaintMouseMove(x, y, dx, dy)
+	if pauseMenu.tab ~= "paint" then
+		return false
+	end
+	if pauseMenu.paint.draggingSlider then
+		return setPausePaintSliderValue(pauseMenu.paint.draggingSlider, x)
+	end
+	if pauseMenu.paint.draggingCanvas then
+		return applyPausePaintStrokeAt(x, y)
+	end
+	if pointInBounds(pauseMenu.paint.canvasBounds, x, y) then
+		pauseMenu.paint.helpText = "Drag to " .. (pauseMenu.paint.mode == "erase" and "erase" or "paint") ..
+			". Mouse wheel-free sliders live in the left rail."
+		return true
+	end
+	return false
+end
+
+local function handlePausePaintMousePress(x, y, button)
+	if pauseMenu.tab ~= "paint" or button ~= 1 then
+		return false
+	end
+
+	for actionId, bounds in pairs(pauseMenu.paint.actionBounds or {}) do
+		if pointInBounds(bounds, x, y) then
+			performPausePaintAction(actionId)
+			return true
+		end
+	end
+
+	for sliderId, bounds in pairs(pauseMenu.paint.sliderBounds or {}) do
+		if pointInBounds(bounds, x, y) then
+			pauseMenu.paint.draggingSlider = sliderId
+			setPausePaintSliderValue(sliderId, x)
+			return true
+		end
+	end
+
+	for index, bounds in ipairs(pauseMenu.paint.swatchBounds or {}) do
+		if pointInBounds(bounds, x, y) then
+			pauseMenu.paint.colorIndex = index
+			local _, preset = getPausePaintColor()
+			pauseMenu.paint.helpText = "Color selected: " .. tostring(preset and preset.label or "paint")
+			return true
+		end
+	end
+
+	if pointInBounds(pauseMenu.paint.canvasBounds, x, y) then
+		pauseMenu.paint.draggingCanvas = true
+		pauseMenu.paint.lastCanvasU = nil
+		pauseMenu.paint.lastCanvasV = nil
+		pauseMenu.paint.lastPaintAt = -math.huge
+		applyPausePaintStrokeAt(x, y)
+		return true
+	end
+
+	return false
+end
+
+local function handlePausePaintMouseRelease(x, y, button)
+	if button ~= 1 then
+		return false
+	end
+	if pauseMenu.paint.draggingCanvas or pauseMenu.paint.draggingSlider then
+		resetPausePaintInteraction()
+		return true
+	end
+	return false
+end
+
+local function handlePausePaintKeyPress(key)
+	if pauseMenu.tab ~= "paint" then
+		return false
+	end
+
+	local modifiers = controls.getCurrentModifiers()
+	if controls.actionTriggeredByKey("paint_mode_paint", key, modifiers) then
+		return performPausePaintAction("mode_paint")
+	end
+	if controls.actionTriggeredByKey("paint_mode_erase", key, modifiers) then
+		return performPausePaintAction("mode_erase")
+	end
+	if controls.actionTriggeredByKey("paint_fill", key, modifiers) then
+		return performPausePaintAction("fill")
+	end
+	if controls.actionTriggeredByKey("paint_undo", key, modifiers) then
+		return performPausePaintAction("undo")
+	end
+	if controls.actionTriggeredByKey("paint_redo", key, modifiers) then
+		return performPausePaintAction("redo")
+	end
+	if controls.actionTriggeredByKey("paint_commit", key, modifiers) then
+		return performPausePaintAction("commit")
+	end
+	if key == "pageup" then
+		pauseMenu.paint.brushSize = clamp((pauseMenu.paint.brushSize or 28) + 4, 6, 96)
+		return true
+	end
+	if key == "pagedown" then
+		pauseMenu.paint.brushSize = clamp((pauseMenu.paint.brushSize or 28) - 4, 6, 96)
+		return true
+	end
+	return false
+end
+
 local function buildPauseMenuLayout()
 	local titleFont = pauseTitleFont or love.graphics.getFont()
 	local itemFont = pauseItemFont or love.graphics.getFont()
 	local currentItems = getPauseItemsForCurrentPage()
 	clampPauseSelection()
-	local isListTab = pauseMenu.tab ~= "help" and pauseMenu.tab ~= "controls"
+	local isListTab = pauseMenu.tab ~= "help" and pauseMenu.tab ~= "controls" and pauseMenu.tab ~= "paint"
 	local isHelpTab = pauseMenu.tab == "help"
 	local isControlsTab = pauseMenu.tab == "controls"
+	local isPaintTab = pauseMenu.tab == "paint"
 	local itemCount = #currentItems
 	local subTabs = getPauseSubTabs(pauseMenu.tab)
 	local hasSubTabs = subTabs and #subTabs > 0
@@ -1588,6 +2086,8 @@ local function buildPauseMenuLayout()
 		else
 			controlsText = "Enter listen | Left/Right slot | Backspace clear | R reset defaults | Esc resume"
 		end
+	elseif isPaintTab then
+		controlsText = "Drag on the canvas to paint | Click sidebar buttons for fill/undo/redo/commit | Esc resume"
 	else
 		controlsText = "Tab/H switch tabs | Mouse wheel scroll | [ ] sub-pages | Esc resume"
 	end
@@ -1599,6 +2099,8 @@ local function buildPauseMenuLayout()
 		detailText = selectedItem and selectedItem.help or ""
 	elseif isControlsTab then
 		detailText = selectedControl and selectedControl.description or ""
+	elseif isPaintTab then
+		detailText = pauseMenu.paint.helpText or ""
 	end
 	local statusText = pauseMenu.statusText
 
@@ -1679,6 +2181,7 @@ local function buildPauseMenuLayout()
 		isListTab = isListTab,
 		isHelpTab = isHelpTab,
 		isControlsTab = isControlsTab,
+		isPaintTab = isPaintTab,
 		hasSubTabs = hasSubTabs,
 		subTabY = subTabY,
 		subTabH = subTabH,
@@ -1726,6 +2229,7 @@ local function clearPauseRangeDrag()
 end
 
 local function setPauseTab(tab)
+	local previousTab = pauseMenu.tab
 	local valid = false
 	for _, entry in ipairs(getPauseTopTabs()) do
 		if entry.id == tab then
@@ -1750,6 +2254,11 @@ local function setPauseTab(tab)
 	pauseMenu.controlsSlotBounds = {}
 	pauseMenu.tabBounds = {}
 	pauseMenu.subTabBounds = {}
+	if previousTab == "paint" and tab ~= "paint" then
+		endPausePaintSession()
+	else
+		resetPausePaintInteraction()
+	end
 	clearPauseRangeDrag()
 	clearPauseConfirm()
 	if tab == "controls" then
@@ -1836,6 +2345,12 @@ local function getPauseItemValue(item)
 	if item.id == "draw_distance" then
 		return string.format("%dm", math.floor((graphicsSettings.drawDistance or 1800) + 0.5))
 	end
+	if item.id == "horizon_fog" then
+		return (graphicsSettings.horizonFog ~= false) and "On" or "Off"
+	end
+	if item.id == "texture_mipmaps" then
+		return (graphicsSettings.textureMipmaps ~= false) and "On" or "Off"
+	end
 	if item.id == "audio_enabled" then
 		return (audioSettings.enabled ~= false) and "On" or "Off"
 	end
@@ -1853,6 +2368,12 @@ local function getPauseItemValue(item)
 	end
 	if item.id == "audio_ambient_pitch" then
 		return string.format("%.2fx", tonumber(audioSettings.ambiencePitch) or 1.0)
+	end
+	if item.id == "radio_channel" then
+		return string.format("CH %02d", math.floor(tonumber(radioState and radioState.channel) or 1))
+	end
+	if item.id == "map_orientation" then
+		return (mapState.orientationMode == "north_up") and "North-Up" or "Heading-Up"
 	end
 	if item.id == "vsync" then
 		return graphicsSettings.vsync and "On" or "Off"
@@ -1881,6 +2402,15 @@ local function getPauseItemValue(item)
 	if item.id == "plane_preview_roll" then
 		return string.format("%d deg", math.floor((getRoleOrientation("plane").roll or 0) + 0.5))
 	end
+	if item.id == "plane_model_offset_x" then
+		return string.format("%.2f", tonumber(getRoleOrientation("plane").offset and getRoleOrientation("plane").offset[1]) or 0)
+	end
+	if item.id == "plane_model_offset_y" then
+		return string.format("%.2f", tonumber(getRoleOrientation("plane").offset and getRoleOrientation("plane").offset[2]) or 0)
+	end
+	if item.id == "plane_model_offset_z" then
+		return string.format("%.2f", tonumber(getRoleOrientation("plane").offset and getRoleOrientation("plane").offset[3]) or 0)
+	end
 	if item.id == "plane_preview_zoom" then
 		return string.format("%.2fx", characterPreview.plane.zoom or 1.0)
 	end
@@ -1895,6 +2425,15 @@ local function getPauseItemValue(item)
 	end
 	if item.id == "walking_preview_roll" then
 		return string.format("%d deg", math.floor((getRoleOrientation("walking").roll or 0) + 0.5))
+	end
+	if item.id == "walking_model_offset_x" then
+		return string.format("%.2f", tonumber(getRoleOrientation("walking").offset and getRoleOrientation("walking").offset[1]) or 0)
+	end
+	if item.id == "walking_model_offset_y" then
+		return string.format("%.2f", tonumber(getRoleOrientation("walking").offset and getRoleOrientation("walking").offset[2]) or 0)
+	end
+	if item.id == "walking_model_offset_z" then
+		return string.format("%.2f", tonumber(getRoleOrientation("walking").offset and getRoleOrientation("walking").offset[3]) or 0)
 	end
 	if item.id == "walking_preview_zoom" then
 		return string.format("%.2fx", characterPreview.walking.zoom or 1.0)
@@ -1987,6 +2526,9 @@ local function getPauseItemValue(item)
 	end
 	if item.id == "terrain_lod1_radius" then
 		return string.format("%d", math.floor(tonumber(terrainParams.lod1Radius) or 0))
+	end
+	if item.id == "terrain_quality" then
+		return string.format("%.1fx", tonumber(terrainParams.terrainQuality) or 1.0)
 	end
 	if item.id == "terrain_mesh_budget" then
 		return string.format("%d", math.floor(tonumber(terrainParams.meshBuildBudget) or 0))
@@ -2194,6 +2736,27 @@ local function adjustPauseItem(item, direction, multiplier)
 		return
 	end
 
+	if item.id == "radio_channel" then
+		local maxChannel = math.max(item.min or 1, math.min(item.max or 8, math.floor(tonumber(radioState.channelCount) or 8)))
+		radioState.channel = clamp(
+			math.floor((tonumber(radioState.channel) or 1) + item.step * direction * scale),
+			item.min or 1,
+			maxChannel
+		)
+		radioState.lastSentAt = -math.huge
+		forceStateSync()
+		setPauseStatus("Radio Channel: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "map_orientation" then
+		mapState.orientationMode = (mapState.orientationMode == "north_up") and "heading_up" or "north_up"
+		mapState.logicalCamera = nil
+		invalidateMapCache()
+		setPauseStatus("Map Orientation: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
 	if item.id == "speed" and camera then
 		camera.speed = clamp(camera.speed + item.step * direction * scale, item.min, item.max)
 		setPauseStatus("Move Speed: " .. getPauseItemValue(item), 1.2)
@@ -2244,6 +2807,40 @@ local function adjustPauseItem(item, direction, multiplier)
 		return
 	end
 
+	if item.id == "plane_model_offset_x" then
+		local orient = getRoleOrientation("plane")
+		orient.offset = orient.offset or { 0, 0, 0 }
+		orient.offset[1] = clamp((tonumber(orient.offset[1]) or 0) + item.step * direction * scale, item.min, item.max)
+		syncActivePlayerModelState()
+		syncLocalPlayerObject()
+		forceStateSync()
+		setPauseStatus("Plane Offset X: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "plane_model_offset_y" then
+		local orient = getRoleOrientation("plane")
+		orient.offset = orient.offset or { 0, 0, 0 }
+		orient.offset[2] = clamp((tonumber(orient.offset[2]) or tonumber(orient.offsetY) or 0) + item.step * direction * scale, item.min, item.max)
+		orient.offsetY = orient.offset[2]
+		syncActivePlayerModelState()
+		syncLocalPlayerObject()
+		forceStateSync()
+		setPauseStatus("Plane Offset Y: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "plane_model_offset_z" then
+		local orient = getRoleOrientation("plane")
+		orient.offset = orient.offset or { 0, 0, 0 }
+		orient.offset[3] = clamp((tonumber(orient.offset[3]) or 0) + item.step * direction * scale, item.min, item.max)
+		syncActivePlayerModelState()
+		syncLocalPlayerObject()
+		forceStateSync()
+		setPauseStatus("Plane Offset Z: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
 	if item.id == "plane_preview_zoom" then
 		local value = clamp(characterPreview.plane.zoom + item.step * direction * scale, item.min, item.max)
 		characterPreview.plane.zoom = math.floor(value * 100 + 0.5) / 100
@@ -2272,6 +2869,40 @@ local function adjustPauseItem(item, direction, multiplier)
 		orient.roll = clamp((orient.roll or 0) + item.step * direction * scale, item.min, item.max)
 		onRoleOrientationChanged("walking")
 		setPauseStatus("Walking Model Roll: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "walking_model_offset_x" then
+		local orient = getRoleOrientation("walking")
+		orient.offset = orient.offset or { 0, 0, 0 }
+		orient.offset[1] = clamp((tonumber(orient.offset[1]) or 0) + item.step * direction * scale, item.min, item.max)
+		syncActivePlayerModelState()
+		syncLocalPlayerObject()
+		forceStateSync()
+		setPauseStatus("Walking Offset X: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "walking_model_offset_y" then
+		local orient = getRoleOrientation("walking")
+		orient.offset = orient.offset or { 0, 0, 0 }
+		orient.offset[2] = clamp((tonumber(orient.offset[2]) or tonumber(orient.offsetY) or 0) + item.step * direction * scale, item.min, item.max)
+		orient.offsetY = orient.offset[2]
+		syncActivePlayerModelState()
+		syncLocalPlayerObject()
+		forceStateSync()
+		setPauseStatus("Walking Offset Y: " .. getPauseItemValue(item), 1.2)
+		return
+	end
+
+	if item.id == "walking_model_offset_z" then
+		local orient = getRoleOrientation("walking")
+		orient.offset = orient.offset or { 0, 0, 0 }
+		orient.offset[3] = clamp((tonumber(orient.offset[3]) or 0) + item.step * direction * scale, item.min, item.max)
+		syncActivePlayerModelState()
+		syncLocalPlayerObject()
+		forceStateSync()
+		setPauseStatus("Walking Offset Z: " .. getPauseItemValue(item), 1.2)
 		return
 	end
 
@@ -2413,6 +3044,7 @@ local function adjustPauseItem(item, direction, multiplier)
 		item.id == "terrain_tunnel_radius_max" or
 		item.id == "terrain_lod0_radius" or
 		item.id == "terrain_lod1_radius" or
+		item.id == "terrain_quality" or
 		item.id == "terrain_mesh_budget" then
 		local params = deepCopyPrimitiveTable(activeGroundParams or defaultGroundParams, 4) or {}
 		local delta = item.step * direction * scale
@@ -2451,6 +3083,9 @@ local function adjustPauseItem(item, direction, multiplier)
 			params.lod0Radius = math.min(params.lod1Radius, tonumber(params.lod0Radius) or params.lod1Radius)
 			terrainSdfDefaults.lod0Radius = params.lod0Radius
 			terrainSdfDefaults.lod1Radius = params.lod1Radius
+		elseif item.id == "terrain_quality" then
+			params.terrainQuality = clamp((tonumber(params.terrainQuality) or 1.0) + delta, item.min, item.max)
+			terrainSdfDefaults.terrainQuality = params.terrainQuality
 		elseif item.id == "terrain_mesh_budget" then
 			params.meshBuildBudget = math.floor(clamp((tonumber(params.meshBuildBudget) or 2) + delta, item.min, item.max))
 			terrainSdfDefaults.meshBuildBudget = params.meshBuildBudget
@@ -2666,6 +3301,18 @@ local function activatePauseItem(item)
 	elseif item.id == "vsync" then
 		graphicsSettings.vsync = not graphicsSettings.vsync
 		setPauseStatus("VSync: " .. getPauseItemValue(item) .. " (select Apply Display).", 1.6)
+	elseif item.id == "horizon_fog" then
+		graphicsSettings.horizonFog = not (graphicsSettings.horizonFog ~= false)
+		applySunSettingsToRenderer()
+		setPauseStatus("Horizon Fog: " .. getPauseItemValue(item), 1.2)
+	elseif item.id == "texture_mipmaps" then
+		graphicsSettings.textureMipmaps = not (graphicsSettings.textureMipmaps ~= false)
+		if renderer and type(renderer.setTextureSampling) == "function" then
+			renderer.setTextureSampling({
+				textureMipmaps = graphicsSettings.textureMipmaps ~= false
+			})
+		end
+		setPauseStatus("Texture Mipmaps: " .. getPauseItemValue(item), 1.2)
 	elseif item.id == "renderer" then
 		setRendererPreference(not useGpuRenderer)
 		setPauseStatus("Renderer: " .. getPauseItemValue(item), 1.2)
@@ -2791,7 +3438,7 @@ local function activateSelectedPauseItem()
 end
 
 local function updatePauseMenuHover(x, y)
-	if pauseMenu.tab == "help" or pauseMenu.tab == "controls" then
+	if pauseMenu.tab == "help" or pauseMenu.tab == "controls" or pauseMenu.tab == "paint" then
 		return
 	end
 	if pauseMenu.dragRange.active then
@@ -2937,8 +3584,12 @@ local function handlePauseMenuMouseClick(x, y)
 	for _, subTabBounds in ipairs(pauseMenu.subTabBounds) do
 		if x >= subTabBounds.x and x <= subTabBounds.x + subTabBounds.w and
 			y >= subTabBounds.y and y <= subTabBounds.y + subTabBounds.h then
+			if pauseMenu.tab == "paint" and pauseMenu.subTab[pauseMenu.tab] ~= subTabBounds.id then
+				endPausePaintSession()
+			end
 			pauseMenu.subTab[pauseMenu.tab] = subTabBounds.id
 			pauseMenu.selected = 1
+			resetPausePaintInteraction()
 			clearPauseRangeDrag()
 			clearPauseConfirm()
 			return
@@ -2947,6 +3598,10 @@ local function handlePauseMenuMouseClick(x, y)
 
 	if pauseMenu.tab == "controls" then
 		handlePauseControlsMouseClick(x, y, 1)
+		return
+	end
+
+	if pauseMenu.tab == "paint" then
 		return
 	end
 
@@ -2994,6 +3649,7 @@ setPauseState = function(paused)
 		pauseMenu.selected = 1
 		getPauseActiveSubTab("settings")
 		getPauseActiveSubTab("characters")
+		getPauseActiveSubTab("paint")
 		getPauseActiveSubTab("hud")
 		clampPauseSelection()
 		pauseMenu.controlsSelection = clamp(pauseMenu.controlsSelection, 1, #controlActions)
@@ -3003,6 +3659,7 @@ setPauseState = function(paused)
 		pauseMenu.controlsSlotBounds = {}
 		pauseMenu.tabBounds = {}
 		pauseMenu.subTabBounds = {}
+		endPausePaintSession()
 		clearPauseRangeDrag()
 		clearControlBindingCapture()
 		setPauseStatus("", 0)
@@ -3019,6 +3676,7 @@ setPauseState = function(paused)
 		pauseMenu.itemBounds = {}
 		pauseMenu.controlsRowBounds = {}
 		pauseMenu.controlsSlotBounds = {}
+		endPausePaintSession()
 		clearPauseRangeDrag()
 		clearControlBindingCapture()
 		setPauseStatus("", 0)
@@ -3441,6 +4099,223 @@ local function drawPauseControlsContent(layout)
 	end
 end
 
+local function drawPausePaintContent(layout)
+	local font = love.graphics.getFont()
+	local lineH = font:getHeight()
+	local role = getPausePaintRole()
+	local session, sessionErr, target = getPausePaintSession(role, false)
+	local overlay = session and session.overlay or nil
+	local currentPaintHash = getConfiguredSkinHashForRole(role) or ""
+
+	local contentX = layout.contentX
+	local contentY = layout.contentY
+	local contentW = layout.contentW
+	local contentH = layout.contentH
+	local railW = clamp(math.floor(contentW * 0.34), 220, 300)
+	local gap = 12
+	local canvasX = contentX + railW + gap
+	local canvasW = math.max(120, contentW - railW - gap)
+	local railX = contentX
+
+	pauseMenu.itemBounds = {}
+	pauseMenu.paint.actionBounds = {}
+	pauseMenu.paint.swatchBounds = {}
+	pauseMenu.paint.sliderBounds = {}
+	pauseMenu.paint.canvasBounds = nil
+
+	local function drawButton(id, label, x, y, w, h, active)
+		pauseMenu.paint.actionBounds[id] = { x = x, y = y, w = w, h = h }
+		if active then
+			love.graphics.setColor(0.28, 0.38, 0.58, 0.98)
+		else
+			love.graphics.setColor(0.18, 0.2, 0.26, 0.95)
+		end
+		love.graphics.rectangle("fill", x, y, w, h, 6, 6)
+		love.graphics.setColor(1, 1, 1, active and 1 or 0.88)
+		love.graphics.printf(label, x, y + math.floor((h - lineH) / 2), w, "center")
+	end
+
+	local function drawSlider(id, label, valueLabel, value, minValue, maxValue, x, y, w)
+		local trackY = y + lineH + 8
+		local trackH = 18
+		local t = clamp((value - minValue) / math.max(1e-6, maxValue - minValue), 0, 1)
+		pauseMenu.paint.sliderBounds[id] = { x = x, y = trackY, w = w, h = trackH }
+		love.graphics.setColor(0.82, 0.88, 0.96, 0.94)
+		love.graphics.print(label, x, y)
+		love.graphics.setColor(0.65, 0.76, 0.9, 0.9)
+		love.graphics.printf(valueLabel, x, y, w, "right")
+		love.graphics.setColor(0.14, 0.16, 0.2, 0.96)
+		love.graphics.rectangle("fill", x, trackY, w, trackH, 6, 6)
+		love.graphics.setColor(0.32, 0.44, 0.68, 0.98)
+		love.graphics.rectangle("fill", x, trackY, math.max(8, w * t), trackH, 6, 6)
+		love.graphics.setColor(1, 1, 1, 0.95)
+		local knobX = x + (w * t)
+		love.graphics.circle("fill", knobX, trackY + trackH * 0.5, 6)
+		return trackY + trackH
+	end
+
+	love.graphics.setColor(0.12, 0.13, 0.16, 0.92)
+	love.graphics.rectangle("fill", railX, contentY, railW, contentH, 6, 6)
+	love.graphics.setColor(0.10, 0.11, 0.14, 0.94)
+	love.graphics.rectangle("fill", canvasX, contentY, canvasW, contentH, 6, 6)
+
+	local railPad = 10
+	local cursorY = contentY + railPad
+	love.graphics.setColor(0.86, 0.92, 1.0, 0.98)
+	love.graphics.printf(string.upper(role) .. " PAINT", railX + railPad, cursorY, railW - railPad * 2, "center")
+	cursorY = cursorY + lineH + 6
+
+	love.graphics.setColor(0.72, 0.84, 0.95, 0.92)
+	love.graphics.printf(
+		"Model " .. shortHash(target and target.modelHash or "none"),
+		railX + railPad,
+		cursorY,
+		railW - railPad * 2,
+		"center"
+	)
+	cursorY = cursorY + lineH + 10
+
+	local buttonW = math.floor((railW - railPad * 2 - 8) * 0.5)
+	drawButton("mode_paint", "Brush", railX + railPad, cursorY, buttonW, 28, pauseMenu.paint.mode == "paint")
+	drawButton("mode_erase", "Erase", railX + railPad + buttonW + 8, cursorY, buttonW, 28, pauseMenu.paint.mode == "erase")
+	cursorY = cursorY + 36
+
+	drawButton("fill", "Fill", railX + railPad, cursorY, buttonW, 28, false)
+	drawButton("clear", "Clear", railX + railPad + buttonW + 8, cursorY, buttonW, 28, false)
+	cursorY = cursorY + 36
+
+	drawButton("undo", "Undo", railX + railPad, cursorY, buttonW, 28, false)
+	drawButton("redo", "Redo", railX + railPad + buttonW + 8, cursorY, buttonW, 28, false)
+	cursorY = cursorY + 36
+
+	drawButton("commit", "Commit + Sync", railX + railPad, cursorY, railW - railPad * 2, 30, false)
+	cursorY = cursorY + 42
+
+	cursorY = drawSlider(
+		"size",
+		"Brush Size",
+		string.format("%d px", math.floor(pauseMenu.paint.brushSize or 28)),
+		pauseMenu.paint.brushSize or 28,
+		6,
+		96,
+		railX + railPad,
+		cursorY,
+		railW - railPad * 2
+	) + 12
+	cursorY = drawSlider(
+		"opacity",
+		"Opacity",
+		string.format("%d%%", math.floor((pauseMenu.paint.brushOpacity or 1.0) * 100 + 0.5)),
+		pauseMenu.paint.brushOpacity or 1.0,
+		0.05,
+		1.0,
+		railX + railPad,
+		cursorY,
+		railW - railPad * 2
+	) + 12
+	cursorY = drawSlider(
+		"hardness",
+		"Hardness",
+		string.format("%d%%", math.floor((pauseMenu.paint.brushHardness or 0.75) * 100 + 0.5)),
+		pauseMenu.paint.brushHardness or 0.75,
+		0.05,
+		1.0,
+		railX + railPad,
+		cursorY,
+		railW - railPad * 2
+	) + 14
+
+	love.graphics.setColor(0.82, 0.88, 0.96, 0.94)
+	love.graphics.print("Palette", railX + railPad, cursorY)
+	cursorY = cursorY + lineH + 8
+	local swatchGap = 8
+	local swatchCols = 4
+	local swatchW = math.floor((railW - railPad * 2 - swatchGap * (swatchCols - 1)) / swatchCols)
+	local swatchH = 24
+	for index, preset in ipairs(PAINT_COLOR_PRESETS) do
+		local col = (index - 1) % swatchCols
+		local row = math.floor((index - 1) / swatchCols)
+		local sx = railX + railPad + col * (swatchW + swatchGap)
+		local sy = cursorY + row * (swatchH + swatchGap)
+		pauseMenu.paint.swatchBounds[index] = { x = sx, y = sy, w = swatchW, h = swatchH }
+		love.graphics.setColor(preset.color[1], preset.color[2], preset.color[3], 1)
+		love.graphics.rectangle("fill", sx, sy, swatchW, swatchH, 5, 5)
+		if index == (pauseMenu.paint.colorIndex or 1) then
+			love.graphics.setColor(1, 1, 1, 1)
+			love.graphics.setLineWidth(2)
+		else
+			love.graphics.setColor(0, 0, 0, 0.35)
+			love.graphics.setLineWidth(1)
+		end
+		love.graphics.rectangle("line", sx, sy, swatchW, swatchH, 5, 5)
+	end
+	love.graphics.setLineWidth(1)
+	cursorY = cursorY + math.ceil(#PAINT_COLOR_PRESETS / swatchCols) * (swatchH + swatchGap) + 4
+
+	love.graphics.setColor(0.7, 0.82, 0.94, 0.9)
+	love.graphics.printf(
+		"Current: " .. shortHash(currentPaintHash ~= "" and currentPaintHash or "none"),
+		railX + railPad,
+		cursorY,
+		railW - railPad * 2,
+		"left"
+	)
+	cursorY = cursorY + lineH + 4
+	if target and not target.hasUvs then
+		love.graphics.setColor(0.96, 0.7, 0.34, 0.94)
+		love.graphics.printf("No UVs detected. The overlay may not show on the mesh.", railX + railPad, cursorY,
+			railW - railPad * 2, "left")
+	end
+
+	local canvasPad = 12
+	local innerX = canvasX + canvasPad
+	local innerY = contentY + canvasPad
+	local innerW = canvasW - canvasPad * 2
+	local innerH = contentH - canvasPad * 2
+	local cell = 20
+	for row = 0, math.ceil(innerH / cell) - 1 do
+		for col = 0, math.ceil(innerW / cell) - 1 do
+			local tint = ((row + col) % 2 == 0) and 0.18 or 0.13
+			love.graphics.setColor(tint, tint, tint, 0.92)
+			love.graphics.rectangle("fill", innerX + col * cell, innerY + row * cell, cell, cell)
+		end
+	end
+
+	if overlay and overlay.image then
+		local imageW = (overlay.image.getWidth and overlay.image:getWidth()) or overlay.width or 1
+		local imageH = (overlay.image.getHeight and overlay.image:getHeight()) or overlay.height or 1
+		local scale = math.min(innerW / math.max(1, imageW), innerH / math.max(1, imageH))
+		local drawW = imageW * scale
+		local drawH = imageH * scale
+		local drawX = innerX + (innerW - drawW) * 0.5
+		local drawY = innerY + (innerH - drawH) * 0.5
+		love.graphics.setColor(1, 1, 1, 1)
+		love.graphics.draw(overlay.image, drawX, drawY, 0, scale, scale)
+		love.graphics.setColor(0.84, 0.9, 1.0, 0.96)
+		love.graphics.rectangle("line", drawX, drawY, drawW, drawH, 6, 6)
+		pauseMenu.paint.canvasBounds = { x = drawX, y = drawY, w = drawW, h = drawH }
+	else
+		love.graphics.setColor(0.82, 0.88, 0.96, 0.9)
+		love.graphics.printf(
+			target and target.assetId and (sessionErr or "Starting paint session...") or
+			"Load a custom character model first, then return here to paint it.",
+			innerX + 16,
+			innerY + innerH * 0.45,
+			innerW - 32,
+			"center"
+		)
+	end
+
+	love.graphics.setColor(0.8, 0.88, 1.0, 0.9)
+	love.graphics.printf(
+		"Canvas edits stay local until Commit + Sync.",
+		innerX,
+		contentY + contentH - lineH - 6,
+		innerW,
+		"center"
+	)
+end
+
 local function drawPauseCharacterPreview(layout)
 	if pauseMenu.tab ~= "characters" or not layout.previewX then
 		return
@@ -3617,6 +4492,9 @@ local function drawPauseMenu()
 	elseif layout.isControlsTab then
 		pauseMenu.itemBounds = {}
 		drawPauseControlsContent(layout)
+	elseif layout.isPaintTab then
+		pauseMenu.itemBounds = {}
+		drawPausePaintContent(layout)
 	else
 		pauseMenu.itemBounds = {}
 		drawPauseHelpContent(layout)
@@ -3666,6 +4544,10 @@ end
 			activateSelectedPauseItem = activateSelectedPauseItem,
 			updatePauseMenuHover = updatePauseMenuHover,
 			updatePauseControlsHover = updatePauseControlsHover,
+			handlePausePaintMouseMove = handlePausePaintMouseMove,
+			handlePausePaintMousePress = handlePausePaintMousePress,
+			handlePausePaintMouseRelease = handlePausePaintMouseRelease,
+			handlePausePaintKeyPress = handlePausePaintKeyPress,
 			beginPauseRangeDrag = beginPauseRangeDrag,
 			updatePauseRangeDrag = updatePauseRangeDrag,
 			endPauseRangeDrag = endPauseRangeDrag,

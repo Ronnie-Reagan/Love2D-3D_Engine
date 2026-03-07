@@ -1,5 +1,35 @@
 
-local hostAddy = "love.donreagan.ca:1988"
+local DEFAULT_NET_SERVER = "love.donreagan.ca:1988"
+
+local function normalizeNetworkMode(value)
+	local mode = tostring(value or "client"):lower()
+	if mode == "host" or mode == "listen" then
+		return "host"
+	end
+	if mode == "offline" or mode == "none" then
+		return "offline"
+	end
+	if mode == "dedicated" or mode == "server" then
+		return "dedicated"
+	end
+	return "client"
+end
+
+local function normalizePort(value, fallback)
+	local port = math.floor(tonumber(value) or fallback or 1988)
+	if port < 1 then
+		return 1
+	end
+	if port > 65535 then
+		return 65535
+	end
+	return port
+end
+
+local NET_MODE = normalizeNetworkMode(os.getenv("L2D3D_NET_MODE") or "client")
+local NET_PORT = normalizePort(os.getenv("L2D3D_NET_PORT"), 1988)
+local NET_SERVER = tostring(os.getenv("L2D3D_NET_SERVER") or DEFAULT_NET_SERVER)
+local hostAddy = NET_SERVER
 
 local function requireContract(modulePath, requiredKeys)
 	local ok, loaded = pcall(require, modulePath)
@@ -67,6 +97,8 @@ local engine = require "Source.Core.Engine"
 local modelModule = require "Source.ModelModule.Init"
 local networking = require "Source.Net.Networking"
 local packetCodec = require "Source.Net.PacketCodec"
+local hostedServerModule = require "Source.Net.HostedServer"
+local webRtcVoiceBackend = require "Source.Net.WebRtcVoiceBackend"
 local renderer = require "Source.Render.GpuRenderer"
 local cpuRenderClassifier = require "Source.Render.CpuRenderClassifier"
 local controls = require "Source.Input.Controls"
@@ -76,12 +108,96 @@ local flightDynamics = require "Source.Systems.FlightDynamicsSystem"
 local viewMath = require "Source.Math.ViewMath"
 local cloudSim = require "Source.Systems.CloudSim"
 local logger = require "Source.Core.Logger"
+local userProfileStore = require "Source.Core.UserProfileStore"
 local objectDefs = require "Source.Core.ObjectDefs"
 local appStateModule = requireContract("Source.Core.AppState", { "create" })
 local viewSystemModule = requireContract("Source.Systems.ViewSystem", { "create" })
 local inputSystemModule = requireContract("Source.Input.InputSystem", { "create" })
-local relay = enet.host_create()
-local relayServer = relay and relay:connect(hostAddy) or nil
+local relay = nil
+local relayServer = nil
+local hostedRelay = nil
+local netMode = NET_MODE
+local localRelayAddress = "127.0.0.1:" .. tostring(NET_PORT)
+local formatNetFloat
+local relayIsConnected
+local SERVER_AUTHORITY_PEER_ID = 0
+local relayUsesServerAuthority
+
+local function createRelayClient(address)
+	local host = enet.host_create(nil, 1, 4)
+	if not host then
+		return nil, nil
+	end
+	local okPeer, peerOrErr = pcall(function()
+		return host:connect(address, 4)
+	end)
+	if not okPeer or not peerOrErr then
+		return host, nil
+	end
+	return host, peerOrErr
+end
+
+local function startHostedRelayServer(port)
+	local server, err = hostedServerModule.create({
+		port = port,
+		bindAddress = "*",
+		maxPeers = 128,
+		log = function(message)
+			logger.log(message)
+		end
+	})
+	if not server then
+		logger.log("Hosted relay start failed: " .. tostring(err))
+		return nil
+	end
+	logger.log(string.format("Hosted relay listening on 0.0.0.0:%d", tonumber(port) or NET_PORT))
+	return server
+end
+
+local function initializeNetworkSession()
+	if netMode == "offline" then
+		relay = nil
+		relayServer = nil
+		hostedRelay = nil
+		return
+	end
+
+	if netMode == "host" or netMode == "dedicated" then
+		hostAddy = localRelayAddress
+		hostedRelay = startHostedRelayServer(NET_PORT)
+		if not hostedRelay then
+			logger.log(string.format("Hosted relay unavailable for %s mode on %s.", tostring(netMode), tostring(localRelayAddress)))
+		end
+	end
+
+	if netMode == "host" then
+		if hostedRelay then
+			relay, relayServer = createRelayClient(localRelayAddress)
+		else
+			relay = nil
+			relayServer = nil
+		end
+		if relay and relayServer then
+			logger.log("Network mode: host (local listen server + client).")
+		else
+			logger.log("Host mode client connect failed; local host stays available for reconnect.")
+		end
+	elseif netMode == "dedicated" then
+		relay = nil
+		relayServer = nil
+		logger.log("Network mode: dedicated server (no local client).")
+	else
+		relay, relayServer = createRelayClient(hostAddy)
+		if relay and relayServer then
+			logger.log("Network mode: client -> " .. tostring(hostAddy))
+		else
+			logger.log("Client connect failed; staying disconnected. Target=" .. tostring(hostAddy))
+			relayServer = nil
+		end
+	end
+end
+
+initializeNetworkSession()
 local flightSimMode = false
 local relative = true
 local peers = {}
@@ -99,8 +215,10 @@ defaultPlayerModelScale = 3.0
 defaultWalkingModelScale = 1.0
 playerPlaneModelScale = defaultPlayerModelScale
 playerPlaneModelHash = "builtin-cube"
+playerPlaneSkinHash = ""
 playerWalkingModelScale = defaultWalkingModelScale
 playerWalkingModelHash = "builtin-cube"
+playerWalkingSkinHash = ""
 playerModelScale = playerWalkingModelScale
 playerModelHash = playerWalkingModelHash
 local screen, camera, groundObject, terrainState, triangleCount, frameImage, renderMode, gpuErrorLogged --, zBuffer
@@ -115,6 +233,65 @@ local invertLookY = false
 local showCrosshair = true
 local showDebugOverlay = true
 local colorCorruptionMode = false
+profilerColors = {
+	update = { 0.98, 0.62, 0.18, 1.0 },
+	draw = { 0.20, 0.84, 1.0, 1.0 },
+	terrain = { 0.92, 0.52, 0.20, 1.0 },
+	movement = { 0.86, 0.74, 0.22, 1.0 },
+	cloud = { 0.44, 0.88, 0.92, 1.0 },
+	network = { 0.42, 0.90, 0.35, 1.0 },
+	audio = { 0.84, 0.46, 0.96, 1.0 },
+	gc = { 0.92, 0.36, 0.88, 1.0 },
+	render = { 0.22, 0.78, 0.98, 1.0 },
+	hud = { 1.00, 0.88, 0.26, 1.0 },
+	profile = { 0.96, 0.96, 0.96, 1.0 }
+}
+profilerStatColors = {
+	current = { 1.00, 1.00, 1.00, 0.90 },
+	avg = { 0.28, 0.84, 1.00, 0.72 },
+	min = { 0.40, 0.92, 0.48, 0.60 },
+	max = { 1.00, 0.42, 0.34, 0.78 }
+}
+frameProfiler = requireContract("Source.Core.FrameProfiler", { "create" }).create({
+	historySize = 360,
+	targetFrameMs = 16.6,
+	minGraphMs = 20.0,
+	maxLegendItems = 9,
+	statPalette = profilerStatColors
+})
+profilerSpikeMonitor = {
+	enabled = true,
+	metricId = "frame.total",
+	statsWindow = 180,
+	minThresholdMs = 45.0,
+	targetMultiplier = 2.4,
+	logCooldownSec = 2.5,
+	deltaTriggerMs = 12.0,
+	quietResetSec = 8.0,
+	minContributionMs = 0.35,
+	maxContributors = 5,
+	lastLogAt = -math.huge,
+	lastLoggedSpikeMs = 0
+}
+profilerGraphMetrics = {
+	{ id = "frame.total", label = "frame", color = { 1.00, 1.00, 1.00, 1.0 } },
+	{ id = "update.total", label = "update", color = profilerColors.update },
+	{ id = "draw.total", label = "draw", color = profilerColors.draw },
+	{ id = "terrain.update", label = "terrain", color = profilerColors.terrain },
+	{ id = "network.events", label = "net events", color = profilerColors.network },
+	{ id = "profile.save", label = "profile save", color = profilerColors.profile },
+	{ id = "terrain.worker_thread_build", label = "worker build", color = { 0.98, 0.28, 0.16, 1.0 } },
+	{ id = "render.world", label = "render world", color = profilerColors.render },
+	{ id = "runtime.gc", label = "lua gc", color = profilerColors.gc },
+	{ id = "render.mesh_build", label = "gpu mesh build", color = { 1.00, 0.40, 0.18, 1.0 } },
+	{ id = "draw.hud", label = "draw hud", color = profilerColors.hud }
+}
+gcRuntime = {
+	enabled = true,
+	minStepKb = 24,
+	maxStepKb = 240,
+	baseStepKb = 64
+}
 local pauseTitleFont, pauseItemFont
 local startupUi = {
 	active = false,
@@ -144,6 +321,8 @@ local hudTheme = defaults.hudTheme
 local hudCache = defaults.hudCache
 
 local graphicsSettings = defaults.graphicsSettings
+graphicsSettings.horizonFog = graphicsSettings.horizonFog ~= false
+graphicsSettings.textureMipmaps = graphicsSettings.textureMipmaps ~= false
 currentGraphicsApiPreference = defaults.currentGraphicsApiPreference
 local graphicsBackend = defaults.graphicsBackend
 bootRestartPayload, bootRestartSnapshotState = nil, nil
@@ -169,10 +348,30 @@ modelLoadPrompt = defaults.modelLoadPrompt
 modelLoadTargetRole = defaults.modelLoadTargetRole
 playerModelCache = {}
 modelTransferState = defaults.modelTransferState
+local radioState = defaults.radioState or {
+	channel = 1,
+	channelCount = 8,
+	transmitting = false,
+	statusInterval = 0.30,
+	lastSentAt = -math.huge
+}
+local radioVoice = webRtcVoiceBackend.create({
+	channelCount = radioState.channelCount
+})
 local stateNet = {
-	sendInterval = 1 / 20,
+	sendInterval = 1 / 30,
 	lastSentAt = -math.huge,
 	forceSend = true
+}
+local clientNet = {
+	localPeerId = nil,
+	serverAuthoritative = false,
+	helloSent = false,
+	forceHello = true,
+	inputTick = 0,
+	lastAckTick = 0,
+	pendingInputs = {},
+	lastVoiceSeq = 0
 }
 local forceStateSync
 local worldHalfExtent = defaults.worldHalfExtent
@@ -191,6 +390,7 @@ local appState = appStateModule.create({
 	viewState = viewState,
 	mapState = mapState,
 	modelTransferState = modelTransferState,
+	radioState = radioState,
 	cloudNetState = cloudNetState,
 	groundNetState = groundNetState,
 	stateNet = stateNet
@@ -236,7 +436,52 @@ function getRoleOrientation(role)
 	orient.yaw = tonumber(orient.yaw) or 0
 	orient.pitch = tonumber(orient.pitch) or 0
 	orient.roll = tonumber(orient.roll) or 0
+	local offset = orient.offset
+	if type(offset) ~= "table" then
+		offset = { 0, tonumber(orient.offsetY) or 0, 0 }
+		orient.offset = offset
+	end
+	offset[1] = tonumber(offset[1] or offset.x) or 0
+	offset[2] = tonumber(offset[2] or offset.y or orient.offsetY) or 0
+	offset[3] = tonumber(offset[3] or offset.z) or 0
+	offset.x = offset[1]
+	offset.y = offset[2]
+	offset.z = offset[3]
+	orient.offsetY = offset[2]
 	return orient
+end
+
+local function resolveVisualOffsetVector(explicitOffset, role, modelHash, scale)
+	local entry = playerModelCache[modelHash]
+	local bounds = entry and entry.bounds
+	local bottomDistance = ((bounds and bounds.bottomDistance) or 1) * math.max(0.01, scale or 1)
+	local orient = getRoleOrientation(role)
+	local source = explicitOffset
+	if type(source) ~= "table" then
+		source = orient and orient.offset or { 0, 0, 0 }
+	end
+	local offsetX = tonumber(source[1] or source.x) or 0
+	local offsetY = tonumber(source[2] or source.y)
+	local offsetZ = tonumber(source[3] or source.z) or 0
+	if offsetY == nil then
+		offsetY = tonumber(explicitOffset) or tonumber(orient and orient.offsetY) or 0
+	end
+	return {
+		offsetX,
+		bottomDistance - getGroundClearance() + offsetY,
+		offsetZ
+	}
+end
+
+local function applyVisualOffsetToWorld(basePos, baseRot, visualOffset)
+	local srcPos = basePos or { 0, 0, 0 }
+	local offset = visualOffset or { 0, 0, 0 }
+	local rotated = q.rotateVector(baseRot or q.identity(), offset)
+	return {
+		(srcPos[1] or 0) + (rotated[1] or 0),
+		(srcPos[2] or 0) + (rotated[2] or 0),
+		(srcPos[3] or 0) + (rotated[3] or 0)
+	}
 end
 
 function composeRoleOrientationOffset(role, modelHash)
@@ -279,6 +524,7 @@ end
 
 function applySunSettingsToRenderer()
 	if renderer and renderer.setLighting then
+		local horizonFogEnabled = graphicsSettings.horizonFog ~= false
 		local fogDensity = tonumber(sunSettings.fogDensity) or tonumber(lightingModel.fogDensity) or 0.00055
 		local fogHeightFalloff = tonumber(sunSettings.fogHeightFalloff) or tonumber(lightingModel.fogHeightFalloff) or 0.0017
 		local exposureEV = tonumber(sunSettings.exposureEV) or tonumber(lightingModel.exposureEV) or 0.0
@@ -306,7 +552,7 @@ function applySunSettingsToRenderer()
 			},
 			specularAmbient = math.max(0, tonumber(sunSettings.giSpecular) or 0.35),
 			bounce = math.max(0, tonumber(sunSettings.giBounce) or 0.24),
-			fogDensity = math.max(0, fogDensity),
+			fogDensity = horizonFogEnabled and math.max(0, fogDensity) or 0.0,
 			fogHeightFalloff = math.max(0, fogHeightFalloff),
 			fogColor = {
 				math.max(0, tonumber(sunSettings.fogR) or tonumber(lightingModel.fogR) or 0.64),
@@ -318,6 +564,14 @@ function applySunSettingsToRenderer()
 			shadowEnabled = shadowEnabled,
 			shadowSoftness = shadowSoftness,
 			shadowDistance = shadowDistance
+		})
+	end
+end
+
+local function applyTextureSamplingSettingsToRenderer()
+	if renderer and renderer.setTextureSampling then
+		renderer.setTextureSampling({
+			textureMipmaps = graphicsSettings.textureMipmaps ~= false
 		})
 	end
 end
@@ -337,6 +591,151 @@ local function clamp(value, minValue, maxValue)
 		return maxValue
 	end
 	return value
+end
+
+function applyMeshBuildBudgetToRenderer()
+	if not (renderer and renderer.setMeshBuildBudget) then
+		return
+	end
+	local terrainParams = activeGroundParams or defaultGroundParams or {}
+	local targetFrameMs = clamp(tonumber(terrainParams.targetFrameMs) or 16.6, 8.0, 50.0)
+	local maxInflight = clamp(math.floor(tonumber(terrainParams.workerMaxInflight) or 6), 1, 6)
+	local meshBuildMaxPerFrame = clamp(math.floor(maxInflight * 0.5), 1, 3)
+	local meshBuildMaxMs = clamp(targetFrameMs * 0.22, 1.5, 6.0)
+	renderer.setMeshBuildBudget({
+		maxPerFrame = meshBuildMaxPerFrame,
+		maxMs = meshBuildMaxMs
+	})
+end
+
+
+
+function beginProfileScope(metricId, color, label)
+	if not frameProfiler then
+		return nil
+	end
+	return frameProfiler:beginScope(metricId, color, label)
+end
+
+function endProfileScope(scopeToken)
+	if frameProfiler and scopeToken then
+		frameProfiler:endScope(scopeToken)
+	end
+end
+
+function buildSpikeContributorSummary(frame, maxContributors, minContributionMs)
+	local samples = frame and frame.samples
+	if type(samples) ~= "table" then
+		return "none"
+	end
+	local contributors = {}
+	for metricId, valueMs in pairs(samples) do
+		local ms = math.max(0, tonumber(valueMs) or 0)
+		if ms > 0 and metricId ~= "frame.total" and metricId ~= "frame.dt" then
+			contributors[#contributors + 1] = {
+				id = tostring(metricId),
+				ms = ms
+			}
+		end
+	end
+	if #contributors == 0 then
+		return "none"
+	end
+	table.sort(contributors, function(a, b)
+		return a.ms > b.ms
+	end)
+	local limit = math.max(1, math.floor(tonumber(maxContributors) or 5))
+	local thresholdMs = math.max(0, tonumber(minContributionMs) or 0)
+	local kept = 0
+	local parts = {}
+	for i = 1, #contributors do
+		local entry = contributors[i]
+		if entry.ms >= thresholdMs then
+			kept = kept + 1
+			if kept <= limit then
+				parts[#parts + 1] = string.format("%s=%.2fms", entry.id, entry.ms)
+			end
+		end
+	end
+	if #parts == 0 then
+		return "none"
+	end
+	if kept > limit then
+		parts[#parts + 1] = string.format("+%d more", kept - limit)
+	end
+	return table.concat(parts, ", ")
+end
+
+function maybeLogProfilerSpike(completedFrame)
+	if not (frameProfiler and completedFrame and profilerSpikeMonitor and profilerSpikeMonitor.enabled) then
+		return
+	end
+	local metricId = tostring(profilerSpikeMonitor.metricId or "frame.total")
+	local samples = completedFrame.samples or {}
+	local frameMs = math.max(
+		0,
+		tonumber(samples[metricId]) or tonumber(completedFrame.totalMs) or 0
+	)
+	local targetMs = tonumber(
+		(activeGroundParams and activeGroundParams.targetFrameMs) or
+		(defaultGroundParams and defaultGroundParams.targetFrameMs) or
+		16.6
+	) or 16.6
+	local thresholdMs = math.max(
+		tonumber(profilerSpikeMonitor.minThresholdMs) or 45.0,
+		targetMs * (tonumber(profilerSpikeMonitor.targetMultiplier) or 2.4)
+	)
+	local now = love.timer.getTime()
+	if frameMs < thresholdMs then
+		if (now - (tonumber(profilerSpikeMonitor.lastLogAt) or -math.huge)) >=
+			(tonumber(profilerSpikeMonitor.quietResetSec) or 8.0) then
+			profilerSpikeMonitor.lastLoggedSpikeMs = 0
+		end
+		return
+	end
+	local cooldownSec = tonumber(profilerSpikeMonitor.logCooldownSec) or 2.5
+	local deltaTriggerMs = tonumber(profilerSpikeMonitor.deltaTriggerMs) or 12.0
+	local canLog = false
+	if (now - (tonumber(profilerSpikeMonitor.lastLogAt) or -math.huge)) >= cooldownSec then
+		canLog = true
+	end
+	if frameMs >= ((tonumber(profilerSpikeMonitor.lastLoggedSpikeMs) or 0) + deltaTriggerMs) then
+		canLog = true
+	end
+	if not canLog then
+		return
+	end
+	local statsWindow = math.max(30, math.floor(tonumber(profilerSpikeMonitor.statsWindow) or 180))
+	local stats = frameProfiler:getMetricStats(metricId, statsWindow)
+	local contributors = buildSpikeContributorSummary(
+		completedFrame,
+		profilerSpikeMonitor.maxContributors,
+		profilerSpikeMonitor.minContributionMs
+	)
+	logger.log(string.format(
+		"Profiler spike: %s=%.2fms | C %.2f A %.2f N %.2f X %.2f (%df) | target %.2f threshold %.2f | top %s",
+		metricId,
+		frameMs,
+		tonumber(stats.current) or tonumber(stats.latest) or 0,
+		tonumber(stats.avg) or 0,
+		tonumber(stats.min) or 0,
+		tonumber(stats.max) or tonumber(stats.peak) or 0,
+		math.max(0, math.floor(tonumber(stats.samples) or 0)),
+		targetMs,
+		thresholdMs,
+		contributors
+	))
+	profilerSpikeMonitor.lastLogAt = now
+	profilerSpikeMonitor.lastLoggedSpikeMs = frameMs
+end
+
+function finalizeFrameProfiler()
+	if not frameProfiler then
+		return nil
+	end
+	local completedFrame = frameProfiler:endFrame()
+	maybeLogProfilerSpike(completedFrame)
+	return completedFrame
 end
 
 local function sanitizePositiveScale(value, fallback)
@@ -570,7 +969,7 @@ local function randomRange(minValue, maxValue)
 end
 
 local function syncChunkingWithDrawDistance(forceGroundRebuild)
-	local drawDistance = clamp(tonumber(graphicsSettings.drawDistance) or 1800, 300, 5000)
+	local drawDistance = clamp(tonumber(graphicsSettings.drawDistance) or 1800, 300, 20000)
 	local spawnRadius = math.max(
 		drawDistanceChunkingTuning.cloudSpawnMin,
 		drawDistance * drawDistanceChunkingTuning.cloudSpawnRatio
@@ -652,12 +1051,58 @@ function invalidateMapCache()
 	mapState.mapImageData = nil
 	mapState.mapBuildJob = nil
 	mapState.mapRes = 0
+	mapState.activeRequestId = 0
+	mapState.completedRequestId = 0
 	mapState.lastCenterX = nil
 	mapState.lastCenterZ = nil
 	mapState.lastHeading = nil
 	mapState.lastExtent = nil
 	mapState.lastGroundSignature = nil
+	mapState.lastOrientationMode = nil
 	mapState.lastRefreshAt = -math.huge
+end
+
+local function initializeMapWorker()
+	if mapState.workerEnabled ~= true or netMode == "dedicated" then
+		return false
+	end
+	if mapState.workerAvailable then
+		return true
+	end
+	if not (love and love.thread and love.thread.newThread and love.thread.getChannel) then
+		return false
+	end
+	if mapState.workerThread then
+		mapState.workerAvailable = true
+		return true
+	end
+
+	local workerId = tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999))
+	local requestName = "map_raster_req_" .. workerId
+	local responseName = "map_raster_rsp_" .. workerId
+	local okThread, threadOrErr = pcall(function()
+		return love.thread.newThread("Source/Systems/MapRasterWorker.lua")
+	end)
+	if not okThread or not threadOrErr then
+		return false
+	end
+
+	local requestChannel = love.thread.getChannel(requestName)
+	local responseChannel = love.thread.getChannel(responseName)
+	local started = pcall(function()
+		threadOrErr:start(requestName, responseName)
+	end)
+	if not started then
+		return false
+	end
+
+	mapState.workerThread = threadOrErr
+	mapState.workerRequestChannel = requestChannel
+	mapState.workerResponseChannel = responseChannel
+	mapState.workerAvailable = true
+	mapState.activeRequestId = 0
+	mapState.completedRequestId = 0
+	return true
 end
 
 function groundParamsSignature(params)
@@ -1169,6 +1614,10 @@ local viewSystem = viewSystemModule.create({
 	graphicsSettings = function()
 		return graphicsSettings
 	end,
+	sampleGroundHeightAt = function(worldX, worldZ)
+		local terrainRef = terrainState or activeGroundParams or defaultGroundParams
+		return terrainSdfSystem.sampleGroundHeightAtWorld(worldX, worldZ, terrainRef) or 0
+	end,
 	mouseSensitivity = function()
 		return mouseSensitivity
 	end,
@@ -1196,88 +1645,12 @@ local function ensureMapGroundImage(panelSize, mapCam)
 		return nil
 	end
 
-	local function beginMapBuild(targetRes, groundSig)
-		if (not mapState.mapImageData) or mapState.mapRes ~= targetRes then
-			local okData, dataOrErr = pcall(function()
-				return love.image.newImageData(targetRes, targetRes)
-			end)
-			if not okData or not dataOrErr then
-				mapState.mapImage = nil
-				mapState.mapImageData = nil
-				mapState.mapBuildJob = nil
-				mapState.mapRes = 0
-				return false
-			end
-			mapState.mapImageData = dataOrErr
-			mapState.mapRes = targetRes
-		end
-
-		local centerX = (mapCam.pos and mapCam.pos[1]) or 0
-		local centerZ = (mapCam.pos and mapCam.pos[3]) or 0
-		local heading = tonumber(mapCam.heading) or 0
-		mapState.mapBuildJob = {
-			targetRes = targetRes,
-			nextRow = 0,
-			worldPerPixel = (mapCam.extent * 2) / targetRes,
-			cosHeading = math.cos(heading),
-			sinHeading = math.sin(heading),
-			centerX = centerX,
-			centerZ = centerZ,
-			heading = heading,
-			extent = mapCam.extent,
-			groundSig = groundSig
-		}
-		return true
-	end
-
-	local function stepMapBuild()
-		local job = mapState.mapBuildJob
-		local data = mapState.mapImageData
-		if type(job) ~= "table" or not data then
-			mapState.mapBuildJob = nil
+	local function applyMapImageData(data, job)
+		if not data or type(job) ~= "table" then
 			return false
 		end
-
-		local targetRes = job.targetRes
-		local halfRes = targetRes * 0.5
-		local worldPerPixel = job.worldPerPixel
-		local cosH = job.cosHeading
-		local sinH = job.sinHeading
-		local colorParams = activeGroundParams or defaultGroundParams
-		local terrainRef = terrainState or colorParams
-		local rowsPerStep = clamp(math.floor(targetRes * 0.08), 6, 24)
-		local startRow = math.floor(tonumber(job.nextRow) or 0)
-		local endRow = math.min(targetRes - 1, startRow + rowsPerStep - 1)
-
-		for y = startRow, endRow do
-			for x = 0, targetRes - 1 do
-				local mapX = (x + 0.5 - halfRes) * worldPerPixel
-				local mapZ = (halfRes - (y + 0.5)) * worldPerPixel
-				local worldDX = cosH * mapX + sinH * mapZ
-				local worldDZ = -sinH * mapX + cosH * mapZ
-				local worldX = job.centerX + worldDX
-				local worldZ = job.centerZ + worldDZ
-				local c = terrainSdfSystem.sampleGroundColorAtWorld(worldX, worldZ, terrainRef)
-				local edgeX = math.abs((x + 0.5) / targetRes * 2 - 1)
-				local edgeY = math.abs((y + 0.5) / targetRes * 2 - 1)
-				local vignette = 1 - (math.max(edgeX, edgeY) * 0.09)
-				vignette = clamp(vignette, 0.78, 1.0)
-				data:setPixel(
-					x,
-					y,
-					clamp(c[1] * vignette, 0, 1),
-					clamp(c[2] * vignette, 0, 1),
-					clamp(c[3] * vignette, 0, 1),
-					0.98
-				)
-			end
-		end
-
-		job.nextRow = endRow + 1
-		if job.nextRow < targetRes then
-			return false
-		end
-
+		mapState.mapImageData = data
+		mapState.mapRes = job.targetRes
 		if mapState.mapImage then
 			local okReplace = pcall(function()
 				mapState.mapImage:replacePixels(data)
@@ -1292,26 +1665,183 @@ local function ensureMapGroundImage(panelSize, mapCam)
 			end)
 			if not okImage or not imageOrErr then
 				mapState.mapImage = nil
-				mapState.mapBuildJob = nil
 				return false
 			end
 			mapState.mapImage = imageOrErr
 			mapState.mapImage:setFilter("linear", "linear")
 		end
-
 		mapState.lastCenterX = job.centerX
 		mapState.lastCenterZ = job.centerZ
 		mapState.lastHeading = job.heading
 		mapState.lastExtent = job.extent
 		mapState.lastGroundSignature = job.groundSig
+		mapState.lastOrientationMode = job.orientationMode
 		mapState.lastRefreshAt = love.timer.getTime()
 		mapState.mapBuildJob = nil
 		return true
 	end
 
+	local function beginMapBuild(targetRes, groundSig)
+		local centerX = (mapCam.pos and mapCam.pos[1]) or 0
+		local centerZ = (mapCam.pos and mapCam.pos[3]) or 0
+		local heading = tonumber(mapCam.heading) or 0
+		local orientationMode = mapState.orientationMode == "north_up" and "north_up" or "heading_up"
+		mapState.activeRequestId = (tonumber(mapState.activeRequestId) or 0) + 1
+		mapState.mapBuildJob = {
+			targetRes = targetRes,
+			centerX = centerX,
+			centerZ = centerZ,
+			heading = heading,
+			extent = mapCam.extent,
+			groundSig = groundSig,
+			orientationMode = orientationMode,
+			requestId = mapState.activeRequestId
+		}
+
+		if initializeMapWorker() and mapState.workerRequestChannel then
+			local ok = pcall(function()
+				mapState.workerRequestChannel:push({
+					type = "build_map",
+					requestId = mapState.activeRequestId,
+					targetRes = targetRes,
+					centerX = centerX,
+					centerZ = centerZ,
+					heading = heading,
+					extent = mapCam.extent,
+					groundSig = groundSig,
+					orientationMode = orientationMode,
+					params = activeGroundParams or defaultGroundParams
+				})
+			end)
+			if ok then
+				return true
+			end
+			mapState.workerAvailable = false
+		end
+		if mapState.workerEnabled ~= false then
+			-- Avoid synchronous raster fallback on the render thread; keep last map image
+			-- rather than introducing large hitches when worker dispatch fails.
+			mapState.mapBuildJob = nil
+			return false
+		end
+
+		local targetRes = mapState.mapBuildJob.targetRes
+		local halfRes = targetRes * 0.5
+		local worldPerPixel = (mapCam.extent * 2) / targetRes
+		local colorParams = activeGroundParams or defaultGroundParams
+		local terrainRef = terrainState or colorParams
+		local okData, dataOrErr = pcall(function()
+			return love.image.newImageData(targetRes, targetRes)
+		end)
+		if not okData or not dataOrErr then
+			mapState.mapBuildJob = nil
+			mapState.mapImage = nil
+			mapState.mapImageData = nil
+			mapState.mapRes = 0
+			return false
+		end
+		for y = 0, targetRes - 1 do
+			for x = 0, targetRes - 1 do
+				local mapX = (x + 0.5 - halfRes) * worldPerPixel
+				local mapZ = (halfRes - (y + 0.5)) * worldPerPixel
+				local worldDX, worldDZ = viewMath.mapToWorldDelta(
+					mapX,
+					mapZ,
+					heading,
+					orientationMode
+				)
+				local worldX = centerX + worldDX
+				local worldZ = centerZ + worldDZ
+				local c = terrainSdfSystem.sampleGroundColorAtWorld(worldX, worldZ, terrainRef)
+				local edgeX = math.abs((x + 0.5) / targetRes * 2 - 1)
+				local edgeY = math.abs((y + 0.5) / targetRes * 2 - 1)
+				local vignette = 1 - (math.max(edgeX, edgeY) * 0.09)
+				vignette = clamp(vignette, 0.78, 1.0)
+				dataOrErr:setPixel(
+					x,
+					y,
+					clamp(c[1] * vignette, 0, 1),
+					clamp(c[2] * vignette, 0, 1),
+					clamp(c[3] * vignette, 0, 1),
+					0.98
+				)
+			end
+		end
+		return applyMapImageData(dataOrErr, mapState.mapBuildJob)
+	end
+
+	local function collectMapBuildResults()
+		if not (mapState.workerAvailable and mapState.workerResponseChannel) then
+			return false
+		end
+		local updated = false
+		local processed = 0
+		local maxResultsPerFrame = 1
+		local maxCollectMs = 1.0
+		local startedAt = love.timer.getTime()
+		while processed < maxResultsPerFrame do
+			if ((love.timer.getTime() - startedAt) * 1000.0) >= maxCollectMs then
+				break
+			end
+			local msg = mapState.workerResponseChannel:pop()
+			if not msg then
+				break
+			end
+			processed = processed + 1
+			if type(msg) == "table" and msg.type == "build_map_done" then
+				if tonumber(msg.requestId) == tonumber(mapState.activeRequestId) then
+					mapState.completedRequestId = tonumber(msg.requestId) or 0
+					applyMapImageData(msg.imageData, {
+						targetRes = msg.targetRes,
+						centerX = msg.centerX,
+						centerZ = msg.centerZ,
+						heading = msg.heading,
+						extent = msg.extent,
+						groundSig = msg.groundSig,
+						orientationMode = msg.orientationMode
+					})
+					updated = true
+				end
+			end
+		end
+		return updated
+	end
+
 	local now = love.timer.getTime()
-	local targetRes = clamp(math.floor(panelSize), 96, 224)
+	local missingRequired = math.max(0, math.floor(tonumber(terrainState and terrainState.missingRequiredChunks) or 0))
+	local buildQueueSize = math.max(0, math.floor(tonumber(terrainState and terrainState.buildQueueSize) or 0))
+	local workerInflightCount = math.max(0, math.floor(tonumber(terrainState and terrainState.workerInflightCount) or 0))
+	local terrainBusy = (missingRequired + buildQueueSize + workerInflightCount) > 0
+	local flightVel = (camera and (camera.flightVel or camera.vel)) or { 0, 0, 0 }
+	local speed = math.sqrt(
+		((tonumber(flightVel[1]) or 0) * (tonumber(flightVel[1]) or 0)) +
+		((tonumber(flightVel[2]) or 0) * (tonumber(flightVel[2]) or 0)) +
+		((tonumber(flightVel[3]) or 0) * (tonumber(flightVel[3]) or 0))
+	)
+	local fastFlight = speed > 120
+	local qualityScale = clamp(tonumber(mapState.qualityScale) or 1.0, 0.5, 2.0)
+	local maxResolution = math.max(160, math.floor(tonumber(mapState.maxResolution) or 512))
+	local targetRes = clamp(math.floor(panelSize * qualityScale + 0.5), 96, maxResolution)
+	if terrainBusy then
+		targetRes = math.min(targetRes, 384)
+	end
+	if fastFlight then
+		targetRes = math.min(targetRes, 320)
+	end
 	local groundSig = groundParamsSignature(activeGroundParams or defaultGroundParams)
+	collectMapBuildResults()
+	local moveThreshold = math.max(4.0, mapCam.extent * (terrainBusy and 0.06 or 0.04))
+	local headingThreshold = terrainBusy and math.rad(3.0) or math.rad(1.5)
+	if fastFlight then
+		headingThreshold = math.max(headingThreshold, math.rad(5.0))
+	end
+	local refreshInterval = terrainBusy and 0.45 or 0.20
+	if fastFlight then
+		refreshInterval = math.max(refreshInterval, 0.55)
+	end
+	local centerDx = math.abs((mapState.lastCenterX or mapCam.pos[1]) - mapCam.pos[1])
+	local centerDz = math.abs((mapState.lastCenterZ or mapCam.pos[3]) - mapCam.pos[3])
+	local headingDelta = math.abs(viewMath.shortestAngleDelta(mapState.lastHeading or mapCam.heading, mapCam.heading))
 	local needRefresh = false
 	if not mapState.mapImage then
 		needRefresh = true
@@ -1319,14 +1849,12 @@ local function ensureMapGroundImage(panelSize, mapCam)
 		needRefresh = true
 	elseif mapState.lastGroundSignature ~= groundSig then
 		needRefresh = true
+	elseif (mapState.lastOrientationMode or "heading_up") ~= (mapState.orientationMode or "heading_up") then
+		needRefresh = true
 	elseif math.abs((mapState.lastExtent or 0) - mapCam.extent) > 1e-6 then
 		needRefresh = true
-	elseif (now - (mapState.lastRefreshAt or -math.huge)) >= 0.2 then
-		local dx = math.abs((mapState.lastCenterX or mapCam.pos[1]) - mapCam.pos[1])
-		local dz = math.abs((mapState.lastCenterZ or mapCam.pos[3]) - mapCam.pos[3])
-		local headingDelta = math.abs(viewMath.shortestAngleDelta(mapState.lastHeading or mapCam.heading, mapCam.heading))
-		local moveThreshold = math.max(3.0, mapCam.extent * 0.03)
-		if dx > moveThreshold or dz > moveThreshold or headingDelta > math.rad(2.0) then
+	elseif (now - (mapState.lastRefreshAt or -math.huge)) >= refreshInterval then
+		if centerDx > moveThreshold or centerDz > moveThreshold or headingDelta > headingThreshold then
 			needRefresh = true
 		end
 	end
@@ -1334,10 +1862,20 @@ local function ensureMapGroundImage(panelSize, mapCam)
 	local activeJob = type(mapState.mapBuildJob) == "table"
 	if activeJob then
 		local job = mapState.mapBuildJob
-		if job.targetRes ~= targetRes or job.groundSig ~= groundSig or math.abs((job.extent or 0) - mapCam.extent) > 1e-6 then
-			beginMapBuild(targetRes, groundSig)
+		if job.targetRes ~= targetRes or
+			job.groundSig ~= groundSig or
+			job.orientationMode ~= (mapState.orientationMode or "heading_up") or
+			math.abs((job.extent or 0) - mapCam.extent) > 1e-6 or
+			math.abs((tonumber(job.centerX) or mapCam.pos[1]) - mapCam.pos[1]) > moveThreshold or
+			math.abs((tonumber(job.centerZ) or mapCam.pos[3]) - mapCam.pos[3]) > moveThreshold or
+			math.abs(viewMath.shortestAngleDelta(job.heading or mapCam.heading, mapCam.heading)) > headingThreshold then
+			needRefresh = true
 		end
-		stepMapBuild()
+		collectMapBuildResults()
+		if (not mapState.mapBuildJob) and needRefresh then
+			beginMapBuild(targetRes, groundSig)
+			collectMapBuildResults()
+		end
 		return mapState.mapImage
 	end
 
@@ -1345,9 +1883,8 @@ local function ensureMapGroundImage(panelSize, mapCam)
 		return mapState.mapImage
 	end
 
-	if beginMapBuild(targetRes, groundSig) then
-		stepMapBuild()
-	end
+	beginMapBuild(targetRes, groundSig)
+	collectMapBuildResults()
 	return mapState.mapImage
 end
 
@@ -1367,7 +1904,7 @@ local function updateLogicalMapCamera()
 	mapCam.pos[1] = camera.pos[1]
 	mapCam.pos[2] = camera.pos[2]
 	mapCam.pos[3] = camera.pos[3]
-	mapCam.heading = viewMath.getYawFromRotation(camera.rot, q)
+	mapCam.heading = viewMath.getStableYawFromRotation(camera.rot, q, mapCam.heading or 0)
 	mapCam.extent = mapState.zoomExtents[mapState.zoomIndex] or (worldHalfExtent or 1000)
 	return mapCam
 end
@@ -1381,9 +1918,11 @@ local function syncLocalPlayerObject()
 	localPlayerObject.basePos[1] = camera.pos[1]
 	localPlayerObject.basePos[2] = camera.pos[2]
 	localPlayerObject.basePos[3] = camera.pos[3]
-	localPlayerObject.pos[1] = camera.pos[1]
-	localPlayerObject.pos[2] = camera.pos[2] + (localPlayerObject.visualOffsetY or 0)
-	localPlayerObject.pos[3] = camera.pos[3]
+	localPlayerObject.pos = applyVisualOffsetToWorld(
+		localPlayerObject.basePos,
+		camera.rot,
+		localPlayerObject.visualOffset
+	)
 	localPlayerObject.rot = composePlayerModelRotation(camera.rot, activeRole, localPlayerObject.modelHash)
 end
 
@@ -1529,14 +2068,13 @@ function getGroundClearance()
 	return localGroundClearance
 end
 
-function computeModelVisualOffsetY(modelHash, scale)
-	local entry = playerModelCache[modelHash]
-	local bounds = entry and entry.bounds
-	local bottomDistance = ((bounds and bounds.bottomDistance) or 1) * math.max(0.01, scale or 1)
-	return bottomDistance - getGroundClearance()
+function computeModelVisualOffsetY(modelHash, scale, role, explicitOffset)
+	return resolveVisualOffsetVector(explicitOffset, role, modelHash, scale)[2]
 end
 
-function applyPlaneVisualToObject(obj, modelHash, scale)
+local resolvePaintOverlayByHash
+
+function applyPlaneVisualToObject(obj, modelHash, scale, role, explicitOffset, explicitSkinHash)
 	if not obj then
 		return
 	end
@@ -1548,19 +2086,17 @@ function applyPlaneVisualToObject(obj, modelHash, scale)
 	obj.submeshes = entry and entry.submeshes or nil
 	obj.faceMaterials = entry and entry.faceMaterials or nil
 	obj.modelAssetId = entry and entry.assetId or nil
+	obj.paintOverlay = resolvePaintOverlayByHash(explicitSkinHash)
 	local s = sanitizePositiveScale(scale, 1)
 	obj.scale = { s, s, s }
 	obj.halfSize = { x = s, y = s, z = s }
 	obj.modelHash = modelHash
 	obj.uvFlipV = false
 	obj.modelRotationOffset = getModelRotationOffsetForHash(modelHash)
-	obj.visualOffsetY = computeModelVisualOffsetY(modelHash, s)
+	obj.visualOffset = resolveVisualOffsetVector(explicitOffset, role, modelHash, s)
+	obj.visualOffsetY = obj.visualOffset[2]
 	if obj.basePos then
-		obj.pos = {
-			obj.basePos[1],
-			obj.basePos[2] + obj.visualOffsetY,
-			obj.basePos[3]
-		}
+		obj.pos = applyVisualOffsetToWorld(obj.basePos, obj.baseRot, obj.visualOffset)
 	end
 end
 
@@ -1641,6 +2177,8 @@ function cacheModelEntry(raw, sourceLabel, loaderOptions)
 	return entry
 end
 
+local ensureConfiguredSkinHashCompatible
+
 function setActivePlayerModel(entry, sourceLabel, targetRole)
 	if not entry then
 		return
@@ -1652,6 +2190,7 @@ function setActivePlayerModel(entry, sourceLabel, targetRole)
 	else
 		playerPlaneModelHash = entry.hash
 	end
+	ensureConfiguredSkinHashCompatible(role)
 
 	if role == getActiveModelRole() then
 		syncActivePlayerModelState()
@@ -1759,6 +2298,62 @@ do
 	playerModelCache[fallbackEntry.hash] = fallbackEntry
 end
 
+local MAX_PERSISTED_MODEL_CACHE = 96
+
+local function buildPersistedModelCache(maxEntries)
+	local encodedCap = modelTransferState.maxEncodedBytes or (200 * 1024 * 1024)
+	local entries = {}
+	for hash, entry in pairs(playerModelCache) do
+		if hash ~= "builtin-cube" and type(entry) == "table" then
+			local encoded = entry.encoded
+			if type(encoded) == "string" and encoded ~= "" and #encoded <= encodedCap then
+				entries[#entries + 1] = {
+					hash = tostring(hash),
+					source = tostring(entry.source or "cached"),
+					encoded = encoded,
+					byteLength = math.floor(tonumber(entry.byteLength) or 0),
+					encodedLength = #encoded
+				}
+			end
+		end
+	end
+	table.sort(entries, function(a, b)
+		return tostring(a.hash) < tostring(b.hash)
+	end)
+	local limit = math.max(0, math.floor(tonumber(maxEntries) or MAX_PERSISTED_MODEL_CACHE))
+	if #entries > limit then
+		local trimmed = {}
+		for i = 1, limit do
+			trimmed[i] = entries[i]
+		end
+		return trimmed
+	end
+	return entries
+end
+
+local function restorePersistedModelCache(entries)
+	if type(entries) ~= "table" then
+		return 0
+	end
+	local loaded = 0
+	for _, snapshot in ipairs(entries) do
+		local hash = type(snapshot.hash) == "string" and snapshot.hash or nil
+		if hash and hash ~= "" and hash ~= "builtin-cube" and not playerModelCache[hash] then
+			local encoded = type(snapshot.encoded) == "string" and snapshot.encoded or nil
+			if encoded and encoded ~= "" then
+				local raw = decodeModelBytes(encoded)
+				if type(raw) == "string" and raw ~= "" then
+					local entry = cacheModelEntry(raw, tostring(snapshot.source or ("persisted " .. hash)))
+					if entry and entry.hash == hash then
+						loaded = loaded + 1
+					end
+				end
+			end
+		end
+	end
+	return loaded
+end
+
 
 local function setMouseCapture(enabled)
 	love.mouse.setRelativeMode(enabled)
@@ -1778,22 +2373,97 @@ function getConfiguredModelForRole(role)
 	return playerPlaneModelHash or "builtin-cube", sanitizePositiveScale(playerPlaneModelScale, defaultPlayerModelScale)
 end
 
-function getConfiguredSkinHashForRole(role)
+local function setConfiguredSkinHashForRole(role, hash)
+	local nextHash = tostring(hash or "")
+	if normalizeRoleId(role) == "walking" then
+		playerWalkingSkinHash = nextHash
+		return nextHash
+	end
+	playerPlaneSkinHash = nextHash
+	return nextHash
+end
+
+resolvePaintOverlayByHash = function(hash)
+	local paintHash = tostring(hash or "")
+	if paintHash == "" or type(modelModule.getPaintOverlay) ~= "function" then
+		return nil
+	end
+	return modelModule.getPaintOverlay(paintHash) or nil
+end
+
+ensureConfiguredSkinHashCompatible = function(role)
 	local roleId = normalizeRoleId(role)
 	local modelHash = (roleId == "walking") and playerWalkingModelHash or playerPlaneModelHash
-	local entry = playerModelCache and playerModelCache[modelHash or "builtin-cube"]
-	if not entry or not entry.assetId then
+	local skinHash = (roleId == "walking") and playerWalkingSkinHash or playerPlaneSkinHash
+	if type(skinHash) ~= "string" or skinHash == "" then
 		return ""
 	end
-	local asset = modelModule.getAsset(entry.assetId)
-	if not asset or type(asset.paintByRole) ~= "table" then
-		return ""
+	local overlay = resolvePaintOverlayByHash(skinHash)
+	if overlay and overlay.modelHash and overlay.modelHash ~= modelHash then
+		return setConfiguredSkinHashForRole(roleId, "")
 	end
-	local overlay = asset.paintByRole[roleId]
-	if overlay and type(overlay.hash) == "string" then
-		return overlay.hash
+	return skinHash
+end
+
+function getConfiguredSkinHashForRole(role)
+	local roleId = normalizeRoleId(role)
+	return ensureConfiguredSkinHashCompatible(roleId)
+end
+
+local function buildConfiguredPaintSnapshotForRole(role)
+	local roleId = normalizeRoleId(role)
+	local paintHash = getConfiguredSkinHashForRole(roleId)
+	if paintHash == "" then
+		return nil
 	end
-	return ""
+
+	local snapshot = {
+		paintHash = paintHash
+	}
+	if type(modelModule.getBlobRaw) == "function" then
+		local raw = modelModule.getBlobRaw("paint", paintHash)
+		local encoded = (type(raw) == "string" and raw ~= "") and encodeModelBytes(raw) or nil
+		if type(encoded) == "string" and encoded ~= "" and #encoded <= RESTART_MODEL_ENCODED_LIMIT then
+			snapshot.paintEncoded = encoded
+		end
+	end
+	return snapshot
+end
+
+local function restoreConfiguredPaintSnapshotForRole(role, snapshot)
+	if type(snapshot) ~= "table" then
+		return false
+	end
+
+	local roleId = normalizeRoleId(role)
+	local modelHash = (roleId == "walking") and playerWalkingModelHash or playerPlaneModelHash
+	if type(modelHash) ~= "string" or modelHash == "" then
+		return false
+	end
+
+	local paintHash = tostring(snapshot.skinHash or snapshot.paintHash or "")
+	local encodedPaint = snapshot.skinEncoded or snapshot.paintEncoded
+	if paintHash ~= "" and type(encodedPaint) == "string" and encodedPaint ~= "" and
+		type(modelModule.importPaintBlob) == "function" then
+		local raw = decodeModelBytes(encodedPaint)
+		if type(raw) == "string" and raw ~= "" then
+			local okImport, errImport = modelModule.importPaintBlob(paintHash, raw, {
+				role = roleId,
+				modelHash = modelHash
+			})
+			if not okImport then
+				logger.log("Paint restore import failed for " .. tostring(roleId) .. ": " .. tostring(errImport))
+			end
+		end
+	end
+
+	setConfiguredSkinHashForRole(roleId, paintHash)
+	if roleId == getActiveModelRole() then
+		syncActivePlayerModelState()
+	else
+		forceStateSync()
+	end
+	return true
 end
 
 function syncActivePlayerModelState()
@@ -1802,10 +2472,19 @@ function syncActivePlayerModelState()
 	local modelHash, modelScale = getConfiguredModelForRole(getActiveModelRole())
 	playerModelHash = modelHash
 	playerModelScale = modelScale
+	ensureConfiguredSkinHashCompatible("plane")
+	ensureConfiguredSkinHashCompatible("walking")
 	local entry = playerModelCache and playerModelCache[playerModelHash]
 	playerModel = (entry and entry.model) or cubeModel
 	if localPlayerObject then
-		applyPlaneVisualToObject(localPlayerObject, playerModelHash, playerModelScale)
+		applyPlaneVisualToObject(
+			localPlayerObject,
+			playerModelHash,
+			playerModelScale,
+			getActiveModelRole(),
+			nil,
+			getConfiguredSkinHashForRole(getActiveModelRole())
+		)
 		syncLocalPlayerObject()
 	end
 	forceStateSync()
@@ -1920,18 +2599,23 @@ local function setFlightMode(enabled)
 	syncActivePlayerModelState()
 end
 
-function addCrashCraterAt(impactX, impactY, impactZ, impactSpeed)
+local function buildCrashCrater(impactX, impactY, impactZ, impactSpeed)
 	local speed = math.max(0, tonumber(impactSpeed) or 0)
 	local radius = clamp(6 + speed * 0.22, 6, 28)
 	local depth = clamp(radius * 0.48, 1.8, 14)
-	local added, craterState = terrainSdfSystem.addCrater({
+	return {
 		x = impactX,
 		y = impactY,
 		z = impactZ,
 		radius = radius,
 		depth = depth,
 		rim = 0.14
-	}, {
+	}
+end
+
+function addCrashCraterAt(impactX, impactY, impactZ, impactSpeed)
+	local crater = buildCrashCrater(impactX, impactY, impactZ, impactSpeed)
+	local added, craterState = terrainSdfSystem.addCrater(crater, {
 		defaultGroundParams = defaultGroundParams,
 		activeGroundParams = activeGroundParams,
 		terrainState = terrainState,
@@ -1944,21 +2628,9 @@ function addCrashCraterAt(impactX, impactY, impactZ, impactSpeed)
 		terrainState = craterState.terrainState or terrainState
 		groundObject = nil
 		invalidateMapCache()
-		return craterState.crater or {
-			x = impactX,
-			y = impactY,
-			z = impactZ,
-			radius = radius,
-			depth = depth
-		}
+		return craterState.crater or crater
 	end
-	return {
-		x = impactX,
-		y = impactY,
-		z = impactZ,
-		radius = radius,
-		depth = depth
-	}
+	return crater
 end
 
 function handleFlightCrashEvent(crashEvent)
@@ -1972,7 +2644,28 @@ function handleFlightCrashEvent(crashEvent)
 	local impactZ = tonumber(impactPos[3]) or tonumber(camera.pos and camera.pos[3]) or 0
 	local impactSpeed = tonumber(crashEvent.totalSpeed) or 0
 
-	local crater = addCrashCraterAt(impactX, impactY, impactZ, impactSpeed)
+	local crater
+	if relayIsConnected() then
+		crater = buildCrashCrater(impactX, impactY, impactZ, impactSpeed)
+		local craterPacket = table.concat({
+			"CRATER_EVENT",
+			"x=" .. formatNetFloat(crater.x),
+			"y=" .. formatNetFloat(crater.y),
+			"z=" .. formatNetFloat(crater.z),
+			"radius=" .. formatNetFloat(crater.radius),
+			"depth=" .. formatNetFloat(crater.depth),
+			"rim=" .. formatNetFloat(crater.rim)
+		}, "|")
+		if hostedRelay and type(hostedRelay.addCrater) == "function" then
+			hostedRelay:addCrater(crater)
+		elseif relayServer then
+			pcall(function()
+				relayServer:send(craterPacket, 0)
+			end)
+		end
+	else
+		crater = addCrashCraterAt(impactX, impactY, impactZ, impactSpeed)
+	end
 	local normal = crashEvent.normal or { 0, 1, 0 }
 	local nx = tonumber(normal[1]) or 0
 	local nz = tonumber(normal[3]) or 0
@@ -2025,7 +2718,7 @@ function handleFlightCrashEvent(crashEvent)
 
 	syncLocalPlayerObject()
 	resolveActiveRenderCamera()
-	if cloudNetState and cloudNetState.role == "authority" and type(sendGroundSnapshot) == "function" then
+	if (not relayIsConnected()) and cloudNetState and cloudNetState.role == "authority" and type(sendGroundSnapshot) == "function" then
 		sendGroundSnapshot("crash crater")
 	end
 	logger.log(string.format(
@@ -2103,6 +2796,25 @@ function clearPeerObjects()
 	syncAppStateReferences()
 end
 
+local function removePeerObject(peerId)
+	local id = tonumber(peerId)
+	if not id then
+		return false
+	end
+	local obj = peers[id]
+	if not obj then
+		return false
+	end
+	for i = #objects, 1, -1 do
+		if objects[i] == obj then
+			table.remove(objects, i)
+			break
+		end
+	end
+	peers[id] = nil
+	return true
+end
+
 function splitPacketFields(data)
 	return packetCodec.splitFields(data, "|")
 end
@@ -2119,13 +2831,410 @@ local function makeBlobTransferKey(kind, hash)
 	return tostring(kind or "") .. "|" .. tostring(hash or "")
 end
 
-local function formatNetFloat(value)
+formatNetFloat = function(value)
 	return string.format("%.4f", tonumber(value) or 0)
+end
+
+local function normalizeRadioChannel(channel)
+	local maxChannel = math.max(1, math.floor(tonumber(radioState.channelCount) or 8))
+	return clamp(math.floor(tonumber(channel) or 1), 1, maxChannel)
+end
+
+local function setRadioChannel(channel)
+	local nextChannel = normalizeRadioChannel(channel)
+	if nextChannel == radioState.channel then
+		return
+	end
+	radioState.channel = nextChannel
+	if radioVoice and type(radioVoice.setChannel) == "function" then
+		radioVoice:setChannel(nextChannel)
+	end
+	radioState.lastSentAt = -math.huge
+	forceStateSync()
+end
+
+local function applyPeerRadioStateFromPacket(packetData, peerId)
+	local peer = peerId and peers[peerId]
+	if not peer or type(packetData) ~= "string" then
+		return
+	end
+	local parts = splitPacketFields(packetData)
+	if parts[1] ~= "STATE3" and parts[1] ~= "SNAPSHOT" and parts[1] ~= "AVATAR_MANIFEST" then
+		return
+	end
+	local kv = parsePacketKeyValues(parts, 2)
+	if kv.radio then
+		peer.radioChannel = normalizeRadioChannel(kv.radio)
+	end
+	if kv.ptt then
+		peer.radioTx = (tonumber(kv.ptt) or 0) ~= 0
+	end
+	if kv.planeOffX or kv.planeOffY or kv.planeOffZ then
+		peer.planeOffset = peer.planeOffset or { 0, 0, 0 }
+		peer.planeOffset[1] = tonumber(kv.planeOffX) or peer.planeOffset[1] or 0
+		peer.planeOffset[2] = tonumber(kv.planeOffY) or peer.planeOffset[2] or 0
+		peer.planeOffset[3] = tonumber(kv.planeOffZ) or peer.planeOffset[3] or 0
+		peer.planeOffsetY = peer.planeOffset[2]
+	end
+	if kv.walkingOffX or kv.walkingOffY or kv.walkingOffZ then
+		peer.walkingOffset = peer.walkingOffset or { 0, 0, 0 }
+		peer.walkingOffset[1] = tonumber(kv.walkingOffX) or peer.walkingOffset[1] or 0
+		peer.walkingOffset[2] = tonumber(kv.walkingOffY) or peer.walkingOffset[2] or 0
+		peer.walkingOffset[3] = tonumber(kv.walkingOffZ) or peer.walkingOffset[3] or 0
+		peer.walkingOffsetY = peer.walkingOffset[2]
+	end
 end
 
 forceStateSync = function()
 	stateNet.forceSend = true
 	stateNet.lastSentAt = -math.huge
+	radioState.lastSentAt = -math.huge
+	clientNet.forceHello = true
+end
+
+function buildHelloPacket()
+	local planeOrientation = getRoleOrientation("plane")
+	local walkingOrientation = getRoleOrientation("walking")
+	local planeHash, planeScale = getConfiguredModelForRole("plane")
+	local walkingHash, walkingScale = getConfiguredModelForRole("walking")
+	return table.concat({
+		"HELLO",
+		"callsign=" .. tostring(sanitizeCallsign(localCallsign) or "Pilot"),
+		"role=" .. tostring(getActiveModelRole()),
+		"planeModelHash=" .. tostring(planeHash or "builtin-cube"),
+		"planeScale=" .. formatNetFloat(planeScale),
+		"planeSkinHash=" .. tostring(getConfiguredSkinHashForRole("plane") or ""),
+		"planeYaw=" .. formatNetFloat(planeOrientation.yaw),
+		"planePitch=" .. formatNetFloat(planeOrientation.pitch),
+		"planeRoll=" .. formatNetFloat(planeOrientation.roll),
+		"planeOffX=" .. formatNetFloat(planeOrientation.offset[1] or 0),
+		"planeOffY=" .. formatNetFloat(planeOrientation.offset[2] or 0),
+		"planeOffZ=" .. formatNetFloat(planeOrientation.offset[3] or 0),
+		"walkingModelHash=" .. tostring(walkingHash or "builtin-cube"),
+		"walkingScale=" .. formatNetFloat(walkingScale),
+		"walkingSkinHash=" .. tostring(getConfiguredSkinHashForRole("walking") or ""),
+		"walkingYaw=" .. formatNetFloat(walkingOrientation.yaw),
+		"walkingPitch=" .. formatNetFloat(walkingOrientation.pitch),
+		"walkingRoll=" .. formatNetFloat(walkingOrientation.roll),
+		"walkingOffX=" .. formatNetFloat(walkingOrientation.offset[1] or 0),
+		"walkingOffY=" .. formatNetFloat(walkingOrientation.offset[2] or 0),
+		"walkingOffZ=" .. formatNetFloat(walkingOrientation.offset[3] or 0),
+		"radio=" .. tostring(normalizeRadioChannel(radioState.channel)),
+		"ptt=" .. tostring((radioState.transmitting and 1) or 0)
+	}, "|")
+end
+
+function buildInputPacket(inputState, tick)
+	local planeOrientation = getRoleOrientation("plane")
+	local walkingOrientation = getRoleOrientation("walking")
+	local planeHash, planeScale = getConfiguredModelForRole("plane")
+	local walkingHash, walkingScale = getConfiguredModelForRole("walking")
+	local outboundCallsign = sanitizeCallsign(localCallsign) or "Pilot"
+	return table.concat({
+		"INPUT",
+		"tick=" .. tostring(math.floor(tonumber(tick) or 0)),
+		"role=" .. tostring(getActiveModelRole()),
+		"callsign=" .. outboundCallsign,
+		"walkYaw=" .. formatNetFloat(camera.walkYaw or 0),
+		"walkPitch=" .. formatNetFloat(camera.walkPitch or 0),
+		"throttle=" .. formatNetFloat(camera.throttle or 0),
+		"yokePitch=" .. formatNetFloat(camera.yoke and camera.yoke.pitch or 0),
+		"yokeYaw=" .. formatNetFloat(camera.yoke and camera.yoke.yaw or 0),
+		"yokeRoll=" .. formatNetFloat(camera.yoke and camera.yoke.roll or 0),
+		"walkForward=" .. tostring(inputState.walkForward and 1 or 0),
+		"walkBackward=" .. tostring(inputState.walkBackward and 1 or 0),
+		"walkStrafeLeft=" .. tostring(inputState.walkStrafeLeft and 1 or 0),
+		"walkStrafeRight=" .. tostring(inputState.walkStrafeRight and 1 or 0),
+		"walkSprint=" .. tostring(inputState.walkSprint and 1 or 0),
+		"walkJump=" .. tostring(inputState.walkJump and 1 or 0),
+		"flightThrottleUp=" .. tostring(inputState.flightThrottleUp and 1 or 0),
+		"flightThrottleDown=" .. tostring(inputState.flightThrottleDown and 1 or 0),
+		"flightAirBrakes=" .. tostring(inputState.flightAirBrakes and 1 or 0),
+		"flightAfterburner=" .. tostring(inputState.flightAfterburner and 1 or 0),
+		"planeModelHash=" .. tostring(planeHash or "builtin-cube"),
+		"planeScale=" .. formatNetFloat(planeScale),
+		"planeSkinHash=" .. tostring(getConfiguredSkinHashForRole("plane") or ""),
+		"planeYaw=" .. formatNetFloat(planeOrientation.yaw),
+		"planePitch=" .. formatNetFloat(planeOrientation.pitch),
+		"planeRoll=" .. formatNetFloat(planeOrientation.roll),
+		"planeOffX=" .. formatNetFloat(planeOrientation.offset[1] or 0),
+		"planeOffY=" .. formatNetFloat(planeOrientation.offset[2] or 0),
+		"planeOffZ=" .. formatNetFloat(planeOrientation.offset[3] or 0),
+		"walkingModelHash=" .. tostring(walkingHash or "builtin-cube"),
+		"walkingScale=" .. formatNetFloat(walkingScale),
+		"walkingSkinHash=" .. tostring(getConfiguredSkinHashForRole("walking") or ""),
+		"walkingYaw=" .. formatNetFloat(walkingOrientation.yaw),
+		"walkingPitch=" .. formatNetFloat(walkingOrientation.pitch),
+		"walkingRoll=" .. formatNetFloat(walkingOrientation.roll),
+		"walkingOffX=" .. formatNetFloat(walkingOrientation.offset[1] or 0),
+		"walkingOffY=" .. formatNetFloat(walkingOrientation.offset[2] or 0),
+		"walkingOffZ=" .. formatNetFloat(walkingOrientation.offset[3] or 0),
+		"radio=" .. tostring(normalizeRadioChannel(radioState.channel)),
+		"ptt=" .. tostring((radioState.transmitting and 1) or 0)
+	}, "|")
+end
+
+function buildState3FromSnapshot(kv)
+	return table.concat({
+		"STATE3",
+		"px=" .. tostring(kv.px or "0"),
+		"py=" .. tostring(kv.py or "0"),
+		"pz=" .. tostring(kv.pz or "0"),
+		"rw=" .. tostring(kv.rw or "1"),
+		"rx=" .. tostring(kv.rx or "0"),
+		"ry=" .. tostring(kv.ry or "0"),
+		"rz=" .. tostring(kv.rz or "0"),
+		"vx=" .. tostring(kv.vx or "0"),
+		"vy=" .. tostring(kv.vy or "0"),
+		"vz=" .. tostring(kv.vz or "0"),
+		"wx=" .. tostring(kv.wx or "0"),
+		"wy=" .. tostring(kv.wy or "0"),
+		"wz=" .. tostring(kv.wz or "0"),
+		"thr=" .. tostring(kv.thr or "0"),
+		"elev=" .. tostring(kv.elev or "0"),
+		"ail=" .. tostring(kv.ail or "0"),
+		"rud=" .. tostring(kv.rud or "0"),
+		"tick=" .. tostring(kv.tick or "0"),
+		"ts=" .. tostring(kv.ts or "0"),
+		"scale=" .. tostring(kv.planeScale or kv.walkingScale or "1"),
+		"modelHash=" .. tostring((kv.role == "walking") and (kv.walkingModelHash or "builtin-cube") or (kv.planeModelHash or "builtin-cube")),
+		"role=" .. tostring(kv.role or "plane"),
+		"planeScale=" .. tostring(kv.planeScale or "1"),
+		"planeModelHash=" .. tostring(kv.planeModelHash or "builtin-cube"),
+		"planeYaw=" .. tostring(kv.planeYaw or "0"),
+		"planePitch=" .. tostring(kv.planePitch or "0"),
+		"planeRoll=" .. tostring(kv.planeRoll or "0"),
+		"planeOffX=" .. tostring(kv.planeOffX or "0"),
+		"planeOffY=" .. tostring(kv.planeOffY or "0"),
+		"planeOffZ=" .. tostring(kv.planeOffZ or "0"),
+		"walkingScale=" .. tostring(kv.walkingScale or "1"),
+		"walkingModelHash=" .. tostring(kv.walkingModelHash or kv.planeModelHash or "builtin-cube"),
+		"walkingYaw=" .. tostring(kv.walkingYaw or "0"),
+		"walkingPitch=" .. tostring(kv.walkingPitch or "0"),
+		"walkingRoll=" .. tostring(kv.walkingRoll or "0"),
+		"walkingOffX=" .. tostring(kv.walkingOffX or "0"),
+		"walkingOffY=" .. tostring(kv.walkingOffY or "0"),
+		"walkingOffZ=" .. tostring(kv.walkingOffZ or "0"),
+		"planeSkinHash=" .. tostring(kv.planeSkinHash or ""),
+		"walkingSkinHash=" .. tostring(kv.walkingSkinHash or ""),
+		"callsign=" .. tostring(kv.callsign or "Pilot"),
+		tostring(kv.id or "0")
+	}, "|")
+end
+
+function applyAuthoritativeLocalSnapshot(kv)
+	if not camera then
+		return
+	end
+	clientNet.lastAckTick = math.max(clientNet.lastAckTick or 0, math.floor(tonumber(kv.ack) or 0))
+	for pendingTick in pairs(clientNet.pendingInputs or {}) do
+		if pendingTick <= clientNet.lastAckTick then
+			clientNet.pendingInputs[pendingTick] = nil
+		end
+	end
+	local serverPos = {
+		tonumber(kv.px) or camera.pos[1],
+		tonumber(kv.py) or camera.pos[2],
+		tonumber(kv.pz) or camera.pos[3]
+	}
+	local dx = serverPos[1] - (camera.pos[1] or 0)
+	local dy = serverPos[2] - (camera.pos[2] or 0)
+	local dz = serverPos[3] - (camera.pos[3] or 0)
+	local errorLen = math.sqrt(dx * dx + dy * dy + dz * dz)
+	local snap = errorLen > 4.0
+	local alpha = snap and 1.0 or 0.35
+	camera.pos[1] = camera.pos[1] + dx * alpha
+	camera.pos[2] = camera.pos[2] + dy * alpha
+	camera.pos[3] = camera.pos[3] + dz * alpha
+	camera.rot = q.normalize({
+		w = ((camera.rot and camera.rot.w) or 1) + ((tonumber(kv.rw) or 1) - ((camera.rot and camera.rot.w) or 1)) * alpha,
+		x = ((camera.rot and camera.rot.x) or 0) + ((tonumber(kv.rx) or 0) - ((camera.rot and camera.rot.x) or 0)) * alpha,
+		y = ((camera.rot and camera.rot.y) or 0) + ((tonumber(kv.ry) or 0) - ((camera.rot and camera.rot.y) or 0)) * alpha,
+		z = ((camera.rot and camera.rot.z) or 0) + ((tonumber(kv.rz) or 0) - ((camera.rot and camera.rot.z) or 0)) * alpha
+	})
+	camera.flightVel = {
+		tonumber(kv.vx) or (camera.flightVel and camera.flightVel[1]) or 0,
+		tonumber(kv.vy) or (camera.flightVel and camera.flightVel[2]) or 0,
+		tonumber(kv.vz) or (camera.flightVel and camera.flightVel[3]) or 0
+	}
+	camera.vel = { camera.flightVel[1], camera.flightVel[2], camera.flightVel[3] }
+	camera.flightAngVel = {
+		tonumber(kv.wx) or (camera.flightAngVel and camera.flightAngVel[1]) or 0,
+		tonumber(kv.wy) or (camera.flightAngVel and camera.flightAngVel[2]) or 0,
+		tonumber(kv.wz) or (camera.flightAngVel and camera.flightAngVel[3]) or 0
+	}
+	camera.throttle = clamp(tonumber(kv.thr) or camera.throttle or 0, 0, 1)
+	if camera.yoke then
+		camera.yoke.pitch = tonumber(kv.elev) or camera.yoke.pitch or 0
+		camera.yoke.roll = tonumber(kv.ail) or camera.yoke.roll or 0
+		camera.yoke.yaw = tonumber(kv.rud) or camera.yoke.yaw or 0
+	end
+	if camera.box and camera.box.pos then
+		camera.box.pos[1] = camera.pos[1]
+		camera.box.pos[2] = camera.pos[2]
+		camera.box.pos[3] = camera.pos[3]
+	end
+	syncLocalPlayerObject()
+end
+
+function applyWorldSyncFromPacket(packetData)
+	local parts = splitPacketFields(packetData)
+	local kv = parsePacketKeyValues(parts, 2)
+	local params = terrainSdfSystem.normalizeGroundParams({
+		seed = tonumber(kv.seed),
+		chunkSize = tonumber(kv.chunk),
+		lod0Radius = tonumber(kv.lod0),
+		lod1Radius = tonumber(kv.lod1),
+		lod2Radius = tonumber(kv.lod2),
+		splitLodEnabled = (kv.splitLod ~= nil) and ((tonumber(kv.splitLod) or 0) ~= 0) or nil,
+		highResSplitRatio = tonumber(kv.splitRatio),
+		lod0BaseCellSize = tonumber(kv.lod0Cell),
+		lod1BaseCellSize = tonumber(kv.lod1Cell),
+		lod2BaseCellSize = tonumber(kv.lod2Cell),
+		terrainQuality = tonumber(kv.quality),
+		meshBuildBudget = tonumber(kv.meshBudget),
+		workerMaxInflight = tonumber(kv.inflight),
+		chunkCacheLimit = tonumber(kv.cache),
+		autoQualityEnabled = (tonumber(kv.autoQuality) or 0) ~= 0,
+		targetFrameMs = tonumber(kv.targetFrameMs),
+		heightAmplitude = tonumber(kv.heightAmp),
+		heightFrequency = tonumber(kv.heightFreq),
+		caveEnabled = (tonumber(kv.caveEnabled) or 0) ~= 0,
+		caveStrength = tonumber(kv.caveStrength),
+		tunnelCount = tonumber(kv.tunnelCount),
+		tunnelRadiusMin = tonumber(kv.tunnelRadiusMin),
+		tunnelRadiusMax = tonumber(kv.tunnelRadiusMax),
+		dynamicCraters = decodeCraterListToken(kv.craters)
+	}, terrainSdfDefaults)
+	rebuildGroundFromParams(params, "server world sync")
+	if relayUsesServerAuthority() then
+		groundNetState.authorityPeerId = SERVER_AUTHORITY_PEER_ID
+		groundNetState.lastSnapshotReceivedAt = love.timer.getTime()
+	end
+end
+
+function resetClientNetState()
+	clientNet.localPeerId = nil
+	clientNet.serverAuthoritative = false
+	clientNet.helloSent = false
+	clientNet.forceHello = true
+	clientNet.inputTick = 0
+	clientNet.lastAckTick = 0
+	clientNet.pendingInputs = {}
+	clientNet.lastVoiceSeq = 0
+end
+
+function buildPeerDefaults()
+	return {
+		scale = defaultPlayerModelScale,
+		modelHash = "builtin-cube",
+		planeScale = defaultPlayerModelScale,
+		walkingScale = defaultWalkingModelScale,
+		planeModelHash = "builtin-cube",
+		walkingModelHash = "builtin-cube",
+		planeSkinHash = "",
+		walkingSkinHash = "",
+		planeOrientation = { yaw = 0, pitch = 0, roll = 0 },
+		walkingOrientation = { yaw = 0, pitch = 0, roll = 0 },
+		role = "plane"
+	}
+end
+
+function ensurePeerForAvatarManifest(peerId, kv)
+	local id = math.floor(tonumber(peerId) or 0)
+	if id <= 0 then
+		return nil
+	end
+	if peers[id] then
+		return peers[id]
+	end
+	return networking.createObjectForPeer(
+		id,
+		objects,
+		q,
+		cubeModel,
+		getModelRotationOffsetForRole,
+		{
+			scale = tonumber(kv.planeScale) or defaultPlayerModelScale,
+			modelHash = kv.planeModelHash or "builtin-cube",
+			planeScale = tonumber(kv.planeScale) or defaultPlayerModelScale,
+			walkingScale = tonumber(kv.walkingScale) or defaultWalkingModelScale,
+			planeModelHash = kv.planeModelHash or "builtin-cube",
+			walkingModelHash = kv.walkingModelHash or kv.planeModelHash or "builtin-cube",
+			planeSkinHash = kv.planeSkinHash or "",
+			walkingSkinHash = kv.walkingSkinHash or "",
+			planeOrientation = {
+				yaw = tonumber(kv.planeYaw) or 0,
+				pitch = tonumber(kv.planePitch) or 0,
+				roll = tonumber(kv.planeRoll) or 0
+			},
+			walkingOrientation = {
+				yaw = tonumber(kv.walkingYaw) or 0,
+				pitch = tonumber(kv.walkingPitch) or 0,
+				roll = tonumber(kv.walkingRoll) or 0
+			},
+			role = kv.role or "plane",
+			callsign = kv.callsign or "Pilot"
+		}
+	)
+end
+
+function applyAvatarManifestPacket(packetData)
+	local parts = splitPacketFields(packetData)
+	local kv = parsePacketKeyValues(parts, 2)
+	local peerId = math.floor(tonumber(kv.id) or 0)
+	if peerId <= 0 or peerId == tonumber(clientNet.localPeerId) then
+		return
+	end
+	local peer = ensurePeerForAvatarManifest(peerId, kv)
+	if not peer then
+		return
+	end
+	peer.callsign = sanitizeCallsign(kv.callsign) or peer.callsign or "Pilot"
+	peer.remoteRole = normalizeRoleId(kv.role or peer.remoteRole or "plane")
+	peer.planeModelHash = kv.planeModelHash or peer.planeModelHash or "builtin-cube"
+	peer.walkingModelHash = kv.walkingModelHash or peer.walkingModelHash or peer.planeModelHash
+	peer.planeSkinHash = kv.planeSkinHash or peer.planeSkinHash or ""
+	peer.walkingSkinHash = kv.walkingSkinHash or peer.walkingSkinHash or ""
+	peer.planeModelScale = sanitizePositiveScale(tonumber(kv.planeScale), peer.planeModelScale or defaultPlayerModelScale)
+	peer.walkingModelScale = sanitizePositiveScale(tonumber(kv.walkingScale), peer.walkingModelScale or defaultWalkingModelScale)
+	peer.planeOrientation = peer.planeOrientation or { yaw = 0, pitch = 0, roll = 0 }
+	peer.walkingOrientation = peer.walkingOrientation or { yaw = 0, pitch = 0, roll = 0 }
+	peer.planeOrientation.yaw = tonumber(kv.planeYaw) or peer.planeOrientation.yaw or 0
+	peer.planeOrientation.pitch = tonumber(kv.planePitch) or peer.planeOrientation.pitch or 0
+	peer.planeOrientation.roll = tonumber(kv.planeRoll) or peer.planeOrientation.roll or 0
+	peer.walkingOrientation.yaw = tonumber(kv.walkingYaw) or peer.walkingOrientation.yaw or 0
+	peer.walkingOrientation.pitch = tonumber(kv.walkingPitch) or peer.walkingOrientation.pitch or 0
+	peer.walkingOrientation.roll = tonumber(kv.walkingRoll) or peer.walkingOrientation.roll or 0
+	applyPeerRadioStateFromPacket(packetData, peerId)
+	updatePeerVisualModel(peerId)
+end
+
+function applyCraterEventPacket(packetData)
+	local kv = parsePacketKeyValues(splitPacketFields(packetData), 2)
+	local params = terrainSdfSystem.normalizeGroundParams(activeGroundParams or defaultGroundParams, defaultGroundParams)
+	local craters = {}
+	for i = 1, #(params.dynamicCraters or {}) do
+		local crater = params.dynamicCraters[i]
+		craters[i] = {
+			x = tonumber(crater.x) or 0,
+			y = tonumber(crater.y) or 0,
+			z = tonumber(crater.z) or 0,
+			radius = tonumber(crater.radius) or 8.0,
+			depth = tonumber(crater.depth) or 3.0,
+			rim = tonumber(crater.rim) or 0.12
+		}
+	end
+	craters[#craters + 1] = {
+		x = tonumber(kv.x) or 0,
+		y = tonumber(kv.y) or 0,
+		z = tonumber(kv.z) or 0,
+		radius = math.max(1.0, tonumber(kv.radius) or 8.0),
+		depth = math.max(0.4, tonumber(kv.depth) or 3.0),
+		rim = clamp(tonumber(kv.rim) or 0.12, 0.0, 0.75)
+	}
+	params.dynamicCraters = craters
+	rebuildGroundFromParams(params, "server crater event")
 end
 
 function encodeColor3Token(color)
@@ -2190,7 +3299,7 @@ function decodeCraterListToken(token)
 	return out
 end
 
-local function relayIsConnected()
+relayIsConnected = function()
 	if not relayServer then
 		return false
 	end
@@ -2199,6 +3308,29 @@ local function relayIsConnected()
 		return relayServer:state()
 	end)
 	return ok and state == "connected"
+end
+
+local function getRelayRttSeconds()
+	if not relayServer then
+		return nil
+	end
+	local ok, rttMs = pcall(function()
+		if type(relayServer.round_trip_time) == "function" then
+			return relayServer:round_trip_time()
+		end
+		if type(relayServer.roundTripTime) == "function" then
+			return relayServer:roundTripTime()
+		end
+		return nil
+	end)
+	if not ok then
+		return nil
+	end
+	local rtt = tonumber(rttMs)
+	if not rtt then
+		return nil
+	end
+	return clamp(rtt / 1000.0, 0.0, 2.0)
 end
 
 local function pruneRequestedTransferMap(now)
@@ -2284,6 +3416,10 @@ local function requestBlobFromPeers(kind, hash, reason)
 		if playerModelCache[hash] then
 			return false
 		end
+	elseif kind == "paint" then
+		if type(modelModule.hasPaintOverlay) == "function" and modelModule.hasPaintOverlay(hash) then
+			return false
+		end
 	end
 	if not relayIsConnected() then
 		return false
@@ -2319,6 +3455,10 @@ function requestModelFromPeers(hash, reason)
 	return requestBlobFromPeers("model", hash, reason)
 end
 
+local function requestPaintFromPeers(hash, reason)
+	return requestBlobFromPeers("paint", hash, reason)
+end
+
 function updatePeerVisualModel(peerId)
 	local peer = peerId and peers[peerId]
 	if not peer then
@@ -2328,28 +3468,35 @@ function updatePeerVisualModel(peerId)
 	local role = (peer.remoteRole == "walking") and "walking" or "plane"
 	local planeHash = peer.planeModelHash or peer.modelHash or "builtin-cube"
 	local walkingHash = peer.walkingModelHash or peer.modelHash or planeHash or "builtin-cube"
+	local planeSkinHash = tostring(peer.planeSkinHash or "")
+	local walkingSkinHash = tostring(peer.walkingSkinHash or "")
 	local planeScale = sanitizePositiveScale(
 		peer.planeModelScale,
 		(peer.scale and peer.scale[1]) or defaultPlayerModelScale
 	)
 	local walkingScale = sanitizePositiveScale(peer.walkingModelScale, planeScale or defaultWalkingModelScale)
 	local wantedHash = (role == "walking") and walkingHash or planeHash
+	local wantedSkinHash = (role == "walking") and walkingSkinHash or planeSkinHash
 	local peerScale = (role == "walking") and walkingScale or planeScale
 
 	peer.remoteRole = role
 	peer.planeModelHash = planeHash
 	peer.walkingModelHash = walkingHash
+	peer.planeSkinHash = planeSkinHash
+	peer.walkingSkinHash = walkingSkinHash
 	peer.planeModelScale = planeScale
 	peer.walkingModelScale = walkingScale
 	peer.modelHash = wantedHash
 	peer.scale = { peerScale, peerScale, peerScale }
 	peer.halfSize = { x = peerScale, y = peerScale, z = peerScale }
+	local manualOffset = (role == "walking") and (peer.walkingOffset or { 0, tonumber(peer.walkingOffsetY) or 0, 0 }) or
+		(peer.planeOffset or { 0, tonumber(peer.planeOffsetY) or 0, 0 })
 
 	if playerModelCache[wantedHash] then
-		applyPlaneVisualToObject(peer, wantedHash, peerScale)
+		applyPlaneVisualToObject(peer, wantedHash, peerScale, role, manualOffset, wantedSkinHash)
 		peer.modelHash = wantedHash
 	else
-		applyPlaneVisualToObject(peer, "builtin-cube", peerScale)
+		applyPlaneVisualToObject(peer, "builtin-cube", peerScale, role, manualOffset, wantedSkinHash)
 		peer.modelHash = wantedHash
 		requestModelFromPeers(wantedHash, "missing for peer " .. tostring(peerId))
 	end
@@ -2359,6 +3506,14 @@ function updatePeerVisualModel(peerId)
 	end
 	if walkingHash ~= "builtin-cube" and not playerModelCache[walkingHash] then
 		requestModelFromPeers(walkingHash, "prefetch walking for peer " .. tostring(peerId))
+	end
+	if planeSkinHash ~= "" and type(modelModule.hasPaintOverlay) == "function" and
+		not modelModule.hasPaintOverlay(planeSkinHash) then
+		requestPaintFromPeers(planeSkinHash, "prefetch plane paint for peer " .. tostring(peerId))
+	end
+	if walkingSkinHash ~= "" and type(modelModule.hasPaintOverlay) == "function" and
+		not modelModule.hasPaintOverlay(walkingSkinHash) then
+		requestPaintFromPeers(walkingSkinHash, "prefetch walking paint for peer " .. tostring(peerId))
 	end
 end
 
@@ -2446,6 +3601,9 @@ function handleModelMetaPacket(data)
 	if kind == "model" and playerModelCache[hash] then
 		return true
 	end
+	if kind == "paint" and type(modelModule.hasPaintOverlay) == "function" and modelModule.hasPaintOverlay(hash) then
+		return true
+	end
 	local okMeta, errMeta = modelModule.acceptBlobMeta({
 		kind = kind,
 		hash = hash,
@@ -2502,6 +3660,35 @@ function finalizeIncomingModelTransfer(hash, transfer)
 	return true
 end
 
+local function finalizeIncomingPaintTransfer(hash, transfer)
+	local completed = modelModule.getCompletedBlob("paint", hash)
+	if type(completed) ~= "table" or type(completed.raw) ~= "string" or completed.raw == "" then
+		return false
+	end
+	local raw = completed.raw
+	if #raw > (modelTransferState.maxRawBytes or math.huge) then
+		return false
+	end
+	local expectedBytes = math.max(0, math.floor(tonumber(completed.meta and completed.meta.rawBytes) or -1))
+	if expectedBytes > 0 and #raw ~= expectedBytes then
+		return false
+	end
+
+	local okImport, errImport = modelModule.importPaintBlob(hash, raw, completed.meta or {})
+	if not okImport then
+		logger.log("Remote paint cache failed for " .. tostring(hash) .. ": " .. tostring(errImport))
+		return false
+	end
+
+	for peerId, peer in pairs(peers) do
+		if peer and (peer.planeSkinHash == hash or peer.walkingSkinHash == hash) then
+			updatePeerVisualModel(peerId)
+		end
+	end
+	logger.log("Cached remote paint " .. hash .. " (" .. tostring(#raw) .. " bytes).")
+	return true
+end
+
 function handleModelChunkPacket(data)
 	local parts = splitPacketFields(data)
 	local packetType = parts[1]
@@ -2542,6 +3729,8 @@ function handleModelChunkPacket(data)
 	if not transfer then
 		if kind == "model" then
 			requestModelFromPeers(hash, "chunk without metadata")
+		elseif kind == "paint" then
+			requestPaintFromPeers(hash, "chunk without metadata")
 		end
 		return false
 	end
@@ -2566,6 +3755,8 @@ function handleModelChunkPacket(data)
 		modelTransferState.incoming[key] = nil
 		if kind == "model" then
 			requestModelFromPeers(hash, "validation retry")
+		elseif kind == "paint" then
+			requestPaintFromPeers(hash, "validation retry")
 		end
 		return false
 	end
@@ -2576,6 +3767,10 @@ function handleModelChunkPacket(data)
 		if completeKind == "model" then
 			if not finalizeIncomingModelTransfer(completeHash, completeTransfer) then
 				requestModelFromPeers(completeHash, "validation retry")
+			end
+		elseif completeKind == "paint" then
+			if not finalizeIncomingPaintTransfer(completeHash, completeTransfer) then
+				requestPaintFromPeers(completeHash, "validation retry")
 			end
 		end
 	end
@@ -2595,7 +3790,10 @@ function pumpModelTransfers(now)
 					"rawBytes=" .. tostring(transfer.meta.rawBytes or 0),
 					"encodedBytes=" .. tostring(transfer.meta.encodedBytes or 0),
 					"chunkSize=" .. tostring(transfer.meta.chunkSize or 0),
-					"chunkCount=" .. tostring(transfer.meta.chunkCount or 0)
+					"chunkCount=" .. tostring(transfer.meta.chunkCount or 0),
+					"ownerId=" .. tostring(transfer.meta.ownerId or ""),
+					"role=" .. tostring(transfer.meta.role or ""),
+					"modelHash=" .. tostring(transfer.meta.modelHash or "")
 				}, "|")
 				pcall(function()
 					relayServer:send(packet)
@@ -2646,6 +3844,8 @@ function pumpModelTransfers(now)
 			modelTransferState.incoming[incomingKey] = nil
 			if transfer.kind == "model" then
 				requestModelFromPeers(transfer.hash, "timed out")
+			elseif transfer.kind == "paint" then
+				requestPaintFromPeers(transfer.hash, "timed out")
 			end
 		end
 	end
@@ -2677,7 +3877,7 @@ local function beginCloudRoleElection(reason)
 end
 
 local function requestCloudSnapshot(reason)
-	if cloudNetState.role ~= "follower" then
+	if cloudNetState.role ~= "follower" and not (relayUsesServerAuthority() and cloudNetState.role == "pending") then
 		return false
 	end
 	if not relayIsConnected() then
@@ -2759,7 +3959,7 @@ local function sendCloudSnapshot(forceSend, reason)
 end
 
 function requestGroundSnapshot(reason)
-	if cloudNetState.role ~= "follower" then
+	if cloudNetState.role ~= "follower" and not (relayUsesServerAuthority() and cloudNetState.role == "pending") then
 		return false
 	end
 	if not relayIsConnected() then
@@ -2793,11 +3993,15 @@ function buildGroundSnapshotPacket(now)
 		"chunkSize=" .. formatNetFloat(params.chunkSize or 64),
 		"lod0=" .. tostring(params.lod0Radius or 2),
 		"lod1=" .. tostring(params.lod1Radius or 4),
+		"lod2=" .. tostring(params.lod2Radius or 6),
+		"splitLod=" .. tostring((params.splitLodEnabled ~= false) and 1 or 0),
+		"splitRatio=" .. formatNetFloat(params.highResSplitRatio or 0.5),
 		"lod0Cell=" .. formatNetFloat(params.lod0CellSize or 4),
 		"lod1Cell=" .. formatNetFloat(params.lod1CellSize or 8),
-		"meshBudget=" .. tostring(params.meshBuildBudget or 2),
-		"inflight=" .. tostring(params.workerMaxInflight or 2),
-		"cache=" .. tostring(params.chunkCacheLimit or 768),
+		"lod2Cell=" .. formatNetFloat(params.lod2CellSize or 12),
+		"meshBudget=" .. tostring(params.meshBuildBudget or 4),
+		"inflight=" .. tostring(params.workerMaxInflight or 6),
+		"cache=" .. tostring(params.chunkCacheLimit or 128),
 		"surfaceOnly=" .. tostring((params.surfaceOnlyMeshing ~= false) and 1 or 0),
 		"threaded=" .. tostring((params.threadedMeshing ~= false) and 1 or 0),
 		"minY=" .. formatNetFloat(params.minY or -180),
@@ -2909,8 +4113,12 @@ local function applyGroundSnapshot2Parts(parts, senderId, idFieldIndex)
 		chunkSize = tonumber(kv.chunkSize),
 		lod0Radius = tonumber(kv.lod0),
 		lod1Radius = tonumber(kv.lod1),
+		lod2Radius = tonumber(kv.lod2),
+		splitLodEnabled = (kv.splitLod ~= nil) and ((tonumber(kv.splitLod) or 0) ~= 0) or nil,
+		highResSplitRatio = tonumber(kv.splitRatio),
 		lod0CellSize = tonumber(kv.lod0Cell),
 		lod1CellSize = tonumber(kv.lod1Cell),
+		lod2CellSize = tonumber(kv.lod2Cell),
 		meshBuildBudget = tonumber(kv.meshBudget),
 		workerMaxInflight = tonumber(kv.inflight),
 		chunkCacheLimit = tonumber(kv.cache),
@@ -2958,13 +4166,29 @@ local function applyGroundSnapshot2Parts(parts, senderId, idFieldIndex)
 	return true
 end
 
+relayUsesServerAuthority = function()
+	return relayIsConnected() and clientNet.serverAuthoritative == true
+end
+
+local function readNetworkAuthorityId(parts, startIndex)
+	local senderId = readTrailingPacketInteger(parts, startIndex)
+	if senderId ~= nil then
+		return senderId
+	end
+	if relayUsesServerAuthority() then
+		return SERVER_AUTHORITY_PEER_ID
+	end
+	return nil
+end
+
 function handleGroundSnapshotPacket(data)
 	local parts = splitPacketFields(data)
 	if parts[1] ~= "GROUND_SNAPSHOT" and parts[1] ~= "GROUND_SNAPSHOT2" then
 		return false
 	end
 
-	local senderId, idFieldIndex = readTrailingPacketInteger(parts, 2)
+	local senderId = readNetworkAuthorityId(parts, 2)
+	local _, idFieldIndex = readTrailingPacketInteger(parts, 2)
 	if not senderId then
 		return false
 	end
@@ -2995,7 +4219,7 @@ function handleGroundRequestPacket(data)
 		return false
 	end
 
-	local senderId = readTrailingPacketInteger(parts, 2)
+	local senderId = readNetworkAuthorityId(parts, 2)
 	if not senderId then
 		return false
 	end
@@ -3082,7 +4306,7 @@ local function handleCloudSnapshotPacket(data)
 		return false
 	end
 
-	local senderId = readTrailingPacketInteger(parts, 2)
+	local senderId = readNetworkAuthorityId(parts, 2)
 	if not senderId then
 		return false
 	end
@@ -3108,7 +4332,7 @@ local function handleCloudRequestPacket(data)
 		return false
 	end
 
-	local senderId = readTrailingPacketInteger(parts, 2)
+	local senderId = readNetworkAuthorityId(parts, 2)
 	if not senderId then
 		return false
 	end
@@ -3125,6 +4349,15 @@ end
 
 local function notePeerStateReceived(peerId)
 	if not peerId then
+		return
+	end
+	if relayUsesServerAuthority() then
+		if cloudNetState.role == "standalone" then
+			setCloudRole("pending", "authoritative relay active")
+		end
+		if cloudNetState.role == "pending" then
+			cloudNetState.sawPeerOnJoin = true
+		end
 		return
 	end
 	if cloudNetState.role == "standalone" and relayIsConnected() then
@@ -3154,6 +4387,25 @@ local function updateCloudNetworkState(now)
 		return
 	end
 
+	if relayUsesServerAuthority() then
+		if cloudNetState.role == "standalone" then
+			setCloudRole("pending", "authoritative relay connected")
+		end
+		cloudNetState.authorityPeerId = SERVER_AUTHORITY_PEER_ID
+		groundNetState.authorityPeerId = SERVER_AUTHORITY_PEER_ID
+		if cloudNetState.lastSnapshotReceivedAt <= -1e30 or
+			(now - cloudNetState.lastSnapshotReceivedAt) >= cloudNetState.staleTimeout then
+			if cloudNetState.role ~= "pending" then
+				setCloudRole("pending", "awaiting authoritative cloud sync")
+			end
+			requestCloudSnapshot("authoritative relay sync")
+		end
+		if groundNetState.lastSnapshotReceivedAt <= -1e30 then
+			requestGroundSnapshot("awaiting authoritative world params")
+		end
+		return
+	end
+
 	if cloudNetState.role == "standalone" then
 		beginCloudRoleElection("relay connected")
 	end
@@ -3172,21 +4424,64 @@ local function updateCloudNetworkState(now)
 		return
 	end
 
-	if cloudNetState.role == "follower" and (now - cloudNetState.lastSnapshotReceivedAt) >= cloudNetState.staleTimeout then
-		requestCloudSnapshot("snapshot stale")
-	end
+	if cloudNetState.role == "follower" then
+		local peerCount = 0
+		for _ in pairs(peers) do
+			peerCount = peerCount + 1
+		end
 
-	if cloudNetState.role == "follower" and groundNetState.lastSnapshotReceivedAt <= -1e30 then
-		requestGroundSnapshot("awaiting world params")
+		local authorityPeerId = tonumber(cloudNetState.authorityPeerId)
+		if authorityPeerId and authorityPeerId ~= SERVER_AUTHORITY_PEER_ID and not peers[authorityPeerId] then
+			cloudNetState.authorityPeerId = nil
+			cloudNetState.lastSnapshotReceivedAt = -math.huge
+		end
+
+		local groundAuthorityPeerId = tonumber(groundNetState.authorityPeerId)
+		if groundAuthorityPeerId and groundAuthorityPeerId ~= SERVER_AUTHORITY_PEER_ID and
+			not peers[groundAuthorityPeerId] then
+			groundNetState.authorityPeerId = nil
+			groundNetState.lastSnapshotReceivedAt = -math.huge
+		end
+
+		if peerCount <= 0 then
+			cloudNetState.authorityPeerId = nil
+			groundNetState.authorityPeerId = nil
+			groundNetState.lastSnapshotReceivedAt = -math.huge
+			groundNetState.lastSnapshotRequestAt = -math.huge
+			setCloudRole("authority", "no peers available")
+			sendGroundSnapshot("authority fallback")
+			return
+		end
+
+		if (now - cloudNetState.lastSnapshotReceivedAt) >= cloudNetState.staleTimeout then
+			requestCloudSnapshot("snapshot stale")
+		end
+
+		if groundNetState.lastSnapshotReceivedAt <= -1e30 then
+			requestGroundSnapshot("awaiting world params")
+		end
 	end
 end
 
 local function getRelayStatus()
+	if netMode == "offline" then
+		return "Offline"
+	end
+	if netMode == "dedicated" then
+		if hostedRelay then
+			return "Dedicated : " .. tostring(NET_PORT)
+		end
+		return "Dedicated down"
+	end
+
 	if not relay then
-		return "Host down"
+		if netMode == "host" then
+			return hostedRelay and "Host up / client down" or "Host down"
+		end
+		return "Disconnected"
 	end
 	if not relayServer then
-		return "Disconnected"
+		return (netMode == "host") and "Host up / client down" or "Disconnected"
 	end
 
 	local ok, state = pcall(function()
@@ -3196,14 +4491,39 @@ local function getRelayStatus()
 		return "Unknown"
 	end
 	if state == "connected" then
+		if netMode == "host" then
+			return "Host(local)"
+		end
 		return "Connected"
 	end
 	return tostring(state)
 end
 
 local function reconnectRelay()
+	if netMode == "offline" then
+		logger.log("Reconnect skipped: offline mode.")
+		return false
+	end
+
+	if netMode == "host" or netMode == "dedicated" then
+		if hostedRelay then
+			hostedRelay:stop()
+			hostedRelay = nil
+		end
+		hostedRelay = startHostedRelayServer(NET_PORT)
+		if not hostedRelay then
+			logger.log("Hosted relay restart failed.")
+			return false
+		end
+	end
+
+	if netMode == "dedicated" then
+		logger.log("Dedicated relay restarted.")
+		return true
+	end
+
 	if not relay then
-		relay = enet.host_create()
+		relay = enet.host_create(nil, 1, 4)
 		if not relay then
 			logger.log("ENet host creation failed; reconnect unavailable.")
 			return false
@@ -3224,8 +4544,9 @@ local function reconnectRelay()
 	groundNetState.lastSnapshotRequestAt = -math.huge
 	setCloudRole("standalone", "relay reconnecting")
 
+	local connectAddress = (netMode == "host") and localRelayAddress or hostAddy
 	local ok, peerOrErr = pcall(function()
-		return relay:connect(hostAddy)
+		return relay:connect(connectAddress)
 	end)
 	if not ok then
 		logger.log("Relay reconnect failed: " .. tostring(peerOrErr))
@@ -3234,7 +4555,7 @@ local function reconnectRelay()
 
 	relayServer = peerOrErr
 	if relayServer then
-		logger.log("Reconnecting to relay server: " .. hostAddy)
+		logger.log("Reconnecting to relay server: " .. tostring(connectAddress))
 		forceStateSync()
 		return true
 	end
@@ -3259,6 +4580,7 @@ local pauseExports = pauseMenuSystem.create({
 		logger = logger,
 		resetHudCaches = resetHudCaches,
 		mapState = mapState,
+		radioState = radioState,
 		viewState = viewState,
 		graphicsSettings = graphicsSettings,
 		graphicsBackend = graphicsBackend,
@@ -3269,6 +4591,7 @@ local pauseExports = pauseMenuSystem.create({
 		characterPreview = characterPreview,
 		modelLoadPrompt = modelLoadPrompt,
 		playerModelCache = playerModelCache,
+		modelModule = modelModule,
 		modelTransferState = modelTransferState,
 		cloudNetState = cloudNetState,
 		groundNetState = groundNetState,
@@ -3301,6 +4624,7 @@ local pauseExports = pauseMenuSystem.create({
 		applySunSettingsToRenderer = applySunSettingsToRenderer,
 		syncChunkingWithDrawDistance = syncChunkingWithDrawDistance,
 		getConfiguredModelForRole = getConfiguredModelForRole,
+		getConfiguredSkinHashForRole = getConfiguredSkinHashForRole,
 		getActiveModelRole = getActiveModelRole,
 		syncActivePlayerModelState = syncActivePlayerModelState,
 		composeRoleOrientationOffset = composeRoleOrientationOffset,
@@ -3310,7 +4634,10 @@ local pauseExports = pauseMenuSystem.create({
 		syncLocalPlayerObject = syncLocalPlayerObject,
 		invalidateMapCache = invalidateMapCache,
 		getRelayStatus = getRelayStatus,
-		cloudSim = cloudSim
+		cloudSim = cloudSim,
+		buildConfiguredPaintSnapshotForRole = buildConfiguredPaintSnapshotForRole,
+		restoreConfiguredPaintSnapshotForRole = restoreConfiguredPaintSnapshotForRole,
+		setConfiguredSkinHashForRole = setConfiguredSkinHashForRole
 	},
 	getters = {
 		screen = function()
@@ -3477,7 +4804,7 @@ local pauseExports = pauseMenuSystem.create({
 	}
 })
 
-local function assertExports(moduleName, exportTable, requiredKeys)
+function assertExports(moduleName, exportTable, requiredKeys)
 	for _, key in ipairs(requiredKeys or {}) do
 		if exportTable[key] == nil then
 			error(string.format("%s missing required export '%s'.", moduleName, tostring(key)), 2)
@@ -3521,6 +4848,10 @@ assertExports("PauseMenuSystem", pauseExports, {
 	"activateSelectedPauseItem",
 	"updatePauseMenuHover",
 	"updatePauseControlsHover",
+	"handlePausePaintMouseMove",
+	"handlePausePaintMousePress",
+	"handlePausePaintMouseRelease",
+	"handlePausePaintKeyPress",
 	"updatePauseRangeDrag",
 	"endPauseRangeDrag",
 	"handlePauseMenuMouseClick",
@@ -3530,13 +4861,13 @@ assertExports("PauseMenuSystem", pauseExports, {
 	"refreshGraphicsBackendInfo"
 })
 
-local pauseMenu = pauseExports.pauseMenu
-local refreshUiFonts = pauseExports.refreshUiFonts
-local setPauseStatus = pauseExports.setPauseStatus
-local getPauseItemsForCurrentPage = pauseExports.getPauseItemsForCurrentPage
+pauseMenu = pauseExports.pauseMenu
+refreshUiFonts = pauseExports.refreshUiFonts
+setPauseStatus = pauseExports.setPauseStatus
+getPauseItemsForCurrentPage = pauseExports.getPauseItemsForCurrentPage
 normalizeGraphicsApiPreference = pauseExports.normalizeGraphicsApiPreference
 getGraphicsApiPreferenceLabel = pauseExports.getGraphicsApiPreferenceLabel
-local getGraphicsBackendLabel = pauseExports.getGraphicsBackendLabel
+getGraphicsBackendLabel = pauseExports.getGraphicsBackendLabel
 getEngineRestartPayload = pauseExports.getEngineRestartPayload
 deepCopyPrimitiveTable = pauseExports.deepCopyPrimitiveTable
 buildRestartModelSnapshot = pauseExports.buildRestartModelSnapshot
@@ -3545,34 +4876,329 @@ restoreModelFromRestartSnapshot = pauseExports.restoreModelFromRestartSnapshot
 applyRestartSnapshot = pauseExports.applyRestartSnapshot
 requestGraphicsApiRestart = pauseExports.requestGraphicsApiRestart
 
-local syncGraphicsSettingsFromWindow = pauseExports.syncGraphicsSettingsFromWindow
-local resetControlBindingsToDefaults = pauseExports.resetControlBindingsToDefaults
-local cyclePauseTab = pauseExports.cyclePauseTab
-local cyclePauseSubTab = pauseExports.cyclePauseSubTab
-local moveControlsSelection = pauseExports.moveControlsSelection
-local moveControlsSlot = pauseExports.moveControlsSlot
-local clearSelectedControlBinding = pauseExports.clearSelectedControlBinding
-local beginSelectedControlBindingCapture = pauseExports.beginSelectedControlBindingCapture
-local cancelControlBindingCapture = pauseExports.cancelControlBindingCapture
-local captureBindingFromKey = pauseExports.captureBindingFromKey
-local captureBindingFromMouseButton = pauseExports.captureBindingFromMouseButton
-local captureBindingFromWheel = pauseExports.captureBindingFromWheel
-local captureBindingFromMouseMotion = pauseExports.captureBindingFromMouseMotion
-local clearPauseConfirm = pauseExports.clearPauseConfirm
-local clearPauseRangeDrag = pauseExports.clearPauseRangeDrag
-local movePauseSelection = pauseExports.movePauseSelection
-local adjustSelectedPauseItem = pauseExports.adjustSelectedPauseItem
-local adjustSelectedPauseItemCoarse = pauseExports.adjustSelectedPauseItemCoarse
-local activateSelectedPauseItem = pauseExports.activateSelectedPauseItem
-local updatePauseMenuHover = pauseExports.updatePauseMenuHover
-local updatePauseControlsHover = pauseExports.updatePauseControlsHover
-local updatePauseRangeDrag = pauseExports.updatePauseRangeDrag
-local endPauseRangeDrag = pauseExports.endPauseRangeDrag
-local handlePauseMenuMouseClick = pauseExports.handlePauseMenuMouseClick
-local setPauseState = pauseExports.setPauseState
-local drawPauseMenu = pauseExports.drawPauseMenu
-local getPauseControlActionsCount = pauseExports.getControlActionsCount
-local refreshGraphicsBackendInfo = pauseExports.refreshGraphicsBackendInfo
+syncGraphicsSettingsFromWindow = pauseExports.syncGraphicsSettingsFromWindow
+resetControlBindingsToDefaults = pauseExports.resetControlBindingsToDefaults
+cyclePauseTab = pauseExports.cyclePauseTab
+cyclePauseSubTab = pauseExports.cyclePauseSubTab
+moveControlsSelection = pauseExports.moveControlsSelection
+moveControlsSlot = pauseExports.moveControlsSlot
+clearSelectedControlBinding = pauseExports.clearSelectedControlBinding
+beginSelectedControlBindingCapture = pauseExports.beginSelectedControlBindingCapture
+cancelControlBindingCapture = pauseExports.cancelControlBindingCapture
+captureBindingFromKey = pauseExports.captureBindingFromKey
+captureBindingFromMouseButton = pauseExports.captureBindingFromMouseButton
+captureBindingFromWheel = pauseExports.captureBindingFromWheel
+captureBindingFromMouseMotion = pauseExports.captureBindingFromMouseMotion
+clearPauseConfirm = pauseExports.clearPauseConfirm
+clearPauseRangeDrag = pauseExports.clearPauseRangeDrag
+movePauseSelection = pauseExports.movePauseSelection
+adjustSelectedPauseItem = pauseExports.adjustSelectedPauseItem
+adjustSelectedPauseItemCoarse = pauseExports.adjustSelectedPauseItemCoarse
+activateSelectedPauseItem = pauseExports.activateSelectedPauseItem
+updatePauseMenuHover = pauseExports.updatePauseMenuHover
+updatePauseControlsHover = pauseExports.updatePauseControlsHover
+handlePausePaintMouseMove = pauseExports.handlePausePaintMouseMove
+handlePausePaintMousePress = pauseExports.handlePausePaintMousePress
+handlePausePaintMouseRelease = pauseExports.handlePausePaintMouseRelease
+handlePausePaintKeyPress = pauseExports.handlePausePaintKeyPress
+updatePauseRangeDrag = pauseExports.updatePauseRangeDrag
+endPauseRangeDrag = pauseExports.endPauseRangeDrag
+handlePauseMenuMouseClick = pauseExports.handlePauseMenuMouseClick
+setPauseState = pauseExports.setPauseState
+drawPauseMenu = pauseExports.drawPauseMenu
+getPauseControlActionsCount = pauseExports.getControlActionsCount
+refreshGraphicsBackendInfo = pauseExports.refreshGraphicsBackendInfo
+
+USER_PROFILE_VERSION = 4
+USER_PROFILE_AUTOSAVE_INTERVAL = 12.0
+userProfileLastSavedAt = -math.huge
+userProfileNeedsCompaction = false
+
+function buildUserProfilePayload()
+	local restartPayload = buildRestartSnapshot(normalizeGraphicsApiPreference(graphicsSettings.graphicsApiPreference))
+	return {
+		_l2d3d_profile_version = USER_PROFILE_VERSION,
+		savedAt = os.time(),
+		state = restartPayload and restartPayload.state or nil,
+		network = {
+			mode = netMode,
+			server = hostAddy,
+			port = NET_PORT
+		}
+	}
+end
+
+function saveUserProfile(reason, force)
+	local now = love.timer.getTime()
+	if (not force) and (now - userProfileLastSavedAt) < USER_PROFILE_AUTOSAVE_INTERVAL then
+		return false
+	end
+	if (not force) and flightSimMode and camera and (type(pauseMenu) == "table") and (not pauseMenu.active) then
+		local speedVec = camera.flightVel or camera.vel or { 0, 0, 0 }
+		local speed = math.sqrt(
+			(tonumber(speedVec[1]) or 0) * (tonumber(speedVec[1]) or 0) +
+			(tonumber(speedVec[2]) or 0) * (tonumber(speedVec[2]) or 0) +
+			(tonumber(speedVec[3]) or 0) * (tonumber(speedVec[3]) or 0)
+		)
+		if speed > 35 then
+			return false
+		end
+	end
+	local payload = buildUserProfilePayload()
+	local ok, err = userProfileStore.save(payload)
+	if ok then
+		userProfileLastSavedAt = now
+		if reason and reason ~= "" then
+			logger.log("Saved user profile (" .. reason .. ").")
+		end
+		return true
+	end
+	logger.log("User profile save failed: " .. tostring(err))
+	return false
+end
+
+function loadUserProfile()
+	local payload, err = userProfileStore.load()
+	if type(payload) ~= "table" then
+		return nil, err
+	end
+	restorePersistedModelCache(payload.modelCache)
+	local loadedVersion = math.floor(tonumber(payload._l2d3d_profile_version) or 0)
+	payload._l2d3d_profile_needs_compaction = (payload.modelCache ~= nil) or
+		(loadedVersion > 0 and loadedVersion < USER_PROFILE_VERSION)
+	return payload
+end
+
+function sanitizeStartupSnapshotState(snapshot)
+	if type(snapshot) ~= "table" then
+		return false
+	end
+
+	local adjusted = false
+	local function clampNumber(value, minValue, maxValue, fallback)
+		local n = tonumber(value)
+		if n == nil then
+			return fallback
+		end
+		if n < minValue then
+			return minValue
+		end
+		if n > maxValue then
+			return maxValue
+		end
+		return n
+	end
+
+	local function migratePitch(value, fallback)
+		local n = tonumber(value)
+		if n == nil then
+			n = fallback
+		end
+		n = tonumber(n) or 0.3
+		return clampNumber(n, 0.3, 2.5, fallback or 0.3)
+	end
+
+	if snapshot.useGpuRenderer == false then
+		snapshot.useGpuRenderer = true
+		adjusted = true
+	end
+
+	local graphics = type(snapshot.graphicsSettings) == "table" and snapshot.graphicsSettings or nil
+	if graphics then
+		local drawDistance = clampNumber(graphics.drawDistance, 500, 20000, 1800)
+		local renderScale = clampNumber(graphics.renderScale, 0.75, 1.1, 1.0)
+		if drawDistance ~= graphics.drawDistance then
+			graphics.drawDistance = drawDistance
+			adjusted = true
+		end
+		if renderScale ~= graphics.renderScale then
+			graphics.renderScale = renderScale
+			adjusted = true
+		end
+		local horizonFog = graphics.horizonFog ~= false
+		local textureMipmaps = graphics.textureMipmaps ~= false
+		if graphics.horizonFog ~= horizonFog then
+			graphics.horizonFog = horizonFog
+			adjusted = true
+		end
+		if graphics.textureMipmaps ~= textureMipmaps then
+			graphics.textureMipmaps = textureMipmaps
+			adjusted = true
+		end
+	end
+
+	local function sanitizeTerrainParams(t)
+		if type(t) ~= "table" then
+			return
+		end
+		local before = {
+			lod0Radius = t.lod0Radius,
+			lod1Radius = t.lod1Radius,
+			lod2Radius = t.lod2Radius,
+			splitLodEnabled = t.splitLodEnabled,
+			highResSplitRatio = t.highResSplitRatio,
+			terrainQuality = t.terrainQuality,
+			meshBuildBudget = t.meshBuildBudget,
+			workerMaxInflight = t.workerMaxInflight,
+			workerResultBudgetPerFrame = t.workerResultBudgetPerFrame,
+			workerResultTimeBudgetMs = t.workerResultTimeBudgetMs,
+			maxAdaptiveLod1Radius = t.maxAdaptiveLod1Radius,
+			maxPendingChunks = t.maxPendingChunks,
+			maxStaleChunks = t.maxStaleChunks,
+			maxDisplayedChunks = t.maxDisplayedChunks,
+			maxDisplayedChunksHardCap = t.maxDisplayedChunksHardCap,
+			chunkCacheLimit = t.chunkCacheLimit,
+			maxChunkCellsPerAxis = t.maxChunkCellsPerAxis,
+			farLodConeEnabled = t.farLodConeEnabled,
+			farLodConeDegrees = t.farLodConeDegrees,
+			rearLod2Radius = t.rearLod2Radius,
+			autoQualityEnabled = t.autoQualityEnabled,
+			targetFrameMs = t.targetFrameMs
+		}
+		t.lod0Radius = math.floor(clampNumber(t.lod0Radius, 1, 3, 2))
+		t.lod1Radius = math.floor(clampNumber(t.lod1Radius, t.lod0Radius, 6, 4))
+		t.lod2Radius = math.floor(clampNumber(t.lod2Radius, t.lod1Radius, 8, math.max(t.lod1Radius, 6)))
+		t.terrainQuality = clampNumber(t.terrainQuality, 2.0, 6.0, 3.5)
+		t.meshBuildBudget = math.floor(clampNumber(t.meshBuildBudget, 1, 8, 4))
+		t.workerMaxInflight = math.floor(clampNumber(t.workerMaxInflight, 1, 6, 6))
+		t.workerResultBudgetPerFrame = math.floor(clampNumber(t.workerResultBudgetPerFrame, 1, 12, 4))
+		t.workerResultTimeBudgetMs = clampNumber(t.workerResultTimeBudgetMs, 0.25, 20.0, 3.0)
+		t.maxAdaptiveLod1Radius = math.floor(clampNumber(t.maxAdaptiveLod1Radius, t.lod1Radius, 6, t.lod1Radius))
+		t.maxPendingChunks = math.floor(clampNumber(t.maxPendingChunks, 16, 192, 96))
+		t.maxStaleChunks = math.floor(clampNumber(t.maxStaleChunks, 8, 128, 32))
+		t.maxDisplayedChunksHardCap = math.floor(clampNumber(t.maxDisplayedChunksHardCap, 1536, 16384, 8192))
+		t.maxDisplayedChunks = math.floor(clampNumber(t.maxDisplayedChunks, 128, t.maxDisplayedChunksHardCap, 512))
+		t.chunkCacheLimit = math.floor(clampNumber(t.chunkCacheLimit, 32, 256, 128))
+		t.maxChunkCellsPerAxis = math.floor(clampNumber(t.maxChunkCellsPerAxis, 24, 128, 48))
+		t.splitLodEnabled = false
+		t.highResSplitRatio = clampNumber(t.highResSplitRatio, 0.2, 0.8, 0.5)
+		t.farLodConeEnabled = t.farLodConeEnabled ~= false
+		t.farLodConeDegrees = clampNumber(t.farLodConeDegrees, 70, 170, 110)
+		t.rearLod2Radius = math.floor(clampNumber(
+			t.rearLod2Radius,
+			t.lod1Radius,
+			t.lod2Radius,
+			math.max(t.lod1Radius, math.floor(t.lod2Radius * 0.6))
+		))
+		t.autoQualityEnabled = t.autoQualityEnabled == true
+		t.targetFrameMs = clampNumber(t.targetFrameMs, 8.0, 33.3, 16.6)
+		if before.lod0Radius ~= t.lod0Radius or
+			before.lod1Radius ~= t.lod1Radius or
+			before.lod2Radius ~= t.lod2Radius or
+			before.terrainQuality ~= t.terrainQuality or
+			before.meshBuildBudget ~= t.meshBuildBudget or
+			before.workerMaxInflight ~= t.workerMaxInflight or
+			before.workerResultBudgetPerFrame ~= t.workerResultBudgetPerFrame or
+			before.workerResultTimeBudgetMs ~= t.workerResultTimeBudgetMs or
+			before.maxAdaptiveLod1Radius ~= t.maxAdaptiveLod1Radius or
+			before.maxPendingChunks ~= t.maxPendingChunks or
+			before.maxStaleChunks ~= t.maxStaleChunks or
+			before.maxDisplayedChunks ~= t.maxDisplayedChunks or
+			before.maxDisplayedChunksHardCap ~= t.maxDisplayedChunksHardCap or
+			before.chunkCacheLimit ~= t.chunkCacheLimit or
+			before.maxChunkCellsPerAxis ~= t.maxChunkCellsPerAxis or
+			before.splitLodEnabled ~= t.splitLodEnabled or
+			before.highResSplitRatio ~= t.highResSplitRatio or
+			before.farLodConeEnabled ~= t.farLodConeEnabled or
+			before.farLodConeDegrees ~= t.farLodConeDegrees or
+			before.rearLod2Radius ~= t.rearLod2Radius or
+			before.autoQualityEnabled ~= t.autoQualityEnabled or
+			before.targetFrameMs ~= t.targetFrameMs then
+			adjusted = true
+		end
+	end
+
+	sanitizeTerrainParams(snapshot.terrainSdfDefaults)
+	sanitizeTerrainParams(snapshot.groundParams)
+
+	local function sanitizeFogBlock(block)
+		if type(block) ~= "table" then
+			return
+		end
+		local oldDensity = block.fogDensity
+		local oldFalloff = block.fogHeightFalloff
+		block.fogDensity = clampNumber(block.fogDensity, 0.00002, 0.00030, 0.00018)
+		block.fogHeightFalloff = clampNumber(block.fogHeightFalloff, 0.0002, 0.0040, 0.0017)
+		if oldDensity ~= block.fogDensity or oldFalloff ~= block.fogHeightFalloff then
+			adjusted = true
+		end
+	end
+
+	sanitizeFogBlock(snapshot.sunSettings)
+	sanitizeFogBlock(snapshot.lightingModel)
+
+	local audio = type(snapshot.audioSettings) == "table" and snapshot.audioSettings or nil
+	if audio then
+		local enginePitch = migratePitch(audio.enginePitch, 0.3)
+		local ambiencePitch = migratePitch(audio.ambiencePitch, 1.0)
+		if enginePitch ~= audio.enginePitch then
+			audio.enginePitch = enginePitch
+			adjusted = true
+		end
+		if ambiencePitch ~= audio.ambiencePitch then
+			audio.ambiencePitch = ambiencePitch
+			adjusted = true
+		end
+	end
+
+	local storedMap = type(snapshot.mapState) == "table" and snapshot.mapState or nil
+	if storedMap then
+		local nextOrientation = (storedMap.orientationMode == "north_up") and "north_up" or "heading_up"
+		if storedMap.orientationMode ~= nextOrientation then
+			storedMap.orientationMode = nextOrientation
+			adjusted = true
+		end
+		local nextQualityScale = clampNumber(storedMap.qualityScale, 0.5, 2.0, 1.0)
+		local nextMaxResolution = math.floor(clampNumber(storedMap.maxResolution, 160, 1024, 512))
+		local nextWorkerEnabled = true
+		if nextQualityScale ~= storedMap.qualityScale then
+			storedMap.qualityScale = nextQualityScale
+			adjusted = true
+		end
+		if nextMaxResolution ~= storedMap.maxResolution then
+			storedMap.maxResolution = nextMaxResolution
+			adjusted = true
+		end
+		if nextWorkerEnabled ~= storedMap.workerEnabled then
+			storedMap.workerEnabled = nextWorkerEnabled
+			adjusted = true
+		end
+	end
+
+	local orientation = type(snapshot.characterOrientation) == "table" and snapshot.characterOrientation or nil
+	if orientation then
+		for _, role in ipairs({ "plane", "walking" }) do
+			local entry = orientation[role]
+			if type(entry) == "table" then
+				local sourceOffset = type(entry.offset) == "table" and entry.offset or { 0, tonumber(entry.offsetY) or 0, 0 }
+				local nextOffset = {
+					clampNumber(sourceOffset[1] or sourceOffset.x, -20.0, 20.0, 0),
+					clampNumber(sourceOffset[2] or sourceOffset.y, -20.0, 20.0, 0),
+					clampNumber(sourceOffset[3] or sourceOffset.z, -20.0, 20.0, 0)
+				}
+				if type(entry.offset) ~= "table" or
+					tonumber(entry.offset[1]) ~= nextOffset[1] or
+					tonumber(entry.offset[2]) ~= nextOffset[2] or
+					tonumber(entry.offset[3]) ~= nextOffset[3] then
+					entry.offset = nextOffset
+					entry.offsetY = nextOffset[2]
+					adjusted = true
+				end
+			end
+		end
+	end
+
+	local cloud = type(snapshot.cloudState) == "table" and snapshot.cloudState or nil
+	if cloud then
+		local oldGroupCount = cloud.groupCount
+		cloud.groupCount = math.floor(clampNumber(cloud.groupCount, 24, 160, 120))
+		if oldGroupCount ~= cloud.groupCount then
+			adjusted = true
+		end
+	end
+
+	return adjusted
+end
 
 makeRng = groundSystem.makeRng
 generateCellGrid = groundSystem.generateCellGrid
@@ -3582,7 +5208,7 @@ CELL_FIELD = groundSystem.CELL_FIELD
 
 -- Helper function
 -- Ensures that the projection call doesnt use a nil map param table, passes back the module's function called
-local function sampleGroundHeightAtWorld(worldX, worldZ, params)
+function sampleGroundHeightAtWorld(worldX, worldZ, params)
 	local groundParams = params or activeGroundParams or defaultGroundParams
 	if terrainState then
 		return terrainSdfSystem.sampleGroundHeightAtWorld(worldX, worldZ, terrainState) or 0
@@ -3590,20 +5216,24 @@ local function sampleGroundHeightAtWorld(worldX, worldZ, params)
 	return terrainSdfSystem.sampleGroundHeightAtWorld(worldX, worldZ, groundParams) or 0
 end
 
-function updateGroundStreaming(forceRebuild)
+function updateGroundStreaming(forceRebuild, dt, drawDistanceOverride)
 	local changed, nextTerrainState = terrainSdfSystem.updateGroundStreaming(forceRebuild, {
 		terrainState = terrainState,
 		activeGroundParams = activeGroundParams,
 		camera = camera,
-		drawDistance = graphicsSettings and graphicsSettings.drawDistance,
+		drawDistance = (drawDistanceOverride ~= nil and drawDistanceOverride) or
+			(graphicsSettings and graphicsSettings.drawDistance),
+		dt = dt,
+		frameTimeMs = (tonumber(dt) or 0) * 1000.0,
 		objects = objects,
-		q = q
+		q = q,
+		profiler = frameProfiler
 	})
 	if nextTerrainState then
 		terrainState = nextTerrainState
 	end
 	local params = activeGroundParams or defaultGroundParams
-	local halfExtent = (params.chunkSize or 64) * ((params.lod1Radius or 4) + 1)
+	local halfExtent = (params.chunkSize or 64) * ((params.lod2Radius or params.lod1Radius or 4) + 1)
 	if halfExtent > 0 and math.abs((worldHalfExtent or 0) - halfExtent) > 1e-6 then
 		worldHalfExtent = halfExtent
 		mapState.zoomExtents = { 160, 420, math.max(worldHalfExtent, 420) }
@@ -3632,67 +5262,94 @@ rebuildGroundFromParams = function(params, reason)
 		groundObject = nextState.groundObject
 		worldHalfExtent = nextState.worldHalfExtent or worldHalfExtent
 		invalidateMapCache()
+		if hostedRelay and type(hostedRelay.setGroundParams) == "function" and type(reason) == "string" and
+			(not reason:find("server world sync", 1, true)) and
+			(not reason:find("server crater event", 1, true)) then
+			hostedRelay:setGroundParams(activeGroundParams)
+		end
 	end
 	return changed
 end
 
 function getTerrainStreamingStats()
 	local state = terrainState or {}
-	local loaded = 0
-	for _ in pairs(state.chunkMap or {}) do
-		loaded = loaded + 1
-	end
 	local queued = #(state.chunkOrder or {})
-	local pendingBuild = 0
-	for _ in pairs(state.buildQueue or {}) do
-		pendingBuild = pendingBuild + 1
-	end
-	local inflight = 0
-	for _ in pairs(state.workerInflight or {}) do
-		inflight = inflight + 1
-	end
+	local loaded = math.max(0, math.floor(tonumber(state.displayedChunks) or 0))
+	local pendingBuild = math.max(0, math.floor(tonumber(state.buildQueueSize) or 0))
+	local inflight = math.max(0, math.floor(tonumber(state.workerInflightCount) or 0))
+	local missingRequired = math.max(0, math.floor(tonumber(state.missingRequiredChunks) or 0))
+	local staleDisplayed = math.max(0, math.floor(tonumber(state.staleDisplayedChunks) or 0))
+	local workerBuildMs = math.max(0, tonumber(state.workerLastBuildMs) or 0)
+	local workerBuildAvgMs = math.max(0, tonumber(state.workerLastBuildAvgMs) or 0)
+	local workerBuildCount = math.max(0, math.floor(tonumber(state.workerLastBuildCount) or 0))
 	return {
 		loaded = loaded,
 		queued = queued,
 		pendingBuild = pendingBuild,
 		inflight = inflight,
-		pendingTotal = queued + pendingBuild + inflight
+		missingRequired = missingRequired,
+		staleDisplayed = staleDisplayed,
+		pendingTotal = math.max(queued, pendingBuild) + inflight,
+		workerBuildMs = workerBuildMs,
+		workerBuildAvgMs = workerBuildAvgMs,
+		workerBuildCount = workerBuildCount
 	}
 end
 
 function preGenerateTerrainChunks(maxSeconds, minCoverage)
 	local maxWait = math.max(0.1, tonumber(maxSeconds) or 2.5)
-	local coverage = clamp(tonumber(minCoverage) or 0.9, 0.2, 1.0)
-	local params = activeGroundParams or defaultGroundParams or {}
-	local lod1 = math.max(1, math.floor(tonumber(params.lod1Radius) or 2))
-	local expected = math.max(1, (lod1 * 2 + 1) * (lod1 * 2 + 1))
-	local targetReady = math.max(1, math.floor(expected * coverage + 0.5))
+	local streamDt = 1 / 60
+	local requestedDrawDistance = tonumber(graphicsSettings and graphicsSettings.drawDistance) or 1800
+	local pregenDrawDistance = requestedDrawDistance
+	local function countSetEntries(set)
+		local n = 0
+		for _ in pairs(set or {}) do
+			n = n + 1
+		end
+		return n
+	end
+
+	updateGroundStreaming(true, streamDt, pregenDrawDistance)
+	local expected = math.max(1, countSetEntries(terrainState and terrainState.requiredSet))
+	local targetReady = expected
 	local startTime = love.timer.getTime()
 	local lastUiUpdate = -math.huge
 
 	while true do
-		updateGroundStreaming(false)
+		updateGroundStreaming(false, streamDt, pregenDrawDistance)
 		local stats = getTerrainStreamingStats()
+		expected = math.max(expected, countSetEntries(terrainState and terrainState.requiredSet))
+		targetReady = expected
 		local elapsed = love.timer.getTime() - startTime
-		local targetReached = stats.loaded >= targetReady
-		if (targetReached and stats.pendingTotal <= 0) or elapsed >= maxWait then
+		local targetReached = stats.loaded >= targetReady and stats.missingRequired <= 0
+		if targetReached and stats.pendingTotal <= 0 then
 			logger.log(string.format(
-				"Terrain pre-generation complete: loaded=%d target=%d pending=%d elapsed=%.2fs",
+				"Terrain pre-generation complete: loaded=%d target=%d expected=%d missing=%d pending=%d elapsed=%.2fs pregenDraw=%.0f",
 				stats.loaded,
 				targetReady,
+				expected,
+				stats.missingRequired,
 				stats.pendingTotal,
-				elapsed
+				elapsed,
+				pregenDrawDistance
 			))
 			break
 		end
 
 		if startupUi and startupUi.active and (elapsed - lastUiUpdate) >= 0.05 then
-			local phase = clamp(elapsed / maxWait, 0, 1)
+			local phaseByCoverage = clamp(stats.loaded / math.max(1, targetReady), 0, 1)
+			local phaseByTime = clamp(elapsed / maxWait, 0, 1)
+			local phase = math.max(phaseByCoverage, phaseByTime * 0.35)
 			local progress = 0.57 + phase * 0.06
 			setStartupUiStage(
 				"Generating Terrain",
 				progress,
-				string.format("Pre-generating chunks %d/%d", math.min(stats.loaded, targetReady), targetReady)
+				string.format(
+					"Pre-generating chunks %d/%d (%d pending)",
+					math.min(stats.loaded, targetReady),
+					targetReady,
+					stats.missingRequired
+				)
 			)
 			lastUiUpdate = elapsed
 		end
@@ -3752,6 +5409,32 @@ function love.load()
 		logger.log("Restart payload detected; applying preserved world/game state.")
 	else
 		currentGraphicsApiPreference = normalizeGraphicsApiPreference(graphicsSettings.graphicsApiPreference)
+	end
+	local persistedProfile, persistedErr = loadUserProfile()
+	if persistedProfile then
+		logger.log("Loaded persisted user profile from " .. tostring(userProfileStore.filePath()) .. ".")
+		userProfileLastSavedAt = love.timer.getTime()
+		if persistedProfile._l2d3d_profile_needs_compaction then
+			userProfileNeedsCompaction = true
+			local loadedVersion = math.floor(tonumber(persistedProfile._l2d3d_profile_version) or 0)
+			logger.log(string.format(
+				"Persisted profile compaction queued (schema %d -> %d).",
+				loadedVersion,
+				USER_PROFILE_VERSION
+			))
+		end
+		if not bootRestartSnapshotState and type(persistedProfile.state) == "table" then
+			bootRestartSnapshotState = persistedProfile.state
+			logger.log("Using persisted profile snapshot for startup state.")
+		end
+	elseif persistedErr and type(persistedErr) == "string" and persistedErr ~= "" then
+		local errLower = persistedErr:lower()
+		if not errLower:find("not found", 1, true) then
+			logger.log("Persisted profile load skipped: " .. persistedErr)
+		end
+	end
+	if type(bootRestartSnapshotState) == "table" and sanitizeStartupSnapshotState(bootRestartSnapshotState) then
+		logger.log("Sanitized startup snapshot for performance safety.")
 	end
 	if not modeOk then
 		logger.log("Depth buffer mode unavailable, fallback mode set. Detail: " .. tostring(modeErr))
@@ -3876,11 +5559,22 @@ function love.load()
 	modelLoadPrompt.mode = "model_path"
 	modelLoadPrompt.text = ""
 	modelLoadPrompt.cursor = 0
+	radioState.channelCount = math.max(1, math.floor(tonumber(radioState.channelCount) or 8))
+	radioState.channel = normalizeRadioChannel(radioState.channel)
+	radioState.transmitting = false
+	radioState.lastSentAt = -math.huge
+	if radioVoice and type(radioVoice.setChannel) == "function" then
+		radioVoice:setChannel(radioState.channel)
+	end
+	if radioVoice and type(radioVoice.setTransmitting) == "function" then
+		radioVoice:setTransmitting(false)
+	end
 	if love.keyboard and type(love.keyboard.setTextInput) == "function" then
 		love.keyboard.setTextInput(false)
 	end
 	syncGraphicsSettingsFromWindow()
 	graphicsSettings.graphicsApiPreference = normalizeGraphicsApiPreference(graphicsSettings.graphicsApiPreference)
+	applyTextureSamplingSettingsToRenderer()
 	if renderer.setClipPlanes then
 		renderer.setClipPlanes(0.1, graphicsSettings.drawDistance)
 	end
@@ -3906,7 +5600,14 @@ function love.load()
 		isLocalPlayer = true,
 		modelHash = playerModelHash
 	}
-	applyPlaneVisualToObject(localPlayerObject, playerModelHash, playerModelScale)
+	applyPlaneVisualToObject(
+		localPlayerObject,
+		playerModelHash,
+		playerModelScale,
+		getActiveModelRole(),
+		nil,
+		getConfiguredSkinHashForRole(getActiveModelRole())
+	)
 	syncLocalPlayerObject()
 
 	objects = {
@@ -3915,7 +5616,6 @@ function love.load()
 
 	setStartupUiStage("Generating Terrain", 0.57, "Building procedural ground chunks.")
 	rebuildGroundFromParams(defaultGroundParams, "startup")
-	preGenerateTerrainChunks(2.8, 0.92)
 
 	setStartupUiStage("Spawning Clouds", 0.66, "Generating cloud groups and initial wind profile.")
 	windState.angle = randomRange(0, math.pi * 2)
@@ -3937,13 +5637,16 @@ function love.load()
 	else
 		logger.log("Procedural audio unavailable on this runtime.")
 	end
-	if bootRestartSnapshotState then
+	if not bootRestartSnapshotState then
+		preGenerateTerrainChunks(4.5, 0.96)
+	else
 		if applyRestartSnapshot(bootRestartSnapshotState) then
 			logger.log("Restart state restored.")
-			preGenerateTerrainChunks(1.8, 0.88)
+			preGenerateTerrainChunks(3.5, 0.94)
 		else
 			logger.log("Restart state restore failed; using default startup state.")
 		end
+		applyTextureSamplingSettingsToRenderer()
 	end
 	if autoSmoke.enabled then
 		setFlightMode(true)
@@ -3961,7 +5664,14 @@ function love.load()
 		end
 		syncActivePlayerModelState()
 		if localPlayerObject then
-			applyPlaneVisualToObject(localPlayerObject, playerModelHash, playerModelScale)
+			applyPlaneVisualToObject(
+				localPlayerObject,
+				playerModelHash,
+				playerModelScale,
+				getActiveModelRole(),
+				nil,
+				getConfiguredSkinHashForRole(getActiveModelRole())
+			)
 			syncLocalPlayerObject()
 		end
 		logger.log("AutoSmoke enabled: flight mode ON, third-person camera ON.")
@@ -3975,12 +5685,20 @@ function love.load()
 	end
 
 	setStartupUiStage("Connecting Relay", 0.82, "Establishing multiplayer relay connection.")
-	if not relay then
+	if netMode == "offline" then
+		logger.log("Networking disabled (offline mode).")
+	elseif netMode == "dedicated" then
+		logger.log("Dedicated relay server active on port " .. tostring(NET_PORT) .. ".")
+	elseif not relay then
 		logger.log("ENet host creation failed; multiplayer disabled for this session.")
 	elseif not relayServer then
-		logger.log("Could not connect to relay server at " .. hostAddy)
+		logger.log("Could not connect to relay server at " .. tostring(hostAddy))
 	else
-		logger.log("Connected to relay server: " .. hostAddy)
+		if netMode == "host" then
+			logger.log("Connected to local hosted relay at " .. tostring(hostAddy))
+		else
+			logger.log("Connected to relay server: " .. tostring(hostAddy))
+		end
 	end
 
 	setStartupUiStage("Compiling Shaders", 0.88, "Creating GPU shader pipelines.")
@@ -4006,6 +5724,7 @@ function love.load()
 	end
 	setStartupUiStage("Finalizing Startup", 0.98, gpuOk and "GPU renderer ready." or "Falling back to CPU renderer.")
 	applySunSettingsToRenderer()
+	applyTextureSamplingSettingsToRenderer()
 	if renderer.setClipPlanes then
 		renderer.setClipPlanes(0.1, graphicsSettings.drawDistance)
 	end
@@ -4018,123 +5737,6 @@ function love.load()
 	syncAppStateReferences()
 	setStartupUiStage("Ready", 1.0, "Startup complete. Have fun.")
 	finishStartupUi()
-end
-
--- === Mouse Look ===
-local function buildMovementInputState()
-	local throttleBlocked = mapState.mHeld and true or false
-	return {
-		flightPitchDown = controls.isActionDown("flight_pitch_down"),
-		flightPitchUp = controls.isActionDown("flight_pitch_up"),
-		flightRollLeft = controls.isActionDown("flight_roll_left"),
-		flightRollRight = controls.isActionDown("flight_roll_right"),
-		flightYawLeft = controls.isActionDown("flight_yaw_left"),
-		flightYawRight = controls.isActionDown("flight_yaw_right"),
-		flightThrottleDown = (not throttleBlocked) and controls.isActionDown("flight_throttle_down"),
-		flightThrottleUp = (not throttleBlocked) and controls.isActionDown("flight_throttle_up"),
-		flightAfterburner = controls.isActionDown("flight_afterburner"),
-		flightAirBrakes = controls.isActionDown("flight_air_brakes"),
-		walkForward = controls.isActionDown("walk_forward"),
-		walkBackward = controls.isActionDown("walk_backward"),
-		walkStrafeLeft = controls.isActionDown("walk_strafe_left"),
-		walkStrafeRight = controls.isActionDown("walk_strafe_right"),
-		walkSprint = controls.isActionDown("walk_sprint"),
-		walkJump = controls.isActionDown("walk_jump")
-	}
-end
-
-local function applyCameraRotations(pitchAngle, yawAngle, rollAngle)
-	local rot = camera.rot
-	if pitchAngle ~= 0 then
-		local right = q.rotateVector(rot, { 1, 0, 0 })
-		rot = q.normalize(q.multiply(q.fromAxisAngle(right, pitchAngle), rot))
-	end
-	if yawAngle ~= 0 then
-		local up = q.rotateVector(rot, { 0, 1, 0 })
-		rot = q.normalize(q.multiply(q.fromAxisAngle(up, yawAngle), rot))
-	end
-	if rollAngle ~= 0 then
-		local forward = q.rotateVector(rot, { 0, 0, 1 })
-		rot = q.normalize(q.multiply(q.fromAxisAngle(forward, rollAngle), rot))
-	end
-	camera.rot = rot
-end
-
-local function applyWalkingMouseLook(dx, dy, modifiers)
-	local lookDown = controls.getActionMouseAxisValue("walk_look_down", dx, dy, modifiers)
-	local lookUp = controls.getActionMouseAxisValue("walk_look_up", dx, dy, modifiers)
-	local lookLeft = controls.getActionMouseAxisValue("walk_look_left", dx, dy, modifiers)
-	local lookRight = controls.getActionMouseAxisValue("walk_look_right", dx, dy, modifiers)
-
-	local pitchAxis = lookDown - lookUp
-	local yawAxis = lookRight - lookLeft
-	if invertLookY then
-		pitchAxis = -pitchAxis
-	end
-
-	camera.walkYaw = camera.walkYaw or 0
-	camera.walkPitch = camera.walkPitch or 0
-
-	local pitchMult = camera.walkMousePitchMultiplier or 2.2
-	local yawMult = camera.walkMouseYawMultiplier or 2.2
-	local pitchLimit = walkingPitchLimit
-
-	camera.walkPitch = clamp(
-		camera.walkPitch + (pitchAxis * mouseSensitivity * pitchMult),
-		-pitchLimit,
-		pitchLimit
-	)
-	camera.walkYaw = viewMath.wrapAngle(camera.walkYaw + (yawAxis * mouseSensitivity * yawMult))
-	camera.rot = composeWalkingRotation(camera.walkYaw, camera.walkPitch)
-end
-
-local function applyFlightMouseLook(dx, dy, modifiers)
-	local pitchDown = controls.getActionMouseAxisValue("flight_pitch_down", dx, dy, modifiers)
-	local pitchUp = controls.getActionMouseAxisValue("flight_pitch_up", dx, dy, modifiers)
-	local rollLeft = controls.getActionMouseAxisValue("flight_roll_left", dx, dy, modifiers)
-	local rollRight = controls.getActionMouseAxisValue("flight_roll_right", dx, dy, modifiers)
-	local yawLeft = controls.getActionMouseAxisValue("flight_yaw_left", dx, dy, modifiers)
-	local yawRight = controls.getActionMouseAxisValue("flight_yaw_right", dx, dy, modifiers)
-
-	local pitchAxis = pitchDown - pitchUp
-	local yawAxis = yawRight - yawLeft
-	local rollAxis = rollLeft - rollRight
-
-	if invertLookY then
-		pitchAxis = -pitchAxis
-	end
-
-	camera.yoke = camera.yoke or { pitch = 0, yaw = 0, roll = 0 }
-	local yoke = camera.yoke
-	local pitchGain = camera.yokeMousePitchGain or 16
-	local yawGain = camera.yokeMouseYawGain or 14
-	local rollGain = camera.yokeMouseRollGain or 12
-
-	yoke.pitch = clamp(yoke.pitch + pitchAxis * mouseSensitivity * pitchGain, -1, 1)
-	yoke.yaw = clamp(yoke.yaw + yawAxis * mouseSensitivity * yawGain, -1, 1)
-	yoke.roll = clamp(yoke.roll + rollAxis * mouseSensitivity * rollGain, -1, 1)
-end
-
-local function updateZoomFov(dt)
-	local baseFov = camera.baseFov or camera.fov
-	local targetFov = baseFov
-	if flightSimMode and controls.isActionDown("flight_zoom_in") then
-		local zoomFactor = camera.zoomFactor or 0.6
-		targetFov = math.max(math.rad(20), baseFov * zoomFactor)
-	end
-
-	local lerpSpeed = camera.zoomLerpSpeed or 10
-	local alpha = clamp(lerpSpeed * dt, 0, 1)
-	camera.fov = camera.fov + (targetFov - camera.fov) * alpha
-end
-
-local function adjustFlightThrottleFromWheel(direction)
-	if not flightSimMode then
-		return
-	end
-
-	local step = camera.wheelThrottleStep or 0.06
-	camera.throttle = clamp((camera.throttle or 0) + (step * direction), 0, 1)
 end
 
 local inputSystem = inputSystemModule.create({
@@ -4164,13 +5766,6 @@ local inputSystem = inputSystemModule.create({
 		return walkingPitchLimit
 	end
 })
-
-buildMovementInputState = inputSystem.buildMovementInputState
-applyCameraRotations = inputSystem.applyCameraRotations
-applyWalkingMouseLook = inputSystem.applyWalkingMouseLook
-applyFlightMouseLook = inputSystem.applyFlightMouseLook
-updateZoomFov = inputSystem.updateZoomFov
-adjustFlightThrottleFromWheel = inputSystem.adjustFlightThrottleFromWheel
 
 local function setPromptTextInputEnabled(enabled)
 	if love.keyboard and type(love.keyboard.setTextInput) == "function" then
@@ -4259,6 +5854,9 @@ function love.mousemoved(x, y, dx, dy)
 			captureBindingFromMouseMotion(dx, dy)
 			return
 		end
+		if pauseMenu.tab == "paint" and handlePausePaintMouseMove(x, y, dx, dy) then
+			return
+		end
 
 		updatePauseMenuHover(x, y)
 		updatePauseControlsHover(x, y)
@@ -4277,9 +5875,9 @@ function love.mousemoved(x, y, dx, dy)
 
 	local modifiers = controls.getCurrentModifiers()
 	if flightSimMode then
-		applyFlightMouseLook(dx, dy, modifiers)
+		inputSystem.applyFlightMouseLook(dx, dy, modifiers)
 	else
-		applyWalkingMouseLook(dx, dy, modifiers)
+		inputSystem.applyWalkingMouseLook(dx, dy, modifiers)
 	end
 end
 
@@ -4287,89 +5885,107 @@ function updateNet()
 	local canSend = relayIsConnected()
 	local now = love.timer.getTime()
 
+	if canSend and (clientNet.forceHello or (not clientNet.helloSent)) then
+		local okHello = pcall(function()
+			relayServer:send(buildHelloPacket(), 0)
+		end)
+		if okHello then
+			clientNet.helloSent = true
+			clientNet.forceHello = false
+		end
+	end
+
 	if canSend and (stateNet.forceSend or (now - stateNet.lastSentAt) >= stateNet.sendInterval) then
-		local activeRole = getActiveModelRole()
-		local activeHash, activeScale = getConfiguredModelForRole(activeRole)
-		local planeHash, planeScale = getConfiguredModelForRole("plane")
-		local walkingHash, walkingScale = getConfiguredModelForRole("walking")
-		local planeSkinHash = getConfiguredSkinHashForRole("plane")
-		local walkingSkinHash = getConfiguredSkinHashForRole("walking")
-		local planeOrientation = getRoleOrientation("plane")
-		local walkingOrientation = getRoleOrientation("walking")
-		local outboundCallsign = sanitizeCallsign(localCallsign) or "Pilot"
-		local activeVelocity = camera.flightVel or camera.vel or { 0, 0, 0 }
-		local activeAngVel = camera.flightAngVel or {
-			(camera.flightRotVel and camera.flightRotVel.pitch) or 0,
-			(camera.flightRotVel and camera.flightRotVel.yaw) or 0,
-			(camera.flightRotVel and camera.flightRotVel.roll) or 0
+		clientNet.inputTick = math.max(0, math.floor(tonumber(clientNet.inputTick) or 0)) + 1
+		local inputState = inputSystem.buildMovementInputState()
+		clientNet.pendingInputs[clientNet.inputTick] = {
+			sentAt = now,
+			input = inputState
 		}
-		local activeYoke = camera.yoke or { pitch = 0, yaw = 0, roll = 0 }
-		local flightTick = (camera.flightSimState and camera.flightSimState.tick) or 0
-		local packet = table.concat({
-			"STATE3",
-			"px=" .. string.format("%f", camera.pos[1]),
-			"py=" .. string.format("%f", camera.pos[2]),
-			"pz=" .. string.format("%f", camera.pos[3]),
-			"rw=" .. string.format("%f", camera.rot.w),
-			"rx=" .. string.format("%f", camera.rot.x),
-			"ry=" .. string.format("%f", camera.rot.y),
-			"rz=" .. string.format("%f", camera.rot.z),
-			"vx=" .. formatNetFloat(activeVelocity[1] or 0),
-			"vy=" .. formatNetFloat(activeVelocity[2] or 0),
-			"vz=" .. formatNetFloat(activeVelocity[3] or 0),
-			"wx=" .. formatNetFloat(activeAngVel[1] or 0),
-			"wy=" .. formatNetFloat(activeAngVel[2] or 0),
-			"wz=" .. formatNetFloat(activeAngVel[3] or 0),
-			"thr=" .. formatNetFloat(camera.throttle or 0),
-			"elev=" .. formatNetFloat(activeYoke.pitch or 0),
-			"ail=" .. formatNetFloat(activeYoke.roll or 0),
-			"rud=" .. formatNetFloat(-(activeYoke.yaw or 0)),
-			"tick=" .. tostring(math.floor(flightTick)),
-			"ts=" .. formatNetFloat(now),
-			"scale=" .. formatNetFloat(activeScale),
-			"modelHash=" .. tostring(activeHash or "builtin-cube"),
-			"role=" .. tostring(activeRole),
-			"planeScale=" .. formatNetFloat(planeScale),
-			"planeModelHash=" .. tostring(planeHash or "builtin-cube"),
-			"planeYaw=" .. formatNetFloat(planeOrientation.yaw),
-			"planePitch=" .. formatNetFloat(planeOrientation.pitch),
-			"planeRoll=" .. formatNetFloat(planeOrientation.roll),
-			"walkingScale=" .. formatNetFloat(walkingScale),
-			"walkingModelHash=" .. tostring(walkingHash or "builtin-cube"),
-			"walkingYaw=" .. formatNetFloat(walkingOrientation.yaw),
-			"walkingPitch=" .. formatNetFloat(walkingOrientation.pitch),
-			"walkingRoll=" .. formatNetFloat(walkingOrientation.roll),
-			"planeSkinHash=" .. tostring(planeSkinHash or ""),
-			"walkingSkinHash=" .. tostring(walkingSkinHash or ""),
-			"callsign=" .. outboundCallsign
-		}, "|")
 		pcall(function()
-			relayServer:send(packet)
+			relayServer:send(buildInputPacket(inputState, clientNet.inputTick), 1)
 		end)
 		stateNet.lastSentAt = now
 		stateNet.forceSend = false
+	end
 
-		sendCloudSnapshot(false)
+	if canSend and
+		(radioState.lastSentAt == -math.huge or (now - (radioState.lastSentAt or -math.huge)) >= (radioState.statusInterval or 0.30)) then
+		pcall(function()
+			relayServer:send(table.concat({
+				"VOICE_STATE",
+				"channel=" .. tostring(normalizeRadioChannel(radioState.channel)),
+				"tx=" .. tostring((radioState.transmitting and 1) or 0)
+			}, "|"), 0)
+		end)
+		radioState.lastSentAt = now
 	end
 	pumpModelTransfers(now)
 end
 
 function serviceNetworkEvents()
+	if hostedRelay then
+		hostedRelay:update(0)
+	end
+
 	if not relay then
 		return
 	end
 
+	local maxEventsPerTick = 96
+	local maxServiceMs = 2.5
+	local startedAt = love.timer.getTime()
+	local processedEvents = 0
+
 	event = relay:service()
 	while event do
 		if event.type == "connect" and relayServer and event.peer == relayServer then
-			beginCloudRoleElection("relay handshake complete")
+			resetClientNetState()
 			forceStateSync()
 		elseif event.type == "receive" then
 			local packetType = nil
 			if type(event.data) == "string" then
 				packetType = splitPacketFields(event.data)[1]
 			end
-			if packetType == "STATE" or packetType == "STATE2" or packetType == "STATE3" then
+			if packetType == "JOIN_OK" then
+				local kv = parsePacketKeyValues(splitPacketFields(event.data), 2)
+				clientNet.localPeerId = math.floor(tonumber(kv.id) or 0)
+				clientNet.serverAuthoritative = clientNet.localPeerId > 0
+			elseif packetType == "SNAPSHOT" then
+				local kv = parsePacketKeyValues(splitPacketFields(event.data), 2)
+				local peerId = math.floor(tonumber(kv.id) or 0)
+				if peerId > 0 and peerId == tonumber(clientNet.localPeerId) then
+					applyAuthoritativeLocalSnapshot(kv)
+				elseif peerId > 0 then
+					local remoteId = networking.handlePacket(
+						buildState3FromSnapshot(kv),
+						peers,
+						objects,
+						q,
+						cubeModel,
+						getModelRotationOffsetForRole,
+						buildPeerDefaults(),
+						love.timer.getTime()
+					)
+					applyPeerRadioStateFromPacket(event.data, remoteId)
+					updatePeerVisualModel(remoteId)
+				end
+			elseif packetType == "WORLD_SYNC" then
+				applyWorldSyncFromPacket(event.data)
+			elseif packetType == "AVATAR_MANIFEST" then
+				applyAvatarManifestPacket(event.data)
+			elseif packetType == "CRATER_EVENT" then
+				applyCraterEventPacket(event.data)
+			elseif packetType == "VOICE_STATE" then
+				local kv = parsePacketKeyValues(splitPacketFields(event.data), 2)
+				local peerId = math.floor(tonumber(kv.id) or 0)
+				if peerId > 0 and peers[peerId] then
+					peers[peerId].radioChannel = normalizeRadioChannel(kv.channel)
+					peers[peerId].radioTx = (tonumber(kv.tx) or 0) ~= 0
+				end
+			elseif packetType == "VOICE_FRAME" then
+				-- ENet voice transport is optional on the client; routing happens on the hosted server.
+			elseif packetType == "STATE" or packetType == "STATE2" or packetType == "STATE3" then
 				local receivedAt = love.timer.getTime()
 				local peerId = networking.handlePacket(
 					event.data,
@@ -4393,8 +6009,8 @@ function serviceNetworkEvents()
 					},
 					receivedAt
 				)
+				applyPeerRadioStateFromPacket(event.data, peerId)
 				updatePeerVisualModel(peerId)
-				notePeerStateReceived(peerId)
 			elseif packetType == "CLOUD_REQUEST" then
 				handleCloudRequestPacket(event.data)
 			elseif packetType == "CLOUD_SNAPSHOT" then
@@ -4409,9 +6025,13 @@ function serviceNetworkEvents()
 				handleModelMetaPacket(event.data)
 			elseif packetType == "MODEL_CHUNK" or packetType == "BLOB_CHUNK" then
 				handleModelChunkPacket(event.data)
+			elseif packetType == "NET_PEER_LEAVE" or packetType == "PEER_LEAVE" then
+				local kv = parsePacketKeyValues(splitPacketFields(event.data), 2)
+				removePeerObject(kv.id)
 			end
 		elseif event.type == "disconnect" and relayServer and event.peer == relayServer then
 			relayServer = nil
+			resetClientNetState()
 			clearPeerObjects()
 			forceStateSync()
 			cloudNetState.authorityPeerId = nil
@@ -4422,6 +6042,10 @@ function serviceNetworkEvents()
 			logger.log("Relay disconnected.")
 		end
 
+		processedEvents = processedEvents + 1
+		if processedEvents >= maxEventsPerTick or ((love.timer.getTime() - startedAt) * 1000.0) >= maxServiceMs then
+			break
+		end
 		event = relay:service()
 	end
 end
@@ -4431,7 +6055,26 @@ function love.update(dt)
 	syncAppStateReferences()
 	local runtimeState = appState.values
 	local now = love.timer.getTime()
-	updateCloudNetworkState(now)
+
+	if netMode == "dedicated" then
+		local networkEventsScope = beginProfileScope("network.events", profilerColors.network, "network events")
+		serviceNetworkEvents()
+		endProfileScope(networkEventsScope)
+
+		if not startupUi.active then
+			local profileSaveScope = beginProfileScope("profile.save", profilerColors.profile, "profile save")
+			if userProfileNeedsCompaction then
+				if saveUserProfile("profile compacted", true) then
+					userProfileNeedsCompaction = false
+				end
+			else
+				saveUserProfile(nil, false)
+			end
+			endProfileScope(profileSaveScope)
+		end
+		endProfileScope(updateScope)
+		return
+	end
 
 	if pauseMenu.statusUntil > 0 and love.timer.getTime() >= pauseMenu.statusUntil then
 		pauseMenu.statusText = ""
@@ -4442,8 +6085,8 @@ function love.update(dt)
 	end
 
 	if not pauseMenu.active then
-		updateGroundStreaming(false)
-		local movementInput = buildMovementInputState()
+		updateGroundStreaming(false, dt)
+		local movementInput = inputSystem.buildMovementInputState()
 		local terrainRef = terrainState or activeGroundParams or defaultGroundParams
 		local movementEnv = {
 			wind = cloudSim.getWindVector3(windState),
@@ -4496,9 +6139,10 @@ function love.update(dt)
 				movementEnv
 			)
 		end
+
 		syncLocalPlayerObject()
 		cloudSim.updateClouds(dt, cloudState, cloudNetState, camera, windState, love.timer.getTime(), q)
-		updateZoomFov(dt)
+		inputSystem.updateZoomFov(dt)
 
 		perfElapsed = perfElapsed + dt
 		perfFrames = perfFrames + 1
@@ -4548,11 +6192,17 @@ function love.update(dt)
 	end
 
 	updateNet()
+
 	resolveActiveRenderCamera()
 	serviceNetworkEvents()
+	local interpolationDelay = 0.06
+	local relayRttSeconds = getRelayRttSeconds()
+	if relayRttSeconds then
+		interpolationDelay = clamp(relayRttSeconds * 0.5 + 0.025, 0.04, 0.16)
+	end
 	networking.updateRemoteInterpolation(peers, love.timer.getTime(), {
-		interpolationDelay = 0.120,
-		extrapolationCap = 0.200,
+		interpolationDelay = interpolationDelay,
+		extrapolationCap = 0.180,
 		qOps = q
 	})
 	updateCloudNetworkState(love.timer.getTime())
@@ -4580,11 +6230,39 @@ function love.update(dt)
 			return
 		end
 	end
+
+	if radioVoice and type(radioVoice.update) == "function" then
+		radioVoice:update({
+			dt = dt,
+			channel = radioState.channel,
+			transmitting = radioState.transmitting,
+			peers = peers
+		})
+	end
+
+	if not startupUi.active then
+		if not settingsSaved or (settingsSaved ~= nil and lastSave ~= nil and love.timer.getTime() - lastSave > 5000) then
+			if userProfileNeedsCompaction then
+				if saveUserProfile("profile compacted", true) then
+					userProfileNeedsCompaction = false
+				end
+			else
+				saveUserProfile(nil, false)
+			end
+			settingsSaved = true
+			lastSave = love.timer.getTime()
+		end
+	end
 end
 
 function love.quit()
 	if startupUi.audioRuntime and type(startupUi.audioRuntime.stop) == "function" then
 		startupUi.audioRuntime:stop()
+	end
+	saveUserProfile("shutdown", true)
+	if hostedRelay then
+		hostedRelay:stop()
+		hostedRelay = nil
 	end
 end
 
@@ -4651,6 +6329,13 @@ function love.keypressed(key, scancode, isrepeat)
 		end
 		if key == "rightbracket" or key == "]" then
 			cyclePauseSubTab(1)
+			return
+		end
+
+		if pauseMenu.tab == "paint" then
+			if handlePausePaintKeyPress(key) then
+				return
+			end
 			return
 		end
 
@@ -4745,6 +6430,30 @@ function love.keypressed(key, scancode, isrepeat)
 		updateLogicalMapCamera()
 		return
 	end
+	if key == "f7" then
+		if not isrepeat then
+			setRadioChannel((radioState.channel or 1) - 1)
+			logger.log("Radio channel set to " .. tostring(radioState.channel))
+		end
+		return
+	end
+	if key == "f8" then
+		if not isrepeat then
+			setRadioChannel((radioState.channel or 1) + 1)
+			logger.log("Radio channel set to " .. tostring(radioState.channel))
+		end
+		return
+	end
+	if key == "v" then
+		if not isrepeat then
+			radioState.transmitting = true
+			if radioVoice and type(radioVoice.setTransmitting) == "function" then
+				radioVoice:setTransmitting(true)
+			end
+			forceStateSync()
+		end
+		return
+	end
 	if key == "c" then
 		if not isrepeat then
 			cycleViewMode()
@@ -4787,6 +6496,15 @@ function love.keypressed(key, scancode, isrepeat)
 end
 
 function love.keyreleased(key)
+	if key == "v" then
+		radioState.transmitting = false
+		if radioVoice and type(radioVoice.setTransmitting) == "function" then
+			radioVoice:setTransmitting(false)
+		end
+		forceStateSync()
+		return
+	end
+
 	if key == "lalt" then
 		resetAltLookState()
 		resolveActiveRenderCamera()
@@ -4819,6 +6537,9 @@ function love.mousepressed(x, y, button)
 			captureBindingFromMouseButton(button)
 			return
 		end
+		if handlePausePaintMousePress(x, y, button) then
+			return
+		end
 
 		if button == 1 then
 			handlePauseMenuMouseClick(x, y)
@@ -4837,6 +6558,9 @@ end
 
 function love.mousereleased(x, y, button)
 	if not pauseMenu.active or button ~= 1 then
+		return
+	end
+	if handlePausePaintMouseRelease(x, y, button) then
 		return
 	end
 	endPauseRangeDrag(x)
@@ -4869,17 +6593,17 @@ function love.wheelmoved(x, y)
 		local items = getPauseItemsForCurrentPage()
 		local item = items[pauseMenu.selected]
 		if item and (item.kind == "range" or item.kind == "cycle") then
-			adjustPauseItem(item, y > 0 and 1 or -1)
+			adjustSelectedPauseItem(y > 0 and 1 or -1)
 		end
 		return
 	end
 
 	local modifiers = controls.getCurrentModifiers()
 	if controls.actionTriggeredByWheel("flight_throttle_up", y, modifiers) then
-		adjustFlightThrottleFromWheel(1)
+		inputSystem.adjustFlightThrottleFromWheel(1)
 	end
 	if controls.actionTriggeredByWheel("flight_throttle_down", y, modifiers) then
-		adjustFlightThrottleFromWheel(-1)
+		inputSystem.adjustFlightThrottleFromWheel(-1)
 	end
 end
 
@@ -5177,8 +6901,8 @@ function drawHud(w, h, cx, cy, renderCamera)
 
 			local rudderWidth = math.floor(controlW * 0.42)
 			local rudderHeight = 10
-			local rudderX = controlX + controlW - rudderWidth - 18
-			local rudderY = controlY + math.floor(controlH * 0.64)
+			local rudderX = yokeX
+			local rudderY = yokeY + yokeSize * 2 + 18
 			local rudderHandleSize = rudderHeight + 8
 			local rudderRatio = (clamp(yoke.yaw or 0, -1, 1) + 1) * 0.5
 			local rudderHandleX = rudderX + rudderRatio * rudderWidth - (rudderHandleSize * 0.5)
@@ -5207,6 +6931,40 @@ function drawHud(w, h, cx, cy, renderCamera)
 
 	if not pauseMenu.active and hudSettings.showPeerIndicators then
 		drawWorldPeerIndicators(w, h, renderCamera or resolveActiveRenderCamera() or camera)
+	end
+
+	if not pauseMenu.active then
+		local channel = normalizeRadioChannel(radioState.channel)
+		local peersOnChannel = 0
+		local peersTransmitting = 0
+		for _, peerObj in pairs(peers) do
+			if peerObj and normalizeRadioChannel(peerObj.radioChannel or 1) == channel then
+				peersOnChannel = peersOnChannel + 1
+				if peerObj.radioTx then
+					peersTransmitting = peersTransmitting + 1
+				end
+			end
+		end
+		local cardW = 258
+		local cardH = 54
+		local cardX = 12
+		local cardY = h - cardH - 12
+		drawHudPlate(cardX, cardY, cardW, cardH, 6)
+		love.graphics.setColor(0.88, 0.96, 1.0, 0.96)
+		love.graphics.print(
+			string.format("RADIO CH %02d  TX %s", channel, radioState.transmitting and "ON" or "OFF"),
+			cardX + 10,
+			cardY + 8
+		)
+		love.graphics.setColor(0.68, 0.84, 0.96, 0.94)
+		local voiceStatus = (radioVoice and type(radioVoice.getStatusLabel) == "function")
+			and radioVoice:getStatusLabel()
+			or "Radio: n/a"
+		love.graphics.print(
+			string.format("Peers %d  Active %d  F7/F8 ch  V PTT  %s", peersOnChannel, peersTransmitting, tostring(voiceStatus)),
+			cardX + 10,
+			cardY + 28
+		)
 	end
 
 	if hudSettings.showMap and mapState.visible then

@@ -22,6 +22,18 @@ function viewMath.getYawFromRotation(rotation, q)
 	return math.atan(forward[1], forward[3])
 end
 
+function viewMath.getStableYawFromRotation(rotation, q, fallbackYaw)
+	local rot = rotation or q.identity()
+	local forward = q.rotateVector(rot, { 0, 0, 1 })
+	local flatX = tonumber(forward[1]) or 0
+	local flatZ = tonumber(forward[3]) or 0
+	local flatLenSq = flatX * flatX + flatZ * flatZ
+	if flatLenSq <= 1e-6 then
+		return viewMath.wrapAngle(tonumber(fallbackYaw) or 0)
+	end
+	return math.atan(flatX, flatZ)
+end
+
 function viewMath.segmentAabbIntersectionT(startPos, endPos, obj)
 	if not startPos or not endPos or not obj or not obj.pos or not obj.halfSize then
 		return nil
@@ -98,12 +110,39 @@ function viewMath.positiveMod(value, modulus)
 	return result
 end
 
-function viewMath.rotateWorldDeltaToMap(dx, dz, yaw)
+local function normalizeMapOrientationMode(mode)
+	if mode == "north_up" then
+		return "north_up"
+	end
+	return "heading_up"
+end
+
+function viewMath.worldToMapDelta(dx, dz, yaw, orientationMode)
+	local mode = normalizeMapOrientationMode(orientationMode)
+	if mode == "north_up" then
+		return dx, dz
+	end
 	local cosYaw = math.cos(yaw)
 	local sinYaw = math.sin(yaw)
 	local mapX = cosYaw * dx - sinYaw * dz
 	local mapZ = sinYaw * dx + cosYaw * dz
 	return mapX, mapZ
+end
+
+function viewMath.mapToWorldDelta(mapX, mapZ, yaw, orientationMode)
+	local mode = normalizeMapOrientationMode(orientationMode)
+	if mode == "north_up" then
+		return mapX, mapZ
+	end
+	local cosYaw = math.cos(yaw)
+	local sinYaw = math.sin(yaw)
+	local dx = cosYaw * mapX + sinYaw * mapZ
+	local dz = -sinYaw * mapX + cosYaw * mapZ
+	return dx, dz
+end
+
+function viewMath.rotateWorldDeltaToMap(dx, dz, yaw)
+	return viewMath.worldToMapDelta(dx, dz, yaw, "heading_up")
 end
 
 return viewMath

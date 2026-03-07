@@ -104,8 +104,9 @@ end
 
 function blobSync.prepareOutgoing(state, kind, hash, rawBytes, opts)
     opts = opts or {}
+    rawBytes = rawBytes or ""
     local chunkSize = math.max(64, math.floor(tonumber(opts.chunkSize) or 720))
-    local encoded = encodeBase64(rawBytes or "")
+    local encoded = encodeBase64(rawBytes)
     local chunks = {}
     for i = 1, #encoded, chunkSize do
         chunks[#chunks + 1] = encoded:sub(i, i + chunkSize - 1)
@@ -114,18 +115,20 @@ function blobSync.prepareOutgoing(state, kind, hash, rawBytes, opts)
     local transfer = {
         kind = kind,
         hash = hash,
+        raw = rawBytes,
         rawBytes = #rawBytes,
         encodedBytes = #encoded,
         chunkSize = chunkSize,
         chunkCount = #chunks,
-        chunks = chunks
+        chunks = chunks,
+        extra = opts.extra or {}
     }
     state.outgoing[kind .. "|" .. hash] = transfer
     return transfer
 end
 
 function blobSync.buildMetaPacket(transfer, extra)
-    extra = extra or {}
+    extra = extra or transfer.extra or {}
     return {
         kind = transfer.kind,
         hash = transfer.hash,

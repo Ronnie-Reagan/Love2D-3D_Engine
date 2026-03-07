@@ -44,6 +44,48 @@ local function cloneCraterList(list)
 	return out
 end
 
+local function cloneWorkerParamsSnapshot(params)
+	local snapshot = shallowCopy(params or {})
+	snapshot.dynamicCraters = cloneCraterList(snapshot.dynamicCraters)
+	return snapshot
+end
+
+local terrainProfileColors = {
+	runtime = { 0.95, 0.70, 0.22, 1.0 },
+	requiredSet = { 0.91, 0.56, 0.20, 1.0 },
+	slotCollapse = { 0.82, 0.50, 0.20, 1.0 },
+	missingScan = { 0.96, 0.62, 0.28, 1.0 },
+	queueCompaction = { 0.90, 0.52, 0.18, 1.0 },
+	queueFill = { 1.00, 0.64, 0.22, 1.0 },
+	workerHealth = { 0.82, 0.76, 0.26, 1.0 },
+	workerCollect = { 0.98, 0.48, 0.20, 1.0 },
+	workerDispatch = { 1.00, 0.44, 0.16, 1.0 },
+	syncBuild = { 0.94, 0.34, 0.20, 1.0 },
+	prune = { 0.88, 0.40, 0.24, 1.0 },
+	stats = { 0.82, 0.72, 0.24, 1.0 },
+	workerThreadBuild = { 0.98, 0.28, 0.16, 1.0 }
+}
+
+local function beginProfileScope(profiler, metricId, color, label)
+	if type(profiler) == "table" and type(profiler.beginScope) == "function" then
+		return profiler:beginScope(metricId, color, label)
+	end
+	return nil
+end
+
+local function endProfileScope(profiler, token)
+	if token and type(profiler) == "table" and type(profiler.endScope) == "function" then
+		return profiler:endScope(token)
+	end
+	return 0
+end
+
+local function addProfileSample(profiler, metricId, valueMs, color, label)
+	if type(profiler) == "table" and type(profiler.addSample) == "function" then
+		profiler:addSample(metricId, valueMs, color, label)
+	end
+end
+
 local function copyColor3(v, fallback)
 	local src = type(v) == "table" and v or fallback or { 0.3, 0.4, 0.25 }
 	return {
@@ -60,6 +102,13 @@ local function supportsThreading()
 		type(loveLib.thread.getChannel) == "function"
 end
 
+local function currentTimeSeconds()
+	if type(loveLib) == "table" and type(loveLib.timer) == "table" and type(loveLib.timer.getTime) == "function" then
+		return loveLib.timer.getTime()
+	end
+	return os.clock()
+end
+
 local function buildChunkKey(cx, cz, lod, generatorVersion, seed)
 	return table.concat({
 		tostring(seed or 0),
@@ -67,6 +116,13 @@ local function buildChunkKey(cx, cz, lod, generatorVersion, seed)
 		tostring(cz),
 		tostring(lod),
 		tostring(generatorVersion or 1)
+	}, ":")
+end
+
+local function buildChunkCoordKey(cx, cz)
+	return table.concat({
+		tostring(cx),
+		tostring(cz)
 	}, ":")
 end
 
@@ -126,14 +182,66 @@ local function craterListsEqual(aList, bList)
 	return true
 end
 
-local function removeObjectInstance(objects, objectRef)
-	for i = #objects, 1, -1 do
-		if objects[i] == objectRef then
-			table.remove(objects, i)
-			return true
+local function rebuildTerrainObjectIndex(terrainState, objects)
+	if type(terrainState) ~= "table" or type(objects) ~= "table" then
+		return
+	end
+	local indexMap = terrainState.objectIndexByChunkKey or {}
+	for key in pairs(indexMap) do
+		indexMap[key] = nil
+	end
+	for i = 1, #objects do
+		local obj = objects[i]
+		local key = type(obj) == "table" and tostring(obj._terrainChunkKey or "") or ""
+		if key ~= "" then
+			indexMap[key] = i
 		end
 	end
-	return false
+	terrainState.objectIndexByChunkKey = indexMap
+end
+
+local function removeObjectInstance(terrainState, objects, objectRef)
+	if type(objects) ~= "table" or type(objectRef) ~= "table" then
+		return false
+	end
+	local key = tostring(objectRef._terrainChunkKey or "")
+	local indexMap = terrainState and terrainState.objectIndexByChunkKey or nil
+	local index = nil
+	if key ~= "" and type(indexMap) == "table" then
+		index = tonumber(indexMap[key])
+		if index and objects[index] ~= objectRef then
+			rebuildTerrainObjectIndex(terrainState, objects)
+			index = tonumber(indexMap[key])
+		end
+	end
+	if not index or objects[index] ~= objectRef then
+		for i = #objects, 1, -1 do
+			if objects[i] == objectRef then
+				index = i
+				break
+			end
+		end
+	end
+	if not index or objects[index] ~= objectRef then
+		if key ~= "" and type(indexMap) == "table" then
+			indexMap[key] = nil
+		end
+		return false
+	end
+	local lastIndex = #objects
+	local tail = objects[lastIndex]
+	objects[index] = tail
+	objects[lastIndex] = nil
+	if index < lastIndex and type(tail) == "table" and type(indexMap) == "table" then
+		local movedKey = tostring(tail._terrainChunkKey or "")
+		if movedKey ~= "" then
+			indexMap[movedKey] = index
+		end
+	end
+	if key ~= "" and type(indexMap) == "table" then
+		indexMap[key] = nil
+	end
+	return true
 end
 
 local function clearChunkCache(terrainState)
@@ -158,7 +266,7 @@ local function cacheChunkObject(terrainState, key, obj)
 		terrainState.chunkCacheCount = (terrainState.chunkCacheCount or 0) + 1
 	end
 
-	local limit = math.max(32, math.floor(tonumber(terrainState.chunkCacheLimit) or 512))
+	local limit = clamp(math.floor(tonumber(terrainState.chunkCacheLimit) or 128), 32, 256)
 	while (terrainState.chunkCacheCount or 0) > limit do
 		local oldestKey = nil
 		local oldestStamp = math.huge
@@ -276,11 +384,15 @@ local function buildSurfaceChunkModel(bounds, cellSize, fieldContext)
 		isSolid = true
 	}
 
+	local params = fieldContext and fieldContext.params or {}
 	local spanX = math.max(1.0, (bounds.x1 or 0) - (bounds.x0 or 0))
 	local spanZ = math.max(1.0, (bounds.z1 or 0) - (bounds.z0 or 0))
-	local step = math.max(1.0, tonumber(cellSize) or 4.0)
-	local nx = math.max(2, math.floor(spanX / step))
-	local nz = math.max(2, math.floor(spanZ / step))
+	local requestedStep = math.max(1.0, tonumber(cellSize) or 4.0)
+	local maxCellsPerAxis = clamp(math.floor(tonumber(params.maxChunkCellsPerAxis) or 48), 24, 128)
+	local stepX = math.max(requestedStep, spanX / maxCellsPerAxis)
+	local stepZ = math.max(requestedStep, spanZ / maxCellsPerAxis)
+	local nx = math.max(2, math.floor(spanX / stepX))
+	local nz = math.max(2, math.floor(spanZ / stepZ))
 	local xStep = spanX / nx
 	local zStep = spanZ / nz
 
@@ -330,7 +442,6 @@ local function buildSurfaceChunkModel(bounds, cellSize, fieldContext)
 		end
 	end
 
-	local params = fieldContext and fieldContext.params or {}
 	local waterLevel = tonumber(params.waterLevel)
 	local shorelineBand = math.max(0.2, tonumber(params.shorelineBand) or 5.0)
 	if waterLevel then
@@ -418,6 +529,7 @@ local function createChunkObjectFromMesh(cx, cz, lod, params, qModule, model, me
 	model.vertexColors = model.vertexColors or {}
 	model.faceColors = model.faceColors or {}
 	model.isSolid = model.isSolid ~= false
+	model._terrainFastPath = true
 
 	local chunkSize = params.chunkSize
 	local x0 = cx * chunkSize
@@ -453,7 +565,12 @@ local function createChunkObject(cx, cz, lod, params, fieldContext, qModule)
 	local x1 = x0 + chunkSize
 	local z0 = cz * chunkSize
 	local z1 = z0 + chunkSize
-	local cellSize = (lod == 0) and params.lod0CellSize or params.lod1CellSize
+	local cellSize = params.lod2CellSize
+	if lod == 0 then
+		cellSize = params.lod0CellSize
+	elseif lod == 1 then
+		cellSize = params.lod1CellSize
+	end
 	local useSurfaceOnlyMeshing = params.surfaceOnlyMeshing ~= false
 	local model
 	local meshMinY
@@ -520,14 +637,71 @@ function terrain.normalizeGroundParams(params, defaultGroundParams)
 		merged[key] = value
 	end
 	merged.chunkSize = tonumber(merged.chunkSize) or tonumber(merged.tileSize) or 64
-	merged.lod0Radius = clamp(math.floor(tonumber(merged.lod0Radius) or 2), 1, 3)
+	merged.lod0Radius = clamp(math.floor(tonumber(merged.lod0Radius) or 2), 1, 4)
 	merged.lod1Radius = clamp(math.floor(tonumber(merged.lod1Radius) or 4), merged.lod0Radius, 6)
-	merged.lod0CellSize = clamp(tonumber(merged.lod0CellSize) or 3.0, 1.0, 6.0)
-	merged.lod1CellSize = clamp(tonumber(merged.lod1CellSize) or 6.0, merged.lod0CellSize, 12.0)
-	merged.meshBuildBudget = clamp(math.floor(tonumber(merged.meshBuildBudget) or 2), 1, 3)
-	merged.workerMaxInflight = clamp(math.floor(tonumber(merged.workerMaxInflight) or 2), 1, 4)
-	merged.chunkCacheLimit = math.max(32, math.floor(tonumber(merged.chunkCacheLimit) or 768))
+	merged.lod2Radius = clamp(math.floor(tonumber(merged.lod2Radius) or math.max(merged.lod1Radius, 6)), merged.lod1Radius, 8)
+	merged.terrainQuality = clamp(tonumber(merged.terrainQuality) or 1.0, 0.75, 6.0)
+	merged.autoQualityEnabled = merged.autoQualityEnabled ~= false
+	merged.targetFrameMs = clamp(tonumber(merged.targetFrameMs) or 16.6, 8.0, 50.0)
+
+	merged.lod0BaseCellSize = tonumber(merged.lod0BaseCellSize) or tonumber(merged.lod0CellSize) or 3.0
+	merged.lod1BaseCellSize = tonumber(merged.lod1BaseCellSize) or tonumber(merged.lod1CellSize) or 6.0
+	merged.lod2BaseCellSize = tonumber(merged.lod2BaseCellSize) or tonumber(merged.lod2CellSize) or 12.0
+
+	local qualityScale = math.sqrt(merged.terrainQuality)
+	local lod0Cell = merged.lod0BaseCellSize / qualityScale
+	local lod1Cell = merged.lod1BaseCellSize / qualityScale
+	local lod2Cell = merged.lod2BaseCellSize / qualityScale
+	merged.lod0CellSize = clamp(lod0Cell, 1.0, 6.0)
+	merged.lod1CellSize = clamp(lod1Cell, merged.lod0CellSize, 12.0)
+	merged.lod2CellSize = clamp(lod2Cell, merged.lod1CellSize, 24.0)
+
+	merged.meshBuildBudget = clamp(math.floor(tonumber(merged.meshBuildBudget) or 2), 1, 8)
+	merged.workerMaxInflight = clamp(math.floor(tonumber(merged.workerMaxInflight) or 2), 1, 6)
+	merged.workerResultBudgetPerFrame = clamp(
+		math.floor(tonumber(merged.workerResultBudgetPerFrame) or 4),
+		1,
+		12
+	)
+	merged.workerResultTimeBudgetMs = clamp(
+		tonumber(merged.workerResultTimeBudgetMs) or 3.0,
+		0.25,
+		20.0
+	)
+	merged.splitLodEnabled = false
+	merged.highResSplitRatio = clamp(tonumber(merged.highResSplitRatio) or 0.5, 0.2, 0.8)
+	merged.maxPendingChunks = clamp(math.floor(tonumber(merged.maxPendingChunks) or 96), 16, 192)
+	merged.maxStaleChunks = clamp(math.floor(tonumber(merged.maxStaleChunks) or 32), 8, 128)
+	merged.maxDisplayedChunksHardCap = clamp(
+		math.floor(tonumber(merged.maxDisplayedChunksHardCap) or 8192),
+		1536,
+		16384
+	)
+	merged.maxDisplayedChunks = clamp(
+		math.floor(tonumber(merged.maxDisplayedChunks) or 512),
+		128,
+		merged.maxDisplayedChunksHardCap
+	)
+	merged.drawDistanceOverridesLodRadius = merged.drawDistanceOverridesLodRadius == true
+	merged.chunkCacheLimit = clamp(math.floor(tonumber(merged.chunkCacheLimit) or 128), 32, 256)
+	merged.farLodConeEnabled = merged.farLodConeEnabled ~= false
+	merged.farLodConeDegrees = clamp(tonumber(merged.farLodConeDegrees) or 110, 70, 170)
+	merged.rearLod2Radius = clamp(
+		math.floor(tonumber(merged.rearLod2Radius) or math.max(merged.lod1Radius, math.floor(merged.lod2Radius * 0.6))),
+		merged.lod1Radius,
+		merged.lod2Radius
+	)
 	merged.generatorVersion = math.max(1, math.floor(tonumber(merged.generatorVersion) or 1))
+	merged.maxAdaptiveLod1Radius = clamp(
+		math.floor(tonumber(merged.maxAdaptiveLod1Radius) or math.max(merged.lod1Radius, 6)),
+		merged.lod1Radius,
+		8
+	)
+	merged.maxChunkCellsPerAxis = clamp(
+		math.floor(tonumber(merged.maxChunkCellsPerAxis) or 48),
+		24,
+		128
+	)
 	merged.enableSkirts = merged.enableSkirts ~= false
 	merged.skirtDepth = math.max(2.0, tonumber(merged.skirtDepth) or 24.0)
 	local surfaceOnlyRequested = merged.surfaceOnlyMeshing ~= false
@@ -598,11 +772,27 @@ function terrain.groundParamsEqual(a, b)
 		"craterHistoryLimit",
 		"lod0Radius",
 		"lod1Radius",
+		"lod2Radius",
 		"lod0CellSize",
 		"lod1CellSize",
+		"lod2CellSize",
+		"lod0BaseCellSize",
+		"lod1BaseCellSize",
+		"lod2BaseCellSize",
 		"meshBuildBudget",
 		"workerMaxInflight",
+		"workerResultBudgetPerFrame",
+		"workerResultTimeBudgetMs",
 		"chunkCacheLimit",
+		"terrainQuality",
+		"autoQualityEnabled",
+		"targetFrameMs",
+		"maxAdaptiveLod1Radius",
+		"maxDisplayedChunksHardCap",
+		"drawDistanceOverridesLodRadius",
+		"splitLodEnabled",
+		"highResSplitRatio",
+		"maxChunkCellsPerAxis",
 		"surfaceOnlyMeshing",
 		"threadedMeshing",
 		"generatorVersion"
@@ -717,6 +907,8 @@ end
 local function ensureTerrainState(context)
 	context.terrainState = context.terrainState or {
 		chunkMap = {},
+		chunkSlotMap = {},
+		targetRequiredSet = {},
 		buildQueue = {},
 		chunkOrder = {},
 		centerChunkX = math.huge,
@@ -735,10 +927,27 @@ local function ensureTerrainState(context)
 		chunkCacheStamp = {},
 		chunkCacheCount = 0,
 		chunkCacheTick = 0,
-		chunkCacheLimit = 768
+		chunkCacheLimit = 128,
+		adaptiveTerrainQuality = nil,
+		smoothedFrameMs = nil,
+		staleChunkKeys = {},
+		coverageStableSince = nil,
+		displayedChunks = 0,
+		missingRequiredChunks = 0,
+		staleDisplayedChunks = 0,
+		buildQueueSize = 0,
+		workerInflightCount = 0,
+		workerParamsToken = nil,
+		workerUsesBinaryJobs = false,
+		workerLastBuildMs = 0,
+		workerLastBuildAvgMs = 0,
+		workerLastBuildCount = 0,
+		objectIndexByChunkKey = {}
 	}
 	local terrainState = context.terrainState
 	terrainState.chunkMap = terrainState.chunkMap or {}
+	terrainState.chunkSlotMap = terrainState.chunkSlotMap or {}
+	terrainState.targetRequiredSet = terrainState.targetRequiredSet or {}
 	terrainState.buildQueue = terrainState.buildQueue or {}
 	terrainState.chunkOrder = terrainState.chunkOrder or {}
 	terrainState.requiredSet = terrainState.requiredSet or {}
@@ -747,7 +956,14 @@ local function ensureTerrainState(context)
 	terrainState.chunkCacheStamp = terrainState.chunkCacheStamp or {}
 	terrainState.chunkCacheCount = tonumber(terrainState.chunkCacheCount) or countTableKeys(terrainState.chunkCache)
 	terrainState.chunkCacheTick = tonumber(terrainState.chunkCacheTick) or 0
-	terrainState.chunkCacheLimit = math.max(32, math.floor(tonumber(terrainState.chunkCacheLimit) or 768))
+	terrainState.chunkCacheLimit = clamp(math.floor(tonumber(terrainState.chunkCacheLimit) or 128), 32, 256)
+	terrainState.adaptiveTerrainQuality = tonumber(terrainState.adaptiveTerrainQuality)
+	terrainState.smoothedFrameMs = tonumber(terrainState.smoothedFrameMs)
+	terrainState.staleChunkKeys = terrainState.staleChunkKeys or {}
+	terrainState.workerLastBuildMs = tonumber(terrainState.workerLastBuildMs) or 0
+	terrainState.workerLastBuildAvgMs = tonumber(terrainState.workerLastBuildAvgMs) or 0
+	terrainState.workerLastBuildCount = math.max(0, math.floor(tonumber(terrainState.workerLastBuildCount) or 0))
+	terrainState.objectIndexByChunkKey = terrainState.objectIndexByChunkKey or {}
 	return terrainState
 end
 
@@ -790,12 +1006,15 @@ local function initializeWorker(terrainState)
 	terrainState.workerInflight = {}
 	terrainState.workerGeneration = 0
 	terrainState.workerAvailable = true
+	terrainState.workerParamsToken = nil
+	terrainState.workerUsesBinaryJobs = type(loveLib.data) == "table" and type(loveLib.data.pack) == "function"
 	return true
 end
 
 local function resetWorkerGeneration(terrainState)
 	terrainState.workerGeneration = math.max(0, math.floor(tonumber(terrainState.workerGeneration) or 0)) + 1
 	terrainState.workerInflight = {}
+	terrainState.workerParamsToken = nil
 	if terrainState.workerResponseChannel then
 		while true do
 			local msg = terrainState.workerResponseChannel:pop()
@@ -814,35 +1033,217 @@ local function queueChunkBuild(terrainState, key)
 	terrainState.chunkOrder[#terrainState.chunkOrder + 1] = key
 end
 
+local function markDisplayedChunksStale(terrainState)
+	terrainState.staleChunkKeys = terrainState.staleChunkKeys or {}
+	for key in pairs(terrainState.chunkMap or {}) do
+		terrainState.staleChunkKeys[key] = true
+	end
+end
+
+local function removeChunkByKey(terrainState, objects, key, cacheSafe)
+	local obj = terrainState.chunkMap[key]
+	if not obj then
+		return false
+	end
+	local cx = tonumber(obj.chunkX)
+	local cz = tonumber(obj.chunkZ)
+	if cx == nil or cz == nil then
+		local parsedCx, parsedCz = parseChunkKey(key)
+		cx = cx or parsedCx
+		cz = cz or parsedCz
+	end
+	removeObjectInstance(terrainState, objects, obj)
+	terrainState.chunkMap[key] = nil
+	terrainState.staleChunkKeys[key] = nil
+	terrainState.objectIndexByChunkKey[key] = nil
+	local coordKey = buildChunkCoordKey(math.floor(cx or 0), math.floor(cz or 0))
+	if terrainState.chunkSlotMap and terrainState.chunkSlotMap[coordKey] == key then
+		terrainState.chunkSlotMap[coordKey] = nil
+	end
+	if cacheSafe then
+		cacheChunkObject(terrainState, key, obj)
+	end
+	return true
+end
+
+local function replaceChunkAtSlot(terrainState, objects, key, cx, cz, lod, obj)
+	local coordKey = buildChunkCoordKey(cx, cz)
+	local incumbentKey = terrainState.chunkSlotMap and terrainState.chunkSlotMap[coordKey] or nil
+	if incumbentKey and incumbentKey ~= key then
+		removeChunkByKey(terrainState, objects, incumbentKey, false)
+	end
+
+	local existing = terrainState.chunkMap[key]
+	if existing then
+		removeObjectInstance(terrainState, objects, existing)
+	end
+
+	obj._terrainChunkKey = key
+	terrainState.chunkMap[key] = obj
+	terrainState.chunkSlotMap[coordKey] = key
+	objects[#objects + 1] = obj
+	terrainState.objectIndexByChunkKey[key] = #objects
+	terrainState.staleChunkKeys[key] = nil
+	return true
+end
+
+local function countPendingBuilds(terrainState)
+	return countTableKeys(terrainState.buildQueue)
+end
+
+local function countInflight(terrainState)
+	return countTableKeys(terrainState.workerInflight)
+end
+
+local function deriveRuntimeParams(params, terrainState, frameTimeMs)
+	local runtimeParams = shallowCopy(params)
+	if not params.autoQualityEnabled then
+		terrainState.adaptiveTerrainQuality = tonumber(params.terrainQuality) or 3.5
+		terrainState.smoothedFrameMs = tonumber(frameTimeMs) or terrainState.smoothedFrameMs or params.targetFrameMs
+		terrainState.coverageStableSince = currentTimeSeconds()
+		return terrain.normalizeGroundParams(runtimeParams, runtimeParams)
+	end
+
+	local targetFrameMs = clamp(tonumber(params.targetFrameMs) or 16.6, 8.0, 50.0)
+	local measuredFrameMs = clamp(tonumber(frameTimeMs) or targetFrameMs, 1.0, 100.0)
+	local smoothedFrameMs = terrainState.smoothedFrameMs or measuredFrameMs
+	smoothedFrameMs = smoothedFrameMs + (measuredFrameMs - smoothedFrameMs) * 0.12
+	terrainState.smoothedFrameMs = smoothedFrameMs
+
+	local adaptiveQuality = tonumber(terrainState.adaptiveTerrainQuality) or (tonumber(params.terrainQuality) or 3.5)
+	local now = currentTimeSeconds()
+	local missingRequiredChunks = math.max(0, math.floor(tonumber(terrainState.missingRequiredChunks) or 0))
+	local buildQueueCount = countPendingBuilds(terrainState)
+	local inflightCount = countInflight(terrainState)
+	local coverageStableFor = 0
+	if missingRequiredChunks > 0 or buildQueueCount > 0 or inflightCount > 0 then
+		terrainState.coverageStableSince = nil
+	else
+		terrainState.coverageStableSince = terrainState.coverageStableSince or now
+		coverageStableFor = now - terrainState.coverageStableSince
+	end
+	if coverageStableFor >= 0.75 then
+		if smoothedFrameMs > (targetFrameMs * 1.08) then
+			adaptiveQuality = adaptiveQuality - 0.12
+		elseif smoothedFrameMs < (targetFrameMs * 0.92) then
+			adaptiveQuality = adaptiveQuality + 0.08
+		else
+			local baseQuality = tonumber(params.terrainQuality) or adaptiveQuality
+			adaptiveQuality = adaptiveQuality + (baseQuality - adaptiveQuality) * 0.08
+		end
+	end
+	adaptiveQuality = clamp(adaptiveQuality, 2.0, 6.0)
+	terrainState.adaptiveTerrainQuality = adaptiveQuality
+	runtimeParams.terrainQuality = adaptiveQuality
+	return terrain.normalizeGroundParams(runtimeParams, runtimeParams)
+end
+
+local function normalize2(x, z)
+	local len = math.sqrt((x * x) + (z * z))
+	if len <= 1e-6 then
+		return nil
+	end
+	return x / len, z / len
+end
+
+local function cameraForward2D(camera)
+	local vel = camera and (camera.flightVel or camera.vel) or nil
+	if type(vel) == "table" then
+		local vx = tonumber(vel[1]) or 0
+		local vz = tonumber(vel[3]) or 0
+		local speed2 = vx * vx + vz * vz
+		if speed2 > (8.0 * 8.0) then
+			local nx, nz = normalize2(vx, vz)
+			if nx then
+				return nx, nz
+			end
+		end
+	end
+
+	local rot = camera and camera.rot or nil
+	if type(rot) == "table" then
+		local w = tonumber(rot.w) or 1
+		local x = tonumber(rot.x) or 0
+		local y = tonumber(rot.y) or 0
+		local z = tonumber(rot.z) or 0
+		local fx = 2.0 * (x * z + w * y)
+		local fz = 1.0 - 2.0 * (x * x + y * y)
+		local nx, nz = normalize2(fx, fz)
+		if nx then
+			return nx, nz
+		end
+	end
+
+	return 0, 1
+end
+
 local function computeRequiredChunkSet(params, camera, drawDistance)
 	local chunkSize = params.chunkSize
 	local centerCx = math.floor((camera.pos[1] or 0) / chunkSize)
 	local centerCz = math.floor((camera.pos[3] or 0) / chunkSize)
-	local lod0Radius = math.max(1, math.floor(tonumber(params.lod0Radius) or 2))
-	local lod1Radius = math.max(lod0Radius, math.floor(tonumber(params.lod1Radius) or 4))
+	local maxRadius = math.max(
+		1,
+		math.floor(
+			tonumber(params.lod2Radius) or
+			tonumber(params.lod1Radius) or
+			tonumber(params.lod0Radius) or
+			6
+		)
+	)
+	local outerRadius = maxRadius
 	local desiredDrawDistance = tonumber(drawDistance)
+	local drawDistanceOverridesLodRadius = params.drawDistanceOverridesLodRadius == true
+	local maxDisplayedChunksHardCap = math.max(
+		128,
+		math.floor(tonumber(params.maxDisplayedChunksHardCap) or 8192)
+	)
+	local maxDisplayedChunks = math.max(
+		128,
+		math.floor(
+			tonumber(params.maxDisplayedChunks) or
+			((maxRadius * 2 + 1) * (maxRadius * 2 + 1))
+		)
+	)
+	maxDisplayedChunks = math.min(maxDisplayedChunks, maxDisplayedChunksHardCap)
+	local budgetRadius = math.floor((math.sqrt(maxDisplayedChunks) - 1) * 0.5)
+	local safetyRadiusCap = clamp(math.max(maxRadius, budgetRadius), maxRadius, 64)
 	if desiredDrawDistance then
-		local derived = math.ceil(desiredDrawDistance / math.max(8.0, chunkSize * 2.8))
-		local maxAdaptive = math.max(lod1Radius, math.floor(tonumber(params.maxAdaptiveLod1Radius) or 24))
-		lod1Radius = clamp(derived, lod1Radius, maxAdaptive)
-	end
-
-	local required = {}
-	for dx = -lod1Radius, lod1Radius do
-		for dz = -lod1Radius, lod1Radius do
-			local cx = centerCx + dx
-			local cz = centerCz + dz
-			local ring = chunkRingDistance(cx, cz, centerCx, centerCz)
-			local lod = (ring <= lod0Radius) and 0 or 1
-			local key = buildChunkKey(cx, cz, lod, params.generatorVersion, params.seed)
-			required[key] = {
-				cx = cx,
-				cz = cz,
-				lod = lod
-			}
+		local derived = math.ceil(desiredDrawDistance / math.max(16.0, chunkSize * 3.6))
+		if drawDistanceOverridesLodRadius then
+			outerRadius = clamp(derived, 1, safetyRadiusCap)
+		else
+			outerRadius = clamp(derived, 1, maxRadius)
 		end
 	end
-	return required, centerCx, centerCz, lod1Radius
+
+	if not desiredDrawDistance then
+		outerRadius = maxRadius
+	end
+
+	local leadSeconds = 0.75
+	local vel = camera.flightVel or camera.vel or { 0, 0, 0 }
+	local leadX = clamp((tonumber(vel[1]) or 0) * leadSeconds, -chunkSize * 4, chunkSize * 4)
+	local leadZ = clamp((tonumber(vel[3]) or 0) * leadSeconds, -chunkSize * 4, chunkSize * 4)
+	local prefetchCx = math.floor(((camera.pos[1] or 0) + leadX) / chunkSize)
+	local prefetchCz = math.floor(((camera.pos[3] or 0) + leadZ) / chunkSize)
+
+	local required = {}
+	local radiusSq = outerRadius * outerRadius
+	for dx = -outerRadius, outerRadius do
+		for dz = -outerRadius, outerRadius do
+			if (dx * dx + dz * dz) <= radiusSq then
+				local cx = centerCx + dx
+				local cz = centerCz + dz
+				local key = buildChunkKey(cx, cz, 0, params.generatorVersion, params.seed)
+				required[key] = {
+					cx = cx,
+					cz = cz,
+					lod = 0
+				}
+			end
+		end
+	end
+	return required, centerCx, centerCz, outerRadius, prefetchCx, prefetchCz
 end
 
 local function flushChunkQueueSync(terrainState, params, objects, qModule)
@@ -856,8 +1257,7 @@ local function flushChunkQueueSync(terrainState, params, objects, qModule)
 		elseif terrainState.buildQueue[key] then
 			local cx, cz, lod = parseChunkKey(key)
 			local obj = createChunkObject(cx, cz, lod, params, terrainState.fieldContext, qModule)
-			terrainState.chunkMap[key] = obj
-			objects[#objects + 1] = obj
+			replaceChunkAtSlot(terrainState, objects, key, cx, cz, lod, obj)
 			terrainState.buildQueue[key] = nil
 			built = built + 1
 		end
@@ -871,7 +1271,24 @@ local function dispatchChunkQueueToWorker(terrainState, params)
 		return false
 	end
 
-	local maxInflight = clamp(math.floor(tonumber(params.workerMaxInflight) or 2), 1, 4)
+	local paramsChanged = true
+	if type(terrainState.workerParamsToken) == "table" then
+		paramsChanged = not terrain.groundParamsEqual(terrainState.workerParamsToken, params)
+	end
+	if paramsChanged then
+		local okParams = pcall(function()
+			terrainState.workerRequestChannel:push({
+				type = "set_params",
+				params = params
+			})
+		end)
+		if not okParams then
+			return false
+		end
+		terrainState.workerParamsToken = cloneWorkerParamsSnapshot(params)
+	end
+
+	local maxInflight = clamp(math.floor(tonumber(params.workerMaxInflight) or 2), 1, 6)
 	local inflight = 0
 	for _ in pairs(terrainState.workerInflight) do
 		inflight = inflight + 1
@@ -889,15 +1306,29 @@ local function dispatchChunkQueueToWorker(terrainState, params)
 		elseif terrainState.buildQueue[key] then
 			local cx, cz, lod = parseChunkKey(key)
 			local ok = pcall(function()
-				terrainState.workerRequestChannel:push({
-					type = "build_chunk",
-					key = key,
-					cx = cx,
-					cz = cz,
-					lod = lod,
-					generation = terrainState.workerGeneration,
-					params = params
-				})
+				if terrainState.workerUsesBinaryJobs and loveLib.data and loveLib.data.pack then
+					terrainState.workerRequestChannel:push({
+						type = "build_chunk_bin",
+						key = key,
+						payload = loveLib.data.pack(
+							"string",
+							"<iiii",
+							math.floor(cx),
+							math.floor(cz),
+							math.floor(lod),
+							math.floor(terrainState.workerGeneration)
+						)
+					})
+				else
+					terrainState.workerRequestChannel:push({
+						type = "build_chunk",
+						key = key,
+						cx = cx,
+						cz = cz,
+						lod = lod,
+						generation = terrainState.workerGeneration
+					})
+				end
 			end)
 			if ok then
 				terrainState.buildQueue[key] = nil
@@ -913,22 +1344,140 @@ local function dispatchChunkQueueToWorker(terrainState, params)
 	return dispatched
 end
 
-local function collectWorkerChunkResults(terrainState, params, objects, qModule)
+local function collectWorkerChunkResults(terrainState, params, objects, qModule, profiler)
 	if not terrainState.workerAvailable or not terrainState.workerResponseChannel then
 		return false
 	end
 
+	local maxResultsPerFrame = clamp(
+		math.floor(tonumber(params and params.workerResultBudgetPerFrame) or 4),
+		1,
+		12
+	)
+	local maxFinalizeMs = clamp(
+		tonumber(params and params.workerResultTimeBudgetMs) or 3.0,
+		0.25,
+		20.0
+	)
+	local startedAt = currentTimeSeconds()
+	local processedCount = 0
 	local changed = false
-	while true do
+	local workerBuildTotalMs = 0
+	local workerBuildCount = 0
+	local function decodeChunkModelBinary(payload)
+		if type(payload) ~= "string" or payload == "" then
+			return nil
+		end
+		if not (
+			type(loveLib.data) == "table" and
+			type(loveLib.data.decompress) == "function" and
+			type(loveLib.data.unpack) == "function"
+		) then
+			return nil
+		end
+		local okDecompress, raw = pcall(function()
+			return loveLib.data.decompress("string", "lz4", payload)
+		end)
+		if not okDecompress or type(raw) ~= "string" or raw == "" then
+			return nil
+		end
+		local pos = 1
+		local rawLen = #raw
+		local function unpackAt(fmt, byteWidth)
+			if (pos + byteWidth - 1) > rawLen then
+				return nil
+			end
+			local a, b, c, d, e = loveLib.data.unpack(fmt, raw, pos)
+			pos = pos + byteWidth
+			return a, b, c, d, e
+		end
+		local vertexCount, normalCount, colorCount, faceCount = unpackAt("<iiiii", 20)
+		vertexCount = math.max(0, math.floor(tonumber(vertexCount) or 0))
+		normalCount = math.max(0, math.floor(tonumber(normalCount) or 0))
+		colorCount = math.max(0, math.floor(tonumber(colorCount) or 0))
+		faceCount = math.max(0, math.floor(tonumber(faceCount) or 0))
+		if vertexCount <= 0 or faceCount <= 0 then
+			return nil
+		end
+		if vertexCount > 262144 or normalCount > 262144 or colorCount > 262144 or faceCount > 262144 then
+			return nil
+		end
+
+		local model = {
+			vertices = {},
+			faces = {},
+			vertexNormals = {},
+			vertexColors = {},
+			faceColors = {},
+			isSolid = true,
+			_terrainFastPath = true
+		}
+		for i = 1, vertexCount do
+			local x, y, z = unpackAt("<fff", 12)
+			if x == nil then
+				return nil
+			end
+			model.vertices[i] = {
+				tonumber(x) or 0,
+				tonumber(y) or 0,
+				tonumber(z) or 0
+			}
+		end
+		for i = 1, normalCount do
+			local nx, ny, nz = unpackAt("<fff", 12)
+			if nx == nil then
+				return nil
+			end
+			model.vertexNormals[i] = {
+				tonumber(nx) or 0,
+				tonumber(ny) or 1,
+				tonumber(nz) or 0
+			}
+		end
+		for i = 1, colorCount do
+			local r, g, b, a = unpackAt("<ffff", 16)
+			if r == nil then
+				return nil
+			end
+			model.vertexColors[i] = {
+				tonumber(r) or 1,
+				tonumber(g) or 1,
+				tonumber(b) or 1,
+				tonumber(a) or 1
+			}
+		end
+		for i = 1, faceCount do
+			local ia, ib, ic = unpackAt("<iii", 12)
+			if ia == nil then
+				return nil
+			end
+			model.faces[i] = {
+				math.max(1, math.floor(tonumber(ia) or 1)),
+				math.max(1, math.floor(tonumber(ib) or 1)),
+				math.max(1, math.floor(tonumber(ic) or 1))
+			}
+		end
+		return model
+	end
+	while processedCount < maxResultsPerFrame do
+		if ((currentTimeSeconds() - startedAt) * 1000.0) >= maxFinalizeMs then
+			break
+		end
 		local msg = terrainState.workerResponseChannel:pop()
 		if not msg then
 			break
 		end
+		processedCount = processedCount + 1
 		if type(msg) == "table" and msg.type == "build_chunk_done" then
 			local key = tostring(msg.key or "")
 			terrainState.workerInflight[key] = nil
 			local generation = math.floor(tonumber(msg.generation) or -1)
-			if generation == terrainState.workerGeneration and terrainState.requiredSet[key] and not terrainState.chunkMap[key] then
+			local buildMs = math.max(0, tonumber(msg.buildMs) or 0)
+			if buildMs > 0 then
+				workerBuildTotalMs = workerBuildTotalMs + buildMs
+				workerBuildCount = workerBuildCount + 1
+			end
+			if generation == terrainState.workerGeneration and terrainState.requiredSet[key] then
 				local cx = tonumber(msg.cx) or 0
 				local cz = tonumber(msg.cz) or 0
 				local lod = tonumber(msg.lod) or 0
@@ -942,15 +1491,242 @@ local function collectWorkerChunkResults(terrainState, params, objects, qModule)
 					tonumber(msg.meshMinY),
 					tonumber(msg.meshMaxY)
 				)
-				terrainState.chunkMap[key] = obj
-				objects[#objects + 1] = obj
+				replaceChunkAtSlot(terrainState, objects, key, cx, cz, lod, obj)
 				changed = true
+			end
+		elseif type(msg) == "table" and msg.type == "build_chunk_done_bin" then
+			local key = tostring(msg.key or "")
+			terrainState.workerInflight[key] = nil
+			local generation = math.floor(tonumber(msg.generation) or -1)
+			local buildMs = math.max(0, tonumber(msg.buildMs) or 0)
+			if buildMs > 0 then
+				workerBuildTotalMs = workerBuildTotalMs + buildMs
+				workerBuildCount = workerBuildCount + 1
+			end
+			if generation == terrainState.workerGeneration and terrainState.requiredSet[key] then
+				local model = decodeChunkModelBinary(msg.payload)
+				if model then
+					local cx = tonumber(msg.cx) or 0
+					local cz = tonumber(msg.cz) or 0
+					local lod = tonumber(msg.lod) or 0
+					local obj = createChunkObjectFromMesh(
+						cx,
+						cz,
+						lod,
+						params,
+						qModule,
+						model,
+						tonumber(msg.meshMinY),
+						tonumber(msg.meshMaxY)
+					)
+					replaceChunkAtSlot(terrainState, objects, key, cx, cz, lod, obj)
+					changed = true
+				elseif key ~= "" then
+					queueChunkBuild(terrainState, key)
+				end
 			end
 		elseif type(msg) == "table" and msg.type == "build_chunk_failed" then
 			local key = tostring(msg.key or "")
 			terrainState.workerInflight[key] = nil
-			if key ~= "" and terrainState.requiredSet[key] and not terrainState.chunkMap[key] then
+			if key ~= "" and terrainState.requiredSet[key] then
 				queueChunkBuild(terrainState, key)
+			end
+		end
+	end
+	if workerBuildCount > 0 then
+		terrainState.workerLastBuildMs = workerBuildTotalMs
+		terrainState.workerLastBuildCount = workerBuildCount
+		terrainState.workerLastBuildAvgMs = workerBuildTotalMs / workerBuildCount
+		addProfileSample(
+			profiler,
+			"terrain.worker_thread_build",
+			workerBuildTotalMs,
+			terrainProfileColors.workerThreadBuild,
+			"terrain worker build"
+		)
+	else
+		terrainState.workerLastBuildMs = 0
+		terrainState.workerLastBuildCount = 0
+		terrainState.workerLastBuildAvgMs = 0
+	end
+	return changed
+end
+
+local function collapseDisplayedChunkSlots(terrainState, objects, required)
+	local winners = {}
+	local removals = {}
+	for key, obj in pairs(terrainState.chunkMap or {}) do
+		if obj then
+			local cx = tonumber(obj.chunkX)
+			local cz = tonumber(obj.chunkZ)
+			local lod = tonumber(obj.chunkLod)
+			if cx == nil or cz == nil or lod == nil then
+				local parsedCx, parsedCz, parsedLod = parseChunkKey(key)
+				cx = cx or parsedCx
+				cz = cz or parsedCz
+				lod = lod or parsedLod
+			end
+			cx = math.floor(cx or 0)
+			cz = math.floor(cz or 0)
+			lod = math.floor(lod or 0)
+			local coordKey = buildChunkCoordKey(cx, cz)
+			local existing = winners[coordKey]
+			if not existing then
+				winners[coordKey] = {
+					key = key,
+					lod = lod,
+					required = required and required[key] ~= nil
+				}
+			else
+				local currentRequired = required and required[key] ~= nil
+				local keepCurrent = false
+				if currentRequired and not existing.required then
+					keepCurrent = true
+				elseif existing.required and not currentRequired then
+					keepCurrent = false
+				elseif lod < existing.lod then
+					keepCurrent = true
+				end
+				if keepCurrent then
+					removals[#removals + 1] = existing.key
+					winners[coordKey] = {
+						key = key,
+						lod = lod,
+						required = currentRequired
+					}
+				else
+					removals[#removals + 1] = key
+				end
+			end
+		end
+	end
+
+	local changed = false
+	for i = 1, #removals do
+		if removeChunkByKey(terrainState, objects, removals[i], false) then
+			changed = true
+		end
+	end
+	terrainState.chunkSlotMap = terrainState.chunkSlotMap or {}
+	for coordKey in pairs(terrainState.chunkSlotMap) do
+		terrainState.chunkSlotMap[coordKey] = nil
+	end
+	for coordKey, winner in pairs(winners) do
+		if terrainState.chunkMap[winner.key] then
+			terrainState.chunkSlotMap[coordKey] = winner.key
+		end
+	end
+	return changed
+end
+
+local function pruneRetainedChunks(terrainState, objects, required, centerCx, centerCz, retentionRadius, params)
+	local requiredSlots = {}
+	local requiredCount = countTableKeys(required)
+	local retainedStale = {}
+	local removalBudget = clamp(
+		math.floor(tonumber(params and params.pruneRemovalBudgetPerFrame) or 96),
+		16,
+		512
+	)
+	local removalsUsed = 0
+	for key, info in pairs(required or {}) do
+		requiredSlots[buildChunkCoordKey(info.cx, info.cz)] = key
+	end
+
+	local changed = false
+	local function removeWithBudget(key, cacheSafe)
+		if removalsUsed >= removalBudget then
+			return false
+		end
+		if removeChunkByKey(terrainState, objects, key, cacheSafe) then
+			removalsUsed = removalsUsed + 1
+			changed = true
+			return true
+		end
+		return false
+	end
+	for key, obj in pairs(terrainState.chunkMap) do
+		if not required[key] and obj then
+			local cx, cz, lod = parseChunkKey(key)
+			local slotKey = buildChunkCoordKey(cx, cz)
+			local replacementKey = requiredSlots[slotKey]
+			local hasReplacement = replacementKey and terrainState.chunkMap[replacementKey] ~= nil
+			local tooFar = chunkRingDistance(cx, cz, centerCx, centerCz) > retentionRadius
+			local cacheSafe = (terrainState.staleChunkKeys[key] ~= true) and (not hasReplacement)
+			if hasReplacement or tooFar then
+				removeWithBudget(key, cacheSafe and tooFar)
+			else
+				retainedStale[#retainedStale + 1] = {
+					key = key,
+					dist = chunkRingDistance(cx, cz, centerCx, centerCz),
+					lod = lod,
+					requiredCoord = replacementKey ~= nil
+				}
+			end
+		end
+	end
+
+	local configuredStaleBudget = math.max(8, math.floor(tonumber(params and params.maxStaleChunks) or 32))
+	local staleBudget = math.max(8, math.floor(math.min(configuredStaleBudget, math.max(8, requiredCount * 0.20))))
+	local removableStale = {}
+	for i = 1, #retainedStale do
+		if retainedStale[i].requiredCoord ~= true then
+			removableStale[#removableStale + 1] = retainedStale[i]
+		end
+	end
+	if #removableStale > staleBudget then
+		table.sort(removableStale, function(a, b)
+			if a.dist ~= b.dist then
+				return a.dist > b.dist
+			end
+			return (a.lod or 0) > (b.lod or 0)
+		end)
+		for i = 1, (#removableStale - staleBudget) do
+			if removalsUsed >= removalBudget then
+				break
+			end
+			removeWithBudget(removableStale[i].key, false)
+		end
+	end
+
+	local maxDisplayed = math.max(
+		requiredCount + 16,
+		math.floor(tonumber(params and params.maxDisplayedChunks) or (requiredCount + configuredStaleBudget))
+	)
+	local displayedCount = countTableKeys(terrainState.chunkMap)
+	if displayedCount > maxDisplayed then
+		table.sort(removableStale, function(a, b)
+			if a.dist ~= b.dist then
+				return a.dist > b.dist
+			end
+			return (a.lod or 0) > (b.lod or 0)
+		end)
+		for i = 1, #removableStale do
+			if displayedCount <= maxDisplayed then
+				break
+			end
+			if removeWithBudget(removableStale[i].key, false) then
+				displayedCount = displayedCount - 1
+			elseif removalsUsed >= removalBudget then
+				break
+			end
+		end
+		if displayedCount > maxDisplayed then
+			table.sort(retainedStale, function(a, b)
+				if a.dist ~= b.dist then
+					return a.dist > b.dist
+				end
+				return (a.lod or 0) > (b.lod or 0)
+			end)
+			for i = 1, #retainedStale do
+				if displayedCount <= maxDisplayed then
+					break
+				end
+				if removeWithBudget(retainedStale[i].key, false) then
+					displayedCount = displayedCount - 1
+				elseif removalsUsed >= removalBudget then
+					break
+				end
 			end
 		end
 	end
@@ -969,42 +1745,145 @@ function terrain.updateGroundStreaming(forceRebuild, context)
 	if not params then
 		return false, terrainState
 	end
+	local profiler = context.profiler
+	local runtimeScope = beginProfileScope(
+		profiler,
+		"terrain.runtime",
+		terrainProfileColors.runtime,
+		"terrain runtime"
+	)
+	local runtimeParams = deriveRuntimeParams(
+		params,
+		terrainState,
+		tonumber(context.frameTimeMs) or ((tonumber(context.dt) or 0) * 1000.0)
+	)
+	local requestedDrawDistance = tonumber(context.drawDistance)
+	if runtimeParams.drawDistanceOverridesLodRadius == true and requestedDrawDistance and requestedDrawDistance > 0 then
+		local baseDisplayedChunks = math.max(
+			128,
+			math.floor(
+				tonumber(params.maxDisplayedChunks) or
+				tonumber(runtimeParams.maxDisplayedChunks) or
+				512
+			)
+		)
+		local maxDisplayedChunksHardCap = math.max(
+			128,
+			math.floor(tonumber(runtimeParams.maxDisplayedChunksHardCap) or 8192)
+		)
+		local autoScaleDisplayedCap = math.min(
+			maxDisplayedChunksHardCap,
+			math.max(baseDisplayedChunks, math.floor(baseDisplayedChunks * 2.0))
+		)
+		local chunkSizeForRadius = math.max(16.0, tonumber(runtimeParams.chunkSize) or 128)
+		local derivedRadius = math.max(1, math.ceil(requestedDrawDistance / math.max(16.0, chunkSizeForRadius * 3.6)))
+		local desiredDisplayedChunks = math.max(
+			baseDisplayedChunks,
+			((derivedRadius * 2 + 1) * (derivedRadius * 2 + 1))
+		)
+		runtimeParams.maxDisplayedChunks = clamp(
+			math.floor(desiredDisplayedChunks),
+			128,
+			autoScaleDisplayedCap
+		)
+	end
+	endProfileScope(profiler, runtimeScope)
+
+	local signatureScope = beginProfileScope(
+		profiler,
+		"terrain.runtime_signature",
+		terrainProfileColors.runtime,
+		"terrain signature"
+	)
+	local runtimeMeshSignature = table.concat({
+		tostring(runtimeParams.lod0Radius),
+		tostring(runtimeParams.lod1Radius),
+		tostring(runtimeParams.lod2Radius),
+		string.format("%.3f", tonumber(runtimeParams.lod0CellSize) or 0),
+		string.format("%.3f", tonumber(runtimeParams.lod1CellSize) or 0),
+		string.format("%.3f", tonumber(runtimeParams.lod2CellSize) or 0)
+	}, ":")
+	local runtimeRebuildSignature
+	if runtimeParams.autoQualityEnabled == true then
+		-- Adaptive quality can vary continuously; rebuilding every visible chunk on each
+		-- quality tick causes severe hitching. Keep topology stable and let new chunks
+		-- pick up quality changes incrementally.
+		runtimeRebuildSignature = table.concat({
+			tostring(runtimeParams.lod0Radius),
+			tostring(runtimeParams.lod1Radius),
+			tostring(runtimeParams.lod2Radius)
+		}, ":")
+	else
+		runtimeRebuildSignature = runtimeMeshSignature
+	end
 
 	if (not terrainState.fieldContext) or (terrainState.activeGroundParams ~= params) then
+		local hadFieldContext = terrainState.fieldContext ~= nil
 		terrainState.activeGroundParams = params
 		terrainState.fieldContext = sdfField.createContext(params)
 		terrainState.generatorVersion = params.generatorVersion or 1
-		terrainState.chunkCacheLimit = math.max(32, math.floor(tonumber(params.chunkCacheLimit) or terrainState.chunkCacheLimit or 768))
-		for key in pairs(terrainState.chunkMap) do
-			removeObjectInstance(objects, terrainState.chunkMap[key])
-		end
-		terrainState.chunkMap = {}
+		terrainState.chunkCacheLimit = clamp(
+			math.floor(tonumber(params.chunkCacheLimit) or terrainState.chunkCacheLimit or 128),
+			32,
+			256
+		)
 		terrainState.buildQueue = {}
 		terrainState.chunkOrder = {}
 		terrainState.requiredSet = {}
+		terrainState.targetRequiredSet = {}
 		clearChunkCache(terrainState)
 		resetWorkerGeneration(terrainState)
+		if hadFieldContext then
+			markDisplayedChunksStale(terrainState)
+		end
 		forceRebuild = true
 	end
+	if terrainState.runtimeMeshSignature ~= runtimeMeshSignature then
+		terrainState.runtimeMeshSignature = runtimeMeshSignature
+		terrainState.workerParamsToken = nil
+		if runtimeParams.autoQualityEnabled ~= true then
+			markDisplayedChunksStale(terrainState)
+			forceRebuild = true
+		end
+	end
+	if terrainState.runtimeRebuildSignature ~= runtimeRebuildSignature then
+		terrainState.runtimeRebuildSignature = runtimeRebuildSignature
+		markDisplayedChunksStale(terrainState)
+		forceRebuild = true
+	end
+	endProfileScope(profiler, signatureScope)
 
-	local required, centerCx, centerCz, requiredRadius = computeRequiredChunkSet(params, camera, context.drawDistance)
+	local requiredSetScope = beginProfileScope(
+		profiler,
+		"terrain.required_set",
+		terrainProfileColors.requiredSet,
+		"terrain required"
+	)
+	local required, centerCx, centerCz, requiredRadius, prefetchCx, prefetchCz = computeRequiredChunkSet(
+		runtimeParams,
+		camera,
+		context.drawDistance
+	)
+	endProfileScope(profiler, requiredSetScope)
+	local changed = false
 	terrainState.requiredSet = required
+	terrainState.targetRequiredSet = required
 	terrainState.lastRequiredRadius = requiredRadius
+	local slotCollapseScope = beginProfileScope(
+		profiler,
+		"terrain.slot_collapse",
+		terrainProfileColors.slotCollapse,
+		"terrain slot collapse"
+	)
+	if collapseDisplayedChunkSlots(terrainState, objects, required) then
+		changed = true
+	end
+	endProfileScope(profiler, slotCollapseScope)
 	local centerChanged = (centerCx ~= terrainState.centerChunkX) or (centerCz ~= terrainState.centerChunkZ)
 	terrainState.centerChunkX = centerCx
 	terrainState.centerChunkZ = centerCz
 
-	local changed = false
 	if forceRebuild or centerChanged then
-		for key, obj in pairs(terrainState.chunkMap) do
-			if not required[key] then
-				removeObjectInstance(objects, obj)
-				terrainState.chunkMap[key] = nil
-				cacheChunkObject(terrainState, key, obj)
-				changed = true
-			end
-		end
-
 		local nextOrder = {}
 		for _, key in ipairs(terrainState.chunkOrder) do
 			if required[key] and terrainState.buildQueue[key] then
@@ -1021,9 +1900,17 @@ function terrain.updateGroundStreaming(forceRebuild, context)
 		end
 	end
 
+	local missingScanScope = beginProfileScope(
+		profiler,
+		"terrain.missing_scan",
+		terrainProfileColors.missingScan,
+		"terrain missing scan"
+	)
 	local missingKeys = {}
 	for key, info in pairs(required) do
-		if (not terrainState.chunkMap[key]) and (not terrainState.buildQueue[key]) and (not terrainState.workerInflight[key]) then
+		if ((not terrainState.chunkMap[key]) or terrainState.staleChunkKeys[key]) and
+			(not terrainState.buildQueue[key]) and
+			(not terrainState.workerInflight[key]) then
 			missingKeys[#missingKeys + 1] = {
 				key = key,
 				cx = info.cx,
@@ -1033,8 +1920,8 @@ function terrain.updateGroundStreaming(forceRebuild, context)
 		end
 	end
 	table.sort(missingKeys, function(a, b)
-		local da = chunkRingDistance(a.cx, a.cz, centerCx, centerCz)
-		local db = chunkRingDistance(b.cx, b.cz, centerCx, centerCz)
+		local da = chunkRingDistance(a.cx, a.cz, prefetchCx or centerCx, prefetchCz or centerCz)
+		local db = chunkRingDistance(b.cx, b.cz, prefetchCx or centerCx, prefetchCz or centerCz)
 		if da ~= db then
 			return da < db
 		end
@@ -1046,20 +1933,86 @@ function terrain.updateGroundStreaming(forceRebuild, context)
 		end
 		return a.cz < b.cz
 	end)
+	endProfileScope(profiler, missingScanScope)
 
+	local requiredCount = countTableKeys(required)
+	local configuredPendingLimit = math.max(16, math.floor(tonumber(runtimeParams.maxPendingChunks) or 96))
+	local maxPendingBacklog = clamp(
+		math.max(
+			32,
+			math.floor((tonumber(runtimeParams.meshBuildBudget) or 2) * 8),
+			math.floor((tonumber(runtimeParams.workerMaxInflight) or 2) * 8)
+		),
+		16,
+		math.min(math.max(32, requiredCount), configuredPendingLimit)
+	)
+
+	-- Keep queue bookkeeping coherent and bounded; stale/orphaned keys can otherwise
+	-- inflate backlog and stall near-camera chunk builds.
+	local queueCompactionScope = beginProfileScope(
+		profiler,
+		"terrain.queue_compaction",
+		terrainProfileColors.queueCompaction,
+		"terrain queue compact"
+	)
+	do
+		local compactedOrder = {}
+		local seen = {}
+		for _, key in ipairs(terrainState.chunkOrder or {}) do
+			if terrainState.buildQueue[key] and required[key] and (not seen[key]) then
+				seen[key] = true
+				compactedOrder[#compactedOrder + 1] = key
+			else
+				terrainState.buildQueue[key] = nil
+			end
+		end
+		for key in pairs(terrainState.buildQueue) do
+			if required[key] and (not seen[key]) then
+				seen[key] = true
+				compactedOrder[#compactedOrder + 1] = key
+			elseif not required[key] then
+				terrainState.buildQueue[key] = nil
+			end
+		end
+		if #compactedOrder > maxPendingBacklog then
+			for i = maxPendingBacklog + 1, #compactedOrder do
+				terrainState.buildQueue[compactedOrder[i]] = nil
+			end
+			for i = #compactedOrder, maxPendingBacklog + 1, -1 do
+				compactedOrder[i] = nil
+			end
+		end
+		terrainState.chunkOrder = compactedOrder
+	end
+	endProfileScope(profiler, queueCompactionScope)
+
+	local queueFillScope = beginProfileScope(
+		profiler,
+		"terrain.queue_fill",
+		terrainProfileColors.queueFill,
+		"terrain queue fill"
+	)
+	local pendingBacklog = countPendingBuilds(terrainState) + countInflight(terrainState)
 	for _, item in ipairs(missingKeys) do
 		local key = item.key
-		local cachedObj = takeCachedChunkObject(terrainState, key)
+		local cachedObj = terrainState.staleChunkKeys[key] and nil or takeCachedChunkObject(terrainState, key)
 		if cachedObj then
-			terrainState.chunkMap[key] = cachedObj
-			objects[#objects + 1] = cachedObj
+			replaceChunkAtSlot(terrainState, objects, key, item.cx, item.cz, item.lod, cachedObj)
 			changed = true
-		else
+		elseif pendingBacklog < maxPendingBacklog then
 			queueChunkBuild(terrainState, key)
+			pendingBacklog = pendingBacklog + 1
 			changed = true
 		end
 	end
+	endProfileScope(profiler, queueFillScope)
 
+	local workerHealthScope = beginProfileScope(
+		profiler,
+		"terrain.worker_health",
+		terrainProfileColors.workerHealth,
+		"terrain worker health"
+	)
 	if terrainState.workerAvailable and terrainState.workerThread and type(terrainState.workerThread.getError) == "function" then
 		local workerError = terrainState.workerThread:getError()
 		if workerError then
@@ -1070,24 +2023,81 @@ function terrain.updateGroundStreaming(forceRebuild, context)
 			end
 		end
 	end
+	endProfileScope(profiler, workerHealthScope)
 
-	local useWorker = (params.threadedMeshing ~= false) and initializeWorker(terrainState)
+	local useWorker = (runtimeParams.threadedMeshing ~= false) and initializeWorker(terrainState)
 	if useWorker then
-		if collectWorkerChunkResults(terrainState, params, objects, context.q) then
+		local collectScope = beginProfileScope(
+			profiler,
+			"terrain.worker_collect",
+			terrainProfileColors.workerCollect,
+			"terrain worker collect"
+		)
+		if collectWorkerChunkResults(terrainState, runtimeParams, objects, context.q, profiler) then
 			changed = true
 		end
-		if dispatchChunkQueueToWorker(terrainState, params) then
+		endProfileScope(profiler, collectScope)
+
+		local dispatchScope = beginProfileScope(
+			profiler,
+			"terrain.worker_dispatch",
+			terrainProfileColors.workerDispatch,
+			"terrain worker dispatch"
+		)
+		if dispatchChunkQueueToWorker(terrainState, runtimeParams) then
 			changed = true
 		end
+		endProfileScope(profiler, dispatchScope)
 	else
-		if flushChunkQueueSync(terrainState, params, objects, context.q) then
+		local syncBuildScope = beginProfileScope(
+			profiler,
+			"terrain.sync_build",
+			terrainProfileColors.syncBuild,
+			"terrain sync build"
+		)
+		if flushChunkQueueSync(terrainState, runtimeParams, objects, context.q) then
 			changed = true
 		end
+		endProfileScope(profiler, syncBuildScope)
 	end
 
-	if useWorker and collectWorkerChunkResults(terrainState, params, objects, context.q) then
+	local retentionRadius = math.max(requiredRadius or 0, math.floor(tonumber(runtimeParams.lod2Radius) or 0)) + 1
+	local pruneScope = beginProfileScope(
+		profiler,
+		"terrain.prune",
+		terrainProfileColors.prune,
+		"terrain prune"
+	)
+	if pruneRetainedChunks(terrainState, objects, required, centerCx, centerCz, retentionRadius, runtimeParams) then
 		changed = true
 	end
+	endProfileScope(profiler, pruneScope)
+
+	local statsScope = beginProfileScope(
+		profiler,
+		"terrain.stats",
+		terrainProfileColors.stats,
+		"terrain stats"
+	)
+	local displayedChunks = countTableKeys(terrainState.chunkMap)
+	local missingRequiredChunks = 0
+	local staleDisplayedChunks = 0
+	for key in pairs(required) do
+		if not terrainState.chunkMap[key] then
+			missingRequiredChunks = missingRequiredChunks + 1
+		end
+	end
+	for key in pairs(terrainState.chunkMap) do
+		if not required[key] then
+			staleDisplayedChunks = staleDisplayedChunks + 1
+		end
+	end
+	terrainState.displayedChunks = displayedChunks
+	terrainState.missingRequiredChunks = missingRequiredChunks
+	terrainState.staleDisplayedChunks = staleDisplayedChunks
+	terrainState.buildQueueSize = countPendingBuilds(terrainState)
+	terrainState.workerInflightCount = countInflight(terrainState)
+	endProfileScope(profiler, statsScope)
 
 	return changed, terrainState
 end
@@ -1099,24 +2109,26 @@ function terrain.rebuildGroundFromParams(params, reason, context)
 		return false
 	end
 
-	for key, obj in pairs(terrainState.chunkMap or {}) do
-		removeObjectInstance(context.objects, obj)
-		terrainState.chunkMap[key] = nil
-	end
 	terrainState.buildQueue = {}
 	terrainState.chunkOrder = {}
 	terrainState.centerChunkX = math.huge
 	terrainState.centerChunkZ = math.huge
 	terrainState.requiredSet = {}
-	terrainState.chunkCacheLimit = math.max(32, math.floor(tonumber(normalized.chunkCacheLimit) or terrainState.chunkCacheLimit or 768))
+	terrainState.targetRequiredSet = {}
+	terrainState.chunkCacheLimit = clamp(
+		math.floor(tonumber(normalized.chunkCacheLimit) or terrainState.chunkCacheLimit or 128),
+		32,
+		256
+	)
 	clearChunkCache(terrainState)
 	terrainState.activeGroundParams = normalized
 	terrainState.fieldContext = sdfField.createContext(normalized)
 	terrainState.generatorVersion = normalized.generatorVersion or 1
+	markDisplayedChunksStale(terrainState)
 	resetWorkerGeneration(terrainState)
 
 	local changed = terrain.updateGroundStreaming(true, context)
-	local worldHalfExtent = (normalized.chunkSize * (normalized.lod1Radius + 1))
+	local worldHalfExtent = (normalized.chunkSize * (normalized.lod2Radius + 1))
 
 	if reason and reason ~= "" and context.log then
 		context.log(string.format(
@@ -1179,19 +2191,19 @@ function terrain.addCrater(craterSpec, context)
 	terrainState.activeGroundParams = normalized
 	terrainState.fieldContext = sdfField.createContext(normalized)
 	terrainState.generatorVersion = normalized.generatorVersion
-	terrainState.chunkCacheLimit = math.max(32, math.floor(tonumber(normalized.chunkCacheLimit) or terrainState.chunkCacheLimit or 768))
-	if type(context.objects) == "table" then
-		for key, obj in pairs(terrainState.chunkMap or {}) do
-			removeObjectInstance(context.objects, obj)
-			terrainState.chunkMap[key] = nil
-		end
-	end
+	terrainState.chunkCacheLimit = clamp(
+		math.floor(tonumber(normalized.chunkCacheLimit) or terrainState.chunkCacheLimit or 128),
+		32,
+		256
+	)
 	terrainState.buildQueue = {}
 	terrainState.chunkOrder = {}
 	terrainState.requiredSet = {}
+	terrainState.targetRequiredSet = {}
 	terrainState.centerChunkX = math.huge
 	terrainState.centerChunkZ = math.huge
 	clearChunkCache(terrainState)
+	markDisplayedChunksStale(terrainState)
 	resetWorkerGeneration(terrainState)
 
 	if context.camera and context.objects then

@@ -92,6 +92,35 @@ local function imageDataToPngBytes(imageData)
     return nil
 end
 
+local function cloneOverlay(overlay)
+    if type(overlay) ~= "table" or not overlay.imageData then
+        return nil, "paint overlay unavailable"
+    end
+    local clonedImageData = cloneImageData(overlay.imageData)
+    if not clonedImageData then
+        return nil, "failed to clone paint overlay"
+    end
+    local okImage, imageOrErr = pcall(function()
+        return loveLib.graphics.newImage(clonedImageData)
+    end)
+    if not okImage or not imageOrErr then
+        return nil, tostring(imageOrErr or "failed to clone paint texture")
+    end
+    local image = imageOrErr
+    image:setFilter("linear", "linear")
+    return {
+        width = tonumber(overlay.width) or (clonedImageData.getWidth and clonedImageData:getWidth()) or DEFAULT_WIDTH,
+        height = tonumber(overlay.height) or (clonedImageData.getHeight and clonedImageData:getHeight()) or DEFAULT_HEIGHT,
+        ownerId = overlay.ownerId,
+        role = overlay.role,
+        modelHash = overlay.modelHash,
+        imageData = clonedImageData,
+        image = image,
+        encodedPng = overlay.encodedPng,
+        hash = overlay.hash
+    }
+end
+
 local function createOverlay(width, height, ownerId, role, modelHash)
     if not (loveLib and loveLib.image and loveLib.graphics) then
         return nil, "paint overlay requires LOVE image API"
@@ -246,6 +275,15 @@ function paintRuntime.beginSession(assetId, role, ownerId, modelHash, opts, exis
             return nil, err
         end
         overlay = created
+    else
+        local cloned, cloneErr = cloneOverlay(overlay)
+        if not cloned then
+            return nil, cloneErr
+        end
+        overlay = cloned
+        overlay.ownerId = ownerId
+        overlay.role = role
+        overlay.modelHash = modelHash
     end
 
     sessionCounter = sessionCounter + 1

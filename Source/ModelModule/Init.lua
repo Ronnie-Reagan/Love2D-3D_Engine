@@ -18,6 +18,7 @@ local state = {
     blobState = blobSync.newState(),
     outgoingBlobIndex = {},
     incomingBlobResults = {},
+    paintTemplatesByHash = {},
     importers = { gltfImporter, stlImporter }
 }
 
@@ -33,6 +34,105 @@ local function maybeRequireLove()
 end
 
 local loveLib = maybeRequireLove()
+
+local function buildPaintOverlayFromPngBytes(rawPng, ownerId, role, modelHash, forcedHash)
+    if type(rawPng) ~= "string" or rawPng == "" then
+        return nil, "invalid paint payload"
+    end
+    if not (loveLib and loveLib.image and loveLib.graphics) then
+        return nil, "paint overlay requires LOVE image API"
+    end
+
+    local imageSource = rawPng
+    if loveLib.filesystem and loveLib.filesystem.newFileData then
+        local okFileData, fileDataOrErr = pcall(function()
+            return loveLib.filesystem.newFileData(rawPng, (forcedHash or "paint") .. ".png")
+        end)
+        if okFileData and fileDataOrErr then
+            imageSource = fileDataOrErr
+        end
+    elseif loveLib.data and loveLib.data.newByteData then
+        local okByteData, byteDataOrErr = pcall(function()
+            return loveLib.data.newByteData(rawPng)
+        end)
+        if okByteData and byteDataOrErr then
+            imageSource = byteDataOrErr
+        end
+    end
+
+    local okImageData, imageDataOrErr = pcall(function()
+        return loveLib.image.newImageData(imageSource)
+    end)
+    if not okImageData or not imageDataOrErr then
+        return nil, tostring(imageDataOrErr or "failed to decode paint image")
+    end
+
+    local imageData = imageDataOrErr
+    local okImage, imageOrErr = pcall(function()
+        return loveLib.graphics.newImage(imageData)
+    end)
+    if not okImage or not imageOrErr then
+        return nil, tostring(imageOrErr or "failed to create paint texture")
+    end
+
+    local image = imageOrErr
+    if image.setFilter then
+        image:setFilter("linear", "linear")
+    end
+
+    return {
+        width = (imageData.getWidth and imageData:getWidth()) or 0,
+        height = (imageData.getHeight and imageData:getHeight()) or 0,
+        ownerId = ownerId,
+        role = role,
+        modelHash = modelHash,
+        imageData = imageData,
+        image = image,
+        encodedPng = rawPng,
+        hash = forcedHash or hashBytes(rawPng)
+    }
+end
+
+local function clonePaintOverlay(overlay)
+    if type(overlay) ~= "table" or not overlay.imageData then
+        return nil, "paint overlay unavailable"
+    end
+    if not (loveLib and loveLib.graphics) then
+        return nil, "paint overlay requires LOVE graphics API"
+    end
+
+    local okClone, imageDataOrErr = pcall(function()
+        return overlay.imageData:clone()
+    end)
+    if not okClone or not imageDataOrErr then
+        return nil, tostring(imageDataOrErr or "failed to clone paint image")
+    end
+
+    local imageData = imageDataOrErr
+    local okImage, imageOrErr = pcall(function()
+        return loveLib.graphics.newImage(imageData)
+    end)
+    if not okImage or not imageOrErr then
+        return nil, tostring(imageOrErr or "failed to clone paint texture")
+    end
+
+    local image = imageOrErr
+    if image.setFilter then
+        image:setFilter("linear", "linear")
+    end
+
+    return {
+        width = tonumber(overlay.width) or (imageData.getWidth and imageData:getWidth()) or 0,
+        height = tonumber(overlay.height) or (imageData.getHeight and imageData:getHeight()) or 0,
+        ownerId = overlay.ownerId,
+        role = overlay.role,
+        modelHash = overlay.modelHash,
+        imageData = imageData,
+        image = image,
+        encodedPng = overlay.encodedPng,
+        hash = overlay.hash
+    }
+end
 
 local function hashBytes(raw)
     local function bytesToHex(bytes)
@@ -365,10 +465,7 @@ function ModelModule.applyToObject(obj, assetId, role)
             roll = orient.roll
         }
     end
-    local paint = asset.paintByRole and asset.paintByRole[role or "plane"]
-    if paint then
-        obj.paintOverlay = paint
-    end
+    obj.paintOverlay = nil
     return true
 end
 
@@ -387,13 +484,23 @@ function ModelModule.setOrientation(assetId, role, yawDeg, pitchDeg, rollDeg)
     return true
 end
 
-function ModelModule.beginPaintSession(assetId, role, ownerId)
+function ModelModule.beginPaintSession(assetId, role, ownerId, existingPaintHash)
     local asset = state.assetsById[assetId]
     if not asset then
         return nil, "asset not found"
     end
     role = (role == "walking") and "walking" or "plane"
-    local existing = materialRuntime.getPaintOverlay(asset, role)
+    local existing = nil
+    existingPaintHash = tostring(existingPaintHash or "")
+    if existingPaintHash ~= "" then
+        existing = ModelModule.getPaintOverlay(existingPaintHash, true)
+        if not existing then
+            return nil, "paint overlay not found"
+        end
+        existing.hash = existingPaintHash
+        existing.role = role
+        existing.modelHash = asset.modelHash
+    end
     return paintRuntime.beginSession(assetId, role, ownerId, asset.modelHash, {
         width = 1024,
         height = 1024,
@@ -427,11 +534,6 @@ function ModelModule.paintCommit(sessionId)
     if not session then
         return nil, "paint session not found"
     end
-    local asset = state.assetsById[session.assetId]
-    if not asset then
-        return nil, "asset not found for paint session"
-    end
-    materialRuntime.attachPaintOverlay(asset, session.role, overlayOrErr)
 
     local pngRaw = overlayOrErr.encodedPng
     if type(pngRaw) == "string" and pngRaw ~= "" then
@@ -440,11 +542,28 @@ function ModelModule.paintCommit(sessionId)
             "paint",
             paintHash,
             pngRaw,
-            { chunkSize = 720 }
+            {
+                chunkSize = 720,
+                extra = {
+                    ownerId = session.ownerId,
+                    role = session.role,
+                    modelHash = session.modelHash
+                }
+            }
         )
         state.outgoingBlobIndex["paint|" .. paintHash] = transfer
     end
+    local templateOverlay = clonePaintOverlay(overlayOrErr)
+    state.paintTemplatesByHash[paintHash] = templateOverlay or overlayOrErr
     return paintHash
+end
+
+function ModelModule.endPaintSession(sessionId)
+    paintRuntime.endSession(sessionId)
+end
+
+function ModelModule.getPaintSession(sessionId)
+    return paintRuntime.getSession(sessionId)
 end
 
 function ModelModule.getBlobMeta(kind, hash)
@@ -463,6 +582,107 @@ function ModelModule.getBlobChunk(kind, hash, idx)
         return nil, "unknown outgoing blob"
     end
     return blobSync.getOutgoingChunk(transfer, idx)
+end
+
+function ModelModule.getBlobRaw(kind, hash)
+    local key = tostring(kind) .. "|" .. tostring(hash)
+    local transfer = state.outgoingBlobIndex[key]
+    if transfer and type(transfer.raw) == "string" and transfer.raw ~= "" then
+        return transfer.raw
+    end
+    local completed = state.incomingBlobResults[key]
+    if completed and type(completed.raw) == "string" and completed.raw ~= "" then
+        return completed.raw
+    end
+    return nil
+end
+
+function ModelModule.hasPaintOverlay(hash)
+    return state.paintTemplatesByHash[tostring(hash)] ~= nil
+end
+
+function ModelModule.getPaintOverlay(hash, cloneTemplate)
+    local template = state.paintTemplatesByHash[tostring(hash)]
+    if not template then
+        return nil
+    end
+    if cloneTemplate then
+        local overlay = clonePaintOverlay(template)
+        return overlay or template
+    end
+    return template
+end
+
+function ModelModule.attachPaintHashToAsset(assetId, role, paintHash)
+    local asset = state.assetsById[assetId]
+    if not asset then
+        return false, "asset not found"
+    end
+    role = (role == "walking") and "walking" or "plane"
+    paintHash = tostring(paintHash or "")
+    if paintHash == "" then
+        asset.paintByRole = asset.paintByRole or {}
+        asset.paintByRole[role] = nil
+        return true
+    end
+
+    local template = state.paintTemplatesByHash[paintHash]
+    if not template then
+        return false, "paint overlay not found"
+    end
+
+    local overlay, cloneErr = clonePaintOverlay(template)
+    if not overlay then
+        return false, cloneErr
+    end
+    overlay.hash = paintHash
+    overlay.role = role
+    overlay.modelHash = asset.modelHash
+    return materialRuntime.attachPaintOverlay(asset, role, overlay)
+end
+
+function ModelModule.importPaintBlob(hash, rawPng, meta)
+    hash = tostring(hash or "")
+    if hash == "" then
+        return nil, "missing paint hash"
+    end
+
+    meta = meta or {}
+    local role = (meta.role == "walking") and "walking" or "plane"
+    local overlay, err = buildPaintOverlayFromPngBytes(
+        rawPng,
+        meta.ownerId,
+        role,
+        meta.modelHash,
+        hash
+    )
+    if not overlay then
+        return nil, err
+    end
+
+    state.paintTemplatesByHash[hash] = overlay
+    local transfer = blobSync.prepareOutgoing(
+        state.blobState,
+        "paint",
+        hash,
+        rawPng,
+        {
+            chunkSize = math.max(64, math.floor(tonumber(meta.chunkSize) or 720)),
+            extra = {
+                ownerId = meta.ownerId,
+                role = role,
+                modelHash = meta.modelHash
+            }
+        }
+    )
+    state.outgoingBlobIndex["paint|" .. hash] = transfer
+    state.incomingBlobResults["paint|" .. hash] = {
+        kind = "paint",
+        hash = hash,
+        raw = rawPng,
+        meta = meta
+    }
+    return overlay
 end
 
 function ModelModule.acceptBlobMeta(metaPacket)
