@@ -1,9 +1,12 @@
 local function appendPackagePath()
 	local sep = package.config and package.config:sub(1, 1) or "/"
-	local root = ".." .. sep
+	local root = love.filesystem.getSourceBaseDirectory() or (".." .. sep)
+	if root:sub(-1) ~= sep then
+		root = root .. sep
+	end
 	local patterns = {
 		root .. "?.lua",
-		root .. "?/init.lua"
+		root .. "?" .. sep .. "init.lua"
 	}
 	package.path = package.path .. ";" .. table.concat(patterns, ";")
 end
@@ -81,7 +84,7 @@ local function runSelectedOrAll()
 		local normalized = normalizeTestName(requested)
 		local target = normalized .. ".lua"
 		if not love.filesystem.getInfo(target, "file") then
-			error(string.format("Unknown test '%s'. Expected %s in Tests/.", requested, target))
+			error(string.format("Unknown test '%s'. Expected %s in portSource/Tests/.", requested, target))
 		end
 		local passed = runTestFile(target)
 		if not passed then
@@ -94,7 +97,7 @@ local function runSelectedOrAll()
 
 	local tests = listTests()
 	if #tests == 0 then
-		error("No test files found in Tests/.")
+		error("No test files found in portSource/Tests/.")
 	end
 
 	if not runAll then
@@ -115,7 +118,9 @@ local function runSelectedOrAll()
 	end
 
 	if failures > 0 then
-		error(string.format("%d test file(s) failed.", failures))
+		print(string.format("[summary] %d test file(s) failed.", failures))
+		love.event.quit(1)
+		return
 	end
 	love.event.quit(0)
 end

@@ -70,6 +70,22 @@ local function hasCliOption(name)
 	return false
 end
 
+local function fileExists(path)
+	local handle = io.open(path, "rb")
+	if handle then
+		handle:close()
+		return true
+	end
+	return false
+end
+
+local function resolvePortSourcePath(relativePath)
+	if fileExists(relativePath) then
+		return relativePath
+	end
+	return "portSource/" .. tostring(relativePath)
+end
+
 function love.conf(t)
 	t.graphics = t.graphics or {}
 
@@ -99,4 +115,5 @@ function love.conf(t)
 	if #preferred == 0 and restartPreference ~= "auto" then
 		t.graphics.renderers = getRendererOrderForPreference(restartPreference)
 	end
+	t.window.icon = resolvePortSourcePath("Assets/Icons/WindowIcon.png")
 end

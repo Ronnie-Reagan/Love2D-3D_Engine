@@ -1,3 +1,6 @@
 settings.*
 .vscode/
 Scripts/
+build/
+out/
+vc140.pdb

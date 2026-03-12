@@ -13,26 +13,26 @@ Severity legend:
 
 ### 1) Flight Dynamics Core (`FlightDynamicsSystem`, `AeroModel`, `RigidBodyIntegrator`)
 - `S1` (Resolved): Default-config drift between runtime and simulation defaults caused fixed-step inconsistency and physics divergence.
-  - Repro: `lovec Tests --test FlightDynamics` previously failed fixed-step tick consistency.
+  - Repro: `lovec portSource/Tests --test FlightDynamics` previously failed fixed-step tick consistency.
   - Impact: Different behavior across frame rates and test/runtime mismatch.
-  - Fix: Introduced shared default source in `Source/Sim/FlightModelDefaults.lua`; both `FlightDynamicsSystem` and `GameDefaults` now consume it.
+  - Fix: Introduced shared default source in `portSource/Source/Sim/FlightModelDefaults.lua`; both `FlightDynamicsSystem` and `GameDefaults` now consume it.
   - Acceptance: `FlightDynamics` matrix test at 15/30/60/120 passes.
 
 - `S2` (Mitigated): Extreme-parameter instability risk.
   - Repro: High-thrust/low-drag configs can amplify numerical error.
   - Impact: Potential NaN/runaway without guardrails.
-  - Validation: Added stress test in `Tests/FlightDynamics.lua` verifying finite state and speed guard behavior under extreme but valid tuning.
+  - Validation: Added stress test in `portSource/Tests/FlightDynamics.lua` verifying finite state and speed guard behavior under extreme but valid tuning.
   - Acceptance: Test passes.
 
 ### 2) Atmosphere / Propulsion / Trim
 - `S2` (Validated): ISA density trend and thrust lapse behavior.
-  - Repro: `Tests/AtmosphereAndPropulsion.lua`.
+  - Repro: `portSource/Tests/AtmosphereAndPropulsion.lua`.
   - Impact: If incorrect, climb/cruise realism is invalid.
   - Status: Pass (density drops with altitude; thrust drops with speed and altitude).
 
 ### 3) Terrain SDF / Collision / Contact
 - `S2` (Validated): Contact/crash thresholds on low-speed vs high-speed impact and slope normal response.
-  - Repro: `Tests/FlightGroundContact.lua`.
+  - Repro: `portSource/Tests/FlightGroundContact.lua`.
   - Impact: Incorrect crash/contact behavior breaks gameplay realism and recovery logic.
   - Status: Pass (safe touchdown no crash, high-speed impact crash event, slope depenetration along normal).
 
@@ -43,22 +43,22 @@ Severity legend:
 
 ### 4) Terrain Generation/Streaming Determinism
 - `S2` (Validated): SDF determinism and streaming continuity.
-  - Repro: `Tests/TerrainSdfDeterminism.lua`, `Tests/TerrainChunkStreaming.lua`, `Tests/TerrainCollision.lua`.
+  - Repro: `portSource/Tests/TerrainSdfDeterminism.lua`, `portSource/Tests/TerrainChunkStreaming.lua`, `portSource/Tests/TerrainCollision.lua`.
   - Status: Pass.
 
 ### 5) Physics Networking (`STATE3` + interpolation/extrapolation)
 - `S2` (Validated): Dynamic state decode and interpolation continuity.
-  - Repro: `Tests/PacketCodecAndNetworking.lua`.
+  - Repro: `portSource/Tests/PacketCodecAndNetworking.lua`.
   - Added check: quaternion normalization and angular extrapolation coherence.
   - Status: Pass.
 
 ## Surface-Level Systems
 
 ### 1) Test Harness / Launch Reliability
-- `S2` (Resolved): `Tests/main.lua` path resolution depended on process working directory.
+- `S2` (Resolved): `portSource/Tests/main.lua` path resolution depended on process working directory.
   - Repro: Launching from repo root failed with missing test file paths.
   - Fix: Runner now uses `love.filesystem.load` instead of raw `dofile` path assumptions.
-  - Acceptance: `lovec Tests --all` and `cd Tests && lovec . --all` both pass.
+  - Acceptance: `lovec portSource/Tests --all` and `cd portSource/Tests && lovec . --all` both pass.
 
 - `S3` (Resolved): No standardized launcher for exit-code capture.
   - Fix: Added:
@@ -68,17 +68,17 @@ Severity legend:
 
 ### 2) Input/Controls/View
 - `S2` (Validated): Strict modifier behavior and rebind/reset contract.
-  - Repro: `Tests/ControlsStrictModifiers.lua`, `Tests/ControlsRebind.lua`.
+  - Repro: `portSource/Tests/ControlsStrictModifiers.lua`, `portSource/Tests/ControlsRebind.lua`.
   - Status: Pass.
 
 ### 3) Restart Snapshot Compatibility
 - `S2` (Validated): Migration and tuned-parameter persistence on same-version pass-through.
-  - Repro: `Tests/RestartSnapshotCompat.lua`.
+  - Repro: `portSource/Tests/RestartSnapshotCompat.lua`.
   - Status: Pass.
 
 ### 4) Render/HUD Contract Surface
 - `S2` (Validated): CPU classifier and PBR/lighting contract checks.
-  - Repro: `Tests/CpuRenderClassifier.lua`, `Tests/PbrLightingContracts.lua`.
+  - Repro: `portSource/Tests/CpuRenderClassifier.lua`, `portSource/Tests/PbrLightingContracts.lua`.
   - Status: Pass.
 
 ## Acceptance Matrix (Current)
