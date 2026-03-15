@@ -382,6 +382,208 @@ void runTerrainLodChecks(bool& failed)
         failed);
 }
 
+void runTerrainStreamingChecks(bool& failed)
+{
+    require(
+        initialTerrainTileDetailForBand(TerrainFarTileBand::Near) == TerrainFarTileDetail::Lod2,
+        "Terrain streaming regressed: near-field tiles should start from coarse passive coverage",
+        failed);
+    require(
+        initialTerrainTileDetailForBand(TerrainFarTileBand::Mid) == TerrainFarTileDetail::Lod2,
+        "Terrain streaming regressed: mid-field tiles should start from coarse passive coverage",
+        failed);
+    require(
+        nextTerrainTileDetail(TerrainFarTileBand::Near, TerrainFarTileDetail::Lod2) == TerrainFarTileDetail::Lod1 &&
+            nextTerrainTileDetail(TerrainFarTileBand::Near, TerrainFarTileDetail::Lod1) == TerrainFarTileDetail::Lod0 &&
+            !nextTerrainTileDetail(TerrainFarTileBand::Near, TerrainFarTileDetail::Lod0).has_value(),
+        "Terrain streaming regressed: near-field tiles should refine from LOD2 to LOD1 to LOD0",
+        failed);
+    require(
+        nextTerrainTileDetail(TerrainFarTileBand::Mid, TerrainFarTileDetail::Lod2) == TerrainFarTileDetail::Lod1 &&
+            !nextTerrainTileDetail(TerrainFarTileBand::Mid, TerrainFarTileDetail::Lod1).has_value(),
+        "Terrain streaming regressed: mid-field tiles should refine from LOD2 to LOD1 without a blocking extra stage",
+        failed);
+
+    TerrainFarTile currentTile;
+    currentTile.band = TerrainFarTileBand::Near;
+    currentTile.detail = TerrainFarTileDetail::Lod1;
+    currentTile.paramsSignature = 101u;
+    currentTile.sourceSignature = 202u;
+
+    const TerrainTileRequest upgradeRequest {
+        TerrainFarTileBand::Near,
+        TerrainFarTileDetail::Lod0,
+        0,
+        0,
+        101u,
+        202u,
+        0.0f
+    };
+    const TerrainTileRequest downgradeRequest {
+        TerrainFarTileBand::Near,
+        TerrainFarTileDetail::Lod2,
+        0,
+        0,
+        101u,
+        202u,
+        0.0f
+    };
+    const TerrainTileRequest refreshRequest {
+        TerrainFarTileBand::Near,
+        TerrainFarTileDetail::Lod2,
+        0,
+        0,
+        303u,
+        404u,
+        0.0f
+    };
+
+    require(
+        shouldApplyTerrainChunkResult(&currentTile, upgradeRequest),
+        "Terrain streaming regressed: finer current-detail results should still replace a coarse stage",
+        failed);
+    require(
+        !shouldApplyTerrainChunkResult(&currentTile, downgradeRequest),
+        "Terrain streaming regressed: late coarse results should not downgrade a current tile",
+        failed);
+    require(
+        shouldApplyTerrainChunkResult(&currentTile, refreshRequest),
+        "Terrain streaming regressed: stale tiles should still accept a refreshed replacement",
+        failed);
+
+    const auto makeRequest = [](TerrainFarTileBand band, TerrainFarTileDetail detail, float priority, std::uint64_t signature) {
+        return TerrainTileRequest {
+            band,
+            detail,
+            static_cast<int>(priority),
+            static_cast<int>(priority),
+            signature,
+            signature + 1u,
+            priority
+        };
+    };
+
+    {
+        TerrainVisualStreamState queueState;
+        queueState.generation = 3u;
+        queueState.maxPendingRequests = 2;
+        queueState.maxCompletedResults = 1;
+        const TerrainTileRequest nearRequest = makeRequest(TerrainFarTileBand::Near, TerrainFarTileDetail::Lod2, 1.0f, 10u);
+        const TerrainTileRequest midRequest = makeRequest(TerrainFarTileBand::Mid, TerrainFarTileDetail::Lod2, 2.0f, 20u);
+        const TerrainTileRequest horizonRequest = makeRequest(TerrainFarTileBand::Horizon, TerrainFarTileDetail::Lod2, 0.5f, 30u);
+        queueState.desiredRequests[terrainTileIdentityKey(nearRequest.band, nearRequest.tileX, nearRequest.tileZ)] = nearRequest;
+        queueState.desiredRequests[terrainTileIdentityKey(midRequest.band, midRequest.tileX, midRequest.tileZ)] = midRequest;
+        queueState.desiredRequests[terrainTileIdentityKey(horizonRequest.band, horizonRequest.tileX, horizonRequest.tileZ)] = horizonRequest;
+        queueState.queuedRequests.push_back({ nearRequest, {}, queueState.generation });
+        queueState.queuedRequests.push_back({ midRequest, {}, queueState.generation });
+        queueState.queuedRequests.push_back({ horizonRequest, {}, queueState.generation });
+        queueState.queuedRequestKeys[terrainTileRequestKey(nearRequest)] = terrainTileIdentityKey(nearRequest.band, nearRequest.tileX, nearRequest.tileZ);
+        queueState.queuedRequestKeys[terrainTileRequestKey(midRequest)] = terrainTileIdentityKey(midRequest.band, midRequest.tileX, midRequest.tileZ);
+        queueState.queuedRequestKeys[terrainTileRequestKey(horizonRequest)] = terrainTileIdentityKey(horizonRequest.band, horizonRequest.tileX, horizonRequest.tileZ);
+        trimTerrainStreamBacklogLocked(queueState);
+
+        bool hasNear = false;
+        bool hasMid = false;
+        bool hasHorizon = false;
+        for (const TerrainChunkBuildRequest& request : queueState.queuedRequests) {
+            hasNear = hasNear || request.request.band == TerrainFarTileBand::Near;
+            hasMid = hasMid || request.request.band == TerrainFarTileBand::Mid;
+            hasHorizon = hasHorizon || request.request.band == TerrainFarTileBand::Horizon;
+        }
+        require(
+            queueState.queuedRequests.size() == 2u && hasNear && hasMid && !hasHorizon,
+            "Terrain streaming regressed: bounded pending work should evict horizon requests before near/mid coverage",
+            failed);
+    }
+
+    {
+        TerrainVisualStreamState completedState;
+        completedState.generation = 4u;
+        completedState.maxPendingRequests = 6;
+        completedState.maxCompletedResults = 1;
+        const TerrainTileRequest nearRequest = makeRequest(TerrainFarTileBand::Near, TerrainFarTileDetail::Lod1, 1.0f, 40u);
+        const TerrainTileRequest horizonRequest = makeRequest(TerrainFarTileBand::Horizon, TerrainFarTileDetail::Lod2, 0.1f, 50u);
+        completedState.desiredRequests[terrainTileIdentityKey(nearRequest.band, nearRequest.tileX, nearRequest.tileZ)] = nearRequest;
+        completedState.desiredRequests[terrainTileIdentityKey(horizonRequest.band, horizonRequest.tileX, horizonRequest.tileZ)] = horizonRequest;
+        completedState.completedResults.push_back({ horizonRequest, {}, completedState.generation });
+        completedState.completedResults.push_back({ nearRequest, {}, completedState.generation });
+        trimTerrainStreamBacklogLocked(completedState);
+        require(
+            completedState.completedResults.size() == 1u &&
+                completedState.completedResults.front().request.band == TerrainFarTileBand::Near,
+            "Terrain streaming regressed: completed-result backlog should retain the more valuable near tile when capped",
+            failed);
+    }
+
+    {
+        TerrainVisualStreamState staleState;
+        staleState.generation = 5u;
+        staleState.maxPendingRequests = 4;
+        staleState.maxCompletedResults = 2;
+        const TerrainTileRequest request = makeRequest(TerrainFarTileBand::Near, TerrainFarTileDetail::Lod2, 1.0f, 60u);
+        staleState.desiredRequests[terrainTileIdentityKey(request.band, request.tileX, request.tileZ)] = request;
+        staleState.completedResults.push_back({ request, {}, staleState.generation - 1u });
+        trimTerrainStreamBacklogLocked(staleState);
+        require(
+            staleState.completedResults.empty(),
+            "Terrain streaming regressed: stale-generation results should be discarded during backlog trimming",
+            failed);
+    }
+}
+
+void runPressureGovernorChecks(bool& failed)
+{
+    SystemPressureSnapshot pressureSnapshot;
+    pressureSnapshot.valid = true;
+    pressureSnapshot.totalPhysicalBytes = 32ull * kGiB;
+    pressureSnapshot.availablePhysicalBytes = 3ull * kGiB;
+    pressureSnapshot.commitHeadroomBytes = 3ull * kGiB;
+    pressureSnapshot.gpuLocalBudgetBytes = 8ull * kGiB;
+    pressureSnapshot.gpuLocalUsageBytes = 7ull * kGiB;
+
+    require(
+        computeRuntimePressureState(pressureSnapshot, RuntimePressureState::Normal) == RuntimePressureState::Pressure,
+        "Pressure governor regressed: low available RAM / high VRAM usage should enter Pressure",
+        failed);
+
+    SystemPressureSnapshot criticalSnapshot = pressureSnapshot;
+    criticalSnapshot.availablePhysicalBytes = 1ull * kGiB;
+    criticalSnapshot.commitHeadroomBytes = 512ull * kMiB;
+    criticalSnapshot.gpuLocalUsageBytes = static_cast<std::uint64_t>(criticalSnapshot.gpuLocalBudgetBytes * 0.95);
+    require(
+        computeRuntimePressureState(criticalSnapshot, RuntimePressureState::Pressure) == RuntimePressureState::Critical,
+        "Pressure governor regressed: severe RAM and commit pressure should enter Critical",
+        failed);
+
+    SystemPressureSnapshot recoverySnapshot = pressureSnapshot;
+    recoverySnapshot.availablePhysicalBytes = 7ull * kGiB;
+    recoverySnapshot.commitHeadroomBytes = 4ull * kGiB;
+    recoverySnapshot.gpuLocalUsageBytes = static_cast<std::uint64_t>(recoverySnapshot.gpuLocalBudgetBytes * 0.70);
+    require(
+        computeRuntimePressureState(recoverySnapshot, RuntimePressureState::Pressure) == RuntimePressureState::Normal,
+        "Pressure governor regressed: recovered RAM and VRAM headroom should return to Normal",
+        failed);
+
+    PerformanceGovernor governor;
+    governor.pressureState = RuntimePressureState::Normal;
+    governor.hardwareTier = HardwareTier::Requirement;
+    updatePerformanceGovernor(governor, 2.0f, 0.020f, pressureSnapshot);
+    require(
+        governor.pressureState == RuntimePressureState::Pressure,
+        "Pressure governor regressed: update should preserve the sampled Pressure state",
+        failed);
+    require(
+        governor.residentMeshBudgetBytes == (512ull * kMiB) &&
+            governor.sceneTextureBudgetBytes == (1024ull * kMiB) &&
+            governor.maxUploadBytes == (48ull * kMiB),
+        "Pressure governor regressed: requirement-tier pressure budgets should clamp renderer memory and uploads",
+        failed);
+    require(
+        !governor.allowHorizonBand && governor.allowMidBand && governor.upgradeBudget == 1,
+        "Pressure governor regressed: Pressure should stop horizon generation and sharply cap upgrades",
+        failed);
+}
+
 void runTerrainDecorationChecks(bool& failed)
 {
     TerrainParams params = defaultTerrainParams();
@@ -599,6 +801,7 @@ int main()
     std::filesystem::create_directories(tempRoot, ec);
 
     const std::filesystem::path settingsPath = tempRoot / "native_settings.ini";
+    const std::filesystem::path hudSettingsPath = tempRoot / "HUD-settings.ini";
     {
         std::ofstream file(settingsPath, std::ios::binary | std::ios::trunc);
         file << "model.source_path=" << modelPath.generic_string() << "\n";
@@ -623,6 +826,8 @@ int main()
         file << "aircraft.plane.audio.base_rpm=51\n";
         file << "aircraft.plane.audio.engine_frequency_scale=1.10\n";
         file << "ui.walking_move_speed=18\n";
+        file << "ui.ui_scale=1.3\n";
+        file << "ui.scale_hud_with_ui=1\n";
         file << "graphics.window_mode=borderless\n";
         file << "graphics.resolution_width=1920\n";
         file << "graphics.resolution_height=1080\n";
@@ -634,8 +839,6 @@ int main()
         file << "lighting.sky_tint_g=0.88\n";
         file << "lighting.fog_density=0.0007\n";
         file << "lighting.fog_b=0.91\n";
-        file << "hud.show_speedometer=0\n";
-        file << "hud.speedometer_redline_kph=900\n";
         file << "terrain.props_enabled=1\n";
         file << "terrain.prop_density=1.7\n";
         file << "terrain.prop_density_near=1.3\n";
@@ -648,15 +851,34 @@ int main()
         file << "terrain.prop_seed_offset=222\n";
         file << "controls.flight_pitch_down.primary=key:26\n";
         file << "controls.voice_ptt.primary=key:999\n";
+    }
+    {
+        std::ofstream file(hudSettingsPath, std::ios::binary | std::ios::trunc);
+        file << "hud.show_speedometer=0\n";
+        file << "hud.show_crosshair=0\n";
+        file << "hud.speedometer_redline_kph=900\n";
+        file << "hud.style.map.x=0.42\n";
+        file << "hud.style.map.y=0.18\n";
+        file << "hud.style.map.width_scale=1.4\n";
+        file << "hud.style.map.height_scale=0.9\n";
+        file << "hud.style.map.text_r=101\n";
+        file << "hud.style.debug.background_opacity=96\n";
         file << "hud.show_peer_indicators=1\n";
     }
     require(loadPreferences(settingsPath, uiState, graphicsSettings, lightingSettings, hudSettings, controls, planeProfile, terrainParams, walkingPrefs, &preferenceError),
         "Preference file failed to load: " + preferenceError,
         failed);
+    std::string hudPreferenceError;
+    require(loadHudPreferences(hudSettingsPath, hudSettings, &hudPreferenceError),
+        "HUD preference file failed to load: " + hudPreferenceError,
+        failed);
+    syncUiStateFromHud(uiState, hudSettings);
     require(planeProfile.visualPrefs.hasStoredPath, "Legacy model.source_path did not migrate into plane preferences", failed);
     require(planeProfile.visualPrefs.sourcePath == modelPath, "Migrated plane source path does not match stored legacy path", failed);
     require(std::abs(walkingPrefs.scale - 1.5f) < 0.001f, "Walking role scale did not load from character.walking.scale", failed);
     require(std::abs(uiState.walkingMoveSpeed - 18.0f) < 0.001f, "Walking move speed did not load from preferences", failed);
+    require(std::abs(uiState.uiScale - 1.3f) < 0.001f, "UI scale did not load from preferences", failed);
+    require(uiState.scaleHudWithUi, "Scale HUD with UI toggle did not load from preferences", failed);
     require(std::fabs(terrainParams.decoration.density - 1.7f) < 0.001f, "Terrain prop density did not load from preferences", failed);
     require(std::fabs(terrainParams.decoration.nearDensityScale - 1.3f) < 0.001f, "Near-field terrain prop density did not load from preferences", failed);
     require(std::fabs(terrainParams.decoration.farDensityScale - 0.2f) < 0.001f, "Far-field terrain prop density did not load from preferences", failed);
@@ -675,7 +897,12 @@ int main()
     require(std::abs(lightingSettings.fogDensity - 0.0007f) < 0.00001f, "Lighting fog density did not load from preferences", failed);
     require(std::abs(lightingSettings.fogColor.z - 0.91f) < 0.001f, "Lighting fog color did not load from preferences", failed);
     require(!hudSettings.showSpeedometer, "HUD speedometer toggle did not load from preferences", failed);
+    require(!hudSettings.showCrosshair, "HUD crosshair toggle did not load from HUD preferences", failed);
     require(hudSettings.speedometerRedlineKph == 900, "HUD speedometer redline did not load from preferences", failed);
+    require(std::abs(hudSettings.mapPanel.x - 0.42f) < 0.001f, "HUD map X position did not load from HUD preferences", failed);
+    require(std::abs(hudSettings.mapPanel.widthScale - 1.4f) < 0.001f, "HUD map width scale did not load from HUD preferences", failed);
+    require(hudSettings.mapPanel.textColor.r == 101, "HUD map text color did not load from HUD preferences", failed);
+    require(hudSettings.debugFooter.backgroundOpacity == 96, "HUD debug background opacity did not load from HUD preferences", failed);
     require(!hudSettings.showPeerIndicators, "Unsupported HUD rows should ignore persisted values", failed);
     {
         const ControlActionBinding* pitchDown = findControlAction(controls, InputActionId::FlightPitchDown);
@@ -788,20 +1015,29 @@ int main()
         applyVisualPreferenceData(walkingVisual, walkingPrefs);
 
         const std::filesystem::path savedSettingsPath = tempRoot / "saved_settings.ini";
+        const std::filesystem::path savedHudSettingsPath = tempRoot / "saved_hud_settings.ini";
         std::string savePreferenceError;
         require(
             savePreferences(savedSettingsPath, uiState, graphicsSettings, lightingSettings, hudSettings, controls, planeProfile, terrainParams, planeVisual, walkingVisual, &savePreferenceError),
             "Preference file failed to save: " + savePreferenceError,
             failed);
+        require(
+            saveHudPreferences(savedHudSettingsPath, hudSettings, &savePreferenceError),
+            "HUD preference file failed to save: " + savePreferenceError,
+            failed);
 
         std::ifstream savedFile(savedSettingsPath, std::ios::binary);
         const std::string savedContents((std::istreambuf_iterator<char>(savedFile)), std::istreambuf_iterator<char>());
+        std::ifstream savedHudFile(savedHudSettingsPath, std::ios::binary);
+        const std::string savedHudContents((std::istreambuf_iterator<char>(savedHudFile)), std::istreambuf_iterator<char>());
         require(
             savedContents.find("aircraft.plane.audio.base_rpm=51") != std::string::npos,
             "Saved preferences did not persist aircraft-local prop audio keys",
             failed);
         require(
             savedContents.find("ui.walking_move_speed=18") != std::string::npos &&
+            savedContents.find("ui.ui_scale=1.3") != std::string::npos &&
+            savedContents.find("ui.scale_hud_with_ui=1") != std::string::npos &&
             savedContents.find("graphics.window_mode=borderless") != std::string::npos &&
                 savedContents.find("lighting.show_sun_marker=1") != std::string::npos &&
                 savedContents.find("lighting.sun_yaw_degrees=35") != std::string::npos &&
@@ -820,6 +1056,14 @@ int main()
             savedContents.find("controls.voice_ptt.primary=") == std::string::npos &&
                 savedContents.find("hud.show_peer_indicators=") == std::string::npos,
             "Disabled rows should not be written back to native_settings.ini",
+            failed);
+        require(
+            savedHudContents.find("hud.show_crosshair=0") != std::string::npos &&
+                savedHudContents.find("hud.style.map.x=0.42") != std::string::npos &&
+                savedHudContents.find("hud.style.map.width_scale=1.4") != std::string::npos &&
+                savedHudContents.find("hud.style.debug.background_opacity=96") != std::string::npos &&
+                savedHudContents.find("hud.show_peer_indicators=") == std::string::npos,
+            "Saved HUD preferences did not persist element layout/style keys correctly",
             failed);
     }
 
@@ -840,9 +1084,91 @@ int main()
             failed);
     }
 
+    {
+        GraphicsSettings farClipSettings = defaultGraphicsSettings();
+        farClipSettings.drawDistance = 9200.0f;
+        const TerrainFieldContext terrainContext = createTerrainFieldContext(defaultTerrainParams());
+        const Camera farClipCamera = buildRenderCamera(makeFlightState(), terrainContext, uiState, true, 0.0f, 0.0f, computeWorldFarClip(farClipSettings));
+        require(
+            farClipCamera.farClipMeters > farClipSettings.drawDistance,
+            "Render camera far clip should track the configured gameplay draw distance",
+            failed);
+    }
+
+    {
+        const GltfDetail::Mat4 nonUniformScale = GltfDetail::makeTrsMatrix({ 0.0f, 0.0f, 0.0f }, quatIdentity(), { 2.0f, 1.0f, 1.0f });
+        const Vec3 transformedNormal = GltfDetail::transformDirection(nonUniformScale, normalize({ 1.0f, 1.0f, 0.0f }, { 1.0f, 0.0f, 0.0f }));
+        const Vec3 expectedNormal = normalize({ 0.5f, 1.0f, 0.0f }, { 0.0f, 1.0f, 0.0f });
+        require(
+            std::fabs(transformedNormal.x - expectedNormal.x) < 0.01f &&
+                std::fabs(transformedNormal.y - expectedNormal.y) < 0.01f &&
+                std::fabs(transformedNormal.z - expectedNormal.z) < 0.01f,
+            "glTF normal transforms should use inverse-transpose behavior under non-uniform scale",
+            failed);
+    }
+
+    {
+        auto cache = TerrainChunkBakeCache::open(tempRoot / "terrain-cache");
+        require(cache.has_value(), "Terrain chunk bake cache failed to open for smoke checks", failed);
+        if (cache.has_value()) {
+            CompiledTerrainChunk chunk;
+            chunk.key.worldId = "smoke-cache";
+            chunk.key.seed = 7;
+            chunk.key.generatorVersion = 3;
+            chunk.key.band = 1;
+            chunk.key.detail = 2;
+            chunk.key.tileX = -4;
+            chunk.key.tileZ = 9;
+            chunk.key.paramsSignature = 11;
+            chunk.key.sourceSignature = 13;
+            chunk.sourceData.key = chunk.key;
+            chunk.terrainModel.assetKey = "cache:uv1";
+            chunk.terrainModel.vertices = {
+                { 0.0f, 0.0f, 0.0f },
+                { 1.0f, 0.0f, 0.0f },
+                { 0.0f, 1.0f, 0.0f }
+            };
+            chunk.terrainModel.faces = { { { 0, 1, 2 }, 0 } };
+            chunk.terrainModel.faceColors = { { 1.0f, 1.0f, 1.0f } };
+            chunk.terrainModel.vertexNormals = {
+                { 0.0f, 0.0f, 1.0f },
+                { 0.0f, 0.0f, 1.0f },
+                { 0.0f, 0.0f, 1.0f }
+            };
+            chunk.terrainModel.texCoords = {
+                { 0.0f, 0.0f },
+                { 0.0f, 0.0f },
+                { 0.0f, 0.0f }
+            };
+            chunk.terrainModel.texCoords1 = {
+                { 0.0f, 0.0f },
+                { 1.0f, 0.0f },
+                { 0.0f, 1.0f }
+            };
+            chunk.terrainModel.materials.push_back(Material {});
+            chunk.terrainModel.hasTexCoords = true;
+
+            std::string cacheError;
+            require(cache->save(chunk, &cacheError), "Terrain chunk bake cache failed to save UV-set smoke data: " + cacheError, failed);
+
+            CompiledTerrainChunk loadedChunk;
+            require(cache->load(chunk.key, loadedChunk), "Terrain chunk bake cache failed to reload UV-set smoke data", failed);
+            require(loadedChunk.terrainModel.texCoords1.size() == 3u, "Terrain chunk bake cache lost secondary texture coordinates", failed);
+            if (loadedChunk.terrainModel.texCoords1.size() == 3u) {
+                require(
+                    std::fabs(loadedChunk.terrainModel.texCoords1[1].x - 1.0f) < 0.001f &&
+                        std::fabs(loadedChunk.terrainModel.texCoords1[2].y - 1.0f) < 0.001f,
+                    "Terrain chunk bake cache corrupted secondary texture coordinate values",
+                    failed);
+            }
+        }
+    }
+
     runFlightParityChecks(failed);
     runAudioFrameChecks(failed);
     runTerrainLodChecks(failed);
+    runTerrainStreamingChecks(failed);
+    runPressureGovernorChecks(failed);
     runTerrainDecorationChecks(failed);
 
     WorldChunkState wireChunk;

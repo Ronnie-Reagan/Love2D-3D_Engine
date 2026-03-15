@@ -9,6 +9,8 @@ struct Camera {
     Vec3 pos {};
     Quat rot = quatIdentity();
     float fovRadians = radians(80.0f);
+    float nearClipMeters = 0.05f;
+    float farClipMeters = 4200.0f;
 };
 
 struct RenderObject {

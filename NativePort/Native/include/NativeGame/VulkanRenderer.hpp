@@ -6,7 +6,10 @@
 #include "NativeGame/HudCanvas.hpp"
 #include "NativeGame/RenderTypes.hpp"
 
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -31,6 +34,31 @@ struct RendererLightingState {
     float shadowDistance = 1800.0f;
 };
 
+enum class RendererPressureTier {
+    Normal = 0,
+    Pressure = 1,
+    Critical = 2
+};
+
+struct RendererFrameSettings {
+    float renderScale = 1.0f;
+    float dynamicRenderScale = 1.0f;
+    bool textureMipmaps = true;
+    std::size_t maxUploadBytes = std::numeric_limits<std::size_t>::max();
+    RendererPressureTier pressureTier = RendererPressureTier::Normal;
+};
+
+struct RendererMemoryStats {
+    std::size_t residentMeshBytes = 0;
+    std::size_t residentMeshBudgetBytes = 0;
+    std::size_t sceneTextureBytes = 0;
+    std::size_t sceneTextureBudgetBytes = 0;
+    std::size_t framebufferBytes = 0;
+    std::size_t transientBufferBytes = 0;
+    std::size_t uploadBytesThisFrame = 0;
+    std::size_t maxUploadBytesThisFrame = 0;
+};
+
 class VulkanRenderer {
 public:
     VulkanRenderer() = default;
@@ -44,12 +72,15 @@ public:
 
     bool render(
         const Camera& camera,
+        const RendererFrameSettings& frameSettings,
         const RendererLightingState& lightingState,
         const std::vector<RenderObject>& opaqueObjects,
         const std::vector<RenderObject>& translucentObjects,
         const HudCanvas& hudCanvas,
         std::string* errorMessage);
 
+    void setMemoryBudgets(std::size_t residentMeshBudgetBytes, std::size_t sceneTextureBudgetBytes);
+    [[nodiscard]] const RendererMemoryStats& memoryStats() const;
     [[nodiscard]] const char* backendName() const;
 
 private:
@@ -76,12 +107,15 @@ private:
         Uint32 vertexCount = 0;
         const RgbaImage* image = nullptr;
         bool cullBackfaces = false;
+        Vec3 sortCenter {};
     };
 
     struct CachedSceneTexture {
         const RgbaImage* image = nullptr;
         std::uint64_t version = 0;
         SDL_GPUTexture* texture = nullptr;
+        std::size_t textureBytes = 0;
+        std::uint64_t lastFrameUsed = 0;
     };
 
     struct CachedResidentMesh {
@@ -125,15 +159,24 @@ private:
     bool createPipelines(const std::filesystem::path& shaderDirectory, std::string* errorMessage);
     bool createOverlayGeometry(std::string* errorMessage);
     bool ensureSceneCapacity(std::size_t requiredBytes, std::string* errorMessage);
-    bool ensureFramebufferResources(Uint32 width, Uint32 height, std::string* errorMessage);
+    bool ensureFramebufferResources(
+        Uint32 drawableWidth,
+        Uint32 drawableHeight,
+        Uint32 sceneRenderWidth,
+        Uint32 sceneRenderHeight,
+        std::string* errorMessage);
     bool uploadHudTexture(SDL_GPUCopyPass* copyPass, const HudCanvas& hudCanvas, std::string* errorMessage);
     SDL_GPUTexture* ensureSceneTexture(
         SDL_GPUCopyPass* copyPass,
         const RgbaImage* image,
         std::vector<SDL_GPUTransferBuffer*>& uploadBuffers,
+        std::vector<SDL_GPUTexture*>* mipmapTextures,
         std::string* errorMessage);
     void releaseSceneTextures();
+    void releaseSceneTextureEntry(CachedSceneTexture& cached);
     void releaseResidentMeshes();
+    void releaseResidentMeshEntry(CachedResidentMesh& mesh);
+    void pruneSceneTextures(std::uint64_t minFrameToKeep);
     CachedResidentMesh* findResidentMesh(const std::string& key);
     bool isResidentMeshCurrent(const CachedResidentMesh& mesh, const RenderObject& object) const;
     CachedResidentMesh* ensureResidentMesh(
@@ -147,6 +190,9 @@ private:
         std::vector<SceneDrawCommand>& opaqueCommands,
         std::vector<SceneDrawCommand>& translucentCommands,
         const RenderObject& object) const;
+    bool reserveStreamingUploadBytes(std::size_t bytes);
+    void resetFrameUploadStats(const RendererFrameSettings& frameSettings);
+    void refreshMemoryStats();
 
     SDL_Window* window_ = nullptr;
     SDL_GPUDevice* device_ = nullptr;
@@ -156,20 +202,30 @@ private:
     SDL_GPUGraphicsPipeline* translucentCullPipeline_ = nullptr;
     SDL_GPUGraphicsPipeline* overlayPipeline_ = nullptr;
     SDL_GPUSampler* sceneSampler_ = nullptr;
+    SDL_GPUSampler* sceneMipmapSampler_ = nullptr;
     SDL_GPUSampler* overlaySampler_ = nullptr;
     SDL_GPUBuffer* sceneVertexBuffer_ = nullptr;
     SDL_GPUTransferBuffer* sceneTransferBuffer_ = nullptr;
     SDL_GPUBuffer* overlayVertexBuffer_ = nullptr;
+    SDL_GPUTexture* sceneColorTexture_ = nullptr;
     SDL_GPUTexture* depthTexture_ = nullptr;
     SDL_GPUTexture* hudTexture_ = nullptr;
     SDL_GPUTransferBuffer* hudTransferBuffer_ = nullptr;
     Uint32 drawableWidth_ = 0;
     Uint32 drawableHeight_ = 0;
+    Uint32 sceneRenderWidth_ = 0;
+    Uint32 sceneRenderHeight_ = 0;
     std::size_t sceneCapacityBytes_ = 0;
     std::size_t hudTransferCapacityBytes_ = 0;
+    SDL_GPUTextureFormat depthTextureFormat_ = SDL_GPU_TEXTUREFORMAT_D16_UNORM;
     std::vector<CachedSceneTexture> sceneTextures_;
     std::vector<CachedResidentMesh> residentMeshes_;
     std::uint64_t frameCounter_ = 0;
+    std::size_t residentMeshBudgetBytes_ = 0;
+    std::size_t sceneTextureBudgetBytes_ = 0;
+    std::size_t maxStreamingUploadBytes_ = std::numeric_limits<std::size_t>::max();
+    std::size_t streamingUploadBytesThisFrame_ = 0;
+    RendererMemoryStats memoryStats_ {};
     RgbaImage fallbackWhiteImage_ { 1, 1, { 255, 255, 255, 255 }, 1 };
 };
 

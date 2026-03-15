@@ -115,6 +115,9 @@ else()
 endif()
 
 if(WIN32)
+    target_link_libraries(TrueFlight PRIVATE gdi32 dxgi psapi)
+    target_link_libraries(TrueFlightNativeSmoke PRIVATE gdi32 dxgi psapi)
+
     add_custom_command(TARGET TrueFlight POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy -t $<TARGET_FILE_DIR:TrueFlight> $<TARGET_RUNTIME_DLLS:TrueFlight>
         COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:TrueFlight>/Shaders

@@ -64,6 +64,7 @@ struct Model {
     std::vector<Vec3> faceColors;
     std::vector<Vec3> vertexNormals;
     std::vector<Vec2> texCoords;
+    std::vector<Vec2> texCoords1;
     std::vector<Material> materials;
     std::vector<RgbaImage> images;
     bool hasTexCoords = false;

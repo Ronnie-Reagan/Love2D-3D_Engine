@@ -48,7 +48,7 @@ struct CompiledTerrainChunk {
 
 class TerrainChunkBakeCache {
 public:
-    static constexpr std::uint32_t kFormatVersion = 2u;
+    static constexpr std::uint32_t kFormatVersion = 3u;
 
     static std::optional<TerrainChunkBakeCache> open(const std::filesystem::path& rootPath, std::string* error = nullptr)
     {
@@ -381,6 +381,7 @@ private:
         const std::uint32_t normalCount = static_cast<std::uint32_t>(model.vertexNormals.size());
         const std::uint32_t faceColorCount = static_cast<std::uint32_t>(model.faceColors.size());
         const std::uint32_t texCoordCount = static_cast<std::uint32_t>(model.texCoords.size());
+        const std::uint32_t texCoord1Count = static_cast<std::uint32_t>(model.texCoords1.size());
         const std::uint32_t materialCount = static_cast<std::uint32_t>(model.materials.size());
 
         writeString(output, model.assetKey);
@@ -414,6 +415,11 @@ private:
             writeVec2(output, texCoord);
         }
 
+        writeValue(output, texCoord1Count);
+        for (const Vec2& texCoord : model.texCoords1) {
+            writeVec2(output, texCoord);
+        }
+
         writeValue(output, materialCount);
         for (const Material& material : model.materials) {
             writeMaterial(output, material);
@@ -431,6 +437,7 @@ private:
         std::uint32_t faceColorCount = 0u;
         std::uint32_t normalCount = 0u;
         std::uint32_t texCoordCount = 0u;
+        std::uint32_t texCoord1Count = 0u;
         std::uint32_t materialCount = 0u;
         if (!readString(input, model.assetKey) ||
             !readValue(input, vertexCount)) {
@@ -485,6 +492,16 @@ private:
         }
         model.texCoords.resize(texCoordCount);
         for (Vec2& texCoord : model.texCoords) {
+            if (!readVec2(input, texCoord)) {
+                return false;
+            }
+        }
+
+        if (!readValue(input, texCoord1Count)) {
+            return false;
+        }
+        model.texCoords1.resize(texCoord1Count);
+        for (Vec2& texCoord : model.texCoords1) {
             if (!readVec2(input, texCoord)) {
                 return false;
             }

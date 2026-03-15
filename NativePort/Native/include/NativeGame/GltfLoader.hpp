@@ -671,10 +671,38 @@ inline Vec3 transformPosition(const Mat4& matrix, const Vec3& position)
 
 inline Vec3 transformDirection(const Mat4& matrix, const Vec3& direction)
 {
+    const float a11 = matrix.m[0];
+    const float a12 = matrix.m[4];
+    const float a13 = matrix.m[8];
+    const float a21 = matrix.m[1];
+    const float a22 = matrix.m[5];
+    const float a23 = matrix.m[9];
+    const float a31 = matrix.m[2];
+    const float a32 = matrix.m[6];
+    const float a33 = matrix.m[10];
+
+    const float determinant = determinant3x3(matrix);
+    if (std::fabs(determinant) <= 1.0e-8f) {
+        return normalize({
+            (a11 * direction.x) + (a12 * direction.y) + (a13 * direction.z),
+            (a21 * direction.x) + (a22 * direction.y) + (a23 * direction.z),
+            (a31 * direction.x) + (a32 * direction.y) + (a33 * direction.z)
+        }, { 0.0f, 1.0f, 0.0f });
+    }
+
     return normalize({
-        (matrix.m[0] * direction.x) + (matrix.m[4] * direction.y) + (matrix.m[8] * direction.z),
-        (matrix.m[1] * direction.x) + (matrix.m[5] * direction.y) + (matrix.m[9] * direction.z),
-        (matrix.m[2] * direction.x) + (matrix.m[6] * direction.y) + (matrix.m[10] * direction.z)
+        (((a22 * a33) - (a23 * a32)) * direction.x +
+            ((a23 * a31) - (a21 * a33)) * direction.y +
+            ((a21 * a32) - (a22 * a31)) * direction.z) /
+            determinant,
+        (((a13 * a32) - (a12 * a33)) * direction.x +
+            ((a11 * a33) - (a13 * a31)) * direction.y +
+            ((a12 * a31) - (a11 * a32)) * direction.z) /
+            determinant,
+        (((a12 * a23) - (a13 * a22)) * direction.x +
+            ((a13 * a21) - (a11 * a23)) * direction.y +
+            ((a11 * a22) - (a12 * a21)) * direction.z) /
+            determinant
     }, { 0.0f, 1.0f, 0.0f });
 }
 
@@ -1279,11 +1307,25 @@ inline bool appendPrimitiveToModel(
         return false;
     }
 
+    AccessorData texCoords1;
+    const int texCoord1AccessorIndex = asInt(objectMember(*attributes, "TEXCOORD_1"), -1);
+    const bool hasTexCoords1 = texCoord1AccessorIndex >= 0 && decodeAccessor(gltf, buffers, texCoord1AccessorIndex, texCoords1, error);
+    if (texCoord1AccessorIndex >= 0 && !hasTexCoords1) {
+        return false;
+    }
+    if (hasTexCoords1 && (texCoords1.components < 2 || texCoords1.count != positions.count)) {
+        if (error != nullptr) {
+            *error = "glTF TEXCOORD_1 accessor is invalid";
+        }
+        return false;
+    }
+
     const bool mirroredTransform = determinant3x3(worldMatrix) < 0.0f;
     const int baseVertex = static_cast<int>(model.vertices.size());
     model.vertices.reserve(model.vertices.size() + static_cast<std::size_t>(positions.count));
     model.vertexNormals.reserve(model.vertexNormals.size() + static_cast<std::size_t>(positions.count));
     model.texCoords.reserve(model.texCoords.size() + static_cast<std::size_t>(positions.count));
+    model.texCoords1.reserve(model.texCoords1.size() + static_cast<std::size_t>(positions.count));
     for (int i = 0; i < positions.count; ++i) {
         const std::size_t offset = static_cast<std::size_t>(i * positions.components);
         model.vertices.push_back(transformPosition(worldMatrix, {
@@ -1312,6 +1354,17 @@ inline bool appendPrimitiveToModel(
             model.hasTexCoords = true;
         } else {
             model.texCoords.push_back({ 0.0f, 0.0f });
+        }
+
+        if (hasTexCoords1) {
+            const std::size_t texCoordOffset = static_cast<std::size_t>(i * texCoords1.components);
+            model.texCoords1.push_back({
+                static_cast<float>(texCoords1.values[texCoordOffset + 0]),
+                static_cast<float>(texCoords1.values[texCoordOffset + 1])
+            });
+            model.hasTexCoords = true;
+        } else {
+            model.texCoords1.push_back({ 0.0f, 0.0f });
         }
     }
 

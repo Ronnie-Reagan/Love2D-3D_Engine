@@ -13,21 +13,39 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cctype>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <random>
+#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <tuple>
 #include <limits>
 #include <map>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <dxgi1_4.h>
+#include <psapi.h>
+#include <wrl/client.h>
+#endif
 
 namespace {
 
@@ -46,8 +64,10 @@ constexpr float kWalkingCollisionRadius = 0.55f;
 constexpr float kGamepadStickDeadzone = 0.18f;
 constexpr float kGamepadTriggerDeadzone = 0.06f;
 constexpr float kGamepadMenuStickDeadzone = 0.55f;
+constexpr float kGamepadMenuTriggerPressThreshold = 0.55f;
 constexpr float kGamepadMenuRepeatDelay = 0.32f;
 constexpr float kGamepadMenuRepeatInterval = 0.11f;
+constexpr float kUiScaleStep = 0.1f;
 const float kGamepadFlightLookPitchLimitRadians = radians(80.0f);
 constexpr float kGamepadFlightLookYawSpeed = 2.2f;
 constexpr float kGamepadFlightLookPitchSpeed = 1.7f;
@@ -98,6 +118,15 @@ enum class SettingsSubTab {
 enum class CharacterSubTab {
     Plane = 0,
     Player = 1
+};
+
+enum class HudSubTab {
+    Info = 0,
+    Speedometer = 1,
+    Controls = 2,
+    Map = 3,
+    Crosshair = 4,
+    Debug = 5
 };
 
 enum class PaintMode {
@@ -189,19 +218,46 @@ struct LightingSettings {
     Vec3 fogColor { 0.64f, 0.73f, 0.84f };
 };
 
+struct HudRgbColor {
+    int r = 255;
+    int g = 255;
+    int b = 255;
+};
+
+struct HudElementStyle {
+    float x = 0.0f;
+    float y = 0.0f;
+    float widthScale = 1.0f;
+    float heightScale = 1.0f;
+    HudRgbColor backgroundColor { 5, 10, 18 };
+    int backgroundOpacity = 178;
+    HudRgbColor accentColor { 170, 210, 255 };
+    int accentOpacity = 255;
+    HudRgbColor textColor { 230, 240, 255 };
+    int textOpacity = 255;
+};
+
 struct HudSettings {
+    bool showInfoPanel = true;
     bool showSpeedometer = true;
     bool showDebug = true;
     bool showThrottle = true;
     bool showControls = true;
     bool showMap = true;
     bool showGeoInfo = true;
+    bool showCrosshair = true;
     bool showPeerIndicators = false;
     int speedometerMaxKph = 1000;
     int speedometerMinorStepKph = 20;
     int speedometerMajorStepKph = 100;
     int speedometerLabelStepKph = 200;
     int speedometerRedlineKph = 850;
+    HudElementStyle infoPanel { 0.011f, 0.019f, 1.0f, 1.0f, { 5, 10, 18 }, 178, { 170, 210, 255 }, 255, { 230, 240, 255 }, 255 };
+    HudElementStyle speedometer { 0.019f, 0.660f, 1.0f, 1.0f, { 8, 14, 22 }, 220, { 170, 210, 255 }, 228, { 230, 240, 255 }, 255 };
+    HudElementStyle controls { 0.430f, 0.847f, 1.0f, 1.0f, { 7, 12, 18 }, 178, { 175, 214, 255 }, 230, { 220, 234, 255 }, 255 };
+    HudElementStyle mapPanel { 0.834f, 0.022f, 1.0f, 1.0f, { 6, 12, 18 }, 190, { 255, 255, 255 }, 240, { 230, 240, 255 }, 255 };
+    HudElementStyle crosshair { 0.500f, 0.500f, 1.0f, 1.0f, { 0, 0, 0 }, 0, { 255, 92, 54 }, 220, { 255, 92, 54 }, 220 };
+    HudElementStyle debugFooter { 0.011f, 0.800f, 1.0f, 1.0f, { 5, 10, 18 }, 0, { 170, 210, 255 }, 0, { 230, 240, 255 }, 255 };
 };
 
 struct LoadingUiState {
@@ -251,8 +307,10 @@ struct UiState {
     bool mapUsedForZoom = false;
     bool zoomHeld = false;
     bool audioEnabled = true;
+    bool scaleHudWithUi = false;
     int mapZoomIndex = 2;
     float cameraFovDegrees = 82.0f;
+    float uiScale = 1.0f;
     float walkingMoveSpeed = kWalkingSpeedUnitsPerSecond;
     float mouseSensitivity = 1.0f;
     float masterVolume = 1.0f;
@@ -267,6 +325,7 @@ struct PauseState {
     PauseTab tab = PauseTab::Main;
     int selectedIndex = 0;
     SettingsSubTab settingsSubTab = SettingsSubTab::Graphics;
+    HudSubTab hudSubTab = HudSubTab::Info;
     CharacterSubTab charactersSubTab = CharacterSubTab::Plane;
     CharacterSubTab paintSubTab = CharacterSubTab::Plane;
     int controlsSelection = 0;
@@ -400,6 +459,8 @@ struct TerrainVisualCache {
     std::vector<TerrainFarTile> farTiles;
 };
 
+struct TerrainVisualStreamState;
+
 struct VisualPreferenceData {
     bool hasStoredPath = false;
     std::filesystem::path sourcePath {};
@@ -440,6 +501,7 @@ struct BootResources {
     std::vector<AssetEntry> assetCatalog;
     HudCanvas hudCanvas { 1280, 720 };
     std::filesystem::path preferencesPath {};
+    std::filesystem::path hudPreferencesPath {};
     bool preferencesDirty = false;
     float preferencesNextSaveAt = 0.0f;
 };
@@ -451,6 +513,7 @@ struct GamepadState {
     std::array<bool, static_cast<std::size_t>(SDL_GAMEPAD_BUTTON_COUNT)> buttons {};
     std::array<bool, static_cast<std::size_t>(SDL_GAMEPAD_BUTTON_COUNT)> previousButtons {};
     std::array<float, static_cast<std::size_t>(SDL_GAMEPAD_AXIS_COUNT)> axes {};
+    std::array<float, static_cast<std::size_t>(SDL_GAMEPAD_AXIS_COUNT)> previousAxes {};
     int verticalRepeatDirection = 0;
     float verticalRepeatAt = 0.0f;
     int horizontalRepeatDirection = 0;
@@ -464,6 +527,8 @@ struct GameSession {
     std::optional<WorldStore> worldStore;
     std::string terrainWorldId = "native_default";
     std::optional<TerrainChunkBakeCache> terrainChunkBakeCache;
+    std::shared_ptr<std::shared_mutex> terrainWorldMutex {};
+    std::shared_ptr<TerrainVisualStreamState> terrainStream {};
     TerrainVisualCache terrainCache {};
     TerrainFieldContext terrainContext {};
     std::mt19937 worldRng {};
@@ -482,6 +547,89 @@ struct GameSession {
     float foliageImpactPulse = 0.0f;
 };
 
+enum class HardwareTier {
+    Requirement = 0,
+    Suggested = 1
+};
+
+enum class RuntimePressureState {
+    Normal = 0,
+    Pressure = 1,
+    Critical = 2
+};
+
+struct SystemPressureSnapshot {
+    bool valid = false;
+    std::uint64_t totalPhysicalBytes = 0;
+    std::uint64_t availablePhysicalBytes = 0;
+    std::uint64_t totalCommitLimitBytes = 0;
+    std::uint64_t commitHeadroomBytes = 0;
+    std::uint64_t processWorkingSetBytes = 0;
+    std::uint64_t processPrivateBytes = 0;
+    std::uint64_t gpuLocalBudgetBytes = 0;
+    std::uint64_t gpuLocalUsageBytes = 0;
+    std::uint64_t gpuSharedBudgetBytes = 0;
+    std::uint64_t gpuSharedUsageBytes = 0;
+    std::string gpuAdapterName;
+    float sampledAtSeconds = 0.0f;
+};
+
+struct TerrainStreamStats {
+    int queuedCount = 0;
+    int inflightCount = 0;
+    int completedCount = 0;
+    std::uint64_t droppedRequestCount = 0;
+    std::uint64_t droppedResultCount = 0;
+    std::uint64_t adoptedResultCount = 0;
+    float lastFrameAdoptionTimeMs = 0.0f;
+};
+
+struct TerrainStreamBudgetOverrides {
+    int workerCount = -1;
+    int maxPendingChunks = -1;
+    int maxStaleChunks = -1;
+    int resultBudgetPerFrame = -1;
+    float resultBudgetTimeMs = -1.0f;
+    int nearMissingBudget = -1;
+    int midMissingBudget = -1;
+    int horizonMissingBudget = -1;
+    int upgradeBudget = -1;
+    bool allowMidBand = true;
+    bool allowHorizonBand = true;
+    bool allowUpgrades = true;
+};
+
+struct PerformanceGovernor {
+    HardwareTier hardwareTier = HardwareTier::Requirement;
+    RuntimePressureState pressureState = RuntimePressureState::Normal;
+    SystemPressureSnapshot lastSnapshot {};
+    float targetFrameMs = 8.3f;
+    float smoothedFrameMs = 8.3f;
+    float nextPressureSampleAt = 0.0f;
+    float lastQualityChangeAt = -1000.0f;
+    int qualityStep = 0;
+    float dynamicRenderScale = 1.0f;
+    float drawDistanceScale = 1.0f;
+    float shadowDistanceScale = 1.0f;
+    float shadowSoftnessScale = 1.0f;
+    float cloudDensityScale = 1.0f;
+    std::size_t residentMeshBudgetBytes = 0;
+    std::size_t sceneTextureBudgetBytes = 0;
+    std::size_t maxUploadBytes = std::numeric_limits<std::size_t>::max();
+    int terrainWorkerCount = 2;
+    int terrainMaxPendingChunks = 24;
+    int terrainMaxStaleChunks = 6;
+    int terrainResultBudgetPerFrame = 2;
+    float terrainResultBudgetTimeMs = 1.5f;
+    int nearMissingBudget = 8;
+    int midMissingBudget = 6;
+    int horizonMissingBudget = 4;
+    int upgradeBudget = 4;
+    bool allowMidBand = true;
+    bool allowHorizonBand = true;
+    bool allowUpgrades = true;
+};
+
 struct WalkingInputState {
     bool forward = false;
     bool backward = false;
@@ -495,12 +643,13 @@ struct WalkingInputState {
 
 constexpr int kTerrainSettingCount = 38;
 constexpr int kTerrainVisibleRows = 11;
-constexpr int kGraphicsSettingCount = 9;
+constexpr int kGraphicsSettingCount = 11;
 constexpr int kCameraSettingCount = 7;
 constexpr int kSoundSettingCount = 13;
 constexpr int kLightingSettingCount = 28;
 constexpr int kOnlineSettingCount = 5;
 constexpr int kHudSettingCount = 12;
+constexpr int kHudVisibleRows = 12;
 constexpr int kControlsVisibleRows = 10;
 constexpr int kSettingsVisibleRows = 13;
 constexpr int kCharacterAssetListStart = 13;
@@ -556,6 +705,7 @@ HudSettings defaultHudSettings();
 ControlProfile defaultControlProfile();
 void syncUiStateFromHud(UiState& uiState, const HudSettings& hudSettings);
 void syncHudFromUiState(HudSettings& hudSettings, const UiState& uiState);
+std::filesystem::path getHudPreferenceFilePath();
 std::string toLowerAscii(std::string value);
 int parseIntValue(const std::string& value, int fallback);
 const ControlActionBinding* findControlAction(const ControlProfile& profile, InputActionId actionId);
@@ -602,9 +752,15 @@ const char* paintRowLabel(int rowIndex);
 std::string formatPaintRowValue(int rowIndex, const PaintUiState& paintUi, const PlaneVisualState& visual);
 const char* paintRowHelpText(int rowIndex, const PlaneVisualState& visual);
 void adjustPaintRowValue(PaintUiState& paintUi, int rowIndex, int direction);
-void bindTerrainContextWorldStore(TerrainFieldContext& terrainContext, WorldStore* worldStore);
+void bindTerrainContextWorldStore(
+    TerrainFieldContext& terrainContext,
+    WorldStore* worldStore,
+    std::shared_ptr<std::shared_mutex> worldStoreMutex = {});
+void resetTerrainVisualStreamState(TerrainVisualStreamState* streamState);
 Quat composeWalkingRotation(float yaw, float pitch);
 void syncWalkingLookFromRotation(const Quat& rotation, float& walkYaw, float& walkPitch);
+const char* hudSubTabLabel(HudSubTab subTab);
+int hudSubTabItemCount(HudSubTab subTab);
 void clearMenuConfirmation(PauseState& pauseState);
 void requestMenuConfirmation(PauseState& pauseState, int selectedIndex, std::string confirmText, float nowSeconds, float duration = 2.8f);
 void refreshMenuConfirmation(PauseState& pauseState, float nowSeconds);
@@ -616,6 +772,7 @@ bool eraseMenuPromptText(PauseState& pauseState, bool backspace);
 void moveMenuPromptCursor(PauseState& pauseState, int delta);
 bool clearSelectedControlBindingSlot(PauseState& pauseState, ControlProfile& controls);
 int maxMenuHelpScroll(const PauseLayout& layout);
+std::string formatFixed(float value, int precision);
 void applyWalkingMouseInput(
     UiState& uiState,
     const ControlProfile& controls,
@@ -662,6 +819,7 @@ void syncUiStateFromHud(UiState& uiState, const HudSettings& hudSettings)
     uiState.showControlIndicator = hudSettings.showControls;
     uiState.showMap = hudSettings.showMap;
     uiState.showGeoInfo = hudSettings.showGeoInfo;
+    uiState.showCrosshair = hudSettings.showCrosshair;
 }
 
 void syncHudFromUiState(HudSettings& hudSettings, const UiState& uiState)
@@ -671,6 +829,17 @@ void syncHudFromUiState(HudSettings& hudSettings, const UiState& uiState)
     hudSettings.showControls = uiState.showControlIndicator;
     hudSettings.showMap = uiState.showMap;
     hudSettings.showGeoInfo = uiState.showGeoInfo;
+    hudSettings.showCrosshair = uiState.showCrosshair;
+}
+
+float clampUiScaleValue(float uiScale)
+{
+    return std::round(clamp(uiScale, 1.0f, 10.0f) / kUiScaleStep) * kUiScaleStep;
+}
+
+float effectiveUiScale(const UiState& uiState)
+{
+    return clampUiScaleValue(uiState.uiScale);
 }
 
 SDL_Keymod normalizeBindingModifiers(SDL_Keymod modifiers)
@@ -1118,6 +1287,16 @@ HudColor makeHudColor(const Vec4& color)
     };
 }
 
+HudColor makeHudColor(const HudRgbColor& color, int alpha = 255)
+{
+    return {
+        static_cast<std::uint8_t>(std::clamp(color.r, 0, 255)),
+        static_cast<std::uint8_t>(std::clamp(color.g, 0, 255)),
+        static_cast<std::uint8_t>(std::clamp(color.b, 0, 255)),
+        static_cast<std::uint8_t>(std::clamp(alpha, 0, 255))
+    };
+}
+
 std::filesystem::path findAssetPath(const std::string& relativePath)
 {
     std::vector<std::filesystem::path> roots;
@@ -1250,9 +1429,18 @@ float gamepadAxisValue(const GamepadState& gamepad, SDL_GamepadAxis axis)
     return index < gamepad.axes.size() ? gamepad.axes[index] : 0.0f;
 }
 
+bool gamepadAxisPressed(const GamepadState& gamepad, SDL_GamepadAxis axis, float threshold)
+{
+    const std::size_t index = static_cast<std::size_t>(axis);
+    return index < gamepad.axes.size() &&
+        gamepad.axes[index] >= threshold &&
+        gamepad.previousAxes[index] < threshold;
+}
+
 void pollGamepadState(GamepadState& gamepad)
 {
     gamepad.previousButtons = gamepad.buttons;
+    gamepad.previousAxes = gamepad.axes;
     std::fill(gamepad.buttons.begin(), gamepad.buttons.end(), false);
     std::fill(gamepad.axes.begin(), gamepad.axes.end(), 0.0f);
 
@@ -1364,24 +1552,27 @@ void applyFlightGamepadLook(
         kGamepadFlightLookPitchLimitRadians);
 }
 
-void invalidateTerrainCache(TerrainVisualCache& terrainCache)
+void invalidateTerrainCache(TerrainVisualCache& terrainCache, TerrainVisualStreamState* streamState = nullptr)
 {
     terrainCache.valid = false;
     terrainCache.nearTiles.clear();
     terrainCache.farTiles.clear();
+    resetTerrainVisualStreamState(streamState);
 }
 
 void refreshTerrainContext(
     TerrainParams& terrainParams,
     TerrainFieldContext& terrainContext,
     TerrainVisualCache& terrainCache,
-    WorldStore* worldStore = nullptr)
+    WorldStore* worldStore = nullptr,
+    std::shared_ptr<std::shared_mutex> worldStoreMutex = {},
+    TerrainVisualStreamState* streamState = nullptr)
 {
     terrainParams = normalizeTerrainParams(terrainParams);
     terrainContext = createTerrainFieldContext(terrainParams);
-    bindTerrainContextWorldStore(terrainContext, worldStore);
+    bindTerrainContextWorldStore(terrainContext, worldStore, std::move(worldStoreMutex));
     terrainParams = terrainContext.params;
-    invalidateTerrainCache(terrainCache);
+    invalidateTerrainCache(terrainCache, streamState);
 }
 
 void keepPlaneAboveTerrain(FlightState& plane, const TerrainFieldContext& terrainContext, float clearance = 6.0f)
@@ -1397,9 +1588,11 @@ void applyTerrainRuntimeChange(
     TerrainFieldContext& terrainContext,
     TerrainVisualCache& terrainCache,
     FlightState& plane,
-    WorldStore* worldStore = nullptr)
+    WorldStore* worldStore = nullptr,
+    std::shared_ptr<std::shared_mutex> worldStoreMutex = {},
+    TerrainVisualStreamState* streamState = nullptr)
 {
-    refreshTerrainContext(terrainParams, terrainContext, terrainCache, worldStore);
+    refreshTerrainContext(terrainParams, terrainContext, terrainCache, worldStore, std::move(worldStoreMutex), streamState);
     keepPlaneAboveTerrain(plane, terrainContext);
 }
 
@@ -1409,6 +1602,8 @@ bool applyLocalizedTerrainCrater(
     TerrainVisualCache& terrainCache,
     FlightState& plane,
     WorldStore* worldStore,
+    std::shared_ptr<std::shared_mutex> worldStoreMutex,
+    TerrainVisualStreamState* streamState,
     float radius,
     float depth,
     float rim)
@@ -1425,13 +1620,18 @@ bool applyLocalizedTerrainCrater(
         depth,
         rim
     };
+    std::unique_lock<std::shared_mutex> worldWriteLock;
+    if (worldStoreMutex) {
+        worldWriteLock = std::unique_lock<std::shared_mutex>(*worldStoreMutex);
+    }
     const auto craterResult = worldStore->applyCrater(crater);
     if (!craterResult.first) {
         return false;
     }
 
     worldStore->flushDirty(nullptr);
-    refreshTerrainContext(terrainParams, terrainContext, terrainCache, worldStore);
+    worldWriteLock.unlock();
+    refreshTerrainContext(terrainParams, terrainContext, terrainCache, worldStore, std::move(worldStoreMutex), streamState);
     keepPlaneAboveTerrain(plane, terrainContext);
     return true;
 }
@@ -2128,6 +2328,25 @@ CompiledTerrainChunk loadOrBuildTerrainChunk(
     const std::optional<TerrainChunkBakeCache>& bakeCache,
     const TerrainFieldContext& terrainContext)
 {
+    struct TerrainChunkBuildPlan {
+        bool buildVolumetricGround = false;
+        bool buildWater = true;
+        bool buildDecoration = false;
+    };
+
+    const auto buildPlanForRequest = [](TerrainFarTileBand tileBand, TerrainFarTileDetail detail) {
+        TerrainChunkBuildPlan plan;
+        if (tileBand == TerrainFarTileBand::Near) {
+            plan.buildVolumetricGround = detail == TerrainFarTileDetail::Lod0;
+            plan.buildDecoration = detail == TerrainFarTileDetail::Lod0;
+        } else if (tileBand == TerrainFarTileBand::Mid) {
+            plan.buildDecoration = detail == TerrainFarTileDetail::Lod1;
+        }
+        return plan;
+    };
+
+    const TerrainFarTileDetail detail = static_cast<TerrainFarTileDetail>(key.detail);
+    const TerrainChunkBuildPlan buildPlan = buildPlanForRequest(band, detail);
     if (bakeCache.has_value()) {
         CompiledTerrainChunk cachedChunk;
         if (bakeCache->load(key, cachedChunk)) {
@@ -2142,7 +2361,7 @@ CompiledTerrainChunk loadOrBuildTerrainChunk(
     chunk.key = key;
     chunk.sourceData = buildTerrainChunkSourceData(key, bounds, cellSize, terrainContext);
 
-    if (band == TerrainFarTileBand::Near && !terrainContext.params.surfaceOnlyMeshing) {
+    if (buildPlan.buildVolumetricGround && !terrainContext.params.surfaceOnlyMeshing) {
         const float overlap = cellSize;
         const TerrainVolumeBounds tileVolume {
             bounds.x0 - overlap,
@@ -2161,11 +2380,15 @@ CompiledTerrainChunk loadOrBuildTerrainChunk(
         chunk.terrainModel = buildSurfaceTerrainPatch(tileContext, bounds, cellSize);
     }
 
-    appendTerrainWater(chunk.waterModel, terrainContext, bounds, std::max(cellSize, terrainContext.params.lod1CellSize));
-    configureTerrainWaterMaterial(chunk.waterModel);
-    TerrainTileDecorationResult decoration = buildTerrainTileDecoration(key, bounds, band, terrainContext);
-    chunk.propModel = std::move(decoration.propModel);
-    chunk.propColliders = std::move(decoration.propColliders);
+    if (buildPlan.buildWater) {
+        appendTerrainWater(chunk.waterModel, terrainContext, bounds, std::max(cellSize, terrainContext.params.lod1CellSize));
+        configureTerrainWaterMaterial(chunk.waterModel);
+    }
+    if (buildPlan.buildDecoration) {
+        TerrainTileDecorationResult decoration = buildTerrainTileDecoration(key, bounds, band, terrainContext);
+        chunk.propModel = std::move(decoration.propModel);
+        chunk.propColliders = std::move(decoration.propColliders);
+    }
     chunk.terrainModel.assetKey = terrainChunkAssetKey(key, "ground");
     chunk.waterModel.assetKey = terrainChunkAssetKey(key, "water");
     chunk.propModel.assetKey = terrainChunkAssetKey(key, "props");
@@ -2437,19 +2660,31 @@ float terrainTilePriorityBias(TerrainFarTileBand band)
     }
 }
 
+float terrainTileSizeForBand(const TerrainParams& params, TerrainFarTileBand band)
+{
+    switch (band) {
+    case TerrainFarTileBand::Near:
+        return computeLod0TerrainTileSize(params);
+    case TerrainFarTileBand::Mid:
+        return computeLod1TerrainTileSize(params);
+    case TerrainFarTileBand::Horizon:
+    default:
+        return computeLod2TerrainTileSize(params);
+    }
+}
+
 CompiledTerrainChunk buildTerrainTileChunk(
     TerrainFarTileBand band,
     TerrainFarTileDetail detail,
     int tileX,
     int tileZ,
-    const TerrainVisualCache& terrainCache,
     const TerrainFieldContext& terrainContext,
     const std::optional<TerrainChunkBakeCache>& bakeCache,
     std::string_view terrainWorldId,
     std::uint64_t paramsSignature,
     std::uint64_t sourceSignature)
 {
-    const float tileSize = terrainTileSizeForBand(terrainCache, band);
+    const float tileSize = terrainTileSizeForBand(terrainContext.params, band);
     const float tileMinX = static_cast<float>(tileX) * tileSize;
     const float tileMinZ = static_cast<float>(tileZ) * tileSize;
     const float cellSize = terrainCellSizeForDetail(terrainContext, detail);
@@ -2498,15 +2733,544 @@ struct TerrainTileRequest {
     float priority = 0.0f;
 };
 
+TerrainFarTileDetail initialTerrainTileDetailForBand(TerrainFarTileBand band)
+{
+    switch (band) {
+    case TerrainFarTileBand::Near:
+    case TerrainFarTileBand::Mid:
+    case TerrainFarTileBand::Horizon:
+    default:
+        return TerrainFarTileDetail::Lod2;
+    }
+}
+
+std::optional<TerrainFarTileDetail> nextTerrainTileDetail(TerrainFarTileBand band, TerrainFarTileDetail detail)
+{
+    switch (band) {
+    case TerrainFarTileBand::Near:
+        if (detail == TerrainFarTileDetail::Lod2) {
+            return TerrainFarTileDetail::Lod1;
+        }
+        if (detail == TerrainFarTileDetail::Lod1) {
+            return TerrainFarTileDetail::Lod0;
+        }
+        return std::nullopt;
+    case TerrainFarTileBand::Mid:
+        if (detail == TerrainFarTileDetail::Lod2) {
+            return TerrainFarTileDetail::Lod1;
+        }
+        return std::nullopt;
+    case TerrainFarTileBand::Horizon:
+    default:
+        return std::nullopt;
+    }
+}
+
+int terrainTileDetailRank(TerrainFarTileDetail detail)
+{
+    switch (detail) {
+    case TerrainFarTileDetail::Lod0:
+        return 0;
+    case TerrainFarTileDetail::Lod1:
+        return 1;
+    case TerrainFarTileDetail::Lod2:
+    default:
+        return 2;
+    }
+}
+
+std::string terrainTileIdentityKey(TerrainFarTileBand band, int tileX, int tileZ)
+{
+    return std::to_string(static_cast<int>(band)) + "|" + std::to_string(tileX) + "|" + std::to_string(tileZ);
+}
+
+std::string terrainTileRequestKey(const TerrainTileRequest& request)
+{
+    return std::to_string(static_cast<int>(request.band)) + "|" +
+        std::to_string(static_cast<int>(request.detail)) + "|" +
+        std::to_string(request.tileX) + "|" +
+        std::to_string(request.tileZ) + "|" +
+        std::to_string(request.paramsSignature) + "|" +
+        std::to_string(request.sourceSignature);
+}
+
+bool terrainTileRequestsEquivalent(const TerrainTileRequest& lhs, const TerrainTileRequest& rhs)
+{
+    return lhs.band == rhs.band &&
+        lhs.detail == rhs.detail &&
+        lhs.tileX == rhs.tileX &&
+        lhs.tileZ == rhs.tileZ &&
+        lhs.paramsSignature == rhs.paramsSignature &&
+        lhs.sourceSignature == rhs.sourceSignature;
+}
+
+struct TerrainChunkBuildRequest {
+    TerrainTileRequest request {};
+    std::shared_ptr<const struct TerrainStreamGenerationSnapshot> generationContext {};
+    std::uint64_t generation = 0u;
+};
+
+struct TerrainChunkBuildResult {
+    TerrainTileRequest request {};
+    CompiledTerrainChunk compiledChunk {};
+    std::uint64_t generation = 0u;
+};
+
+struct TerrainStreamGenerationSnapshot {
+    TerrainFieldContext terrainContext {};
+    std::optional<TerrainChunkBakeCache> bakeCache;
+    std::string terrainWorldId;
+    std::uint64_t generation = 0u;
+};
+
+struct TerrainVisualStreamState {
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool stopRequested = false;
+    int workerCount = 0;
+    int maxPendingRequests = 0;
+    int maxCompletedResults = 0;
+    std::uint64_t generation = 1u;
+    std::vector<std::thread> workers;
+    std::deque<TerrainChunkBuildRequest> queuedRequests;
+    std::deque<TerrainChunkBuildResult> completedResults;
+    std::map<std::string, TerrainTileRequest> desiredRequests;
+    std::map<std::string, std::string> queuedRequestKeys;
+    std::map<std::string, std::string> inflightRequestKeys;
+    std::shared_ptr<const TerrainStreamGenerationSnapshot> activeGenerationContext {};
+    TerrainStreamStats stats {};
+
+    ~TerrainVisualStreamState()
+    {
+        shutdown();
+    }
+
+    void shutdown()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopRequested = true;
+            queuedRequests.clear();
+            completedResults.clear();
+            desiredRequests.clear();
+            queuedRequestKeys.clear();
+            inflightRequestKeys.clear();
+            activeGenerationContext.reset();
+        }
+        condition.notify_all();
+        for (std::thread& worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+        workers.clear();
+        stopRequested = false;
+        workerCount = 0;
+    }
+};
+
+int terrainBandPriorityRank(TerrainFarTileBand band)
+{
+    switch (band) {
+    case TerrainFarTileBand::Near:
+        return 0;
+    case TerrainFarTileBand::Mid:
+        return 1;
+    case TerrainFarTileBand::Horizon:
+    default:
+        return 2;
+    }
+}
+
+bool terrainStreamRequestMoreValuable(const TerrainTileRequest& lhs, const TerrainTileRequest& rhs)
+{
+    const auto lhsKey = std::tuple {
+        terrainBandPriorityRank(lhs.band),
+        terrainTileDetailRank(lhs.detail),
+        lhs.priority
+    };
+    const auto rhsKey = std::tuple {
+        terrainBandPriorityRank(rhs.band),
+        terrainTileDetailRank(rhs.detail),
+        rhs.priority
+    };
+    return lhsKey < rhsKey;
+}
+
+std::size_t terrainStreamOutstandingCountLocked(const TerrainVisualStreamState& state)
+{
+    return state.queuedRequests.size() + state.inflightRequestKeys.size() + state.completedResults.size();
+}
+
+void updateTerrainStreamStatsLocked(TerrainVisualStreamState& state)
+{
+    state.stats.queuedCount = static_cast<int>(state.queuedRequests.size());
+    state.stats.inflightCount = static_cast<int>(state.inflightRequestKeys.size());
+    state.stats.completedCount = static_cast<int>(state.completedResults.size());
+}
+
+bool terrainStreamRequestIsDesiredLocked(
+    const TerrainVisualStreamState& state,
+    const TerrainTileRequest& request,
+    std::uint64_t generation)
+{
+    if (generation != state.generation) {
+        return false;
+    }
+    const auto desiredIt = state.desiredRequests.find(terrainTileIdentityKey(request.band, request.tileX, request.tileZ));
+    return desiredIt != state.desiredRequests.end() && terrainTileRequestsEquivalent(desiredIt->second, request);
+}
+
+void dropTerrainQueuedRequestAtLocked(TerrainVisualStreamState& state, std::size_t index)
+{
+    const TerrainChunkBuildRequest& droppedRequest = state.queuedRequests[index];
+    state.queuedRequestKeys.erase(terrainTileRequestKey(droppedRequest.request));
+    state.queuedRequests.erase(state.queuedRequests.begin() + static_cast<std::ptrdiff_t>(index));
+    state.stats.droppedRequestCount += 1u;
+}
+
+void dropTerrainCompletedResultAtLocked(TerrainVisualStreamState& state, std::size_t index)
+{
+    state.completedResults.erase(state.completedResults.begin() + static_cast<std::ptrdiff_t>(index));
+    state.stats.droppedResultCount += 1u;
+}
+
+std::size_t findWorstTerrainCompletedResultIndexLocked(const TerrainVisualStreamState& state)
+{
+    std::size_t worstIndex = 0;
+    for (std::size_t index = 1; index < state.completedResults.size(); ++index) {
+        if (terrainStreamRequestMoreValuable(state.completedResults[worstIndex].request, state.completedResults[index].request)) {
+            worstIndex = index;
+        }
+    }
+    return worstIndex;
+}
+
+void trimTerrainStreamBacklogLocked(TerrainVisualStreamState& state)
+{
+    state.completedResults.erase(
+        std::remove_if(
+            state.completedResults.begin(),
+            state.completedResults.end(),
+            [&](const TerrainChunkBuildResult& result) {
+                return !terrainStreamRequestIsDesiredLocked(state, result.request, result.generation);
+            }),
+        state.completedResults.end());
+
+    state.queuedRequests.erase(
+        std::remove_if(
+            state.queuedRequests.begin(),
+            state.queuedRequests.end(),
+            [&](const TerrainChunkBuildRequest& request) {
+                if (terrainStreamRequestIsDesiredLocked(state, request.request, request.generation)) {
+                    return false;
+                }
+                state.queuedRequestKeys.erase(terrainTileRequestKey(request.request));
+                state.stats.droppedRequestCount += 1u;
+                return true;
+            }),
+        state.queuedRequests.end());
+
+    std::sort(
+        state.queuedRequests.begin(),
+        state.queuedRequests.end(),
+        [](const TerrainChunkBuildRequest& lhs, const TerrainChunkBuildRequest& rhs) {
+            return terrainStreamRequestMoreValuable(lhs.request, rhs.request);
+        });
+
+    while (state.maxCompletedResults > 0 && static_cast<int>(state.completedResults.size()) > state.maxCompletedResults) {
+        dropTerrainCompletedResultAtLocked(state, findWorstTerrainCompletedResultIndexLocked(state));
+    }
+
+    while (state.maxPendingRequests > 0 && static_cast<int>(terrainStreamOutstandingCountLocked(state)) > state.maxPendingRequests) {
+        if (!state.queuedRequests.empty()) {
+            dropTerrainQueuedRequestAtLocked(state, state.queuedRequests.size() - 1u);
+            continue;
+        }
+        if (!state.completedResults.empty()) {
+            dropTerrainCompletedResultAtLocked(state, findWorstTerrainCompletedResultIndexLocked(state));
+            continue;
+        }
+        break;
+    }
+    updateTerrainStreamStatsLocked(state);
+}
+
+void terrainStreamWorkerLoop(TerrainVisualStreamState& state)
+{
+    for (;;) {
+        TerrainChunkBuildRequest request;
+        std::string requestKey;
+        {
+            std::unique_lock<std::mutex> lock(state.mutex);
+            state.condition.wait(lock, [&state] {
+                return state.stopRequested || !state.queuedRequests.empty();
+            });
+            if (state.stopRequested) {
+                return;
+            }
+
+            bool foundRequest = false;
+            while (!state.queuedRequests.empty()) {
+                request = std::move(state.queuedRequests.front());
+                state.queuedRequests.pop_front();
+                requestKey = terrainTileRequestKey(request.request);
+                state.queuedRequestKeys.erase(requestKey);
+                if (!terrainStreamRequestIsDesiredLocked(state, request.request, request.generation) ||
+                    request.generationContext == nullptr) {
+                    continue;
+                }
+
+                state.inflightRequestKeys[terrainTileIdentityKey(request.request.band, request.request.tileX, request.request.tileZ)] = requestKey;
+                updateTerrainStreamStatsLocked(state);
+                foundRequest = true;
+                break;
+            }
+
+            if (!foundRequest) {
+                continue;
+            }
+        }
+
+        CompiledTerrainChunk compiledChunk = buildTerrainTileChunk(
+            request.request.band,
+            request.request.detail,
+            request.request.tileX,
+            request.request.tileZ,
+            request.generationContext->terrainContext,
+            request.generationContext->bakeCache,
+            request.generationContext->terrainWorldId,
+            request.request.paramsSignature,
+            request.request.sourceSignature);
+
+        {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            const std::string identityKey = terrainTileIdentityKey(request.request.band, request.request.tileX, request.request.tileZ);
+            const auto inflightIt = state.inflightRequestKeys.find(identityKey);
+            if (inflightIt != state.inflightRequestKeys.end() && inflightIt->second == requestKey) {
+                state.inflightRequestKeys.erase(inflightIt);
+            }
+            if (terrainStreamRequestIsDesiredLocked(state, request.request, request.generation)) {
+                const auto existingIt = std::find_if(
+                    state.completedResults.begin(),
+                    state.completedResults.end(),
+                    [&](const TerrainChunkBuildResult& existing) {
+                        return terrainTileIdentityKey(existing.request.band, existing.request.tileX, existing.request.tileZ) == identityKey;
+                    });
+                if (existingIt != state.completedResults.end()) {
+                    if (terrainStreamRequestMoreValuable(request.request, existingIt->request)) {
+                        state.completedResults.erase(existingIt);
+                        state.stats.droppedResultCount += 1u;
+                    } else {
+                        updateTerrainStreamStatsLocked(state);
+                        continue;
+                    }
+                }
+
+                if (state.maxCompletedResults > 0 && static_cast<int>(state.completedResults.size()) >= state.maxCompletedResults) {
+                    const std::size_t worstIndex = findWorstTerrainCompletedResultIndexLocked(state);
+                    if (terrainStreamRequestMoreValuable(request.request, state.completedResults[worstIndex].request)) {
+                        dropTerrainCompletedResultAtLocked(state, worstIndex);
+                    } else {
+                        updateTerrainStreamStatsLocked(state);
+                        continue;
+                    }
+                }
+
+                state.completedResults.push_back({ request.request, std::move(compiledChunk), request.generation });
+                trimTerrainStreamBacklogLocked(state);
+            }
+            updateTerrainStreamStatsLocked(state);
+        }
+    }
+}
+
+void synchronizeTerrainStreamWorkers(TerrainVisualStreamState& state, int requestedWorkerCount)
+{
+    const int workerCount = std::clamp(requestedWorkerCount, 1, 6);
+    if (state.workerCount == workerCount && static_cast<int>(state.workers.size()) == workerCount) {
+        return;
+    }
+
+    state.shutdown();
+    state.workerCount = workerCount;
+    for (int workerIndex = 0; workerIndex < workerCount; ++workerIndex) {
+        state.workers.emplace_back([&state] {
+            terrainStreamWorkerLoop(state);
+        });
+    }
+}
+
+void resetTerrainVisualStreamState(TerrainVisualStreamState* streamState)
+{
+    if (streamState == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(streamState->mutex);
+    streamState->queuedRequests.clear();
+    streamState->completedResults.clear();
+    streamState->desiredRequests.clear();
+    streamState->queuedRequestKeys.clear();
+    streamState->inflightRequestKeys.clear();
+    streamState->activeGenerationContext.reset();
+    streamState->generation += 1u;
+    streamState->stats = {};
+    updateTerrainStreamStatsLocked(*streamState);
+}
+
+void enqueueTerrainTileRequests(
+    TerrainVisualStreamState& streamState,
+    const std::vector<TerrainTileRequest>& missingRequests,
+    const std::vector<TerrainTileRequest>& upgradeRequests,
+    int missingBudget,
+    int upgradeBudget,
+    int maxPendingRequests,
+    int maxCompletedResults,
+    const TerrainFieldContext& terrainContext,
+    const std::optional<TerrainChunkBakeCache>& bakeCache,
+    std::string_view terrainWorldId)
+{
+    std::lock_guard<std::mutex> lock(streamState.mutex);
+    streamState.maxPendingRequests = maxPendingRequests;
+    streamState.maxCompletedResults = maxCompletedResults;
+    streamState.desiredRequests.clear();
+    if (!streamState.activeGenerationContext || streamState.activeGenerationContext->generation != streamState.generation) {
+        auto generationContext = std::make_shared<TerrainStreamGenerationSnapshot>();
+        generationContext->terrainContext = terrainContext;
+        generationContext->bakeCache = bakeCache;
+        generationContext->terrainWorldId = terrainWorldId.empty() ? std::string("default") : std::string(terrainWorldId);
+        generationContext->generation = streamState.generation;
+        streamState.activeGenerationContext = std::move(generationContext);
+    }
+
+    const auto recordDesiredRequest = [&](const TerrainTileRequest& request) {
+        streamState.desiredRequests[terrainTileIdentityKey(request.band, request.tileX, request.tileZ)] = request;
+    };
+    for (const TerrainTileRequest& request : missingRequests) {
+        recordDesiredRequest(request);
+    }
+    for (const TerrainTileRequest& request : upgradeRequests) {
+        recordDesiredRequest(request);
+    }
+
+    const auto queueRequest = [&](const TerrainTileRequest& request) {
+        const std::string requestKey = terrainTileRequestKey(request);
+        if (streamState.queuedRequestKeys.find(requestKey) != streamState.queuedRequestKeys.end()) {
+            return;
+        }
+
+        const std::string identityKey = terrainTileIdentityKey(request.band, request.tileX, request.tileZ);
+        const auto queuedIt = std::find_if(
+            streamState.queuedRequests.begin(),
+            streamState.queuedRequests.end(),
+            [&](const TerrainChunkBuildRequest& queued) {
+                return terrainTileIdentityKey(queued.request.band, queued.request.tileX, queued.request.tileZ) == identityKey;
+            });
+        if (queuedIt != streamState.queuedRequests.end()) {
+            return;
+        }
+        const auto inflightIt = streamState.inflightRequestKeys.find(identityKey);
+        if (inflightIt != streamState.inflightRequestKeys.end()) {
+            return;
+        }
+
+        TerrainChunkBuildRequest buildRequest;
+        buildRequest.request = request;
+        buildRequest.generationContext = streamState.activeGenerationContext;
+        buildRequest.generation = streamState.generation;
+        streamState.queuedRequests.push_back(std::move(buildRequest));
+        streamState.queuedRequestKeys[requestKey] = identityKey;
+    };
+
+    for (int index = 0; index < std::min<int>(static_cast<int>(missingRequests.size()), missingBudget); ++index) {
+        queueRequest(missingRequests[static_cast<std::size_t>(index)]);
+    }
+    for (int index = 0; index < std::min<int>(static_cast<int>(upgradeRequests.size()), upgradeBudget); ++index) {
+        queueRequest(upgradeRequests[static_cast<std::size_t>(index)]);
+    }
+
+    trimTerrainStreamBacklogLocked(streamState);
+    streamState.condition.notify_all();
+}
+
+bool shouldApplyTerrainChunkResult(
+    const TerrainFarTile* existingTile,
+    const TerrainTileRequest& request)
+{
+    if (existingTile == nullptr) {
+        return true;
+    }
+    if (existingTile->paramsSignature != request.paramsSignature ||
+        existingTile->sourceSignature != request.sourceSignature) {
+        return true;
+    }
+    return terrainTileDetailRank(request.detail) <= terrainTileDetailRank(existingTile->detail);
+}
+
+void applyTerrainChunkResult(TerrainVisualCache& terrainCache, TerrainChunkBuildResult&& result)
+{
+    std::vector<TerrainFarTile>& tileList =
+        result.request.band == TerrainFarTileBand::Near ? terrainCache.nearTiles : terrainCache.farTiles;
+    TerrainFarTile* existingTile = findTerrainTile(tileList, result.request.band, result.request.tileX, result.request.tileZ);
+    if (!shouldApplyTerrainChunkResult(existingTile, result.request)) {
+        return;
+    }
+
+    if (existingTile == nullptr) {
+        TerrainFarTile tile;
+        tile.band = result.request.band;
+        tile.detail = result.request.detail;
+        tile.tileX = result.request.tileX;
+        tile.tileZ = result.request.tileZ;
+        tile.paramsSignature = result.request.paramsSignature;
+        tile.sourceSignature = result.request.sourceSignature;
+        tile.terrainModel = std::move(result.compiledChunk.terrainModel);
+        tile.waterModel = std::move(result.compiledChunk.waterModel);
+        tile.propModel = std::move(result.compiledChunk.propModel);
+        tile.propColliders = std::move(result.compiledChunk.propColliders);
+        tileList.push_back(std::move(tile));
+        return;
+    }
+
+    existingTile->detail = result.request.detail;
+    existingTile->paramsSignature = result.request.paramsSignature;
+    existingTile->sourceSignature = result.request.sourceSignature;
+    existingTile->terrainModel = std::move(result.compiledChunk.terrainModel);
+    existingTile->waterModel = std::move(result.compiledChunk.waterModel);
+    existingTile->propModel = std::move(result.compiledChunk.propModel);
+    existingTile->propColliders = std::move(result.compiledChunk.propColliders);
+}
+
 const TerrainVisualCache& ensureTerrainVisualCache(
     TerrainVisualCache& terrainCache,
     const Vec3& center,
     const Vec3& velocity,
     const TerrainFieldContext& terrainContext,
     const std::optional<TerrainChunkBakeCache>& bakeCache,
-    std::string_view terrainWorldId)
+    std::string_view terrainWorldId,
+    TerrainVisualStreamState* streamState = nullptr,
+    const TerrainStreamBudgetOverrides* budgetOverrides = nullptr)
 {
     const TerrainParams& params = terrainContext.params;
+    const int workerCount = budgetOverrides != nullptr && budgetOverrides->workerCount > 0
+        ? budgetOverrides->workerCount
+        : params.workerMaxInflight;
+    const int maxPendingChunks = budgetOverrides != nullptr && budgetOverrides->maxPendingChunks > 0
+        ? budgetOverrides->maxPendingChunks
+        : params.maxPendingChunks;
+    const int maxStaleChunks = budgetOverrides != nullptr && budgetOverrides->maxStaleChunks > 0
+        ? budgetOverrides->maxStaleChunks
+        : params.maxStaleChunks;
+    const int resultBudgetPerFrame = budgetOverrides != nullptr && budgetOverrides->resultBudgetPerFrame > 0
+        ? budgetOverrides->resultBudgetPerFrame
+        : params.workerResultBudgetPerFrame;
+    const float resultBudgetTimeMs = budgetOverrides != nullptr && budgetOverrides->resultBudgetTimeMs > 0.0f
+        ? budgetOverrides->resultBudgetTimeMs
+        : params.workerResultTimeBudgetMs;
+    const bool allowMidBand = budgetOverrides == nullptr || budgetOverrides->allowMidBand;
+    const bool allowHorizonBand = budgetOverrides == nullptr || budgetOverrides->allowHorizonBand;
+    const bool allowUpgrades = budgetOverrides == nullptr || budgetOverrides->allowUpgrades;
     const std::uint64_t paramsSignature = terrainParamsSignature(params);
     const float lod0TileSize = computeLod0TerrainTileSize(params);
     const float lod1TileSize = computeLod1TerrainTileSize(params);
@@ -2544,6 +3308,7 @@ const TerrainVisualCache& ensureTerrainVisualCache(
     if (paramsChanged) {
         terrainCache.nearTiles.clear();
         terrainCache.farTiles.clear();
+        resetTerrainVisualStreamState(streamState);
     }
 
     terrainCache.valid = true;
@@ -2558,6 +3323,14 @@ const TerrainVisualCache& ensureTerrainVisualCache(
     terrainCache.lod1TileSize = lod1TileSize;
     terrainCache.lod2TileSize = lod2TileSize;
     terrainCache.paramsSnapshot = params;
+
+    if (streamState != nullptr) {
+        if (params.threadedMeshing) {
+            synchronizeTerrainStreamWorkers(*streamState, workerCount);
+        } else if (streamState->workerCount > 0) {
+            streamState->shutdown();
+        }
+    }
 
     for (TerrainFarTile& tile : terrainCache.nearTiles) {
         tile.active = false;
@@ -2582,18 +3355,57 @@ const TerrainVisualCache& ensureTerrainVisualCache(
     std::vector<TerrainTileRequest> missingTiles;
     std::vector<TerrainTileRequest> upgradeTiles;
 
+    if (streamState != nullptr && params.threadedMeshing) {
+        const auto resultBudgetStart = std::chrono::steady_clock::now();
+        const auto resultBudget = std::max(1, resultBudgetPerFrame);
+        const auto resultBudgetDuration = std::chrono::duration<float, std::milli>(std::max(0.25f, resultBudgetTimeMs));
+        int adoptedResults = 0;
+        while (adoptedResults < resultBudget) {
+            if (std::chrono::steady_clock::now() - resultBudgetStart >= resultBudgetDuration) {
+                break;
+            }
+
+            TerrainChunkBuildResult result;
+            {
+                std::lock_guard<std::mutex> lock(streamState->mutex);
+                if (streamState->completedResults.empty()) {
+                    break;
+                }
+                result = std::move(streamState->completedResults.front());
+                streamState->completedResults.pop_front();
+                updateTerrainStreamStatsLocked(*streamState);
+            }
+
+            if (result.generation != streamState->generation) {
+                continue;
+            }
+            if (result.request.paramsSignature != paramsSignature) {
+                continue;
+            }
+            if (result.request.sourceSignature != tileSourceSignature(result.request.band, result.request.tileX, result.request.tileZ)) {
+                continue;
+            }
+
+            applyTerrainChunkResult(terrainCache, std::move(result));
+            ++adoptedResults;
+        }
+
+        std::lock_guard<std::mutex> lock(streamState->mutex);
+        streamState->stats.adoptedResultCount += static_cast<std::uint64_t>(adoptedResults);
+        streamState->stats.lastFrameAdoptionTimeMs =
+            std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - resultBudgetStart).count();
+    }
+
     for (int tileZ = tileIndexBegin(nearZ0, lod0TileSize); tileZ < tileIndexEnd(nearZ1, lod0TileSize); ++tileZ) {
         for (int tileX = tileIndexBegin(nearX0, lod0TileSize); tileX < tileIndexEnd(nearX1, lod0TileSize); ++tileX) {
             const std::uint64_t sourceSignature = tileSourceSignature(TerrainFarTileBand::Near, tileX, tileZ);
             TerrainFarTile* tile = findTerrainTile(terrainCache.nearTiles, TerrainFarTileBand::Near, tileX, tileZ);
             if (tile != nullptr) {
                 tile->active = true;
-                if (tile->detail != TerrainFarTileDetail::Lod0 ||
-                    tile->paramsSignature != paramsSignature ||
-                    tile->sourceSignature != sourceSignature) {
+                if (tile->paramsSignature != paramsSignature || tile->sourceSignature != sourceSignature) {
                     missingTiles.push_back({
                         TerrainFarTileBand::Near,
-                        TerrainFarTileDetail::Lod0,
+                        tile->detail,
                         tileX,
                         tileZ,
                         paramsSignature,
@@ -2601,13 +3413,25 @@ const TerrainVisualCache& ensureTerrainVisualCache(
                         tileCenterDistanceSquared(prefetchCenter, lod0TileSize, tileX, tileZ) +
                             terrainTilePriorityBias(TerrainFarTileBand::Near)
                     });
+                } else if (allowUpgrades) {
+                    if (const auto nextDetail = nextTerrainTileDetail(TerrainFarTileBand::Near, tile->detail); nextDetail.has_value()) {
+                        upgradeTiles.push_back({
+                            TerrainFarTileBand::Near,
+                            *nextDetail,
+                            tileX,
+                            tileZ,
+                            paramsSignature,
+                            sourceSignature,
+                            tileCenterDistanceSquared(prefetchCenter, lod0TileSize, tileX, tileZ)
+                        });
+                    }
                 }
                 continue;
             }
 
             missingTiles.push_back({
                 TerrainFarTileBand::Near,
-                TerrainFarTileDetail::Lod0,
+                initialTerrainTileDetailForBand(TerrainFarTileBand::Near),
                 tileX,
                 tileZ,
                 paramsSignature,
@@ -2628,7 +3452,7 @@ const TerrainVisualCache& ensureTerrainVisualCache(
             TerrainFarTile* tile = findTerrainTile(terrainCache.farTiles, TerrainFarTileBand::Mid, tileX, tileZ);
             if (tile != nullptr) {
                 tile->active = true;
-                if (tile->paramsSignature != paramsSignature || tile->sourceSignature != sourceSignature) {
+                if (allowMidBand && (tile->paramsSignature != paramsSignature || tile->sourceSignature != sourceSignature)) {
                     missingTiles.push_back({
                         TerrainFarTileBand::Mid,
                         tile->detail,
@@ -2639,30 +3463,34 @@ const TerrainVisualCache& ensureTerrainVisualCache(
                         tileCenterDistanceSquared(prefetchCenter, lod1TileSize, tileX, tileZ) +
                             terrainTilePriorityBias(TerrainFarTileBand::Mid)
                     });
-                } else if (tile->detail == TerrainFarTileDetail::Lod2) {
-                    upgradeTiles.push_back({
-                        TerrainFarTileBand::Mid,
-                        TerrainFarTileDetail::Lod1,
-                        tileX,
-                        tileZ,
-                        paramsSignature,
-                        sourceSignature,
-                        tileCenterDistanceSquared(prefetchCenter, lod1TileSize, tileX, tileZ)
-                    });
+                } else if (allowMidBand && allowUpgrades) {
+                    if (const auto nextDetail = nextTerrainTileDetail(TerrainFarTileBand::Mid, tile->detail); nextDetail.has_value()) {
+                        upgradeTiles.push_back({
+                            TerrainFarTileBand::Mid,
+                            *nextDetail,
+                            tileX,
+                            tileZ,
+                            paramsSignature,
+                            sourceSignature,
+                            tileCenterDistanceSquared(prefetchCenter, lod1TileSize, tileX, tileZ)
+                        });
+                    }
                 }
                 continue;
             }
 
-            missingTiles.push_back({
-                TerrainFarTileBand::Mid,
-                TerrainFarTileDetail::Lod2,
-                tileX,
-                tileZ,
-                paramsSignature,
-                sourceSignature,
-                tileCenterDistanceSquared(prefetchCenter, lod1TileSize, tileX, tileZ) +
-                    terrainTilePriorityBias(TerrainFarTileBand::Mid)
-            });
+            if (allowMidBand) {
+                missingTiles.push_back({
+                    TerrainFarTileBand::Mid,
+                    initialTerrainTileDetailForBand(TerrainFarTileBand::Mid),
+                    tileX,
+                    tileZ,
+                    paramsSignature,
+                    sourceSignature,
+                    tileCenterDistanceSquared(prefetchCenter, lod1TileSize, tileX, tileZ) +
+                        terrainTilePriorityBias(TerrainFarTileBand::Mid)
+                });
+            }
         }
     }
 
@@ -2676,7 +3504,7 @@ const TerrainVisualCache& ensureTerrainVisualCache(
             TerrainFarTile* tile = findTerrainTile(terrainCache.farTiles, TerrainFarTileBand::Horizon, tileX, tileZ);
             if (tile != nullptr) {
                 tile->active = true;
-                if (tile->paramsSignature != paramsSignature || tile->sourceSignature != sourceSignature) {
+                if (allowHorizonBand && (tile->paramsSignature != paramsSignature || tile->sourceSignature != sourceSignature)) {
                     missingTiles.push_back({
                         TerrainFarTileBand::Horizon,
                         TerrainFarTileDetail::Lod2,
@@ -2691,16 +3519,18 @@ const TerrainVisualCache& ensureTerrainVisualCache(
                 continue;
             }
 
-            missingTiles.push_back({
-                TerrainFarTileBand::Horizon,
-                TerrainFarTileDetail::Lod2,
-                tileX,
-                tileZ,
-                paramsSignature,
-                sourceSignature,
-                tileCenterDistanceSquared(prefetchCenter, lod2TileSize, tileX, tileZ) +
-                    terrainTilePriorityBias(TerrainFarTileBand::Horizon)
-            });
+            if (allowHorizonBand) {
+                missingTiles.push_back({
+                    TerrainFarTileBand::Horizon,
+                    initialTerrainTileDetailForBand(TerrainFarTileBand::Horizon),
+                    tileX,
+                    tileZ,
+                    paramsSignature,
+                    sourceSignature,
+                    tileCenterDistanceSquared(prefetchCenter, lod2TileSize, tileX, tileZ) +
+                        terrainTilePriorityBias(TerrainFarTileBand::Horizon)
+                });
+            }
         }
     }
 
@@ -2718,86 +3548,123 @@ const TerrainVisualCache& ensureTerrainVisualCache(
         });
 
     const int missingBudget = std::max(8, params.meshBuildBudget * 4);
-    const int upgradeBudget = std::max(2, params.meshBuildBudget);
+    const int nearMissingBudget = budgetOverrides != nullptr && budgetOverrides->nearMissingBudget >= 0
+        ? budgetOverrides->nearMissingBudget
+        : missingBudget;
+    const int midMissingBudget = budgetOverrides != nullptr && budgetOverrides->midMissingBudget >= 0
+        ? budgetOverrides->midMissingBudget
+        : missingBudget;
+    const int horizonMissingBudget = budgetOverrides != nullptr && budgetOverrides->horizonMissingBudget >= 0
+        ? budgetOverrides->horizonMissingBudget
+        : missingBudget;
+    const int upgradeBudget = !allowUpgrades
+        ? 0
+        : (budgetOverrides != nullptr && budgetOverrides->upgradeBudget >= 0
+            ? budgetOverrides->upgradeBudget
+            : std::max(2, params.meshBuildBudget));
 
-    int builtMissing = 0;
+    std::vector<TerrainTileRequest> selectedMissingTiles;
+    selectedMissingTiles.reserve(missingTiles.size());
+    int selectedNearMissing = 0;
+    int selectedMidMissing = 0;
+    int selectedHorizonMissing = 0;
     for (const TerrainTileRequest& request : missingTiles) {
-        if (builtMissing >= missingBudget) {
-            break;
+        int* selectedCount = &selectedHorizonMissing;
+        int budget = horizonMissingBudget;
+        if (request.band == TerrainFarTileBand::Near) {
+            selectedCount = &selectedNearMissing;
+            budget = nearMissingBudget;
+        } else if (request.band == TerrainFarTileBand::Mid) {
+            selectedCount = &selectedMidMissing;
+            budget = midMissingBudget;
         }
 
-        std::vector<TerrainFarTile>& tileList =
-            request.band == TerrainFarTileBand::Near ? terrainCache.nearTiles : terrainCache.farTiles;
-        TerrainFarTile* existingTile = findTerrainTile(tileList, request.band, request.tileX, request.tileZ);
-        const CompiledTerrainChunk compiledChunk = buildTerrainTileChunk(
-            request.band,
-            request.detail,
-            request.tileX,
-            request.tileZ,
-            terrainCache,
-            terrainContext,
-            bakeCache,
-            terrainWorldId,
-            request.paramsSignature,
-            request.sourceSignature);
-
-        if (existingTile == nullptr) {
-            TerrainFarTile tile;
-            tile.band = request.band;
-            tile.detail = request.detail;
-            tile.tileX = request.tileX;
-            tile.tileZ = request.tileZ;
-            tile.paramsSignature = request.paramsSignature;
-            tile.sourceSignature = request.sourceSignature;
-            tile.active = true;
-            tile.terrainModel = compiledChunk.terrainModel;
-            tile.waterModel = compiledChunk.waterModel;
-            tile.propModel = compiledChunk.propModel;
-            tile.propColliders = compiledChunk.propColliders;
-            tileList.push_back(std::move(tile));
-        } else {
-            existingTile->detail = request.detail;
-            existingTile->paramsSignature = request.paramsSignature;
-            existingTile->sourceSignature = request.sourceSignature;
-            existingTile->active = true;
-            existingTile->terrainModel = compiledChunk.terrainModel;
-            existingTile->waterModel = compiledChunk.waterModel;
-            existingTile->propModel = compiledChunk.propModel;
-            existingTile->propColliders = compiledChunk.propColliders;
-        }
-        ++builtMissing;
-    }
-
-    int upgradedTiles = 0;
-    for (const TerrainTileRequest& request : upgradeTiles) {
-        if (upgradedTiles >= upgradeBudget) {
-            break;
-        }
-
-        TerrainFarTile* tile = findTerrainTile(terrainCache.farTiles, request.band, request.tileX, request.tileZ);
-        if (tile == nullptr || tile->detail == TerrainFarTileDetail::Lod1) {
+        if (budget >= 0 && *selectedCount >= budget) {
             continue;
         }
+        selectedMissingTiles.push_back(request);
+        *selectedCount += 1;
+    }
 
-        const CompiledTerrainChunk compiledChunk = buildTerrainTileChunk(
-            tile->band,
-            request.detail,
-            tile->tileX,
-            tile->tileZ,
-            terrainCache,
+    std::vector<TerrainTileRequest> selectedUpgradeTiles;
+    selectedUpgradeTiles.reserve(upgradeTiles.size());
+    for (const TerrainTileRequest& request : upgradeTiles) {
+        if (static_cast<int>(selectedUpgradeTiles.size()) >= upgradeBudget) {
+            break;
+        }
+        selectedUpgradeTiles.push_back(request);
+    }
+
+    if (streamState != nullptr && params.threadedMeshing) {
+        enqueueTerrainTileRequests(
+            *streamState,
+            selectedMissingTiles,
+            selectedUpgradeTiles,
+            static_cast<int>(selectedMissingTiles.size()),
+            static_cast<int>(selectedUpgradeTiles.size()),
+            std::max(8, maxPendingChunks),
+            std::max(1, maxStaleChunks),
             terrainContext,
             bakeCache,
-            terrainWorldId,
-            request.paramsSignature,
-            request.sourceSignature);
-        tile->detail = request.detail;
-        tile->paramsSignature = request.paramsSignature;
-        tile->sourceSignature = request.sourceSignature;
-        tile->terrainModel = compiledChunk.terrainModel;
-        tile->waterModel = compiledChunk.waterModel;
-        tile->propModel = compiledChunk.propModel;
-        tile->propColliders = compiledChunk.propColliders;
-        ++upgradedTiles;
+            terrainWorldId);
+    } else {
+        int builtMissing = 0;
+        for (const TerrainTileRequest& request : selectedMissingTiles) {
+            if (builtMissing >= static_cast<int>(selectedMissingTiles.size())) {
+                break;
+            }
+            TerrainChunkBuildResult result;
+            result.request = request;
+            result.compiledChunk = buildTerrainTileChunk(
+                request.band,
+                request.detail,
+                request.tileX,
+                request.tileZ,
+                terrainContext,
+                bakeCache,
+                terrainWorldId,
+                request.paramsSignature,
+                request.sourceSignature);
+            applyTerrainChunkResult(terrainCache, std::move(result));
+            if (TerrainFarTile* tile = findTerrainTile(
+                    request.band == TerrainFarTileBand::Near ? terrainCache.nearTiles : terrainCache.farTiles,
+                    request.band,
+                    request.tileX,
+                    request.tileZ);
+                tile != nullptr) {
+                tile->active = true;
+            }
+            ++builtMissing;
+        }
+
+        int upgradedTiles = 0;
+        for (const TerrainTileRequest& request : selectedUpgradeTiles) {
+            if (upgradedTiles >= static_cast<int>(selectedUpgradeTiles.size())) {
+                break;
+            }
+            TerrainChunkBuildResult result;
+            result.request = request;
+            result.compiledChunk = buildTerrainTileChunk(
+                request.band,
+                request.detail,
+                request.tileX,
+                request.tileZ,
+                terrainContext,
+                bakeCache,
+                terrainWorldId,
+                request.paramsSignature,
+                request.sourceSignature);
+            applyTerrainChunkResult(terrainCache, std::move(result));
+            if (TerrainFarTile* tile = findTerrainTile(
+                    request.band == TerrainFarTileBand::Near ? terrainCache.nearTiles : terrainCache.farTiles,
+                    request.band,
+                    request.tileX,
+                    request.tileZ);
+                tile != nullptr) {
+                tile->active = true;
+            }
+            ++upgradedTiles;
+        }
     }
 
     terrainCache.nearTiles.erase(
@@ -2821,20 +3688,512 @@ const TerrainVisualCache& ensureTerrainVisualCache(
     return terrainCache;
 }
 
-PauseLayout buildPauseLayout(int width, int height)
+constexpr std::uint64_t kMiB = 1024ull * 1024ull;
+constexpr std::uint64_t kGiB = 1024ull * 1024ull * 1024ull;
+
+std::uint64_t saturatingSub(std::uint64_t lhs, std::uint64_t rhs)
 {
+    return lhs > rhs ? lhs - rhs : 0ull;
+}
+
+#ifdef _WIN32
+struct DxgiTelemetryState {
+    bool initialized = false;
+    Microsoft::WRL::ComPtr<IDXGIAdapter3> adapter;
+    std::string adapterName;
+};
+
+std::string narrowWideString(const wchar_t* text)
+{
+    if (text == nullptr || *text == L'\0') {
+        return {};
+    }
+
+    const int byteCount = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+    if (byteCount <= 1) {
+        return {};
+    }
+
+    std::string output(static_cast<std::size_t>(byteCount - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, output.data(), byteCount, nullptr, nullptr);
+    return output;
+}
+
+DxgiTelemetryState& dxgiTelemetryState()
+{
+    static DxgiTelemetryState state;
+    if (state.initialized) {
+        return state;
+    }
+
+    state.initialized = true;
+    Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        return state;
+    }
+
+    std::size_t bestDedicatedBytes = 0;
+    for (UINT index = 0; ; ++index) {
+        Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter1;
+        if (factory->EnumAdapters1(index, &adapter1) == DXGI_ERROR_NOT_FOUND) {
+            break;
+        }
+
+        DXGI_ADAPTER_DESC1 desc {};
+        if (FAILED(adapter1->GetDesc1(&desc)) || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0u) {
+            continue;
+        }
+
+        Microsoft::WRL::ComPtr<IDXGIAdapter3> adapter3;
+        if (FAILED(adapter1.As(&adapter3)) || adapter3 == nullptr) {
+            continue;
+        }
+
+        const std::size_t dedicatedBytes = static_cast<std::size_t>(desc.DedicatedVideoMemory);
+        if (dedicatedBytes < bestDedicatedBytes) {
+            continue;
+        }
+
+        bestDedicatedBytes = dedicatedBytes;
+        state.adapter = adapter3;
+        state.adapterName = narrowWideString(desc.Description);
+    }
+
+    return state;
+}
+#endif
+
+bool sampleSystemPressureSnapshot(SystemPressureSnapshot& snapshot, float nowSeconds)
+{
+    snapshot = {};
+    snapshot.sampledAtSeconds = nowSeconds;
+
+#ifdef _WIN32
+    bool valid = false;
+
+    MEMORYSTATUSEX memoryStatus {};
+    memoryStatus.dwLength = sizeof(memoryStatus);
+    if (GlobalMemoryStatusEx(&memoryStatus) != 0) {
+        snapshot.totalPhysicalBytes = memoryStatus.ullTotalPhys;
+        snapshot.availablePhysicalBytes = memoryStatus.ullAvailPhys;
+        valid = true;
+    }
+
+    PERFORMANCE_INFORMATION perfInfo {};
+    perfInfo.cb = sizeof(perfInfo);
+    if (GetPerformanceInfo(&perfInfo, sizeof(perfInfo)) != 0) {
+        const std::uint64_t pageSize = static_cast<std::uint64_t>(perfInfo.PageSize);
+        const std::uint64_t commitTotalBytes = static_cast<std::uint64_t>(perfInfo.CommitTotal) * pageSize;
+        snapshot.totalCommitLimitBytes = static_cast<std::uint64_t>(perfInfo.CommitLimit) * pageSize;
+        snapshot.commitHeadroomBytes = saturatingSub(snapshot.totalCommitLimitBytes, commitTotalBytes);
+        valid = true;
+    }
+
+    PROCESS_MEMORY_COUNTERS_EX processCounters {};
+    if (GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&processCounters),
+            sizeof(processCounters)) != 0) {
+        snapshot.processWorkingSetBytes = processCounters.WorkingSetSize;
+        snapshot.processPrivateBytes = processCounters.PrivateUsage;
+        valid = true;
+    }
+
+    DxgiTelemetryState& dxgiState = dxgiTelemetryState();
+    if (dxgiState.adapter != nullptr) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO localInfo {};
+        DXGI_QUERY_VIDEO_MEMORY_INFO sharedInfo {};
+        if (SUCCEEDED(dxgiState.adapter->QueryVideoMemoryInfo(0u, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &localInfo))) {
+            snapshot.gpuLocalBudgetBytes = localInfo.Budget;
+            snapshot.gpuLocalUsageBytes = localInfo.CurrentUsage;
+            valid = true;
+        }
+        if (SUCCEEDED(dxgiState.adapter->QueryVideoMemoryInfo(0u, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &sharedInfo))) {
+            snapshot.gpuSharedBudgetBytes = sharedInfo.Budget;
+            snapshot.gpuSharedUsageBytes = sharedInfo.CurrentUsage;
+            valid = true;
+        }
+        snapshot.gpuAdapterName = dxgiState.adapterName;
+    }
+
+    snapshot.valid = valid;
+    return valid;
+#else
+    (void)nowSeconds;
+    return false;
+#endif
+}
+
+float gpuUsageRatio(const SystemPressureSnapshot& snapshot)
+{
+    if (snapshot.gpuLocalBudgetBytes == 0u) {
+        return 0.0f;
+    }
+    return static_cast<float>(snapshot.gpuLocalUsageBytes) / static_cast<float>(snapshot.gpuLocalBudgetBytes);
+}
+
+RuntimePressureState computeRuntimePressureState(
+    const SystemPressureSnapshot& snapshot,
+    RuntimePressureState previousState)
+{
+    if (!snapshot.valid || snapshot.totalPhysicalBytes == 0u) {
+        return previousState;
+    }
+
+    const std::uint64_t pressureRamFloor = std::max(snapshot.totalPhysicalBytes / 10u, 4ull * kGiB);
+    const std::uint64_t criticalRamFloor = std::max((snapshot.totalPhysicalBytes * 7u) / 100u, 2ull * kGiB);
+    const std::uint64_t recoveryRamFloor = std::max((snapshot.totalPhysicalBytes * 15u) / 100u, 6ull * kGiB);
+    const float gpuRatio = gpuUsageRatio(snapshot);
+    const bool pressure =
+        snapshot.availablePhysicalBytes < pressureRamFloor ||
+        snapshot.commitHeadroomBytes < (2ull * kGiB) ||
+        gpuRatio > 0.85f;
+    const bool critical =
+        snapshot.availablePhysicalBytes < criticalRamFloor ||
+        snapshot.commitHeadroomBytes < (1ull * kGiB) ||
+        gpuRatio > 0.92f;
+    const bool recovered =
+        snapshot.availablePhysicalBytes > recoveryRamFloor &&
+        snapshot.commitHeadroomBytes > (2ull * kGiB) &&
+        (snapshot.gpuLocalBudgetBytes == 0u || gpuRatio < 0.75f);
+
+    switch (previousState) {
+    case RuntimePressureState::Critical:
+        if (!recovered) {
+            return RuntimePressureState::Critical;
+        }
+        return pressure ? RuntimePressureState::Pressure : RuntimePressureState::Normal;
+    case RuntimePressureState::Pressure:
+        if (critical) {
+            return RuntimePressureState::Critical;
+        }
+        return recovered ? RuntimePressureState::Normal : RuntimePressureState::Pressure;
+    case RuntimePressureState::Normal:
+    default:
+        if (critical) {
+            return RuntimePressureState::Critical;
+        }
+        return pressure ? RuntimePressureState::Pressure : RuntimePressureState::Normal;
+    }
+}
+
+HardwareTier detectHardwareTier(const SystemPressureSnapshot& snapshot)
+{
+    const unsigned int logicalCores = std::max(1u, std::thread::hardware_concurrency());
+    if (snapshot.gpuLocalBudgetBytes >= (12ull * kGiB) && logicalCores >= 16u) {
+        return HardwareTier::Suggested;
+    }
+    return HardwareTier::Requirement;
+}
+
+RendererPressureTier toRendererPressureTier(RuntimePressureState state)
+{
+    switch (state) {
+    case RuntimePressureState::Pressure:
+        return RendererPressureTier::Pressure;
+    case RuntimePressureState::Critical:
+        return RendererPressureTier::Critical;
+    case RuntimePressureState::Normal:
+    default:
+        return RendererPressureTier::Normal;
+    }
+}
+
+float hardwareTierDrawDistance(HardwareTier tier)
+{
+    return tier == HardwareTier::Suggested ? 7000.0f : 4500.0f;
+}
+
+float hardwareTierShadowDistance(HardwareTier tier)
+{
+    return tier == HardwareTier::Suggested ? 2000.0f : 1200.0f;
+}
+
+TerrainStreamBudgetOverrides terrainBudgetOverridesForGovernor(const PerformanceGovernor& governor)
+{
+    TerrainStreamBudgetOverrides overrides;
+    overrides.workerCount = governor.terrainWorkerCount;
+    overrides.maxPendingChunks = governor.terrainMaxPendingChunks;
+    overrides.maxStaleChunks = governor.terrainMaxStaleChunks;
+    overrides.resultBudgetPerFrame = governor.terrainResultBudgetPerFrame;
+    overrides.resultBudgetTimeMs = governor.terrainResultBudgetTimeMs;
+    overrides.nearMissingBudget = governor.nearMissingBudget;
+    overrides.midMissingBudget = governor.midMissingBudget;
+    overrides.horizonMissingBudget = governor.horizonMissingBudget;
+    overrides.upgradeBudget = governor.upgradeBudget;
+    overrides.allowMidBand = governor.allowMidBand;
+    overrides.allowHorizonBand = governor.allowHorizonBand;
+    overrides.allowUpgrades = governor.allowUpgrades;
+    return overrides;
+}
+
+void updatePerformanceGovernor(
+    PerformanceGovernor& governor,
+    float nowSeconds,
+    float dt,
+    const SystemPressureSnapshot& snapshot)
+{
+    governor.smoothedFrameMs = mix(governor.smoothedFrameMs, dt * 1000.0f, 0.08f);
+    if (snapshot.valid) {
+        governor.lastSnapshot = snapshot;
+        governor.hardwareTier = detectHardwareTier(snapshot);
+        governor.pressureState = computeRuntimePressureState(snapshot, governor.pressureState);
+    }
+
+    const bool frameSlow = governor.smoothedFrameMs > (governor.targetFrameMs * 1.08f);
+    const bool frameFast = governor.smoothedFrameMs < (governor.targetFrameMs * 0.88f);
+    if ((frameSlow || governor.pressureState != RuntimePressureState::Normal) &&
+        (nowSeconds - governor.lastQualityChangeAt) > 0.35f) {
+        governor.qualityStep = std::min(4, governor.qualityStep + 1);
+        governor.lastQualityChangeAt = nowSeconds;
+    } else if (frameFast &&
+        governor.pressureState == RuntimePressureState::Normal &&
+        (nowSeconds - governor.lastQualityChangeAt) > 2.0f) {
+        governor.qualityStep = std::max(0, governor.qualityStep - 1);
+        governor.lastQualityChangeAt = nowSeconds;
+    }
+
+    const bool suggestedTier = governor.hardwareTier == HardwareTier::Suggested;
+    const float dynamicMin = suggestedTier ? 1.0f : 0.8f;
+    const float dynamicMax = suggestedTier ? 1.2f : 1.0f;
+    const float dynamicStep = (dynamicMax - dynamicMin) / 4.0f;
+    governor.dynamicRenderScale = clamp(dynamicMax - (dynamicStep * static_cast<float>(governor.qualityStep)), dynamicMin, dynamicMax);
+    governor.drawDistanceScale = governor.qualityStep >= 4 ? (suggestedTier ? 0.88f : 0.78f) : 1.0f;
+    governor.shadowDistanceScale = governor.qualityStep >= 2 ? 0.82f : 1.0f;
+    governor.shadowSoftnessScale = governor.qualityStep >= 2 ? 0.88f : 1.0f;
+    governor.cloudDensityScale = clamp(1.0f - (0.12f * static_cast<float>(governor.qualityStep)), 0.45f, 1.0f);
+
+    if (governor.pressureState == RuntimePressureState::Pressure) {
+        governor.dynamicRenderScale = std::min(governor.dynamicRenderScale, suggestedTier ? 1.0f : 0.9f);
+        governor.drawDistanceScale = std::min(governor.drawDistanceScale, suggestedTier ? 0.82f : 0.72f);
+        governor.shadowDistanceScale = std::min(governor.shadowDistanceScale, 0.70f);
+        governor.shadowSoftnessScale = std::min(governor.shadowSoftnessScale, 0.82f);
+        governor.cloudDensityScale = std::min(governor.cloudDensityScale, 0.65f);
+    } else if (governor.pressureState == RuntimePressureState::Critical) {
+        governor.dynamicRenderScale = dynamicMin;
+        governor.drawDistanceScale = suggestedTier ? 0.65f : 0.55f;
+        governor.shadowDistanceScale = 0.55f;
+        governor.shadowSoftnessScale = 0.72f;
+        governor.cloudDensityScale = 0.40f;
+    }
+
+    if (governor.pressureState == RuntimePressureState::Normal) {
+        governor.residentMeshBudgetBytes = suggestedTier ? (1536ull * kMiB) : (768ull * kMiB);
+        governor.sceneTextureBudgetBytes = suggestedTier ? (3072ull * kMiB) : (1536ull * kMiB);
+        governor.maxUploadBytes = suggestedTier ? (192ull * kMiB) : (96ull * kMiB);
+        governor.terrainWorkerCount = suggestedTier ? 4 : 2;
+        governor.terrainMaxPendingChunks = suggestedTier ? 48 : 24;
+        governor.terrainMaxStaleChunks = suggestedTier ? 12 : 6;
+        governor.terrainResultBudgetPerFrame = suggestedTier ? 6 : 3;
+        governor.terrainResultBudgetTimeMs = suggestedTier ? 2.5f : 1.5f;
+        governor.nearMissingBudget = suggestedTier ? 12 : 8;
+        governor.midMissingBudget = suggestedTier ? 10 : 6;
+        governor.horizonMissingBudget = suggestedTier ? 8 : 4;
+        governor.upgradeBudget = suggestedTier ? 6 : 4;
+        governor.allowMidBand = true;
+        governor.allowHorizonBand = true;
+        governor.allowUpgrades = true;
+    } else if (governor.pressureState == RuntimePressureState::Pressure) {
+        governor.residentMeshBudgetBytes = suggestedTier ? (1024ull * kMiB) : (512ull * kMiB);
+        governor.sceneTextureBudgetBytes = suggestedTier ? (2048ull * kMiB) : (1024ull * kMiB);
+        governor.maxUploadBytes = suggestedTier ? (96ull * kMiB) : (48ull * kMiB);
+        governor.terrainWorkerCount = suggestedTier ? 3 : 2;
+        governor.terrainMaxPendingChunks = suggestedTier ? 32 : 16;
+        governor.terrainMaxStaleChunks = suggestedTier ? 8 : 4;
+        governor.terrainResultBudgetPerFrame = suggestedTier ? 4 : 2;
+        governor.terrainResultBudgetTimeMs = suggestedTier ? 1.5f : 1.0f;
+        governor.nearMissingBudget = suggestedTier ? 8 : 6;
+        governor.midMissingBudget = suggestedTier ? 3 : 2;
+        governor.horizonMissingBudget = 0;
+        governor.upgradeBudget = 1;
+        governor.allowMidBand = true;
+        governor.allowHorizonBand = false;
+        governor.allowUpgrades = true;
+    } else {
+        governor.residentMeshBudgetBytes = suggestedTier ? (768ull * kMiB) : (384ull * kMiB);
+        governor.sceneTextureBudgetBytes = suggestedTier ? (1536ull * kMiB) : (768ull * kMiB);
+        governor.maxUploadBytes = suggestedTier ? (48ull * kMiB) : (24ull * kMiB);
+        governor.terrainWorkerCount = suggestedTier ? 2 : 1;
+        governor.terrainMaxPendingChunks = suggestedTier ? 16 : 12;
+        governor.terrainMaxStaleChunks = suggestedTier ? 4 : 3;
+        governor.terrainResultBudgetPerFrame = 1;
+        governor.terrainResultBudgetTimeMs = 0.75f;
+        governor.nearMissingBudget = 4;
+        governor.midMissingBudget = 0;
+        governor.horizonMissingBudget = 0;
+        governor.upgradeBudget = 0;
+        governor.allowMidBand = false;
+        governor.allowHorizonBand = false;
+        governor.allowUpgrades = false;
+    }
+}
+
+GraphicsSettings applyGovernorToGraphicsSettings(const GraphicsSettings& graphicsSettings, const PerformanceGovernor& governor)
+{
+    GraphicsSettings effective = graphicsSettings;
+    effective.drawDistance =
+        std::min(graphicsSettings.drawDistance, hardwareTierDrawDistance(governor.hardwareTier)) * governor.drawDistanceScale;
+    return effective;
+}
+
+LightingSettings applyGovernorToLightingSettings(const LightingSettings& lightingSettings, const PerformanceGovernor& governor)
+{
+    LightingSettings effective = lightingSettings;
+    effective.shadowDistance =
+        std::min(lightingSettings.shadowDistance, hardwareTierShadowDistance(governor.hardwareTier)) * governor.shadowDistanceScale;
+    effective.shadowSoftness *= governor.shadowSoftnessScale;
+    return effective;
+}
+
+TerrainStreamStats snapshotTerrainStreamStats(TerrainVisualStreamState* streamState)
+{
+    if (streamState == nullptr) {
+        return {};
+    }
+
+    std::lock_guard<std::mutex> lock(streamState->mutex);
+    TerrainStreamStats stats = streamState->stats;
+    stats.queuedCount = static_cast<int>(streamState->queuedRequests.size());
+    stats.inflightCount = static_cast<int>(streamState->inflightRequestKeys.size());
+    stats.completedCount = static_cast<int>(streamState->completedResults.size());
+    return stats;
+}
+
+std::string formatByteCountCompact(std::uint64_t bytes)
+{
+    std::ostringstream output;
+    output.setf(std::ios::fixed, std::ios::floatfield);
+    output.precision(1);
+    if (bytes >= kGiB) {
+        output << (static_cast<double>(bytes) / static_cast<double>(kGiB)) << " GiB";
+    } else if (bytes >= kMiB) {
+        output << (static_cast<double>(bytes) / static_cast<double>(kMiB)) << " MiB";
+    } else {
+        output.precision(0);
+        output << bytes << " B";
+    }
+    return output.str();
+}
+
+const char* runtimePressureStateLabel(RuntimePressureState state)
+{
+    switch (state) {
+    case RuntimePressureState::Pressure:
+        return "Pressure";
+    case RuntimePressureState::Critical:
+        return "Critical";
+    case RuntimePressureState::Normal:
+    default:
+        return "Normal";
+    }
+}
+
+const char* hardwareTierLabel(HardwareTier tier)
+{
+    return tier == HardwareTier::Suggested ? "Suggested" : "Requirement";
+}
+
+std::vector<std::string> buildRuntimeDebugLines(
+    const PerformanceGovernor& governor,
+    const RendererMemoryStats& rendererStats,
+    const TerrainStreamStats& terrainStats)
+{
+    std::vector<std::string> lines;
+    lines.reserve(4);
+    lines.push_back(
+        std::string("Gov ") + runtimePressureStateLabel(governor.pressureState) +
+        " | Tier " + hardwareTierLabel(governor.hardwareTier) +
+        " | Frame " + formatFixed(governor.smoothedFrameMs, 2) + " ms" +
+        " | Dyn " + formatFixed(governor.dynamicRenderScale, 2) + "x");
+
+    if (governor.lastSnapshot.valid) {
+        lines.push_back(
+            std::string("RAM free ") + formatByteCountCompact(governor.lastSnapshot.availablePhysicalBytes) +
+            " | Commit headroom " + formatByteCountCompact(governor.lastSnapshot.commitHeadroomBytes) +
+            " | Proc WS " + formatByteCountCompact(governor.lastSnapshot.processWorkingSetBytes) +
+            " | Private " + formatByteCountCompact(governor.lastSnapshot.processPrivateBytes));
+        lines.push_back(
+            std::string("GPU local ") + formatByteCountCompact(governor.lastSnapshot.gpuLocalUsageBytes) +
+            " / " + formatByteCountCompact(governor.lastSnapshot.gpuLocalBudgetBytes) +
+            " | shared " + formatByteCountCompact(governor.lastSnapshot.gpuSharedUsageBytes) +
+            " / " + formatByteCountCompact(governor.lastSnapshot.gpuSharedBudgetBytes));
+    }
+
+    lines.push_back(
+        std::string("Renderer mesh ") + formatByteCountCompact(rendererStats.residentMeshBytes) +
+        " / " + formatByteCountCompact(rendererStats.residentMeshBudgetBytes) +
+        " | tex " + formatByteCountCompact(rendererStats.sceneTextureBytes) +
+        " / " + formatByteCountCompact(rendererStats.sceneTextureBudgetBytes) +
+        " | uploads " + formatByteCountCompact(rendererStats.uploadBytesThisFrame));
+    lines.push_back(
+        std::string("Terrain q ") + std::to_string(terrainStats.queuedCount) +
+        " i " + std::to_string(terrainStats.inflightCount) +
+        " c " + std::to_string(terrainStats.completedCount) +
+        " | dropR " + std::to_string(terrainStats.droppedRequestCount) +
+        " | dropC " + std::to_string(terrainStats.droppedResultCount) +
+        " | adopt " + std::to_string(terrainStats.adoptedResultCount));
+    return lines;
+}
+
+bool sphereWithinView(const Camera& camera, const Vec3& center, float radius, float maxDistance)
+{
+    const Vec3 toCenter = center - camera.pos;
+    const float distanceSquared = lengthSquared(toCenter);
+    const float distance = std::sqrt(std::max(0.0f, distanceSquared));
+    if ((distance - radius) > std::min(camera.farClipMeters, maxDistance)) {
+        return false;
+    }
+
+    if (distance <= radius) {
+        return true;
+    }
+
+    const Vec3 forward = forwardFromRotation(camera.rot);
+    const float cosine = dot(toCenter / distance, forward);
+    const float expandedHalfFov = std::min(radians(89.0f), camera.fovRadians * 0.72f);
+    return cosine >= std::cos(expandedHalfFov);
+}
+
+Vec3 terrainTileCenter(const TerrainVisualCache& terrainCache, const TerrainFarTile& tile)
+{
+    const float tileSize = terrainTileSizeForBand(terrainCache, tile.band);
+    return {
+        (static_cast<float>(tile.tileX) + 0.5f) * tileSize,
+        0.0f,
+        (static_cast<float>(tile.tileZ) + 0.5f) * tileSize
+    };
+}
+
+float terrainTileRadius(const TerrainVisualCache& terrainCache, const TerrainFarTile& tile)
+{
+    return terrainTileSizeForBand(terrainCache, tile.band) * 0.82f;
+}
+
+bool pauseTabHasSubTabs(PauseTab tab)
+{
+    return tab == PauseTab::Settings ||
+        tab == PauseTab::Hud ||
+        tab == PauseTab::Characters ||
+        tab == PauseTab::Paint;
+}
+
+PauseLayout buildPauseLayout(int width, int height, float uiScale = 1.0f, PauseTab activeTab = PauseTab::Main)
+{
+    const float scale = clamp(uiScale, 1.0f, 10.0f);
+    const float logicalWidth = std::max(80.0f, static_cast<float>(width) / scale);
+    const float logicalHeight = std::max(80.0f, static_cast<float>(height) / scale);
     PauseLayout layout;
-    layout.panelW = std::max(240.0f, std::min(static_cast<float>(width) - 12.0f, 920.0f));
-    layout.panelH = std::max(220.0f, std::min(static_cast<float>(height) - 12.0f, 560.0f));
-    layout.panelX = (static_cast<float>(width) - layout.panelW) * 0.5f;
-    layout.panelY = (static_cast<float>(height) - layout.panelH) * 0.5f;
+    layout.panelW = std::max(80.0f, std::min(logicalWidth - 12.0f, 920.0f));
+    layout.panelH = std::max(80.0f, std::min(logicalHeight - 12.0f, 560.0f));
+    layout.panelX = (logicalWidth - layout.panelW) * 0.5f;
+    layout.panelY = (logicalHeight - layout.panelH) * 0.5f;
     layout.tabY = layout.panelY + 72.0f;
     constexpr float tabGap = 8.0f;
     layout.tabW = (layout.panelW - 48.0f - (tabGap * static_cast<float>(kPauseTabs.size() - 1))) / static_cast<float>(kPauseTabs.size());
     layout.tabH = 28.0f;
     layout.subTabY = layout.tabY + 40.0f;
     layout.contentX = layout.panelX + 30.0f;
-    layout.contentY = layout.tabY + 48.0f;
+    layout.contentY = pauseTabHasSubTabs(activeTab) ? (layout.subTabY + 36.0f) : (layout.tabY + 48.0f);
     const float availableContentWidth = layout.panelW - 60.0f;
     if (availableContentWidth > 420.0f) {
         layout.previewW = std::clamp(availableContentWidth * 0.34f, 180.0f, 280.0f);
@@ -2886,6 +4245,26 @@ const char* characterRoleLabel(CharacterSubTab role)
     }
 }
 
+const char* hudSubTabLabel(HudSubTab subTab)
+{
+    switch (subTab) {
+    case HudSubTab::Info:
+        return "Info";
+    case HudSubTab::Speedometer:
+        return "Speed";
+    case HudSubTab::Controls:
+        return "Controls";
+    case HudSubTab::Map:
+        return "Map";
+    case HudSubTab::Crosshair:
+        return "Crosshair";
+    case HudSubTab::Debug:
+        return "Debug";
+    default:
+        return "";
+    }
+}
+
 PlaneVisualState& visualForRole(CharacterSubTab role, PlaneVisualState& planeVisual, PlaneVisualState& walkingVisual)
 {
     return role == CharacterSubTab::Player ? walkingVisual : planeVisual;
@@ -2932,6 +4311,23 @@ int settingsSubTabItemCount(SettingsSubTab subTab)
     }
 }
 
+int hudSubTabItemCount(HudSubTab subTab)
+{
+    switch (subTab) {
+    case HudSubTab::Info:
+        return 19;
+    case HudSubTab::Speedometer:
+        return 22;
+    case HudSubTab::Controls:
+    case HudSubTab::Map:
+    case HudSubTab::Crosshair:
+    case HudSubTab::Debug:
+        return 17;
+    default:
+        return 0;
+    }
+}
+
 int characterItemCount(std::size_t assetCount)
 {
     return kCharacterAssetListStart + static_cast<int>(assetCount);
@@ -2968,6 +4364,8 @@ int hitPauseSubTabIndex(const PauseLayout& layout, PauseTab tab, float mouseX, f
     int count = 0;
     if (tab == PauseTab::Settings) {
         count = 7;
+    } else if (tab == PauseTab::Hud) {
+        count = 6;
     } else if (tab == PauseTab::Characters || tab == PauseTab::Paint) {
         count = 2;
     } else {
@@ -3003,6 +4401,15 @@ int maxMenuHelpScroll(const PauseLayout& layout)
     const float visibleHeight = std::max(0.0f, helpBottomY - layout.contentY);
     const int visibleLines = std::max(1, static_cast<int>(std::floor(visibleHeight / kHelpLineHeight)));
     return std::max(0, static_cast<int>(kMenuHelpLines.size()) - visibleLines);
+}
+
+int hudVisibleStartIndex(HudSubTab subTab, int selectedIndex)
+{
+    const int itemCount = hudSubTabItemCount(subTab);
+    if (itemCount <= kHudVisibleRows) {
+        return 0;
+    }
+    return std::clamp(selectedIndex - (kHudVisibleRows / 2), 0, std::max(0, itemCount - kHudVisibleRows));
 }
 
 RectF pauseRowRect(const PauseLayout& layout, const PauseState& pauseState, std::size_t assetCount, int rowIndex)
@@ -3043,9 +4450,16 @@ RectF pauseRowRect(const PauseLayout& layout, const PauseState& pauseState, std:
         rowH = 22.0f;
         break;
     case PauseTab::Hud:
-        rowY += static_cast<float>(rowIndex) * 32.0f;
+    {
+        const int startIndex = hudVisibleStartIndex(pauseState.hudSubTab, pauseState.selectedIndex);
+        const int endIndex = std::min(hudSubTabItemCount(pauseState.hudSubTab), startIndex + kHudVisibleRows);
+        if (rowIndex < startIndex || rowIndex >= endIndex) {
+            return {};
+        }
+        rowY += static_cast<float>(rowIndex - startIndex) * 32.0f;
         rowH = 24.0f;
         break;
+    }
     default:
         return {};
     }
@@ -3164,6 +4578,7 @@ void clampUiStatePersistentValues(UiState& uiState)
 {
     uiState.mapZoomIndex = std::clamp(uiState.mapZoomIndex, 0, static_cast<int>(uiState.mapZoomExtents.size()) - 1);
     uiState.cameraFovDegrees = clamp(uiState.cameraFovDegrees, 60.0f, 120.0f);
+    uiState.uiScale = clampUiScaleValue(uiState.uiScale);
     uiState.walkingMoveSpeed = clamp(uiState.walkingMoveSpeed, 2.0f, 30.0f);
     uiState.mouseSensitivity = clamp(uiState.mouseSensitivity, 0.3f, 2.5f);
     uiState.masterVolume = clamp(uiState.masterVolume, 0.0f, 1.5f);
@@ -3209,6 +4624,27 @@ void clampLightingSettings(LightingSettings& lightingSettings)
     lightingSettings.fogColor = clampLightingColor(lightingSettings.fogColor, 2.0f);
 }
 
+void clampHudRgbColor(HudRgbColor& color)
+{
+    color.r = std::clamp(color.r, 0, 255);
+    color.g = std::clamp(color.g, 0, 255);
+    color.b = std::clamp(color.b, 0, 255);
+}
+
+void clampHudElementStyle(HudElementStyle& style)
+{
+    style.x = clamp(style.x, 0.0f, 1.0f);
+    style.y = clamp(style.y, 0.0f, 1.0f);
+    style.widthScale = clamp(style.widthScale, 0.25f, 4.0f);
+    style.heightScale = clamp(style.heightScale, 0.25f, 4.0f);
+    clampHudRgbColor(style.backgroundColor);
+    style.backgroundOpacity = std::clamp(style.backgroundOpacity, 0, 255);
+    clampHudRgbColor(style.accentColor);
+    style.accentOpacity = std::clamp(style.accentOpacity, 0, 255);
+    clampHudRgbColor(style.textColor);
+    style.textOpacity = std::clamp(style.textOpacity, 0, 255);
+}
+
 void clampHudSettings(HudSettings& hudSettings)
 {
     hudSettings.speedometerMaxKph = std::clamp(hudSettings.speedometerMaxKph, 50, 2500);
@@ -3216,6 +4652,12 @@ void clampHudSettings(HudSettings& hudSettings)
     hudSettings.speedometerMajorStepKph = std::clamp(hudSettings.speedometerMajorStepKph, hudSettings.speedometerMinorStepKph, 500);
     hudSettings.speedometerLabelStepKph = std::clamp(hudSettings.speedometerLabelStepKph, hudSettings.speedometerMajorStepKph, 600);
     hudSettings.speedometerRedlineKph = std::clamp(hudSettings.speedometerRedlineKph, 50, hudSettings.speedometerMaxKph);
+    clampHudElementStyle(hudSettings.infoPanel);
+    clampHudElementStyle(hudSettings.speedometer);
+    clampHudElementStyle(hudSettings.controls);
+    clampHudElementStyle(hudSettings.mapPanel);
+    clampHudElementStyle(hudSettings.crosshair);
+    clampHudElementStyle(hudSettings.debugFooter);
 }
 
 void clampPropAudioConfigValues(PropAudioConfig& config)
@@ -3332,6 +4774,7 @@ std::string buildPaintTargetKey(const Model& model)
         << model.vertices.size() << '|'
         << model.faces.size() << '|'
         << model.texCoords.size() << '|'
+        << model.texCoords1.size() << '|'
         << model.materials.size() << '|'
         << (model.hasTexCoords ? 1 : 0) << '|'
         << (model.hasPaintableMaterial ? 1 : 0);
@@ -3636,6 +5079,18 @@ std::filesystem::path getPreferenceFilePath()
     return result;
 }
 
+std::filesystem::path getHudPreferenceFilePath()
+{
+    char* prefPath = SDL_GetPrefPath("TrueFlight", "TrueFlight");
+    if (prefPath == nullptr) {
+        return {};
+    }
+
+    const std::filesystem::path result = std::filesystem::path(prefPath) / "HUD-settings.ini";
+    SDL_free(prefPath);
+    return result;
+}
+
 std::filesystem::path getPreferenceRootPath()
 {
     const std::filesystem::path settingsPath = getPreferenceFilePath();
@@ -3678,7 +5133,10 @@ WorldInfoSnapshot buildWorldInfoSnapshot(const TerrainParams& terrainParams, std
     return info;
 }
 
-void bindTerrainContextWorldStore(TerrainFieldContext& terrainContext, WorldStore* worldStore)
+void bindTerrainContextWorldStore(
+    TerrainFieldContext& terrainContext,
+    WorldStore* worldStore,
+    std::shared_ptr<std::shared_mutex> worldStoreMutex)
 {
     if (worldStore == nullptr) {
         terrainContext.sampleHeightDeltaAt = {};
@@ -3687,13 +5145,25 @@ void bindTerrainContextWorldStore(TerrainFieldContext& terrainContext, WorldStor
         return;
     }
 
-    terrainContext.sampleHeightDeltaAt = [worldStore](float x, float z) {
+    terrainContext.sampleHeightDeltaAt = [worldStore, worldStoreMutex](float x, float z) {
+        std::shared_lock<std::shared_mutex> lock;
+        if (worldStoreMutex) {
+            lock = std::shared_lock<std::shared_mutex>(*worldStoreMutex);
+        }
         return worldStore->sampleHeightDelta(x, z);
     };
-    terrainContext.sampleVolumetricOverrideSdfAt = [worldStore](float x, float y, float z) {
+    terrainContext.sampleVolumetricOverrideSdfAt = [worldStore, worldStoreMutex](float x, float y, float z) {
+        std::shared_lock<std::shared_mutex> lock;
+        if (worldStoreMutex) {
+            lock = std::shared_lock<std::shared_mutex>(*worldStoreMutex);
+        }
         return worldStore->sampleVolumetricOverrideSdf(x, y, z);
     };
-    terrainContext.sampleChunkRevisionSignature = [worldStore](float x0, float z0, float x1, float z1) {
+    terrainContext.sampleChunkRevisionSignature = [worldStore, worldStoreMutex](float x0, float z0, float x1, float z1) {
+        std::shared_lock<std::shared_mutex> lock;
+        if (worldStoreMutex) {
+            lock = std::shared_lock<std::shared_mutex>(*worldStoreMutex);
+        }
         return worldStore->revisionSignatureForBounds(x0, z0, x1, z1, 1);
     };
 }
@@ -4045,6 +5515,8 @@ bool savePreferences(
     file << "ui.map_north_up=" << (uiState.mapNorthUp ? 1 : 0) << "\n";
     file << "ui.map_zoom_index=" << uiState.mapZoomIndex << "\n";
     file << "ui.camera_fov_degrees=" << uiState.cameraFovDegrees << "\n";
+    file << "ui.ui_scale=" << uiState.uiScale << "\n";
+    file << "ui.scale_hud_with_ui=" << (uiState.scaleHudWithUi ? 1 : 0) << "\n";
     file << "ui.walking_move_speed=" << uiState.walkingMoveSpeed << "\n";
     file << "ui.mouse_sensitivity=" << uiState.mouseSensitivity << "\n";
     file << "ui.audio_enabled=" << (uiState.audioEnabled ? 1 : 0) << "\n";
@@ -4318,6 +5790,10 @@ bool loadPreferences(
             uiState.mapZoomIndex = parseIntValue(value, uiState.mapZoomIndex);
         } else if (key == "ui.camera_fov_degrees") {
             uiState.cameraFovDegrees = parseFloatValue(value, uiState.cameraFovDegrees);
+        } else if (key == "ui.ui_scale") {
+            uiState.uiScale = parseFloatValue(value, uiState.uiScale);
+        } else if (key == "ui.scale_hud_with_ui") {
+            uiState.scaleHudWithUi = parseBoolValue(value, uiState.scaleHudWithUi);
         } else if (key == "ui.walking_move_speed") {
             uiState.walkingMoveSpeed = parseFloatValue(value, uiState.walkingMoveSpeed);
         } else if (key == "ui.mouse_sensitivity") {
@@ -4405,6 +5881,9 @@ bool loadPreferences(
         } else if (key == "hud.show_speedometer") {
             hasHudSettings = true;
             hudSettings.showSpeedometer = parseBoolValue(value, hudSettings.showSpeedometer);
+        } else if (key == "hud.show_info_panel") {
+            hasHudSettings = true;
+            hudSettings.showInfoPanel = parseBoolValue(value, hudSettings.showInfoPanel);
         } else if (key == "hud.show_debug") {
             hasHudSettings = true;
             hudSettings.showDebug = parseBoolValue(value, hudSettings.showDebug);
@@ -4420,6 +5899,9 @@ bool loadPreferences(
         } else if (key == "hud.show_geo") {
             hasHudSettings = true;
             hudSettings.showGeoInfo = parseBoolValue(value, hudSettings.showGeoInfo);
+        } else if (key == "hud.show_crosshair") {
+            hasHudSettings = true;
+            hudSettings.showCrosshair = parseBoolValue(value, hudSettings.showCrosshair);
         } else if (key == "hud.speedometer_max_kph") {
             hasHudSettings = true;
             hudSettings.speedometerMaxKph = parseIntValue(value, hudSettings.speedometerMaxKph);
@@ -4504,6 +5986,242 @@ bool loadPreferences(
     clampVisualPreferenceData(planePrefs);
     clampVisualPreferenceData(walkingPrefs);
     terrainParams = normalizeTerrainParams(terrainParams);
+    return true;
+}
+
+void saveHudStylePreferences(std::ofstream& file, std::string_view styleKey, const HudElementStyle& style)
+{
+    file << "hud.style." << styleKey << ".x=" << style.x << "\n";
+    file << "hud.style." << styleKey << ".y=" << style.y << "\n";
+    file << "hud.style." << styleKey << ".width_scale=" << style.widthScale << "\n";
+    file << "hud.style." << styleKey << ".height_scale=" << style.heightScale << "\n";
+    file << "hud.style." << styleKey << ".background_r=" << style.backgroundColor.r << "\n";
+    file << "hud.style." << styleKey << ".background_g=" << style.backgroundColor.g << "\n";
+    file << "hud.style." << styleKey << ".background_b=" << style.backgroundColor.b << "\n";
+    file << "hud.style." << styleKey << ".background_opacity=" << style.backgroundOpacity << "\n";
+    file << "hud.style." << styleKey << ".accent_r=" << style.accentColor.r << "\n";
+    file << "hud.style." << styleKey << ".accent_g=" << style.accentColor.g << "\n";
+    file << "hud.style." << styleKey << ".accent_b=" << style.accentColor.b << "\n";
+    file << "hud.style." << styleKey << ".accent_opacity=" << style.accentOpacity << "\n";
+    file << "hud.style." << styleKey << ".text_r=" << style.textColor.r << "\n";
+    file << "hud.style." << styleKey << ".text_g=" << style.textColor.g << "\n";
+    file << "hud.style." << styleKey << ".text_b=" << style.textColor.b << "\n";
+    file << "hud.style." << styleKey << ".text_opacity=" << style.textOpacity << "\n";
+}
+
+bool applyHudStylePreferenceValue(HudElementStyle& style, const std::string& suffix, const std::string& value)
+{
+    if (suffix == "x") {
+        style.x = parseFloatValue(value, style.x);
+        return true;
+    }
+    if (suffix == "y") {
+        style.y = parseFloatValue(value, style.y);
+        return true;
+    }
+    if (suffix == "width_scale") {
+        style.widthScale = parseFloatValue(value, style.widthScale);
+        return true;
+    }
+    if (suffix == "height_scale") {
+        style.heightScale = parseFloatValue(value, style.heightScale);
+        return true;
+    }
+    if (suffix == "background_r") {
+        style.backgroundColor.r = parseIntValue(value, style.backgroundColor.r);
+        return true;
+    }
+    if (suffix == "background_g") {
+        style.backgroundColor.g = parseIntValue(value, style.backgroundColor.g);
+        return true;
+    }
+    if (suffix == "background_b") {
+        style.backgroundColor.b = parseIntValue(value, style.backgroundColor.b);
+        return true;
+    }
+    if (suffix == "background_opacity") {
+        style.backgroundOpacity = parseIntValue(value, style.backgroundOpacity);
+        return true;
+    }
+    if (suffix == "accent_r") {
+        style.accentColor.r = parseIntValue(value, style.accentColor.r);
+        return true;
+    }
+    if (suffix == "accent_g") {
+        style.accentColor.g = parseIntValue(value, style.accentColor.g);
+        return true;
+    }
+    if (suffix == "accent_b") {
+        style.accentColor.b = parseIntValue(value, style.accentColor.b);
+        return true;
+    }
+    if (suffix == "accent_opacity") {
+        style.accentOpacity = parseIntValue(value, style.accentOpacity);
+        return true;
+    }
+    if (suffix == "text_r") {
+        style.textColor.r = parseIntValue(value, style.textColor.r);
+        return true;
+    }
+    if (suffix == "text_g") {
+        style.textColor.g = parseIntValue(value, style.textColor.g);
+        return true;
+    }
+    if (suffix == "text_b") {
+        style.textColor.b = parseIntValue(value, style.textColor.b);
+        return true;
+    }
+    if (suffix == "text_opacity") {
+        style.textOpacity = parseIntValue(value, style.textOpacity);
+        return true;
+    }
+    return false;
+}
+
+bool saveHudPreferences(const std::filesystem::path& path, const HudSettings& hudSettings, std::string* errorText)
+{
+    if (path.empty()) {
+        if (errorText != nullptr) {
+            *errorText = "SDL_GetPrefPath returned no writable HUD location.";
+        }
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file.is_open()) {
+        if (errorText != nullptr) {
+            *errorText = "Could not open " + path.string() + " for writing.";
+        }
+        return false;
+    }
+
+    file << "hud.show_info_panel=" << (hudSettings.showInfoPanel ? 1 : 0) << "\n";
+    file << "hud.show_speedometer=" << (hudSettings.showSpeedometer ? 1 : 0) << "\n";
+    file << "hud.show_debug=" << (hudSettings.showDebug ? 1 : 0) << "\n";
+    file << "hud.show_throttle=" << (hudSettings.showThrottle ? 1 : 0) << "\n";
+    file << "hud.show_controls=" << (hudSettings.showControls ? 1 : 0) << "\n";
+    file << "hud.show_map=" << (hudSettings.showMap ? 1 : 0) << "\n";
+    file << "hud.show_geo=" << (hudSettings.showGeoInfo ? 1 : 0) << "\n";
+    file << "hud.show_crosshair=" << (hudSettings.showCrosshair ? 1 : 0) << "\n";
+    file << "hud.speedometer_max_kph=" << hudSettings.speedometerMaxKph << "\n";
+    file << "hud.speedometer_minor_step_kph=" << hudSettings.speedometerMinorStepKph << "\n";
+    file << "hud.speedometer_major_step_kph=" << hudSettings.speedometerMajorStepKph << "\n";
+    file << "hud.speedometer_label_step_kph=" << hudSettings.speedometerLabelStepKph << "\n";
+    file << "hud.speedometer_redline_kph=" << hudSettings.speedometerRedlineKph << "\n";
+    saveHudStylePreferences(file, "info", hudSettings.infoPanel);
+    saveHudStylePreferences(file, "speedometer", hudSettings.speedometer);
+    saveHudStylePreferences(file, "controls", hudSettings.controls);
+    saveHudStylePreferences(file, "map", hudSettings.mapPanel);
+    saveHudStylePreferences(file, "crosshair", hudSettings.crosshair);
+    saveHudStylePreferences(file, "debug", hudSettings.debugFooter);
+
+    if (!file.good()) {
+        if (errorText != nullptr) {
+            *errorText = "Failed while writing " + path.string() + ".";
+        }
+        return false;
+    }
+    return true;
+}
+
+bool loadHudPreferences(const std::filesystem::path& path, HudSettings& hudSettings, std::string* errorText)
+{
+    if (path.empty()) {
+        return false;
+    }
+
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        return false;
+    }
+
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) {
+        if (errorText != nullptr) {
+            *errorText = "Could not open " + path.string() + " for reading.";
+        }
+        return false;
+    }
+
+    std::string line;
+    while (std::getline(file, line)) {
+        line = trimAscii(line);
+        if (line.empty() || line[0] == '#' || line[0] == ';') {
+            continue;
+        }
+
+        const std::size_t separator = line.find('=');
+        if (separator == std::string::npos) {
+            continue;
+        }
+
+        const std::string key = trimAscii(line.substr(0, separator));
+        const std::string value = trimAscii(line.substr(separator + 1));
+        constexpr std::string_view infoPrefix = "hud.style.info.";
+        constexpr std::string_view speedPrefix = "hud.style.speedometer.";
+        constexpr std::string_view controlsPrefix = "hud.style.controls.";
+        constexpr std::string_view mapPrefix = "hud.style.map.";
+        constexpr std::string_view crosshairPrefix = "hud.style.crosshair.";
+        constexpr std::string_view debugPrefix = "hud.style.debug.";
+
+        if (key.rfind(infoPrefix, 0) == 0) {
+            applyHudStylePreferenceValue(hudSettings.infoPanel, key.substr(infoPrefix.size()), value);
+            continue;
+        }
+        if (key.rfind(speedPrefix, 0) == 0) {
+            applyHudStylePreferenceValue(hudSettings.speedometer, key.substr(speedPrefix.size()), value);
+            continue;
+        }
+        if (key.rfind(controlsPrefix, 0) == 0) {
+            applyHudStylePreferenceValue(hudSettings.controls, key.substr(controlsPrefix.size()), value);
+            continue;
+        }
+        if (key.rfind(mapPrefix, 0) == 0) {
+            applyHudStylePreferenceValue(hudSettings.mapPanel, key.substr(mapPrefix.size()), value);
+            continue;
+        }
+        if (key.rfind(crosshairPrefix, 0) == 0) {
+            applyHudStylePreferenceValue(hudSettings.crosshair, key.substr(crosshairPrefix.size()), value);
+            continue;
+        }
+        if (key.rfind(debugPrefix, 0) == 0) {
+            applyHudStylePreferenceValue(hudSettings.debugFooter, key.substr(debugPrefix.size()), value);
+            continue;
+        }
+
+        if (key == "hud.show_info_panel") {
+            hudSettings.showInfoPanel = parseBoolValue(value, hudSettings.showInfoPanel);
+        } else if (key == "hud.show_speedometer") {
+            hudSettings.showSpeedometer = parseBoolValue(value, hudSettings.showSpeedometer);
+        } else if (key == "hud.show_debug") {
+            hudSettings.showDebug = parseBoolValue(value, hudSettings.showDebug);
+        } else if (key == "hud.show_throttle") {
+            hudSettings.showThrottle = parseBoolValue(value, hudSettings.showThrottle);
+        } else if (key == "hud.show_controls") {
+            hudSettings.showControls = parseBoolValue(value, hudSettings.showControls);
+        } else if (key == "hud.show_map") {
+            hudSettings.showMap = parseBoolValue(value, hudSettings.showMap);
+        } else if (key == "hud.show_geo") {
+            hudSettings.showGeoInfo = parseBoolValue(value, hudSettings.showGeoInfo);
+        } else if (key == "hud.show_crosshair") {
+            hudSettings.showCrosshair = parseBoolValue(value, hudSettings.showCrosshair);
+        } else if (key == "hud.speedometer_max_kph") {
+            hudSettings.speedometerMaxKph = parseIntValue(value, hudSettings.speedometerMaxKph);
+        } else if (key == "hud.speedometer_minor_step_kph") {
+            hudSettings.speedometerMinorStepKph = parseIntValue(value, hudSettings.speedometerMinorStepKph);
+        } else if (key == "hud.speedometer_major_step_kph") {
+            hudSettings.speedometerMajorStepKph = parseIntValue(value, hudSettings.speedometerMajorStepKph);
+        } else if (key == "hud.speedometer_label_step_kph") {
+            hudSettings.speedometerLabelStepKph = parseIntValue(value, hudSettings.speedometerLabelStepKph);
+        } else if (key == "hud.speedometer_redline_kph") {
+            hudSettings.speedometerRedlineKph = parseIntValue(value, hudSettings.speedometerRedlineKph);
+        }
+    }
+
+    clampHudSettings(hudSettings);
     return true;
 }
 
@@ -5020,6 +6738,14 @@ void cyclePauseSubTab(PauseState& pauseState, int delta)
         pauseState.selectedIndex = 0;
         pauseState.rowDragActive = false;
         clearMenuConfirmation(pauseState);
+    } else if (pauseState.tab == PauseTab::Hud) {
+        constexpr int count = 6;
+        int index = static_cast<int>(pauseState.hudSubTab);
+        index = (index + delta + count) % count;
+        pauseState.hudSubTab = static_cast<HudSubTab>(index);
+        pauseState.selectedIndex = 0;
+        pauseState.rowDragActive = false;
+        clearMenuConfirmation(pauseState);
     }
 }
 
@@ -5035,7 +6761,7 @@ int pauseItemCount(const PauseState& pauseState, std::size_t assetCount)
     case PauseTab::Paint:
         return kPaintSettingCount;
     case PauseTab::Hud:
-        return 5;
+        return hudSubTabItemCount(pauseState.hudSubTab);
     case PauseTab::Controls:
     case PauseTab::Help:
     default:
@@ -5156,16 +6882,12 @@ void handlePauseMouseMove(
     float mouseX,
     float mouseY)
 {
-    const PauseLayout layout = buildPauseLayout(width, height);
+    (void)assetCount;
+    const PauseLayout layout = buildPauseLayout(width, height, 1.0f, pauseState.tab);
     paintUi.canvasRect = paintCanvasRect(layout);
     if (paintUi.draggingCanvas) {
         tryPaintCanvasStroke(layout, pauseState, paintUi, planeVisual, walkingVisual, mouseX, mouseY, false);
         return;
-    }
-
-    const int itemIndex = hitPauseItemIndex(layout, pauseState, assetCount, mouseX, mouseY);
-    if (itemIndex >= 0) {
-        pauseState.selectedIndex = itemIndex;
     }
 }
 
@@ -5198,7 +6920,7 @@ void handlePauseMouseButtonDown(
     std::uint8_t button,
     float nowSeconds)
 {
-    const PauseLayout layout = buildPauseLayout(width, height);
+    const PauseLayout layout = buildPauseLayout(width, height, 1.0f, pauseState.tab);
     const int tabIndex = hitPauseTabIndex(layout, mouseX, mouseY);
     if (tabIndex >= 0) {
         pauseState.tab = static_cast<PauseTab>(tabIndex);
@@ -5390,44 +7112,26 @@ void handlePauseMouseWheel(
     std::size_t assetCount,
     float nowSeconds)
 {
+    (void)uiState;
+    (void)propAudioConfig;
+    (void)plane;
+    (void)config;
+    (void)terrainParams;
+    (void)terrainContext;
+    (void)terrainCache;
+    (void)planeVisual;
+    (void)walkingVisual;
+    (void)paintUi;
+    (void)preferencesDirty;
+    (void)preferencesNextSaveAt;
+    (void)worldStore;
+    (void)nowSeconds;
+
     if (wheelDelta == 0) {
         return;
     }
 
-    if (!pauseTabSupportsMouseAdjustment(pauseState.tab)) {
-        movePauseSelection(pauseState, wheelDelta > 0 ? -1 : 1, assetCount);
-        return;
-    }
-
-    const int direction = wheelDelta > 0 ? 1 : -1;
-    if (pauseState.tab == PauseTab::Settings) {
-        if (pauseState.settingsSubTab == SettingsSubTab::Flight) {
-            adjustTuningValue(config, pauseState.selectedIndex, direction);
-        } else if (pauseState.settingsSubTab == SettingsSubTab::Terrain) {
-            adjustTerrainValue(terrainParams, pauseState.selectedIndex, direction);
-            applyTerrainRuntimeChange(terrainParams, terrainContext, terrainCache, plane, worldStore);
-        } else {
-            adjustSettingsRowValue(uiState, propAudioConfig, pauseState.settingsSubTab, pauseState.selectedIndex, direction);
-        }
-        schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, nowSeconds);
-    } else if (pauseState.tab == PauseTab::Hud) {
-        adjustHudValue(uiState, pauseState.selectedIndex, direction);
-        schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, nowSeconds);
-    } else if (pauseState.tab == PauseTab::Characters) {
-        if (pauseState.selectedIndex < 1 || pauseState.selectedIndex > 10) {
-            movePauseSelection(pauseState, wheelDelta > 0 ? -1 : 1, assetCount);
-            return;
-        }
-        PlaneVisualState& visual = visualForRole(pauseState.charactersSubTab, planeVisual, walkingVisual);
-        adjustCharacterRowValue(visual, pauseState.selectedIndex, direction);
-        schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, nowSeconds);
-    } else if (pauseState.tab == PauseTab::Paint) {
-        if (pauseState.selectedIndex < 0 || pauseState.selectedIndex > 4) {
-            movePauseSelection(pauseState, wheelDelta > 0 ? -1 : 1, assetCount);
-            return;
-        }
-        adjustPaintRowValue(paintUi, pauseState.selectedIndex, direction);
-    }
+    movePauseSelection(pauseState, wheelDelta > 0 ? -1 : 1, assetCount);
 }
 
 void changeMapZoom(UiState& uiState, int delta)
@@ -6975,7 +8679,8 @@ Camera buildRenderCamera(
     const UiState& uiState,
     bool flightMode = true,
     float lookYawRadians = 0.0f,
-    float lookPitchRadians = 0.0f)
+    float lookPitchRadians = 0.0f,
+    float farClipMeters = 4200.0f)
 {
     const Vec3 forward = forwardFromRotation(plane.rot);
     const Vec3 up = upFromRotation(plane.rot);
@@ -6983,6 +8688,7 @@ Camera buildRenderCamera(
     Camera camera;
     camera.rot = applyCameraLookOffset(plane.rot, lookYawRadians, lookPitchRadians);
     camera.fovRadians = radians(uiState.cameraFovDegrees);
+    camera.farClipMeters = std::max(120.0f, farClipMeters);
     if (flightMode && uiState.zoomHeld) {
         camera.fovRadians = std::max(kMinimumZoomFovRadians, camera.fovRadians * kFlightZoomFactor);
     }
@@ -7003,6 +8709,11 @@ Camera buildRenderCamera(
         camera.pos.y = cameraGround;
     }
     return camera;
+}
+
+float computeWorldFarClip(const GraphicsSettings& graphicsSettings)
+{
+    return std::max(400.0f, graphicsSettings.drawDistance + 256.0f);
 }
 
 void drawCrosshair(HudCanvas& canvas, int width, int height)
@@ -7166,7 +8877,7 @@ void drawPauseMenu(
     const PaintUiState& paintUi)
 {
     canvas.fillRect(0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), makeHudColor(2, 4, 7, 168));
-    const PauseLayout layout = buildPauseLayout(width, height);
+    const PauseLayout layout = buildPauseLayout(width, height, 1.0f, pauseState.tab);
 
     canvas.fillRect(layout.panelX, layout.panelY, layout.panelW, layout.panelH, makeHudColor(8, 14, 22, 240));
     canvas.strokeRect(layout.panelX, layout.panelY, layout.panelW, layout.panelH, makeHudColor(186, 224, 255, 255));
@@ -7180,7 +8891,7 @@ void drawPauseMenu(
         canvas.fillRect(x, layout.tabY, layout.tabW, layout.tabH, active ? makeHudColor(58, 112, 168, 220) : makeHudColor(18, 28, 40, 220));
         canvas.strokeRect(x, layout.tabY, layout.tabW, layout.tabH, active ? makeHudColor(218, 239, 255, 255) : makeHudColor(96, 132, 164, 255));
         const std::string_view label(kPauseTabs[i]);
-        const float labelWidth = static_cast<float>(label.size() * 8u);
+        const float labelWidth = canvas.textWidth(label);
         canvas.text(x + std::max(8.0f, (layout.tabW - labelWidth) * 0.5f), layout.tabY + 9.0f, label, makeHudColor(240, 247, 255, 255));
     }
 
@@ -7472,11 +9183,11 @@ void drawPauseMenu(
     if (pauseState.tab == PauseTab::Main) {
         footer = "Tab/H switch tabs | W/S or Up/Down select | Enter apply | Mouse click activates | Esc resume";
     } else if (pauseState.tab == PauseTab::Settings) {
-        footer = "Tab/H switch tabs | Q/E subtab | W/S select | A/D or Wheel adjust | RMB reset row";
+        footer = "Tab/H switch tabs | Q/E subtab | W/S or Wheel scroll | A/D adjust | RMB reset row";
     } else if (pauseState.tab == PauseTab::Characters) {
-        footer = "Tab/H switch tabs | Q/E role | W/S select | A/D or Wheel adjust | Enter/LMB load | RMB reset row";
+        footer = "Tab/H switch tabs | Q/E role | W/S or Wheel scroll | A/D adjust | Enter/LMB load | RMB reset row";
     } else if (pauseState.tab == PauseTab::Paint) {
-        footer = "Tab/H switch tabs | Q/E role | W/S select | Paint on canvas | A/D or Wheel adjust | Enter activates";
+        footer = "Tab/H switch tabs | Q/E role | W/S or Wheel scroll | Paint on canvas | A/D adjust | Enter activates";
     } else if (pauseState.tab == PauseTab::Hud) {
         footer = "Tab/H switch tabs | W/S select | A/D toggle | LMB toggles | RMB reset row";
     }
@@ -7565,16 +9276,20 @@ const char* menuSettingsRowLabel(SettingsSubTab subTab, int localIndex)
         case 2:
             return "Apply Display";
         case 3:
-            return "Render Scale";
+            return "UI Scale";
         case 4:
-            return "Draw Distance";
+            return "Scale HUD with UI";
         case 5:
-            return "Horizon Fog";
+            return "Render Scale";
         case 6:
-            return "Texture Mipmaps";
+            return "Draw Distance";
         case 7:
-            return "VSync";
+            return "Horizon Fog";
         case 8:
+            return "Texture Mipmaps";
+        case 9:
+            return "VSync";
+        case 10:
             return "Graphics API";
         default:
             return "";
@@ -7684,7 +9399,7 @@ const char* menuSettingsRowLabel(SettingsSubTab subTab, int localIndex)
 bool menuSettingsRowDisabled(SettingsSubTab subTab, int localIndex)
 {
     if (subTab == SettingsSubTab::Graphics) {
-        return localIndex == 8;
+        return localIndex == 10;
     }
     return subTab == SettingsSubTab::Online;
 }
@@ -7694,7 +9409,7 @@ bool menuSettingsRowAction(SettingsSubTab subTab, int localIndex)
     return subTab == SettingsSubTab::Graphics && localIndex == 2;
 }
 
-std::string formatGraphicsRowValue(int localIndex, const GraphicsSettings& graphicsSettings)
+std::string formatGraphicsRowValue(int localIndex, const GraphicsSettings& graphicsSettings, const UiState& uiState)
 {
     switch (localIndex) {
     case 0:
@@ -7704,16 +9419,20 @@ std::string formatGraphicsRowValue(int localIndex, const GraphicsSettings& graph
     case 2:
         return "Press Enter";
     case 3:
-        return formatFixed(graphicsSettings.renderScale, 2) + "x";
+        return formatFixed(effectiveUiScale(uiState), 1) + "x";
     case 4:
-        return std::to_string(static_cast<int>(std::round(graphicsSettings.drawDistance))) + " m";
+        return uiState.scaleHudWithUi ? "On" : "Off";
     case 5:
-        return graphicsSettings.horizonFog ? "On" : "Off";
+        return formatFixed(graphicsSettings.renderScale, 2) + "x";
     case 6:
-        return graphicsSettings.textureMipmaps ? "On" : "Off";
+        return std::to_string(static_cast<int>(std::round(graphicsSettings.drawDistance))) + " m";
     case 7:
-        return graphicsSettings.vsync ? "On" : "Off";
+        return graphicsSettings.horizonFog ? "On" : "Off";
     case 8:
+        return graphicsSettings.textureMipmaps ? "On" : "Off";
+    case 9:
+        return graphicsSettings.vsync ? "On" : "Off";
+    case 10:
         return "Vulkan Only";
     default:
         return {};
@@ -7820,7 +9539,7 @@ std::string menuFormatSettingsRowValue(
 {
     switch (subTab) {
     case SettingsSubTab::Graphics:
-        return formatGraphicsRowValue(localIndex, graphicsSettings);
+        return formatGraphicsRowValue(localIndex, graphicsSettings, uiState);
     case SettingsSubTab::Camera:
         return formatCameraRowValue(localIndex, uiState);
     case SettingsSubTab::Sound:
@@ -7844,16 +9563,20 @@ const char* graphicsRowHelpText(int localIndex)
     case 2:
         return "Apply the selected window mode and resolution immediately.";
     case 3:
-        return "Internal render-scale preference. Persistence is ready even though the renderer still uses swapchain resolution.";
+        return "Scales the main menu, pause menu, and other general native UI from 1.0x to 10.0x in 0.1x steps.";
     case 4:
-        return "Controls terrain/object fog distance and culling range.";
+        return "When enabled, HUD modules multiply their own scale by the main UI scale.";
     case 5:
-        return "Enable or disable horizon fog blending.";
+        return "Internal render-scale preference. Persistence is ready even though the renderer still uses swapchain resolution.";
     case 6:
-        return "Texture mipmap preference for native assets.";
+        return "Controls terrain/object fog distance and culling range.";
     case 7:
-        return "Vertical sync preference for swapchain presentation.";
+        return "Enable or disable horizon fog blending.";
     case 8:
+        return "Texture mipmap preference for native assets.";
+    case 9:
+        return "Vertical sync preference for swapchain presentation.";
+    case 10:
         return "Only the Vulkan renderer backend exists in the native port today.";
     default:
         return "";
@@ -7961,7 +9684,7 @@ const char* menuSettingsRowHelpText(SettingsSubTab subTab, int localIndex)
     }
 }
 
-void adjustGraphicsRowValue(GraphicsSettings& graphicsSettings, int localIndex, int direction)
+void adjustGraphicsRowValue(GraphicsSettings& graphicsSettings, UiState& uiState, int localIndex, int direction)
 {
     switch (localIndex) {
     case 0:
@@ -7971,22 +9694,30 @@ void adjustGraphicsRowValue(GraphicsSettings& graphicsSettings, int localIndex, 
         cycleGraphicsResolution(graphicsSettings, direction);
         break;
     case 3:
-        graphicsSettings.renderScale += 0.05f * static_cast<float>(direction);
+        uiState.uiScale = clampUiScaleValue(uiState.uiScale + (static_cast<float>(direction) * kUiScaleStep));
         break;
     case 4:
-        graphicsSettings.drawDistance += 100.0f * static_cast<float>(direction);
+        if (direction != 0) {
+            uiState.scaleHudWithUi = !uiState.scaleHudWithUi;
+        }
         break;
     case 5:
+        graphicsSettings.renderScale += 0.05f * static_cast<float>(direction);
+        break;
+    case 6:
+        graphicsSettings.drawDistance += 100.0f * static_cast<float>(direction);
+        break;
+    case 7:
         if (direction != 0) {
             graphicsSettings.horizonFog = !graphicsSettings.horizonFog;
         }
         break;
-    case 6:
+    case 8:
         if (direction != 0) {
             graphicsSettings.textureMipmaps = !graphicsSettings.textureMipmaps;
         }
         break;
-    case 7:
+    case 9:
         if (direction != 0) {
             graphicsSettings.vsync = !graphicsSettings.vsync;
         }
@@ -7994,10 +9725,11 @@ void adjustGraphicsRowValue(GraphicsSettings& graphicsSettings, int localIndex, 
     default:
         break;
     }
+    clampUiStatePersistentValues(uiState);
     clampGraphicsSettings(graphicsSettings);
 }
 
-void resetGraphicsRowValue(GraphicsSettings& graphicsSettings, const GraphicsSettings& defaults, int localIndex)
+void resetGraphicsRowValue(GraphicsSettings& graphicsSettings, const GraphicsSettings& defaults, UiState& uiState, const UiState& uiDefaults, int localIndex)
 {
     switch (localIndex) {
     case 0:
@@ -8008,23 +9740,30 @@ void resetGraphicsRowValue(GraphicsSettings& graphicsSettings, const GraphicsSet
         graphicsSettings.resolutionHeight = defaults.resolutionHeight;
         break;
     case 3:
-        graphicsSettings.renderScale = defaults.renderScale;
+        uiState.uiScale = clampUiScaleValue(uiDefaults.uiScale);
         break;
     case 4:
-        graphicsSettings.drawDistance = defaults.drawDistance;
+        uiState.scaleHudWithUi = uiDefaults.scaleHudWithUi;
         break;
     case 5:
-        graphicsSettings.horizonFog = defaults.horizonFog;
+        graphicsSettings.renderScale = defaults.renderScale;
         break;
     case 6:
-        graphicsSettings.textureMipmaps = defaults.textureMipmaps;
+        graphicsSettings.drawDistance = defaults.drawDistance;
         break;
     case 7:
+        graphicsSettings.horizonFog = defaults.horizonFog;
+        break;
+    case 8:
+        graphicsSettings.textureMipmaps = defaults.textureMipmaps;
+        break;
+    case 9:
         graphicsSettings.vsync = defaults.vsync;
         break;
     default:
         break;
     }
+    clampUiStatePersistentValues(uiState);
 }
 
 void adjustCameraRowValue(UiState& uiState, int localIndex, int direction)
@@ -8282,6 +10021,509 @@ void resetLightingRowValue(LightingSettings& lightingSettings, const LightingSet
     }
 }
 
+HudElementStyle& hudStyleForSubTab(HudSettings& hudSettings, HudSubTab subTab)
+{
+    switch (subTab) {
+    case HudSubTab::Info:
+        return hudSettings.infoPanel;
+    case HudSubTab::Speedometer:
+        return hudSettings.speedometer;
+    case HudSubTab::Controls:
+        return hudSettings.controls;
+    case HudSubTab::Map:
+        return hudSettings.mapPanel;
+    case HudSubTab::Crosshair:
+        return hudSettings.crosshair;
+    case HudSubTab::Debug:
+    default:
+        return hudSettings.debugFooter;
+    }
+}
+
+const HudElementStyle& hudStyleForSubTab(const HudSettings& hudSettings, HudSubTab subTab)
+{
+    switch (subTab) {
+    case HudSubTab::Info:
+        return hudSettings.infoPanel;
+    case HudSubTab::Speedometer:
+        return hudSettings.speedometer;
+    case HudSubTab::Controls:
+        return hudSettings.controls;
+    case HudSubTab::Map:
+        return hudSettings.mapPanel;
+    case HudSubTab::Crosshair:
+        return hudSettings.crosshair;
+    case HudSubTab::Debug:
+    default:
+        return hudSettings.debugFooter;
+    }
+}
+
+bool& hudVisibilityForSubTab(HudSettings& hudSettings, HudSubTab subTab)
+{
+    switch (subTab) {
+    case HudSubTab::Info:
+        return hudSettings.showInfoPanel;
+    case HudSubTab::Speedometer:
+        return hudSettings.showSpeedometer;
+    case HudSubTab::Controls:
+        return hudSettings.showControls;
+    case HudSubTab::Map:
+        return hudSettings.showMap;
+    case HudSubTab::Crosshair:
+        return hudSettings.showCrosshair;
+    case HudSubTab::Debug:
+    default:
+        return hudSettings.showDebug;
+    }
+}
+
+bool hudVisibilityForSubTab(const HudSettings& hudSettings, HudSubTab subTab)
+{
+    switch (subTab) {
+    case HudSubTab::Info:
+        return hudSettings.showInfoPanel;
+    case HudSubTab::Speedometer:
+        return hudSettings.showSpeedometer;
+    case HudSubTab::Controls:
+        return hudSettings.showControls;
+    case HudSubTab::Map:
+        return hudSettings.showMap;
+    case HudSubTab::Crosshair:
+        return hudSettings.showCrosshair;
+    case HudSubTab::Debug:
+    default:
+        return hudSettings.showDebug;
+    }
+}
+
+const char* hudStyleRowLabel(int localIndex)
+{
+    switch (localIndex) {
+    case 0:
+        return "Visible";
+    case 1:
+        return "X Position";
+    case 2:
+        return "Y Position";
+    case 3:
+        return "Width Scale";
+    case 4:
+        return "Height Scale";
+    case 5:
+        return "BG Red";
+    case 6:
+        return "BG Green";
+    case 7:
+        return "BG Blue";
+    case 8:
+        return "BG Opacity";
+    case 9:
+        return "Accent Red";
+    case 10:
+        return "Accent Green";
+    case 11:
+        return "Accent Blue";
+    case 12:
+        return "Accent Opacity";
+    case 13:
+        return "Text Red";
+    case 14:
+        return "Text Green";
+    case 15:
+        return "Text Blue";
+    case 16:
+        return "Text Opacity";
+    default:
+        return "";
+    }
+}
+
+std::string formatHudStyleRowValue(const HudElementStyle& style, bool visible, int localIndex)
+{
+    switch (localIndex) {
+    case 0:
+        return visible ? "On" : "Off";
+    case 1:
+        return formatFixed(style.x * 100.0f, 0) + "%";
+    case 2:
+        return formatFixed(style.y * 100.0f, 0) + "%";
+    case 3:
+        return formatFixed(style.widthScale, 2) + "x";
+    case 4:
+        return formatFixed(style.heightScale, 2) + "x";
+    case 5:
+        return std::to_string(style.backgroundColor.r);
+    case 6:
+        return std::to_string(style.backgroundColor.g);
+    case 7:
+        return std::to_string(style.backgroundColor.b);
+    case 8:
+        return std::to_string(style.backgroundOpacity);
+    case 9:
+        return std::to_string(style.accentColor.r);
+    case 10:
+        return std::to_string(style.accentColor.g);
+    case 11:
+        return std::to_string(style.accentColor.b);
+    case 12:
+        return std::to_string(style.accentOpacity);
+    case 13:
+        return std::to_string(style.textColor.r);
+    case 14:
+        return std::to_string(style.textColor.g);
+    case 15:
+        return std::to_string(style.textColor.b);
+    case 16:
+        return std::to_string(style.textOpacity);
+    default:
+        return {};
+    }
+}
+
+const char* hudStyleRowHelpText(HudSubTab subTab, int localIndex)
+{
+    switch (localIndex) {
+    case 0:
+        return "Show or hide the current HUD element.";
+    case 1:
+    case 2:
+        return subTab == HudSubTab::Crosshair ? "Normalized screen position for the crosshair center." : "Normalized top-left screen position for this HUD element.";
+    case 3:
+    case 4:
+        return "Independent width and height multipliers for this HUD element.";
+    case 5:
+    case 6:
+    case 7:
+    case 8:
+        return "Background color and opacity used by boxed HUD modules. Setting opacity to 0 disables the fill.";
+    case 9:
+    case 10:
+    case 11:
+    case 12:
+        return "Accent color and opacity used for borders, ticks, markers, and highlights.";
+    case 13:
+    case 14:
+    case 15:
+    case 16:
+        return "Primary text color and opacity for this HUD element.";
+    default:
+        return "";
+    }
+}
+
+const char* hudRowLabel(HudSubTab subTab, int localIndex)
+{
+    if (localIndex < 17) {
+        return hudStyleRowLabel(localIndex);
+    }
+
+    switch (subTab) {
+    case HudSubTab::Info:
+        switch (localIndex) {
+        case 17:
+            return "Geo Readout";
+        case 18:
+            return "Throttle Bar";
+        default:
+            return "";
+        }
+    case HudSubTab::Speedometer:
+        switch (localIndex) {
+        case 17:
+            return "Max KPH";
+        case 18:
+            return "Minor Tick Step";
+        case 19:
+            return "Major Tick Step";
+        case 20:
+            return "Label Step";
+        case 21:
+            return "Redline KPH";
+        default:
+            return "";
+        }
+    default:
+        return "";
+    }
+}
+
+std::string formatHudRowValue(HudSubTab subTab, int localIndex, const HudSettings& hudSettings)
+{
+    const HudElementStyle& style = hudStyleForSubTab(hudSettings, subTab);
+    if (localIndex < 17) {
+        return formatHudStyleRowValue(style, hudVisibilityForSubTab(hudSettings, subTab), localIndex);
+    }
+
+    switch (subTab) {
+    case HudSubTab::Info:
+        if (localIndex == 17) {
+            return hudSettings.showGeoInfo ? "On" : "Off";
+        }
+        if (localIndex == 18) {
+            return hudSettings.showThrottle ? "On" : "Off";
+        }
+        break;
+    case HudSubTab::Speedometer:
+        switch (localIndex) {
+        case 17:
+            return std::to_string(hudSettings.speedometerMaxKph);
+        case 18:
+            return std::to_string(hudSettings.speedometerMinorStepKph);
+        case 19:
+            return std::to_string(hudSettings.speedometerMajorStepKph);
+        case 20:
+            return std::to_string(hudSettings.speedometerLabelStepKph);
+        case 21:
+            return std::to_string(hudSettings.speedometerRedlineKph);
+        default:
+            break;
+        }
+    default:
+        break;
+    }
+    return {};
+}
+
+const char* hudRowHelpText(HudSubTab subTab, int localIndex)
+{
+    if (localIndex < 17) {
+        return hudStyleRowHelpText(subTab, localIndex);
+    }
+
+    switch (subTab) {
+    case HudSubTab::Info:
+        return localIndex == 17
+            ? "Show or hide the latitude/longitude lines inside the info panel."
+            : "Show or hide the throttle progress bar inside the info panel.";
+    case HudSubTab::Speedometer:
+        switch (localIndex) {
+        case 17:
+            return "Maximum speed shown by the speedometer arc.";
+        case 18:
+            return "KPH between minor speedometer ticks.";
+        case 19:
+            return "KPH between major speedometer ticks.";
+        case 20:
+            return "KPH between numeric speedometer labels.";
+        case 21:
+            return "KPH threshold where overspeed highlighting begins.";
+        default:
+            return "";
+        }
+    default:
+        return "";
+    }
+}
+
+bool hudRowDisabled(HudSubTab, int)
+{
+    return false;
+}
+
+void adjustHudRowValue(HudSettings& hudSettings, HudSubTab subTab, int localIndex, int direction)
+{
+    if (direction == 0 || hudRowDisabled(subTab, localIndex)) {
+        return;
+    }
+
+    HudElementStyle& style = hudStyleForSubTab(hudSettings, subTab);
+    if (localIndex < 17) {
+        switch (localIndex) {
+        case 0:
+            hudVisibilityForSubTab(hudSettings, subTab) = !hudVisibilityForSubTab(hudSettings, subTab);
+            break;
+        case 1:
+            style.x += 0.01f * static_cast<float>(direction);
+            break;
+        case 2:
+            style.y += 0.01f * static_cast<float>(direction);
+            break;
+        case 3:
+            style.widthScale += 0.10f * static_cast<float>(direction);
+            break;
+        case 4:
+            style.heightScale += 0.10f * static_cast<float>(direction);
+            break;
+        case 5:
+            style.backgroundColor.r += 5 * direction;
+            break;
+        case 6:
+            style.backgroundColor.g += 5 * direction;
+            break;
+        case 7:
+            style.backgroundColor.b += 5 * direction;
+            break;
+        case 8:
+            style.backgroundOpacity += 5 * direction;
+            break;
+        case 9:
+            style.accentColor.r += 5 * direction;
+            break;
+        case 10:
+            style.accentColor.g += 5 * direction;
+            break;
+        case 11:
+            style.accentColor.b += 5 * direction;
+            break;
+        case 12:
+            style.accentOpacity += 5 * direction;
+            break;
+        case 13:
+            style.textColor.r += 5 * direction;
+            break;
+        case 14:
+            style.textColor.g += 5 * direction;
+            break;
+        case 15:
+            style.textColor.b += 5 * direction;
+            break;
+        case 16:
+            style.textOpacity += 5 * direction;
+            break;
+        default:
+            break;
+        }
+        clampHudSettings(hudSettings);
+        return;
+    }
+
+    switch (subTab) {
+    case HudSubTab::Info:
+        if (localIndex == 17) {
+            hudSettings.showGeoInfo = !hudSettings.showGeoInfo;
+        } else if (localIndex == 18) {
+            hudSettings.showThrottle = !hudSettings.showThrottle;
+        }
+        break;
+    case HudSubTab::Speedometer:
+        switch (localIndex) {
+        case 17:
+            hudSettings.speedometerMaxKph += 50 * direction;
+            break;
+        case 18:
+            hudSettings.speedometerMinorStepKph += 5 * direction;
+            break;
+        case 19:
+            hudSettings.speedometerMajorStepKph += 10 * direction;
+            break;
+        case 20:
+            hudSettings.speedometerLabelStepKph += 10 * direction;
+            break;
+        case 21:
+            hudSettings.speedometerRedlineKph += 50 * direction;
+            break;
+        default:
+            break;
+        }
+        break;
+    default:
+        break;
+    }
+    clampHudSettings(hudSettings);
+}
+
+void resetHudRowValue(HudSettings& hudSettings, const HudSettings& defaults, HudSubTab subTab, int localIndex)
+{
+    if (localIndex < 17) {
+        hudStyleForSubTab(hudSettings, subTab) = hudStyleForSubTab(defaults, subTab);
+        if (localIndex == 0) {
+            hudVisibilityForSubTab(hudSettings, subTab) = hudVisibilityForSubTab(defaults, subTab);
+        } else {
+            HudElementStyle& target = hudStyleForSubTab(hudSettings, subTab);
+            const HudElementStyle& source = hudStyleForSubTab(defaults, subTab);
+            switch (localIndex) {
+            case 1:
+                target.x = source.x;
+                break;
+            case 2:
+                target.y = source.y;
+                break;
+            case 3:
+                target.widthScale = source.widthScale;
+                break;
+            case 4:
+                target.heightScale = source.heightScale;
+                break;
+            case 5:
+                target.backgroundColor.r = source.backgroundColor.r;
+                break;
+            case 6:
+                target.backgroundColor.g = source.backgroundColor.g;
+                break;
+            case 7:
+                target.backgroundColor.b = source.backgroundColor.b;
+                break;
+            case 8:
+                target.backgroundOpacity = source.backgroundOpacity;
+                break;
+            case 9:
+                target.accentColor.r = source.accentColor.r;
+                break;
+            case 10:
+                target.accentColor.g = source.accentColor.g;
+                break;
+            case 11:
+                target.accentColor.b = source.accentColor.b;
+                break;
+            case 12:
+                target.accentOpacity = source.accentOpacity;
+                break;
+            case 13:
+                target.textColor.r = source.textColor.r;
+                break;
+            case 14:
+                target.textColor.g = source.textColor.g;
+                break;
+            case 15:
+                target.textColor.b = source.textColor.b;
+                break;
+            case 16:
+                target.textOpacity = source.textOpacity;
+                break;
+            default:
+                break;
+            }
+        }
+        clampHudSettings(hudSettings);
+        return;
+    }
+
+    switch (subTab) {
+    case HudSubTab::Info:
+        if (localIndex == 17) {
+            hudSettings.showGeoInfo = defaults.showGeoInfo;
+        } else if (localIndex == 18) {
+            hudSettings.showThrottle = defaults.showThrottle;
+        }
+        break;
+    case HudSubTab::Speedometer:
+        switch (localIndex) {
+        case 17:
+            hudSettings.speedometerMaxKph = defaults.speedometerMaxKph;
+            break;
+        case 18:
+            hudSettings.speedometerMinorStepKph = defaults.speedometerMinorStepKph;
+            break;
+        case 19:
+            hudSettings.speedometerMajorStepKph = defaults.speedometerMajorStepKph;
+            break;
+        case 20:
+            hudSettings.speedometerLabelStepKph = defaults.speedometerLabelStepKph;
+            break;
+        case 21:
+            hudSettings.speedometerRedlineKph = defaults.speedometerRedlineKph;
+            break;
+        default:
+            break;
+        }
+        break;
+    default:
+        break;
+    }
+    clampHudSettings(hudSettings);
+}
+
 std::string formatHudRowValue(int hudIndex, const HudSettings& hudSettings)
 {
     switch (hudIndex) {
@@ -8488,7 +10730,7 @@ void adjustMenuSettingsRowValue(
 
     switch (subTab) {
     case SettingsSubTab::Graphics:
-        adjustGraphicsRowValue(graphicsSettings, localIndex, direction);
+        adjustGraphicsRowValue(graphicsSettings, uiState, localIndex, direction);
         break;
     case SettingsSubTab::Camera:
         adjustCameraRowValue(uiState, localIndex, direction);
@@ -8523,7 +10765,7 @@ void resetMenuSettingsRowValue(
 
     switch (subTab) {
     case SettingsSubTab::Graphics:
-        resetGraphicsRowValue(graphicsSettings, defaultGraphicsSettingsValues, localIndex);
+        resetGraphicsRowValue(graphicsSettings, defaultGraphicsSettingsValues, uiState, defaultUiStateValues, localIndex);
         break;
     case SettingsSubTab::Camera:
         resetCameraRowValue(uiState, defaultUiStateValues, localIndex);
@@ -8562,7 +10804,7 @@ int menuItemCount(const PauseState& pauseState, const ControlProfile& controls, 
     case PauseTab::Paint:
         return kPaintSettingCount;
     case PauseTab::Hud:
-        return kHudSettingCount;
+        return hudSubTabItemCount(pauseState.hudSubTab);
     case PauseTab::Controls:
         return static_cast<int>(controls.actions.size());
     case PauseTab::Help:
@@ -8634,9 +10876,16 @@ RectF menuRowRect(
         rowH = 22.0f;
         break;
     case PauseTab::Hud:
-        rowY += static_cast<float>(rowIndex) * 28.0f;
+    {
+        const int startIndex = hudVisibleStartIndex(pauseState.hudSubTab, pauseState.selectedIndex);
+        const int endIndex = std::min(hudSubTabItemCount(pauseState.hudSubTab), startIndex + kHudVisibleRows);
+        if (rowIndex < startIndex || rowIndex >= endIndex) {
+            return {};
+        }
+        rowY += static_cast<float>(rowIndex - startIndex) * 28.0f;
         rowH = 24.0f;
         break;
+    }
     case PauseTab::Controls: {
         const int itemCount = static_cast<int>(controls.actions.size());
         const int startIndex = menuControlsVisibleStartIndex(pauseState.controlsSelection, itemCount);
@@ -8932,16 +11181,21 @@ void drawLoadingOverlay(
     int height,
     const LoadingUiState& loadingUi,
     const std::string& rendererLabel,
-    float nowSeconds)
+    float nowSeconds,
+    float uiScale)
 {
-    canvas.fillRect(0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), makeHudColor(8, 14, 24, 255));
-    canvas.fillRect(static_cast<float>(width) * 0.65f, -40.0f, static_cast<float>(width) * 0.5f, static_cast<float>(height) * 0.55f, makeHudColor(32, 58, 94, 96));
-    canvas.fillRect(-80.0f, static_cast<float>(height) * 0.62f, static_cast<float>(width) * 0.58f, static_cast<float>(height) * 0.5f, makeHudColor(18, 34, 58, 92));
+    const float scale = clamp(uiScale, 1.0f, 10.0f);
+    canvas.setTransform(scale, scale);
+    const float logicalWidth = std::max(80.0f, static_cast<float>(width) / scale);
+    const float logicalHeight = std::max(80.0f, static_cast<float>(height) / scale);
+    canvas.fillRect(0.0f, 0.0f, logicalWidth, logicalHeight, makeHudColor(8, 14, 24, 255));
+    canvas.fillRect(logicalWidth * 0.65f, -40.0f, logicalWidth * 0.5f, logicalHeight * 0.55f, makeHudColor(32, 58, 94, 96));
+    canvas.fillRect(-80.0f, logicalHeight * 0.62f, logicalWidth * 0.58f, logicalHeight * 0.5f, makeHudColor(18, 34, 58, 92));
 
-    const float panelW = std::min(820.0f, static_cast<float>(width) * 0.82f);
-    const float panelH = std::min(360.0f, static_cast<float>(height) * 0.68f);
-    const float panelX = (static_cast<float>(width) - panelW) * 0.5f;
-    const float panelY = (static_cast<float>(height) - panelH) * 0.5f;
+    const float panelW = std::min(820.0f, logicalWidth * 0.82f);
+    const float panelH = std::min(360.0f, logicalHeight * 0.68f);
+    const float panelX = (logicalWidth - panelW) * 0.5f;
+    const float panelY = (logicalHeight - panelH) * 0.5f;
 
     canvas.fillRect(panelX + 4.0f, panelY + 4.0f, panelW, panelH, makeHudColor(0, 0, 0, 90));
     canvas.fillRect(panelX, panelY, panelW, panelH, makeHudColor(6, 12, 20, 244));
@@ -8993,7 +11247,8 @@ void drawLoadingOverlay(
     char elapsedBuffer[64] {};
     std::snprintf(elapsedBuffer, sizeof(elapsedBuffer), "Startup %.2fs", elapsed);
     canvas.text(barX, barY + 24.0f, elapsedBuffer, makeHudColor(168, 204, 232, 255));
-    canvas.text(barX + barW - (static_cast<float>(rendererLabel.size()) * 8.0f), barY + 24.0f, rendererLabel, makeHudColor(168, 204, 232, 255));
+    canvas.text(barX + barW - canvas.textWidth(rendererLabel), barY + 24.0f, rendererLabel, makeHudColor(168, 204, 232, 255));
+    canvas.resetTransform();
 }
 
 bool presentLoadingUi(
@@ -9002,6 +11257,7 @@ bool presentLoadingUi(
     HudCanvas& hudCanvas,
     const LoadingUiState& loadingUi,
     const std::string& rendererLabel,
+    float uiScale,
     const LightingSettings& lightingSettings,
     std::string* errorText)
 {
@@ -9016,16 +11272,20 @@ bool presentLoadingUi(
         height,
         loadingUi,
         rendererLabel,
-        static_cast<float>(SDL_GetTicks()) * 0.001f);
+        static_cast<float>(SDL_GetTicks()) * 0.001f,
+        uiScale);
 
     Camera camera {};
     camera.pos = { 0.0f, 0.0f, -10.0f };
     camera.rot = quatIdentity();
     camera.fovRadians = radians(70.0f);
+    camera.farClipMeters = 200.0f;
+    const RendererFrameSettings frameSettings {};
     std::vector<RenderObject> empty;
     const RendererLightingState lightingState = evaluateRendererLightingState(lightingSettings, true);
     return renderer.render(
         camera,
+        frameSettings,
         lightingState,
         empty,
         empty,
@@ -9102,8 +11362,12 @@ void drawMenuOverlay(
     const PlaneVisualState& walkingVisual,
     const PaintUiState& paintUi)
 {
-    canvas.fillRect(0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), makeHudColor(2, 4, 7, 168));
-    const PauseLayout layout = buildPauseLayout(width, height);
+    const float uiScale = effectiveUiScale(uiState);
+    const float logicalWidth = std::max(80.0f, static_cast<float>(width) / uiScale);
+    const float logicalHeight = std::max(80.0f, static_cast<float>(height) / uiScale);
+    canvas.setTransform(uiScale, uiScale);
+    canvas.fillRect(0.0f, 0.0f, logicalWidth, logicalHeight, makeHudColor(2, 4, 7, 168));
+    const PauseLayout layout = buildPauseLayout(width, height, uiScale, pauseState.tab);
 
     canvas.fillRect(layout.panelX, layout.panelY, layout.panelW, layout.panelH, makeHudColor(8, 14, 22, 240));
     canvas.strokeRect(layout.panelX, layout.panelY, layout.panelW, layout.panelH, makeHudColor(186, 224, 255, 255));
@@ -9123,7 +11387,7 @@ void drawMenuOverlay(
         canvas.fillRect(x, layout.tabY, layout.tabW, layout.tabH, active ? makeHudColor(58, 112, 168, 220) : makeHudColor(18, 28, 40, 220));
         canvas.strokeRect(x, layout.tabY, layout.tabW, layout.tabH, active ? makeHudColor(218, 239, 255, 255) : makeHudColor(96, 132, 164, 255));
         const std::string_view label(kPauseTabs[i]);
-        const float labelWidth = static_cast<float>(label.size() * 8u);
+        const float labelWidth = canvas.textWidth(label);
         canvas.text(x + std::max(8.0f, (layout.tabW - labelWidth) * 0.5f), layout.tabY + 9.0f, label, makeHudColor(240, 247, 255, 255));
     }
 
@@ -9139,6 +11403,8 @@ void drawMenuOverlay(
 
     if (pauseState.tab == PauseTab::Settings) {
         drawSubTabs(7, [](int index) { return std::string(settingsSubTabLabel(static_cast<SettingsSubTab>(index))); }, static_cast<int>(pauseState.settingsSubTab));
+    } else if (pauseState.tab == PauseTab::Hud) {
+        drawSubTabs(6, [](int index) { return std::string(hudSubTabLabel(static_cast<HudSubTab>(index))); }, static_cast<int>(pauseState.hudSubTab));
     } else if (pauseState.tab == PauseTab::Characters || pauseState.tab == PauseTab::Paint) {
         drawSubTabs(2, [](int index) { return std::string(characterRoleLabel(static_cast<CharacterSubTab>(index))); }, static_cast<int>(activeRoleForTab(pauseState, pauseState.tab)));
     }
@@ -9303,17 +11569,27 @@ void drawMenuOverlay(
         }
         canvas.text(contentX, layout.panelY + layout.panelH - 62.0f, paintRowHelpText(pauseState.selectedIndex, paintVisual), makeHudColor(205, 225, 242, 255));
     } else if (pauseState.tab == PauseTab::Hud) {
-        for (int index = 0; index < kHudSettingCount; ++index) {
+        const int count = hudSubTabItemCount(pauseState.hudSubTab);
+        const int startIndex = hudVisibleStartIndex(pauseState.hudSubTab, pauseState.selectedIndex);
+        const int endIndex = std::min(count, startIndex + kHudVisibleRows);
+        for (int index = startIndex; index < endIndex; ++index) {
             const RectF rowRect = menuRowRect(layout, pauseState, controls, assetCatalog.size(), index);
             const bool selected = index == pauseState.selectedIndex;
             if (selected) {
                 canvas.fillRect(rowRect.x, rowRect.y, rowRect.w, rowRect.h, makeHudColor(46, 83, 124, 210));
                 canvas.strokeRect(rowRect.x, rowRect.y, rowRect.w, rowRect.h, makeHudColor(220, 238, 255, 255));
             }
-            canvas.text(rowRect.x + 10.0f, rowRect.y + 8.0f, hudRowLabel(index), makeHudColor(240, 247, 255, 255));
-            canvas.text(rowRect.x + 290.0f, rowRect.y + 8.0f, formatHudRowValue(index, hudSettings), hudRowDisabled(index) ? makeHudColor(255, 196, 124, 255) : makeHudColor(162, 230, 186, 255));
+            canvas.text(rowRect.x + 10.0f, rowRect.y + 8.0f, hudRowLabel(pauseState.hudSubTab, index), makeHudColor(240, 247, 255, 255));
+            canvas.text(rowRect.x + 290.0f, rowRect.y + 8.0f, formatHudRowValue(pauseState.hudSubTab, index, hudSettings), hudRowDisabled(pauseState.hudSubTab, index) ? makeHudColor(255, 196, 124, 255) : makeHudColor(162, 230, 186, 255));
         }
-        canvas.text(contentX, layout.panelY + layout.panelH - 62.0f, hudRowHelpText2(pauseState.selectedIndex), makeHudColor(205, 225, 242, 255));
+        if (count > kHudVisibleRows) {
+            canvas.text(
+                contentX,
+                contentY + 38.0f + (static_cast<float>(kHudVisibleRows) * 28.0f) + 4.0f,
+                std::string("Rows ") + std::to_string(startIndex + 1) + "-" + std::to_string(endIndex) + " / " + std::to_string(count),
+                makeHudColor(180, 214, 240, 255));
+        }
+        canvas.text(contentX, layout.panelY + layout.panelH - 62.0f, hudRowHelpText(pauseState.hudSubTab, pauseState.selectedIndex), makeHudColor(205, 225, 242, 255));
     } else if (pauseState.tab == PauseTab::Controls) {
         const int itemCount = static_cast<int>(controls.actions.size());
         const int startIndex = menuControlsVisibleStartIndex(pauseState.controlsSelection, itemCount);
@@ -9343,7 +11619,7 @@ void drawMenuOverlay(
                 if (listening) {
                     bindingText = "Listening...";
                 }
-                const float textX = slotRect.x + std::max(6.0f, (slotRect.w - static_cast<float>(bindingText.size() * 8u)) * 0.5f);
+                const float textX = slotRect.x + std::max(6.0f, (slotRect.w - canvas.textWidth(bindingText)) * 0.5f);
                 canvas.text(textX, slotRect.y + 8.0f, bindingText, makeHudColor(240, 247, 255, 255));
             }
         }
@@ -9385,13 +11661,13 @@ void drawMenuOverlay(
     } else if (pauseState.confirmPending && pauseState.tab == PauseTab::Main) {
         footer = "Enter or re-click confirm | Esc cancel";
     } else if (pauseState.tab == PauseTab::Settings) {
-        footer = "Tab/H switch tabs | Q/E subtab | W/S select | A/D or Wheel adjust | Enter action | RMB reset row";
+        footer = "Tab/H switch tabs | Q/E subtab | W/S or Wheel scroll | A/D adjust | Enter action | RMB reset row";
     } else if (pauseState.tab == PauseTab::Characters) {
-        footer = "Tab/H switch tabs | Q/E role | W/S select | Drag or A/D adjust | Enter/LMB load | F5 refresh";
+        footer = "Tab/H switch tabs | Q/E role | W/S or Wheel scroll | Drag or A/D adjust | Enter/LMB load | F5 refresh";
     } else if (pauseState.tab == PauseTab::Paint) {
         footer = "Tab/H switch tabs | Q/E role | W/S select | Paint on canvas | PgUp/PgDn brush size | Enter activates";
     } else if (pauseState.tab == PauseTab::Hud) {
-        footer = "Tab/H switch tabs | W/S select | Drag or A/D adjust | LMB toggles | RMB reset row";
+        footer = "Tab/H switch tabs | Q/E HUD page | W/S or Wheel scroll | Drag or A/D adjust | LMB toggles | RMB reset row";
     } else if (pauseState.tab == PauseTab::Controls) {
         footer = "Tab/H switch tabs | W/S choose action | A/D choose slot | Enter capture | Backspace clear | R defaults";
     } else if (pauseState.tab == PauseTab::Help) {
@@ -9424,6 +11700,7 @@ void drawMenuOverlay(
         canvas.text(promptX + 20.0f, promptY + 60.0f, promptText, makeHudColor(240, 247, 255, 255));
         canvas.text(promptX + 14.0f, promptY + 88.0f, "Enter load | Ctrl+V paste | Backspace/Delete edit | Esc cancel", makeHudColor(180, 214, 240, 255));
     }
+    canvas.resetTransform();
 }
 
 void drawSpeedometerGauge(HudCanvas& canvas, int width, int height, float speedKph, const HudSettings& hudSettings)
@@ -9474,7 +11751,7 @@ void drawSpeedometerGauge(HudCanvas& canvas, int width, int height, float speedK
             const float labelR = radius - 30.0f;
             const std::string label = std::to_string(tick);
             canvas.text(
-                dialX + (cosA * labelR) - (static_cast<float>(label.size()) * 4.0f),
+                dialX + (cosA * labelR) - (canvas.textWidth(label) * 0.5f),
                 dialY + (sinA * labelR) - 4.0f,
                 label,
                 makeHudColor(220, 234, 255, 255));
@@ -9489,11 +11766,11 @@ void drawSpeedometerGauge(HudCanvas& canvas, int width, int height, float speedK
 
     const std::string speedText = std::to_string(static_cast<int>(std::round(speedKph))) + " kph";
     const std::string modeText = speedKph > redlineKph ? "OVERSPEED" : "IAS";
-    const float textW = std::max(static_cast<float>(speedText.size()), static_cast<float>(modeText.size())) * 8.0f + 12.0f;
+    const float textW = std::max(canvas.textWidth(speedText), canvas.textWidth(modeText)) + 12.0f;
     canvas.fillRect(dialX - textW * 0.5f, dialY - 20.0f, textW, 42.0f, makeHudColor(8, 14, 22, 220));
     canvas.strokeRect(dialX - textW * 0.5f, dialY - 20.0f, textW, 42.0f, makeHudColor(96, 132, 164, 220));
-    canvas.text(dialX - (static_cast<float>(speedText.size()) * 4.0f), dialY - 16.0f, speedText, makeHudColor(230, 240, 255, 255));
-    canvas.text(dialX - (static_cast<float>(modeText.size()) * 4.0f), dialY - 1.0f, modeText, speedKph > redlineKph ? makeHudColor(255, 118, 96, 255) : makeHudColor(172, 208, 238, 255));
+    canvas.text(dialX - (canvas.textWidth(speedText) * 0.5f), dialY - 16.0f, speedText, makeHudColor(230, 240, 255, 255));
+    canvas.text(dialX - (canvas.textWidth(modeText) * 0.5f), dialY - 1.0f, modeText, speedKph > redlineKph ? makeHudColor(255, 118, 96, 255) : makeHudColor(172, 208, 238, 255));
 }
 
 void drawHud(
@@ -9511,7 +11788,8 @@ void drawHud(
     const std::string& rendererLabel,
     float fps,
     bool mouseCaptured,
-    bool flightMode)
+    bool flightMode,
+    const std::vector<std::string>* extraDebugLines = nullptr)
 {
     const float ground = sampleGroundHeight(plane.pos.x, plane.pos.z, terrainContext);
     const float altitudeAgl = plane.pos.y - ground;
@@ -9524,53 +11802,81 @@ void drawHud(
     char lonBuffer[64] {};
     std::snprintf(latBuffer, sizeof(latBuffer), "Lat %.6f", latLon.x);
     std::snprintf(lonBuffer, sizeof(lonBuffer), "Lon %.6f", latLon.y);
+    const auto beginElement = [&](const HudElementStyle& style) {
+        const float uiMultiplier = uiState.scaleHudWithUi ? effectiveUiScale(uiState) : 1.0f;
+        canvas.setTransform(
+            style.widthScale * uiMultiplier,
+            style.heightScale * uiMultiplier,
+            style.x * static_cast<float>(width),
+            style.y * static_cast<float>(height));
+    };
 
-    std::vector<std::string> lines;
-    lines.reserve(10);
-    lines.push_back("TrueFlight");
-    lines.push_back(rendererLabel);
-    lines.push_back("Model: " + modelLabel);
-    lines.push_back("Speed: " + std::to_string(static_cast<int>(std::round(speedKph))) + " kph");
-    lines.push_back("Altitude AGL: " + std::to_string(static_cast<int>(std::round(altitudeAgl))) + " u");
-    if (flightMode) {
-        lines.push_back("Throttle: " + std::to_string(static_cast<int>(std::round(runtime.engineThrottle * 100.0f))) + "%");
-        lines.push_back(formatManualTrimStatus(plane));
-    } else {
-        lines.push_back(std::string("Mode: walking  Grounded: ") + (plane.onGround ? "yes" : "no"));
-        lines.push_back(std::string("Vertical Speed: ") + std::to_string(static_cast<int>(std::round(plane.vel.y * 3.6f))) + " kph");
-    }
-    lines.push_back(std::string("Wind: ") + std::to_string(static_cast<int>(std::round(windState.speed))) + " u/s @ " + std::to_string(static_cast<int>(std::round(windState.angle * 57.29578f))));
-    if (hudSettings.showGeoInfo) {
-        lines.push_back(latBuffer);
-        lines.push_back(lonBuffer);
-    }
-    if (flightMode) {
-        lines.push_back(runtime.crashed ? "Status: impact reset available (R)" : (std::string("Camera: ") + (uiState.chaseCamera ? "chase" : "cockpit")));
-    } else {
-        lines.push_back(std::string("Camera: ") + (uiState.chaseCamera ? "third person" : "first person"));
-    }
+    const auto drawInfoPanel = [&]() {
+        if (!hudSettings.showInfoPanel) {
+            return;
+        }
 
-    const float panelX = 14.0f;
-    const float panelY = 14.0f;
-    const float panelW = 422.0f;
-    const float panelH = 16.0f + (static_cast<float>(lines.size()) * 14.0f) + ((flightMode && hudSettings.showThrottle) ? 26.0f : 10.0f);
+        std::vector<std::string> lines;
+        lines.reserve(10);
+        lines.push_back("TrueFlight");
+        lines.push_back(rendererLabel);
+        lines.push_back("Model: " + modelLabel);
+        lines.push_back("Speed: " + std::to_string(static_cast<int>(std::round(speedKph))) + " kph");
+        lines.push_back("Altitude AGL: " + std::to_string(static_cast<int>(std::round(altitudeAgl))) + " u");
+        if (flightMode) {
+            if (hudSettings.showThrottle) {
+                lines.push_back("Throttle: " + std::to_string(static_cast<int>(std::round(runtime.engineThrottle * 100.0f))) + "%");
+            }
+            lines.push_back(formatManualTrimStatus(plane));
+        } else {
+            lines.push_back(std::string("Mode: walking  Grounded: ") + (plane.onGround ? "yes" : "no"));
+            lines.push_back(std::string("Vertical Speed: ") + std::to_string(static_cast<int>(std::round(plane.vel.y * 3.6f))) + " kph");
+        }
+        lines.push_back(std::string("Wind: ") + std::to_string(static_cast<int>(std::round(windState.speed))) + " u/s @ " + std::to_string(static_cast<int>(std::round(windState.angle * 57.29578f))));
+        if (hudSettings.showGeoInfo) {
+            lines.push_back(latBuffer);
+            lines.push_back(lonBuffer);
+        }
+        if (flightMode) {
+            lines.push_back(runtime.crashed ? "Status: impact reset available (R)" : (std::string("Camera: ") + (uiState.chaseCamera ? "chase" : "cockpit")));
+        } else {
+            lines.push_back(std::string("Camera: ") + (uiState.chaseCamera ? "third person" : "first person"));
+        }
 
-    canvas.fillRect(panelX, panelY, panelW, panelH, makeHudColor(5, 10, 18, 178));
-    canvas.strokeRect(panelX, panelY, panelW, panelH, makeHudColor(170, 210, 255, 255));
+        const HudElementStyle& style = hudSettings.infoPanel;
+        const HudColor bg = makeHudColor(style.backgroundColor, style.backgroundOpacity);
+        const HudColor accent = makeHudColor(style.accentColor, style.accentOpacity);
+        const HudColor text = makeHudColor(style.textColor, style.textOpacity);
+        const float panelW = 422.0f;
+        const float panelH = 16.0f + (static_cast<float>(lines.size()) * 14.0f) + ((flightMode && hudSettings.showThrottle) ? 26.0f : 10.0f);
 
-    float textY = panelY + 10.0f;
-    for (const std::string& line : lines) {
-        canvas.text(panelX + 10.0f, textY, line, makeHudColor(230, 240, 255, 255));
-        textY += 14.0f;
-    }
+        beginElement(style);
+        if (style.backgroundOpacity > 0) {
+            canvas.fillRect(0.0f, 0.0f, panelW, panelH, bg);
+        }
+        if (style.accentOpacity > 0) {
+            canvas.strokeRect(0.0f, 0.0f, panelW, panelH, accent);
+        }
 
-    if (flightMode && hudSettings.showThrottle) {
-        const float barY = panelY + panelH - 18.0f;
-        canvas.fillRect(panelX + 10.0f, barY, 220.0f, 10.0f, makeHudColor(16, 24, 34, 220));
-        canvas.fillRect(panelX + 10.0f, barY, 220.0f * clamp(runtime.engineThrottle, 0.0f, 1.0f), 10.0f, makeHudColor(52, 214, 136, 255));
-    }
+        float textY = 10.0f;
+        for (const std::string& line : lines) {
+            canvas.text(10.0f, textY, line, text);
+            textY += 14.0f;
+        }
 
-    if (hudSettings.showDebug) {
+        if (flightMode && hudSettings.showThrottle) {
+            const float barY = panelH - 18.0f;
+            canvas.fillRect(10.0f, barY, 220.0f, 10.0f, makeHudColor(style.backgroundColor, std::max(style.backgroundOpacity, 180)));
+            canvas.fillRect(10.0f, barY, 220.0f * clamp(runtime.engineThrottle, 0.0f, 1.0f), 10.0f, makeHudColor(HudRgbColor { 52, 214, 136 }, style.accentOpacity));
+        }
+        canvas.resetTransform();
+    };
+
+    const auto drawDebugFooter = [&]() {
+        if (!hudSettings.showDebug) {
+            return;
+        }
+
         char debugBuffer[256] {};
         if (flightMode) {
             std::snprintf(
@@ -9593,40 +11899,259 @@ void drawHud(
                 degrees(std::asin(clamp(walkForward.y, -1.0f, 1.0f))),
                 plane.debug.tick);
         }
-        canvas.text(14.0f, static_cast<float>(height) - 64.0f, debugBuffer, makeHudColor(230, 240, 255, 255));
-    }
 
-    if (flightMode) {
-        drawSpeedometerGauge(canvas, width, height, speedKph, hudSettings);
-    }
+        const std::vector<std::string> lines {
+            debugBuffer,
+            flightMode
+                ? "Flight: Mouse/RS look  LS yoke  D-Pad rudder/trim  RT/LT throttle  A burner  B brakes"
+                : "Walk: Mouse/RS look  LS move  A jump  C/X view  Y mode swap  R relaunch",
+            flightMode
+                ? "View: RMB/LB zoom  C/X camera  Y mode  RB shoot log  M map  F3 debug  Start/Esc pause"
+                : "View: C/X camera  Y mode  M map  F3 debug  Start/Esc pause",
+            mouseCaptured ? "Mouse locked" : "Cursor free"
+        };
+        std::vector<std::string> debugLines(lines.begin(), lines.end());
+        if (extraDebugLines != nullptr) {
+            debugLines.insert(debugLines.end(), extraDebugLines->begin(), extraDebugLines->end());
+        }
 
-    canvas.text(
-        14.0f,
-        static_cast<float>(height) - 48.0f,
-        flightMode
-            ? "Flight: Mouse/RS look  LS yoke  D-Pad rudder/trim  RT/LT throttle  A burner  B brakes"
-            : "Walk: Mouse/RS look  LS move  A jump  C/X view  Y mode swap  R relaunch",
-        makeHudColor(230, 240, 255, 255));
-    canvas.text(
-        14.0f,
-        static_cast<float>(height) - 34.0f,
-        flightMode
-            ? "View: RMB/LB zoom  C/X camera  Y mode  RB shoot log  M map  F3 debug  Start/Esc pause"
-            : "View: C/X camera  Y mode  M map  F3 debug  Start/Esc pause",
-        makeHudColor(230, 240, 255, 255));
-    canvas.text(
-        static_cast<float>(width) - 130.0f,
-        static_cast<float>(height) - 20.0f,
-        mouseCaptured ? "Mouse locked" : "Cursor free",
-        makeHudColor(180, 214, 240, 255));
+        const HudElementStyle& style = hudSettings.debugFooter;
+        const HudColor bg = makeHudColor(style.backgroundColor, style.backgroundOpacity);
+        const HudColor accent = makeHudColor(style.accentColor, style.accentOpacity);
+        const HudColor text = makeHudColor(style.textColor, style.textOpacity);
+        float panelW = 0.0f;
+        for (const std::string& line : debugLines) {
+            panelW = std::max(panelW, static_cast<float>(line.size()) * 8.0f);
+        }
+        panelW += 16.0f;
+        const float panelH = 10.0f + (static_cast<float>(debugLines.size()) * 14.0f) + 8.0f;
 
-    if (flightMode && hudSettings.showControls) {
-        drawControlIndicator(canvas, width, height, plane);
-    }
-    drawMapPanel(canvas, width, height, plane, terrainContext, hudUiState);
-    if (!uiState.chaseCamera && uiState.showCrosshair) {
-        drawCrosshair(canvas, width, height);
-    }
+        beginElement(style);
+        if (style.backgroundOpacity > 0) {
+            canvas.fillRect(0.0f, 0.0f, panelW, panelH, bg);
+        }
+        if (style.accentOpacity > 0) {
+            canvas.strokeRect(0.0f, 0.0f, panelW, panelH, accent);
+        }
+        float textY = 8.0f;
+        for (const std::string& line : debugLines) {
+            canvas.text(8.0f, textY, line, text);
+            textY += 14.0f;
+        }
+        canvas.resetTransform();
+    };
+
+    const auto drawStyledSpeedometer = [&]() {
+        if (!flightMode || !hudSettings.showSpeedometer) {
+            return;
+        }
+
+        const HudElementStyle& style = hudSettings.speedometer;
+        const HudColor bg = makeHudColor(style.backgroundColor, style.backgroundOpacity);
+        const HudColor accent = makeHudColor(style.accentColor, style.accentOpacity);
+        const HudColor text = makeHudColor(style.textColor, style.textOpacity);
+        const float dialSize = 180.0f;
+        const float dialX = dialSize * 0.5f;
+        const float dialY = dialSize * 0.5f;
+        const float radius = dialSize * 0.42f;
+        const float maxKph = static_cast<float>(std::max(200, hudSettings.speedometerMaxKph));
+        const float redlineKph = static_cast<float>(std::clamp(hudSettings.speedometerRedlineKph, 50, hudSettings.speedometerMaxKph));
+        const float clampedKph = clamp(speedKph, 0.0f, maxKph);
+        const float startAngle = 2.35619449f;
+        const float sweep = 4.71238898f;
+
+        beginElement(style);
+        if (style.backgroundOpacity > 0) {
+            canvas.fillRect(0.0f, 0.0f, dialSize, dialSize, bg);
+        }
+        if (style.accentOpacity > 0) {
+            canvas.strokeRect(0.0f, 0.0f, dialSize, dialSize, accent);
+        }
+
+        Vec2 previousArc {};
+        bool hasPreviousArc = false;
+        for (int tick = 0; tick <= hudSettings.speedometerMaxKph; tick += std::max(5, hudSettings.speedometerMinorStepKph)) {
+            const float t = clamp(static_cast<float>(tick) / maxKph, 0.0f, 1.0f);
+            const float angle = startAngle + (t * sweep);
+            const float cosA = std::cos(angle);
+            const float sinA = std::sin(angle);
+            const bool major = (tick % std::max(hudSettings.speedometerMajorStepKph, hudSettings.speedometerMinorStepKph)) == 0;
+            const float outerR = radius;
+            const float innerR = radius - (major ? 14.0f : 8.0f);
+            const HudColor tickColor = tick >= hudSettings.speedometerRedlineKph ? makeHudColor(255, 118, 96, 255) : accent;
+            const Vec2 outer { dialX + (cosA * outerR), dialY + (sinA * outerR) };
+            const Vec2 inner { dialX + (cosA * innerR), dialY + (sinA * innerR) };
+            canvas.line(inner.x, inner.y, outer.x, outer.y, tickColor);
+            if (hasPreviousArc) {
+                canvas.line(previousArc.x, previousArc.y, outer.x, outer.y, makeHudColor(style.accentColor, std::max(96, style.accentOpacity)));
+            }
+            previousArc = outer;
+            hasPreviousArc = true;
+
+            if (major && (tick % std::max(hudSettings.speedometerLabelStepKph, hudSettings.speedometerMajorStepKph)) == 0) {
+                const float labelR = radius - 30.0f;
+                const std::string label = std::to_string(tick);
+                canvas.text(
+                    dialX + (cosA * labelR) - (canvas.textWidth(label) * 0.5f),
+                    dialY + (sinA * labelR) - 4.0f,
+                    label,
+                    text);
+            }
+        }
+
+        const float needleAngle = startAngle + (clampedKph / maxKph) * sweep;
+        const float needleLen = radius - 18.0f;
+        const HudColor needleColor = speedKph > redlineKph ? makeHudColor(255, 112, 90, 255) : makeHudColor(HudRgbColor { 110, 228, 182 }, style.accentOpacity);
+        canvas.line(dialX, dialY, dialX + (std::cos(needleAngle) * needleLen), dialY + (std::sin(needleAngle) * needleLen), needleColor);
+        canvas.fillRect(dialX - 3.0f, dialY - 3.0f, 6.0f, 6.0f, text);
+
+        const std::string speedText = std::to_string(static_cast<int>(std::round(speedKph))) + " kph";
+        const std::string modeText = speedKph > redlineKph ? "OVERSPEED" : "IAS";
+        const float textW = std::max(canvas.textWidth(speedText), canvas.textWidth(modeText)) + 12.0f;
+        canvas.fillRect(dialX - textW * 0.5f, dialY - 20.0f, textW, 42.0f, makeHudColor(style.backgroundColor, std::max(style.backgroundOpacity, 180)));
+        if (style.accentOpacity > 0) {
+            canvas.strokeRect(dialX - textW * 0.5f, dialY - 20.0f, textW, 42.0f, accent);
+        }
+        canvas.text(dialX - (canvas.textWidth(speedText) * 0.5f), dialY - 16.0f, speedText, text);
+        canvas.text(dialX - (canvas.textWidth(modeText) * 0.5f), dialY - 1.0f, modeText, speedKph > redlineKph ? makeHudColor(255, 118, 96, 255) : text);
+        canvas.resetTransform();
+    };
+
+    const auto drawStyledControls = [&]() {
+        if (!flightMode || !hudSettings.showControls) {
+            return;
+        }
+
+        const HudElementStyle& style = hudSettings.controls;
+        const HudColor bg = makeHudColor(style.backgroundColor, style.backgroundOpacity);
+        const HudColor accent = makeHudColor(style.accentColor, style.accentOpacity);
+        const HudColor text = makeHudColor(style.textColor, style.textOpacity);
+        const float panelW = 180.0f;
+        const float panelH = 92.0f;
+        const float centerX = 52.0f;
+        const float centerY = 42.0f;
+        const float throwDistance = 24.0f;
+        const float handleX = centerX + clamp(-plane.yoke.roll, -1.0f, 1.0f) * throwDistance;
+        const float handleY = centerY + clamp(-plane.yoke.pitch, -1.0f, 1.0f) * throwDistance;
+
+        beginElement(style);
+        if (style.backgroundOpacity > 0) {
+            canvas.fillRect(0.0f, 0.0f, panelW, panelH, bg);
+        }
+        if (style.accentOpacity > 0) {
+            canvas.strokeRect(0.0f, 0.0f, panelW, panelH, accent);
+        }
+        canvas.line(centerX, 10.0f, centerX, 74.0f, accent);
+        canvas.line(20.0f, centerY, 84.0f, centerY, accent);
+        canvas.fillRect(handleX - 6.0f, handleY - 6.0f, 12.0f, 12.0f, text);
+
+        const float rudderX = 102.0f;
+        const float rudderY = 30.0f;
+        canvas.line(rudderX, rudderY, rudderX + 60.0f, rudderY, accent);
+        const float rudderT = (clamp(plane.yoke.yaw, -1.0f, 1.0f) + 1.0f) * 0.5f;
+        canvas.fillRect((rudderX + (rudderT * 60.0f)) - 4.0f, rudderY - 6.0f, 8.0f, 12.0f, makeHudColor(HudRgbColor { 82, 224, 142 }, style.accentOpacity));
+        canvas.text(14.0f, 76.0f, "Yoke", text);
+        canvas.text(104.0f, 40.0f, "Rudder", text);
+        canvas.resetTransform();
+    };
+
+    const auto drawStyledMap = [&]() {
+        if (!hudSettings.showMap) {
+            return;
+        }
+
+        const HudElementStyle& style = hudSettings.mapPanel;
+        const HudColor bg = makeHudColor(style.backgroundColor, style.backgroundOpacity);
+        const HudColor accent = makeHudColor(style.accentColor, style.accentOpacity);
+        const HudColor text = makeHudColor(style.textColor, style.textOpacity);
+        const int zoomIndex = std::clamp(uiState.mapZoomIndex, 0, static_cast<int>(uiState.mapZoomExtents.size()) - 1);
+        const float extent = uiState.mapZoomExtents[zoomIndex];
+        const float heading = getStableYawFromRotation(plane.rot);
+        const float panelSize = 188.0f;
+        const int cells = 40;
+        const float cell = panelSize / static_cast<float>(cells);
+
+        beginElement(style);
+        if (style.backgroundOpacity > 0) {
+            canvas.fillRect(0.0f, 0.0f, panelSize, panelSize, bg);
+        }
+        for (int row = 0; row < cells; ++row) {
+            for (int col = 0; col < cells; ++col) {
+                const float normalizedX = ((static_cast<float>(col) + 0.5f) / static_cast<float>(cells)) * 2.0f - 1.0f;
+                const float normalizedY = ((static_cast<float>(row) + 0.5f) / static_cast<float>(cells)) * 2.0f - 1.0f;
+                const float mapX = normalizedX * extent;
+                const float mapZ = -normalizedY * extent;
+                const Vec2 worldDelta = mapToWorldDelta(mapX, mapZ, heading, uiState.mapNorthUp);
+                const float worldX = plane.pos.x + worldDelta.x;
+                const float worldZ = plane.pos.z + worldDelta.y;
+                const float worldY = sampleGroundHeight(worldX, worldZ, terrainContext);
+                const Vec3 color = sampleTerrainColor(worldX, worldY, worldZ, terrainContext);
+                canvas.fillRect(
+                    static_cast<float>(col) * cell,
+                    static_cast<float>(row) * cell,
+                    cell + 1.0f,
+                    cell + 1.0f,
+                    makeHudColor(color));
+            }
+        }
+
+        const float centerX = panelSize * 0.5f;
+        const float centerY = panelSize * 0.5f;
+        const float markerYaw = uiState.mapNorthUp ? heading : 0.0f;
+        const auto rotateMarkerPoint = [centerX, centerY, markerYaw](float localX, float localY) -> Vec2 {
+            const float cosYaw = std::cos(markerYaw);
+            const float sinYaw = std::sin(markerYaw);
+            return {
+                centerX + (localX * cosYaw) - (localY * sinYaw),
+                centerY + (localX * sinYaw) + (localY * cosYaw)
+            };
+        };
+
+        const Vec2 nose = rotateMarkerPoint(0.0f, -10.0f);
+        const Vec2 left = rotateMarkerPoint(-6.0f, 6.0f);
+        const Vec2 right = rotateMarkerPoint(6.0f, 6.0f);
+        canvas.line(nose.x, nose.y, left.x, left.y, accent);
+        canvas.line(nose.x, nose.y, right.x, right.y, accent);
+        canvas.line(left.x, left.y, right.x, right.y, accent);
+        if (style.accentOpacity > 0) {
+            canvas.strokeRect(0.0f, 0.0f, panelSize, panelSize, accent);
+        }
+
+        const std::array<const char*, 5> zoomLabels { "Near", "Mid", "Wide", "Far", "Full" };
+        canvas.text(
+            0.0f,
+            panelSize + 6.0f,
+            std::string("Map ") + zoomLabels[zoomIndex] + (uiState.mapNorthUp ? " North-Up" : " Heading-Up"),
+            text);
+        canvas.resetTransform();
+    };
+
+    const auto drawStyledCrosshair = [&]() {
+        if (uiState.chaseCamera || !hudSettings.showCrosshair) {
+            return;
+        }
+
+        const HudElementStyle& style = hudSettings.crosshair;
+        const HudColor bg = makeHudColor(style.backgroundColor, style.backgroundOpacity);
+        const HudColor accent = makeHudColor(style.accentColor, style.accentOpacity);
+        beginElement(style);
+        if (style.backgroundOpacity > 0) {
+            canvas.fillRect(-12.0f, -12.0f, 24.0f, 24.0f, bg);
+        }
+        canvas.line(-9.0f, 0.0f, -2.0f, 0.0f, accent);
+        canvas.line(2.0f, 0.0f, 9.0f, 0.0f, accent);
+        canvas.line(0.0f, -9.0f, 0.0f, -2.0f, accent);
+        canvas.line(0.0f, 2.0f, 0.0f, 9.0f, accent);
+        canvas.point(0.0f, 0.0f, accent);
+        canvas.resetTransform();
+    };
+
+    drawInfoPanel();
+    drawStyledSpeedometer();
+    drawDebugFooter();
+    drawStyledControls();
+    drawStyledMap();
+    drawStyledCrosshair();
 }
 
 bool isControlActionHeld(
@@ -9658,7 +12183,8 @@ bool isControlActionHeld(
 
 bool saveBootPreferences(const BootResources& boot, std::string* errorText)
 {
-    return savePreferences(
+    std::string settingsError;
+    if (!savePreferences(
         boot.preferencesPath,
         boot.uiState,
         boot.graphics,
@@ -9669,7 +12195,22 @@ bool saveBootPreferences(const BootResources& boot, std::string* errorText)
         boot.terrainParams,
         boot.planeVisual,
         boot.walkingVisual,
-        errorText);
+        &settingsError)) {
+        if (errorText != nullptr) {
+            *errorText = settingsError;
+        }
+        return false;
+    }
+
+    std::string hudError;
+    if (!saveHudPreferences(boot.hudPreferencesPath, boot.hud, &hudError)) {
+        if (errorText != nullptr) {
+            *errorText = hudError;
+        }
+        return false;
+    }
+
+    return true;
 }
 
 void restoreVisualFromPreferences(
@@ -9708,6 +12249,7 @@ void restoreVisualFromPreferences(
 
 void shutdownGameSession(GameSession& session)
 {
+    session.terrainStream.reset();
     session.audioState.shutdown();
     if (session.worldStore.has_value()) {
         session.worldStore->flushDirty(nullptr);
@@ -9724,6 +12266,8 @@ bool startGameSession(
     std::string* errorText)
 {
     session = {};
+    session.terrainWorldMutex = std::make_shared<std::shared_mutex>();
+    session.terrainStream = std::make_shared<TerrainVisualStreamState>();
     beginLoadingUi(boot.loadingUi, "Loading World", static_cast<float>(SDL_GetTicks()) * 0.001f);
     const std::string terrainWorldName = "native_default";
 
@@ -9731,7 +12275,7 @@ bool startGameSession(
         updateLoadingUi(boot.loadingUi, stageLabel, progress, detail);
         SDL_PumpEvents();
         std::string renderError;
-        if (!presentLoadingUi(window, renderer, boot.hudCanvas, boot.loadingUi, rendererLabel, boot.lighting, &renderError)) {
+        if (!presentLoadingUi(window, renderer, boot.hudCanvas, boot.loadingUi, rendererLabel, effectiveUiScale(boot.uiState), boot.lighting, &renderError)) {
             if (errorText != nullptr) {
                 *errorText = renderError;
             }
@@ -9785,7 +12329,13 @@ bool startGameSession(
     }
 
     WorldStore* worldStorePtr = session.worldStore.has_value() ? &*session.worldStore : nullptr;
-    refreshTerrainContext(boot.terrainParams, session.terrainContext, session.terrainCache, worldStorePtr);
+    refreshTerrainContext(
+        boot.terrainParams,
+        session.terrainContext,
+        session.terrainCache,
+        worldStorePtr,
+        session.terrainWorldMutex,
+        session.terrainStream.get());
 
     if (!stage("Clouds and Flight", 0.66f, "Initializing wind, clouds, and aircraft state.")) {
         return false;
@@ -9817,13 +12367,39 @@ bool startGameSession(
         return false;
     }
 
-    (void)ensureTerrainVisualCache(
-        session.terrainCache,
-        session.plane.pos,
-        session.plane.flightVel,
-        session.terrainContext,
-        session.terrainChunkBakeCache,
-        session.terrainWorldId);
+    if (boot.terrainParams.threadedMeshing) {
+        TerrainStreamBudgetOverrides startupPrime;
+        startupPrime.workerCount = std::max(1, std::min(boot.terrainParams.workerMaxInflight, 2));
+        startupPrime.maxPendingChunks = std::max(4, startupPrime.workerCount);
+        startupPrime.maxStaleChunks = std::max(2, std::min(boot.terrainParams.maxStaleChunks, 4));
+        startupPrime.resultBudgetPerFrame = 1;
+        startupPrime.resultBudgetTimeMs = 0.5f;
+        startupPrime.nearMissingBudget = std::max(1, startupPrime.workerCount);
+        startupPrime.midMissingBudget = 0;
+        startupPrime.horizonMissingBudget = 0;
+        startupPrime.upgradeBudget = 0;
+        startupPrime.allowMidBand = false;
+        startupPrime.allowHorizonBand = false;
+        startupPrime.allowUpgrades = false;
+        (void)ensureTerrainVisualCache(
+            session.terrainCache,
+            session.plane.pos,
+            session.plane.flightVel,
+            session.terrainContext,
+            session.terrainChunkBakeCache,
+            session.terrainWorldId,
+            session.terrainStream.get(),
+            &startupPrime);
+    } else {
+        (void)ensureTerrainVisualCache(
+            session.terrainCache,
+            session.plane.pos,
+            session.plane.flightVel,
+            session.terrainContext,
+            session.terrainChunkBakeCache,
+            session.terrainWorldId,
+            session.terrainStream.get());
+    }
 
     finishLoadingUi(boot.loadingUi, static_cast<float>(SDL_GetTicks()) * 0.001f);
     return true;
@@ -9883,6 +12459,11 @@ int main(int, char**)
         std::sin(sunPitch),
         std::cos(sunPitch) * std::cos(sunYaw)
     });
+    RendererLightingState legacyLightingState {};
+    legacyLightingState.sunDirection = sunDirection;
+    legacyLightingState.skyColor = skyColor;
+    legacyLightingState.fogColor = skyColor;
+    legacyLightingState.backgroundColor = skyColor;
 
     TerrainParams terrainParams = defaultTerrainParams();
     const TerrainParams defaultTerrainParamsValues = defaultTerrainParams();
@@ -10466,7 +13047,7 @@ int main(int, char**)
             }
         }
 
-        const Camera renderCamera = buildRenderCamera(plane, terrainContext, uiState);
+        const Camera renderCamera = buildRenderCamera(plane, terrainContext, uiState, true, 0.0f, 0.0f, computeWorldFarClip(graphicsSettings));
         const TerrainVisualCache& terrainVisuals = ensureTerrainVisualCache(
             terrainCache,
             plane.pos,
@@ -10669,7 +13250,11 @@ int main(int, char**)
             drawPauseMenu(hudCanvas, drawableWidth, drawableHeight, pauseState, uiState, config, propAudioConfig, terrainParams, assetCatalog, planeVisual, walkingVisual, paintUi);
         }
 
-        if (!nativeRenderer.render(renderCamera, sunDirection, skyColor, opaqueObjects, translucentObjects, hudCanvas, &rendererError)) {
+        const RendererFrameSettings frameSettings {
+            graphicsSettings.renderScale,
+            graphicsSettings.textureMipmaps
+        };
+        if (!nativeRenderer.render(renderCamera, frameSettings, legacyLightingState, opaqueObjects, translucentObjects, hudCanvas, &rendererError)) {
             SDL_Log("Vulkan render failed: %s", rendererError.c_str());
             running = false;
         }
@@ -10730,6 +13315,7 @@ int main(int, char**)
     boot.terrainParams = defaultTerrainParamsValues;
     boot.defaultTerrainParamsValues = defaultTerrainParamsValues;
     boot.preferencesPath = getPreferenceFilePath();
+    boot.hudPreferencesPath = getHudPreferenceFilePath();
     boot.planeProfile.visualPrefs.scale = 3.0f;
     boot.walkingPrefs.scale = 1.0f;
     boot.planeVisual.defaultScale = 3.0f;
@@ -10777,6 +13363,14 @@ int main(int, char**)
     }
 
     const std::string rendererLabel = std::string("Renderer: ") + (nativeRenderer.backendName() != nullptr ? nativeRenderer.backendName() : "unknown");
+    PerformanceGovernor runtimeGovernor {};
+    runtimeGovernor.targetFrameMs = 8.3f;
+    runtimeGovernor.nextPressureSampleAt = 0.0f;
+    SystemPressureSnapshot initialPressureSnapshot;
+    if (sampleSystemPressureSnapshot(initialPressureSnapshot, static_cast<float>(SDL_GetTicks()) * 0.001f)) {
+        runtimeGovernor.lastSnapshot = initialPressureSnapshot;
+        runtimeGovernor.hardwareTier = detectHardwareTier(initialPressureSnapshot);
+    }
 
     PauseState menuState {};
     menuState.active = true;
@@ -10790,7 +13384,7 @@ int main(int, char**)
         updateLoadingUi(boot.loadingUi, stageLabel, progress, detail);
         SDL_PumpEvents();
         std::string loadingError;
-        if (!presentLoadingUi(window, nativeRenderer, boot.hudCanvas, boot.loadingUi, rendererLabel, boot.lighting, &loadingError)) {
+        if (!presentLoadingUi(window, nativeRenderer, boot.hudCanvas, boot.loadingUi, rendererLabel, effectiveUiScale(boot.uiState), boot.lighting, &loadingError)) {
             if (!loadingError.empty()) {
                 SDL_Log("Boot loading render failed: %s", loadingError.c_str());
             }
@@ -10799,7 +13393,7 @@ int main(int, char**)
         return true;
     };
 
-    if (!bootStage("Loading Preferences", 0.16f, "Reading native_settings.ini.")) {
+    if (!bootStage("Loading Preferences", 0.16f, "Reading native_settings.ini and HUD-settings.ini.")) {
         nativeRenderer.shutdown();
         SDL_DestroyWindow(window);
         if (audioSubsystemReady) {
@@ -10824,6 +13418,11 @@ int main(int, char**)
         !preferenceError.empty()) {
         SDL_Log("Native preference load failed: %s", preferenceError.c_str());
     }
+    std::string hudPreferenceError;
+    if (!loadHudPreferences(boot.hudPreferencesPath, boot.hud, &hudPreferenceError) && !hudPreferenceError.empty()) {
+        SDL_Log("Native HUD preference load failed: %s", hudPreferenceError.c_str());
+    }
+    syncUiStateFromHud(boot.uiState, boot.hud);
 
     if (!bootStage("Applying Display", 0.32f, "Applying display mode and resolution.")) {
         nativeRenderer.shutdown();
@@ -10909,6 +13508,20 @@ int main(int, char**)
         return &*session->worldStore;
     };
 
+    auto currentWorldStoreMutex = [&]() -> std::shared_ptr<std::shared_mutex> {
+        if (!session.has_value()) {
+            return {};
+        }
+        return session->terrainWorldMutex;
+    };
+
+    auto currentTerrainStream = [&]() -> TerrainVisualStreamState* {
+        if (!session.has_value() || !session->terrainStream) {
+            return nullptr;
+        }
+        return session->terrainStream.get();
+    };
+
     auto closeGamepad = [&]() {
         if (gamepad.handle != nullptr) {
             SDL_CloseGamepad(gamepad.handle);
@@ -10991,7 +13604,7 @@ int main(int, char**)
         int menuWidth = 0;
         int menuHeight = 0;
         SDL_GetWindowSizeInPixels(window, &menuWidth, &menuHeight);
-        const PauseLayout layout = buildPauseLayout(menuWidth, menuHeight);
+        const PauseLayout layout = buildPauseLayout(menuWidth, menuHeight, effectiveUiScale(boot.uiState), menuState.tab);
         menuState.helpScroll = std::clamp(menuState.helpScroll, 0, maxMenuHelpScroll(layout));
     };
 
@@ -11166,12 +13779,23 @@ int main(int, char**)
         }
         if (terrainImpact) {
             if (WorldStore* worldStore = currentWorldStore(); worldStore != nullptr) {
-            const auto craterResult = worldStore->applyCrater(crater);
-            if (craterResult.first) {
-                worldStore->flushDirty(nullptr);
-                refreshTerrainContext(boot.terrainParams, session->terrainContext, session->terrainCache, worldStore);
+                std::unique_lock<std::shared_mutex> worldWriteLock;
+                if (const auto worldMutex = currentWorldStoreMutex()) {
+                    worldWriteLock = std::unique_lock<std::shared_mutex>(*worldMutex);
+                }
+                const auto craterResult = worldStore->applyCrater(crater);
+                if (craterResult.first) {
+                    worldStore->flushDirty(nullptr);
+                    worldWriteLock.unlock();
+                    refreshTerrainContext(
+                        boot.terrainParams,
+                        session->terrainContext,
+                        session->terrainCache,
+                        worldStore,
+                        currentWorldStoreMutex(),
+                        currentTerrainStream());
+                }
             }
-        }
         }
 
         float nx = crashEvent.normal.x;
@@ -11495,7 +14119,14 @@ int main(int, char**)
             } else if (menuState.settingsSubTab == SettingsSubTab::Terrain) {
                 resetTerrainValue(boot.terrainParams, boot.defaultTerrainParamsValues, menuState.selectedIndex);
                 if (session.has_value()) {
-                    applyTerrainRuntimeChange(boot.terrainParams, session->terrainContext, session->terrainCache, session->plane, currentWorldStore());
+                    applyTerrainRuntimeChange(
+                        boot.terrainParams,
+                        session->terrainContext,
+                        session->terrainCache,
+                        session->plane,
+                        currentWorldStore(),
+                        currentWorldStoreMutex(),
+                        currentTerrainStream());
                 }
                 setPauseStatus(menuState, "Reset selected terrain value to default.", nowSeconds, 2.2f);
                 queueSave(nowSeconds);
@@ -11512,12 +14143,15 @@ int main(int, char**)
                     defaultLightingSettingsValues,
                     menuState.settingsSubTab,
                     menuState.selectedIndex);
+                if (menuState.settingsSubTab == SettingsSubTab::Camera && menuState.selectedIndex == 5) {
+                    boot.hud.showCrosshair = boot.uiState.showCrosshair;
+                }
                 setPauseStatus(menuState, "Reset selected setting to default.", nowSeconds, 2.2f);
                 queueSave(nowSeconds);
             }
             break;
         case PauseTab::Hud:
-            resetHudRowValue(boot.hud, defaultHudSettingsValues, menuState.selectedIndex);
+            resetHudRowValue(boot.hud, defaultHudSettingsValues, menuState.hudSubTab, menuState.selectedIndex);
             syncHudUi();
             setPauseStatus(menuState, "Reset selected HUD setting to default.", nowSeconds, 2.2f);
             queueSave(nowSeconds);
@@ -11568,7 +14202,14 @@ int main(int, char**)
             } else if (menuState.settingsSubTab == SettingsSubTab::Terrain) {
                 adjustTerrainValue(boot.terrainParams, menuState.selectedIndex, direction);
                 if (session.has_value()) {
-                    applyTerrainRuntimeChange(boot.terrainParams, session->terrainContext, session->terrainCache, session->plane, currentWorldStore());
+                    applyTerrainRuntimeChange(
+                        boot.terrainParams,
+                        session->terrainContext,
+                        session->terrainCache,
+                        session->plane,
+                        currentWorldStore(),
+                        currentWorldStoreMutex(),
+                        currentTerrainStream());
                 }
                 queueSave(nowSeconds);
             } else if (!menuSettingsRowDisabled(menuState.settingsSubTab, menuState.selectedIndex) &&
@@ -11581,12 +14222,15 @@ int main(int, char**)
                     menuState.settingsSubTab,
                     menuState.selectedIndex,
                     direction);
+                if (menuState.settingsSubTab == SettingsSubTab::Camera && menuState.selectedIndex == 5) {
+                    boot.hud.showCrosshair = boot.uiState.showCrosshair;
+                }
                 queueSave(nowSeconds);
             }
             break;
         case PauseTab::Hud:
-            if (!hudRowDisabled(menuState.selectedIndex)) {
-                adjustHudRowValue(boot.hud, menuState.selectedIndex, direction);
+            if (!hudRowDisabled(menuState.hudSubTab, menuState.selectedIndex)) {
+                adjustHudRowValue(boot.hud, menuState.hudSubTab, menuState.selectedIndex, direction);
                 syncHudUi();
                 queueSave(nowSeconds);
             }
@@ -11622,7 +14266,14 @@ int main(int, char**)
             } else if (menuState.settingsSubTab == SettingsSubTab::Terrain) {
                 boot.terrainParams = boot.defaultTerrainParamsValues;
                 if (session.has_value()) {
-                    applyTerrainRuntimeChange(boot.terrainParams, session->terrainContext, session->terrainCache, session->plane, currentWorldStore());
+                    applyTerrainRuntimeChange(
+                        boot.terrainParams,
+                        session->terrainContext,
+                        session->terrainCache,
+                        session->plane,
+                        currentWorldStore(),
+                        currentWorldStoreMutex(),
+                        currentTerrainStream());
                 }
                 setPauseStatus(menuState, "Restored native terrain defaults.", nowSeconds, 2.6f);
                 queueSave(nowSeconds);
@@ -11646,6 +14297,9 @@ int main(int, char**)
                     if (!applyGraphicsSettingsToWindow(window, boot.graphics, &displayError) && !displayError.empty()) {
                         SDL_Log("Display apply failed while restoring settings defaults: %s", displayError.c_str());
                     }
+                }
+                if (menuState.settingsSubTab == SettingsSubTab::Camera) {
+                    boot.hud.showCrosshair = boot.uiState.showCrosshair;
                 }
                 setPauseStatus(menuState, "Restored native settings defaults.", nowSeconds, 2.6f);
                 queueSave(nowSeconds);
@@ -11870,7 +14524,7 @@ int main(int, char**)
             return !menuSettingsRowDisabled(menuState.settingsSubTab, menuState.selectedIndex) &&
                 !menuSettingsRowAction(menuState.settingsSubTab, menuState.selectedIndex);
         case PauseTab::Hud:
-            return !hudRowDisabled(menuState.selectedIndex);
+            return !hudRowDisabled(menuState.hudSubTab, menuState.selectedIndex);
         case PauseTab::Characters:
             return menuState.selectedIndex >= 1 && menuState.selectedIndex <= 10;
         case PauseTab::Paint:
@@ -11946,13 +14600,13 @@ int main(int, char**)
             clampMenuSelection();
         }
 
-        if (gamepadButtonPressed(gamepad, SDL_GAMEPAD_BUTTON_WEST) &&
-            (menuState.tab == PauseTab::Settings || menuState.tab == PauseTab::Characters || menuState.tab == PauseTab::Paint)) {
+        if (gamepadAxisPressed(gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, kGamepadMenuTriggerPressThreshold) &&
+            pauseTabHasSubTabs(menuState.tab)) {
             cyclePauseSubTab(menuState, -1);
             boot.paintUi.draggingCanvas = false;
             clampMenuSelection();
-        } else if (gamepadButtonPressed(gamepad, SDL_GAMEPAD_BUTTON_NORTH) &&
-                   (menuState.tab == PauseTab::Settings || menuState.tab == PauseTab::Characters || menuState.tab == PauseTab::Paint)) {
+        } else if (gamepadAxisPressed(gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, kGamepadMenuTriggerPressThreshold) &&
+                   pauseTabHasSubTabs(menuState.tab)) {
             cyclePauseSubTab(menuState, 1);
             boot.paintUi.draggingCanvas = false;
             clampMenuSelection();
@@ -12239,7 +14893,10 @@ int main(int, char**)
                 int menuWidth = 0;
                 int menuHeight = 0;
                 SDL_GetWindowSizeInPixels(window, &menuWidth, &menuHeight);
-                const PauseLayout layout = buildPauseLayout(menuWidth, menuHeight);
+                const float menuScale = effectiveUiScale(boot.uiState);
+                const PauseLayout layout = buildPauseLayout(menuWidth, menuHeight, menuScale, menuState.tab);
+                const float logicalMouseX = static_cast<float>(event.motion.x) / menuScale;
+                const float logicalMouseY = static_cast<float>(event.motion.y) / menuScale;
                 boot.paintUi.canvasRect = paintCanvasRect(layout);
 
                 if (boot.paintUi.draggingCanvas) {
@@ -12249,106 +14906,31 @@ int main(int, char**)
                         boot.paintUi,
                         boot.planeVisual,
                         boot.walkingVisual,
-                        static_cast<float>(event.motion.x),
-                        static_cast<float>(event.motion.y),
+                        logicalMouseX,
+                        logicalMouseY,
                         false);
                     continue;
                 }
 
                 if (menuState.rowDragActive) {
                     constexpr float dragStepPixels = 18.0f;
-                    float deltaX = static_cast<float>(event.motion.x) - menuState.rowDragLastX;
+                    float deltaX = logicalMouseX - menuState.rowDragLastX;
                     while (std::fabs(deltaX) >= dragStepPixels) {
                         const int direction = deltaX > 0.0f ? 1 : -1;
                         adjustSelectedRow(direction, uiNowSeconds);
                         menuState.rowDragLastX += dragStepPixels * static_cast<float>(direction);
-                        deltaX = static_cast<float>(event.motion.x) - menuState.rowDragLastX;
+                        deltaX = logicalMouseX - menuState.rowDragLastX;
                     }
                     continue;
                 }
 
-                if (menuState.tab == PauseTab::Controls) {
-                    const int itemCount = static_cast<int>(boot.controls.actions.size());
-                    const int startIndex = menuControlsVisibleStartIndex(menuState.controlsSelection, itemCount);
-                    const int endIndex = std::min(itemCount, startIndex + kControlsVisibleRows);
-                    bool hitSlot = false;
-                    for (int index = startIndex; index < endIndex && !hitSlot; ++index) {
-                        const int visibleIndex = index - startIndex;
-                        for (int slotIndex = 0; slotIndex < 2; ++slotIndex) {
-                            if (pointInRect(
-                                    static_cast<float>(event.motion.x),
-                                    static_cast<float>(event.motion.y),
-                                    menuControlSlotRect(layout, visibleIndex, slotIndex))) {
-                                menuState.controlsSelection = index;
-                                menuState.controlsSlot = slotIndex;
-                                hitSlot = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (hitSlot) {
-                        continue;
-                    }
-                }
-
-                if (menuState.tab == PauseTab::Help) {
-                    continue;
-                }
-
-                const int itemIndex = menuHitItemIndex(
-                    layout,
-                    menuState,
-                    boot.controls,
-                    boot.assetCatalog.size(),
-                    static_cast<float>(event.motion.x),
-                    static_cast<float>(event.motion.y));
-                if (itemIndex >= 0) {
-                    setCurrentSelection(itemIndex);
-                }
                 continue;
             }
 
             if (menuVisible() && event.type == SDL_EVENT_MOUSE_WHEEL) {
-                const SDL_Keymod modifiers = SDL_GetModState();
                 const int wheelY = static_cast<int>(event.wheel.y);
-                if (triggerBoundActionsFromWheel(wheelY, modifiers, uiNowSeconds)) {
-                    continue;
-                }
-
-                const int adjustDirection = wheelY > 0 ? 1 : -1;
                 const int moveDirection = wheelY > 0 ? -1 : 1;
-                if (menuState.tab == PauseTab::Controls) {
-                    moveMenuSelection(moveDirection);
-                } else if (menuState.tab == PauseTab::Settings) {
-                    const bool adjustable =
-                        menuState.settingsSubTab == SettingsSubTab::Flight ||
-                        menuState.settingsSubTab == SettingsSubTab::Terrain ||
-                        (!menuSettingsRowDisabled(menuState.settingsSubTab, menuState.selectedIndex) &&
-                         !menuSettingsRowAction(menuState.settingsSubTab, menuState.selectedIndex));
-                    if (adjustable) {
-                        adjustSelectedRow(adjustDirection, uiNowSeconds);
-                    } else {
-                        moveMenuSelection(moveDirection);
-                    }
-                } else if (menuState.tab == PauseTab::Hud) {
-                    if (!hudRowDisabled(menuState.selectedIndex)) {
-                        adjustSelectedRow(adjustDirection, uiNowSeconds);
-                    } else {
-                        moveMenuSelection(moveDirection);
-                    }
-                } else if (menuState.tab == PauseTab::Characters) {
-                    if (menuState.selectedIndex >= 1 && menuState.selectedIndex <= 10) {
-                        adjustSelectedRow(adjustDirection, uiNowSeconds);
-                    } else {
-                        moveMenuSelection(moveDirection);
-                    }
-                } else if (menuState.tab == PauseTab::Paint) {
-                    if (menuState.selectedIndex >= 0 && menuState.selectedIndex <= 4) {
-                        adjustSelectedRow(adjustDirection, uiNowSeconds);
-                    } else {
-                        moveMenuSelection(moveDirection);
-                    }
-                } else {
+                if (wheelY != 0) {
                     moveMenuSelection(moveDirection);
                 }
                 continue;
@@ -12358,9 +14940,10 @@ int main(int, char**)
                 int menuWidth = 0;
                 int menuHeight = 0;
                 SDL_GetWindowSizeInPixels(window, &menuWidth, &menuHeight);
-                const PauseLayout layout = buildPauseLayout(menuWidth, menuHeight);
-                const float mouseX = static_cast<float>(event.button.x);
-                const float mouseY = static_cast<float>(event.button.y);
+                const float menuScale = effectiveUiScale(boot.uiState);
+                const PauseLayout layout = buildPauseLayout(menuWidth, menuHeight, menuScale, menuState.tab);
+                const float mouseX = static_cast<float>(event.button.x) / menuScale;
+                const float mouseY = static_cast<float>(event.button.y) / menuScale;
 
                 const int tabIndex = hitPauseTabIndex(layout, mouseX, mouseY);
                 if (tabIndex >= 0) {
@@ -12379,6 +14962,8 @@ int main(int, char**)
                     clearMenuInteractions();
                     if (menuState.tab == PauseTab::Settings) {
                         menuState.settingsSubTab = static_cast<SettingsSubTab>(subTabIndex);
+                    } else if (menuState.tab == PauseTab::Hud) {
+                        menuState.hudSubTab = static_cast<HudSubTab>(subTabIndex);
                     } else if (menuState.tab == PauseTab::Characters || menuState.tab == PauseTab::Paint) {
                         setActiveRoleForTab(menuState, menuState.tab, static_cast<CharacterSubTab>(subTabIndex));
                     }
@@ -12518,7 +15103,7 @@ int main(int, char**)
                 }
 
                 if ((scancode == SDL_SCANCODE_Q || scancode == SDL_SCANCODE_LEFTBRACKET) &&
-                    (menuState.tab == PauseTab::Settings || menuState.tab == PauseTab::Characters || menuState.tab == PauseTab::Paint)) {
+                    (menuState.tab == PauseTab::Settings || menuState.tab == PauseTab::Hud || menuState.tab == PauseTab::Characters || menuState.tab == PauseTab::Paint)) {
                     cyclePauseSubTab(menuState, -1);
                     boot.paintUi.draggingCanvas = false;
                     clampMenuSelection();
@@ -12526,7 +15111,7 @@ int main(int, char**)
                 }
 
                 if ((scancode == SDL_SCANCODE_E || scancode == SDL_SCANCODE_RIGHTBRACKET) &&
-                    (menuState.tab == PauseTab::Settings || menuState.tab == PauseTab::Characters || menuState.tab == PauseTab::Paint)) {
+                    (menuState.tab == PauseTab::Settings || menuState.tab == PauseTab::Hud || menuState.tab == PauseTab::Characters || menuState.tab == PauseTab::Paint)) {
                     cyclePauseSubTab(menuState, 1);
                     boot.paintUi.draggingCanvas = false;
                     clampMenuSelection();
@@ -12669,6 +15254,17 @@ int main(int, char**)
         previousCounter = currentCounter;
         const float dt = clamp(static_cast<float>(dtSeconds), 1.0f / 240.0f, 0.05f);
         fpsSmoothed = mix(fpsSmoothed, 1.0f / std::max(dt, 1.0e-4f), 0.08f);
+        if (uiNowSeconds >= runtimeGovernor.nextPressureSampleAt) {
+            SystemPressureSnapshot sampledPressure;
+            if (sampleSystemPressureSnapshot(sampledPressure, uiNowSeconds)) {
+                runtimeGovernor.lastSnapshot = sampledPressure;
+            }
+            runtimeGovernor.nextPressureSampleAt = uiNowSeconds + 0.25f;
+        }
+        updatePerformanceGovernor(runtimeGovernor, uiNowSeconds, dt, runtimeGovernor.lastSnapshot);
+        nativeRenderer.setMemoryBudgets(
+            runtimeGovernor.residentMeshBudgetBytes,
+            runtimeGovernor.sceneTextureBudgetBytes);
         refreshPauseStatus(menuState, uiNowSeconds);
         refreshMenuConfirmation(menuState, uiNowSeconds);
         clampHelpScroll();
@@ -12828,13 +15424,16 @@ int main(int, char**)
                 return sampleTerrainNormal(x, y, z, terrainContext);
             };
             environment.collisionRadius = session->plane.collisionRadius;
+            const TerrainStreamBudgetOverrides terrainStreamOverrides = terrainBudgetOverridesForGovernor(runtimeGovernor);
             const TerrainVisualCache& terrainVisuals = ensureTerrainVisualCache(
                 session->terrainCache,
                 session->plane.pos,
                 session->flightMode ? session->plane.flightVel : session->plane.vel,
                 session->terrainContext,
                 session->terrainChunkBakeCache,
-                session->terrainWorldId);
+                session->terrainWorldId,
+                currentTerrainStream(),
+                &terrainStreamOverrides);
             session->foliageImpactPulse *= clamp(1.0f - (dt * 5.0f), 0.0f, 1.0f);
 
             if (!menuVisible()) {
@@ -12912,6 +15511,10 @@ int main(int, char**)
                 std::string saveError;
                 if (saveBootPreferences(boot, &saveError)) {
                     if (WorldStore* worldStore = currentWorldStore(); worldStore != nullptr) {
+                        std::unique_lock<std::shared_mutex> worldWriteLock;
+                        if (const auto worldMutex = currentWorldStoreMutex()) {
+                            worldWriteLock = std::unique_lock<std::shared_mutex>(*worldMutex);
+                        }
                         worldStore->flushDirty(nullptr);
                     }
                     boot.preferencesDirty = false;
@@ -12921,14 +15524,28 @@ int main(int, char**)
                 }
             }
 
+            const GraphicsSettings effectiveGraphics = applyGovernorToGraphicsSettings(boot.graphics, runtimeGovernor);
+            const LightingSettings effectiveLighting = applyGovernorToLightingSettings(boot.lighting, runtimeGovernor);
             const Camera renderCamera = buildRenderCamera(
                 session->plane,
                 session->terrainContext,
                 boot.uiState,
                 session->flightMode,
                 session->flightMode ? session->flightLookYaw : 0.0f,
-                session->flightMode ? session->flightLookPitch : 0.0f);
-            const RendererLightingState lightingState = evaluateRendererLightingState(boot.lighting, boot.graphics.horizonFog);
+                session->flightMode ? session->flightLookPitch : 0.0f,
+                computeWorldFarClip(effectiveGraphics));
+            const RendererLightingState lightingState = evaluateRendererLightingState(effectiveLighting, effectiveGraphics.horizonFog);
+            const RendererFrameSettings frameSettings {
+                boot.graphics.renderScale,
+                runtimeGovernor.dynamicRenderScale,
+                boot.graphics.textureMipmaps,
+                runtimeGovernor.maxUploadBytes,
+                toRendererPressureTier(runtimeGovernor.pressureState)
+            };
+            const RendererMemoryStats rendererStats = nativeRenderer.memoryStats();
+            const TerrainStreamStats terrainStreamStats = snapshotTerrainStreamStats(currentTerrainStream());
+            const std::vector<std::string> runtimeDebugLines =
+                buildRuntimeDebugLines(runtimeGovernor, rendererStats, terrainStreamStats);
 
             std::vector<RenderObject> opaqueObjects;
             opaqueObjects.reserve(((terrainVisuals.nearTiles.size() + terrainVisuals.farTiles.size()) * 2u) + 4u);
@@ -12939,6 +15556,11 @@ int main(int, char**)
 
             for (const TerrainFarTile& tile : terrainVisuals.farTiles) {
                 if (!tile.active) {
+                    continue;
+                }
+                const Vec3 tileCenter = terrainTileCenter(terrainVisuals, tile);
+                const float tileRadiusMeters = terrainTileRadius(terrainVisuals, tile);
+                if (!sphereWithinView(renderCamera, tileCenter, tileRadiusMeters, effectiveGraphics.drawDistance + tileRadiusMeters)) {
                     continue;
                 }
 
@@ -12954,7 +15576,7 @@ int main(int, char**)
                     true,
                     true
                 };
-                applyFogSettings(terrainObject, boot.graphics, boot.lighting);
+                applyFogSettings(terrainObject, effectiveGraphics, effectiveLighting);
                 opaqueObjects.push_back(terrainObject);
 
                 if (!tile.propModel.faces.empty()) {
@@ -12970,7 +15592,7 @@ int main(int, char**)
                         true,
                         true
                     };
-                    applyFogSettings(propObject, boot.graphics, boot.lighting);
+                    applyFogSettings(propObject, effectiveGraphics, effectiveLighting);
                     opaqueObjects.push_back(propObject);
                 }
 
@@ -12987,13 +15609,18 @@ int main(int, char**)
                         false,
                         true
                     };
-                    applyFogSettings(waterObject, boot.graphics, boot.lighting);
+                    applyFogSettings(waterObject, effectiveGraphics, effectiveLighting);
                     translucentObjects.push_back(waterObject);
                 }
             }
 
             for (const TerrainFarTile& tile : terrainVisuals.nearTiles) {
                 if (!tile.active) {
+                    continue;
+                }
+                const Vec3 tileCenter = terrainTileCenter(terrainVisuals, tile);
+                const float tileRadiusMeters = terrainTileRadius(terrainVisuals, tile);
+                if (!sphereWithinView(renderCamera, tileCenter, tileRadiusMeters, effectiveGraphics.drawDistance + tileRadiusMeters)) {
                     continue;
                 }
 
@@ -13009,7 +15636,7 @@ int main(int, char**)
                     false,
                     true
                 };
-                applyFogSettings(terrainObject, boot.graphics, boot.lighting);
+                applyFogSettings(terrainObject, effectiveGraphics, effectiveLighting);
                 opaqueObjects.push_back(terrainObject);
 
                 if (!tile.propModel.faces.empty()) {
@@ -13025,7 +15652,7 @@ int main(int, char**)
                         false,
                         true
                     };
-                    applyFogSettings(propObject, boot.graphics, boot.lighting);
+                    applyFogSettings(propObject, effectiveGraphics, effectiveLighting);
                     opaqueObjects.push_back(propObject);
                 }
 
@@ -13042,7 +15669,7 @@ int main(int, char**)
                         false,
                         true
                     };
-                    applyFogSettings(waterObject, boot.graphics, boot.lighting);
+                    applyFogSettings(waterObject, effectiveGraphics, effectiveLighting);
                     translucentObjects.push_back(waterObject);
                 }
             }
@@ -13062,7 +15689,7 @@ int main(int, char**)
                     2600.0f,
                     true
                 };
-                applyFogSettings(actorObject, boot.graphics, boot.lighting);
+                applyFogSettings(actorObject, effectiveGraphics, effectiveLighting);
                 opaqueObjects.push_back(actorObject);
             }
 
@@ -13096,16 +15723,32 @@ int main(int, char**)
                     160.0f,
                     true
                 };
-                applyFogSettings(previewObject, boot.graphics, boot.lighting);
+                applyFogSettings(previewObject, effectiveGraphics, effectiveLighting);
                 opaqueObjects.push_back(previewObject);
             }
 
             const Model cloudModel = makeOctahedronModel();
             for (const CloudGroup& group : session->cloudField.groups) {
-                for (const CloudPuff& puff : group.puffs) {
+                if (!sphereWithinView(renderCamera, group.center, group.radius, effectiveGraphics.drawDistance * 1.1f)) {
+                    continue;
+                }
+
+                const int puffBudget = std::max(
+                    1,
+                    static_cast<int>(std::ceil(static_cast<float>(group.puffs.size()) * runtimeGovernor.cloudDensityScale)));
+                for (int puffIndex = 0; puffIndex < std::min<int>(static_cast<int>(group.puffs.size()), puffBudget); ++puffIndex) {
+                    const CloudPuff& puff = group.puffs[static_cast<std::size_t>(puffIndex)];
+                    const Vec3 puffPosition =
+                        group.center + puff.offset +
+                        Vec3 { 0.0f, std::sin((session->worldTime * 0.2f) + puff.bobPhase) * puff.bobAmplitude, 0.0f };
+                    const float puffRadius = std::max(24.0f, puff.scale * 2.6f);
+                    if (!sphereWithinView(renderCamera, puffPosition, puffRadius, effectiveGraphics.drawDistance)) {
+                        continue;
+                    }
+
                     RenderObject cloudObject {
                         &cloudModel,
-                        group.center + puff.offset + Vec3 { 0.0f, std::sin((session->worldTime * 0.2f) + puff.bobPhase) * puff.bobAmplitude, 0.0f },
+                        puffPosition,
                         quatFromAxisAngle({ 0.0f, 1.0f, 0.0f }, puff.yaw),
                         { puff.scale, puff.scale * puff.stretchY, puff.scale },
                         puff.color,
@@ -13114,7 +15757,7 @@ int main(int, char**)
                         3000.0f,
                         true
                     };
-                    applyFogSettings(cloudObject, boot.graphics, boot.lighting);
+                    applyFogSettings(cloudObject, effectiveGraphics, effectiveLighting);
                     translucentObjects.push_back(cloudObject);
                 }
             }
@@ -13138,7 +15781,7 @@ int main(int, char**)
                     std::max(200.0f, markerDistance + markerSize + 50.0f),
                     false
                 };
-                applyFogSettings(sunMarker, boot.graphics, boot.lighting);
+                applyFogSettings(sunMarker, effectiveGraphics, effectiveLighting);
                 opaqueObjects.push_back(sunMarker);
             }
 
@@ -13166,7 +15809,8 @@ int main(int, char**)
                 rendererLabel,
                 fpsSmoothed,
                 mouseCaptured,
-                session->flightMode);
+                session->flightMode,
+                &runtimeDebugLines);
             if (menuVisible()) {
                 drawMenuOverlay(
                     boot.hudCanvas,
@@ -13190,6 +15834,7 @@ int main(int, char**)
             std::string renderError;
             if (!nativeRenderer.render(
                     renderCamera,
+                    frameSettings,
                     lightingState,
                     opaqueObjects,
                     translucentObjects,
@@ -13234,6 +15879,8 @@ int main(int, char**)
 
             std::vector<RenderObject> opaqueObjects;
             std::vector<RenderObject> translucentObjects;
+            const GraphicsSettings effectiveGraphics = applyGovernorToGraphicsSettings(boot.graphics, runtimeGovernor);
+            const LightingSettings effectiveLighting = applyGovernorToLightingSettings(boot.lighting, runtimeGovernor);
             const PlaneVisualState& previewVisual =
                 menuState.tab == PauseTab::Paint
                     ? visualForRole(menuState.paintSubTab, boot.planeVisual, boot.walkingVisual)
@@ -13260,14 +15907,22 @@ int main(int, char**)
                 2600.0f,
                 true
             };
-            applyFogSettings(previewObject, boot.graphics, boot.lighting);
+            applyFogSettings(previewObject, effectiveGraphics, effectiveLighting);
             opaqueObjects.push_back(previewObject);
 
             Camera previewCamera {};
             previewCamera.pos = { 0.0f, 0.0f, -22.0f };
             previewCamera.rot = quatIdentity();
             previewCamera.fovRadians = radians(std::clamp(boot.uiState.cameraFovDegrees, 60.0f, 100.0f));
-            const RendererLightingState lightingState = evaluateRendererLightingState(boot.lighting, boot.graphics.horizonFog);
+            previewCamera.farClipMeters = 3200.0f;
+            const RendererLightingState lightingState = evaluateRendererLightingState(effectiveLighting, effectiveGraphics.horizonFog);
+            const RendererFrameSettings frameSettings {
+                boot.graphics.renderScale,
+                runtimeGovernor.dynamicRenderScale,
+                boot.graphics.textureMipmaps,
+                runtimeGovernor.maxUploadBytes,
+                toRendererPressureTier(runtimeGovernor.pressureState)
+            };
             if (boot.lighting.showSunMarker) {
                 static Model sunMarkerModel = [] {
                     Model model = makeCubeModel();
@@ -13287,13 +15942,14 @@ int main(int, char**)
                     std::max(200.0f, markerDistance + markerSize + 50.0f),
                     false
                 };
-                applyFogSettings(sunMarker, boot.graphics, boot.lighting);
+                applyFogSettings(sunMarker, effectiveGraphics, effectiveLighting);
                 opaqueObjects.push_back(sunMarker);
             }
 
             std::string renderError;
             if (!nativeRenderer.render(
                     previewCamera,
+                    frameSettings,
                     lightingState,
                     opaqueObjects,
                     translucentObjects,
