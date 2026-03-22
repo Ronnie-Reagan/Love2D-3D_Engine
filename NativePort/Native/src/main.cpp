@@ -2,10 +2,13 @@
 
 #include "NativeGame/Flight.hpp"
 #include "NativeGame/GltfLoader.hpp"
+#include "NativeGame/Hash.hpp"
+#include "NativeGame/HostedNetworking.hpp"
 #include "NativeGame/HudCanvas.hpp"
 #include "NativeGame/ProceduralAudio.hpp"
 #include "NativeGame/RenderTypes.hpp"
 #include "NativeGame/StlLoader.hpp"
+#include "NativeGame/SteamSupport.hpp"
 #include "NativeGame/TerrainChunkBakeCache.hpp"
 #include "NativeGame/VulkanRenderer.hpp"
 #include "NativeGame/World.hpp"
@@ -23,6 +26,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -36,6 +40,10 @@
 #include <limits>
 #include <map>
 #include <vector>
+
+#if TRUEFLIGHT_ENABLE_STEAMWORKS
+#include <steam/steam_api.h>
+#endif
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -483,12 +491,117 @@ struct AircraftProfile {
     VisualPreferenceData visualPrefs {};
 };
 
+struct SessionVoicePlaybackState {
+    SDL_AudioStream* stream = nullptr;
+    bool available = false;
+    int sampleRate = 22050;
+    int queueDepth = 6;
+    std::vector<std::int16_t> scratchBuffer;
+
+    bool initialize(int preferredSampleRate, int preferredQueueDepth, std::string* errorText = nullptr)
+    {
+        shutdown();
+        sampleRate = std::max(11025, preferredSampleRate);
+        queueDepth = std::max(2, preferredQueueDepth);
+
+        const SDL_AudioSpec spec { SDL_AUDIO_S16, 1, sampleRate };
+        stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+        if (stream == nullptr) {
+            if (errorText != nullptr) {
+                *errorText = SDL_GetError();
+            }
+            return false;
+        }
+
+        if (!SDL_ResumeAudioStreamDevice(stream)) {
+            if (errorText != nullptr) {
+                *errorText = SDL_GetError();
+            }
+            SDL_DestroyAudioStream(stream);
+            stream = nullptr;
+            return false;
+        }
+
+        available = true;
+        return true;
+    }
+
+    void shutdown()
+    {
+        if (stream != nullptr) {
+            SDL_DestroyAudioStream(stream);
+            stream = nullptr;
+        }
+        available = false;
+        scratchBuffer.clear();
+    }
+
+    void clear()
+    {
+        if (stream != nullptr) {
+            SDL_ClearAudioStream(stream);
+            SDL_PauseAudioStreamDevice(stream);
+        }
+    }
+
+    void queuePcm(const std::int16_t* pcm, std::size_t sampleCount, float gain)
+    {
+        if (!available || stream == nullptr || pcm == nullptr || sampleCount == 0u) {
+            return;
+        }
+
+        const int maxQueuedBytes = sampleRate * queueDepth * static_cast<int>(sizeof(std::int16_t));
+        if (SDL_GetAudioStreamQueued(stream) > maxQueuedBytes) {
+            SDL_ClearAudioStream(stream);
+        }
+        if (!SDL_ResumeAudioStreamDevice(stream)) {
+            available = false;
+            return;
+        }
+
+        const float clampedGain = clamp(gain, 0.0f, 1.5f);
+        const void* data = pcm;
+        int dataBytes = static_cast<int>(sampleCount * sizeof(std::int16_t));
+        if (std::fabs(clampedGain - 1.0f) > 1.0e-3f) {
+            scratchBuffer.resize(sampleCount);
+            for (std::size_t index = 0; index < sampleCount; ++index) {
+                const float scaled = static_cast<float>(pcm[index]) * clampedGain;
+                scratchBuffer[index] = static_cast<std::int16_t>(clamp(scaled, -32768.0f, 32767.0f));
+            }
+            data = scratchBuffer.data();
+            dataBytes = static_cast<int>(scratchBuffer.size() * sizeof(std::int16_t));
+        }
+
+        if (!SDL_PutAudioStreamData(stream, data, dataBytes)) {
+            available = false;
+            SDL_DestroyAudioStream(stream);
+            stream = nullptr;
+            scratchBuffer.clear();
+        }
+    }
+};
+
+struct SessionVoiceRuntime {
+    SessionVoicePlaybackState playback {};
+    bool captureActive = false;
+    bool captureSupported = false;
+    bool playbackSupported = false;
+    bool captureFailed = false;
+    bool playbackFailed = false;
+    std::vector<std::uint8_t> captureScratch;
+    std::vector<std::uint8_t> decodeScratch;
+};
+
 struct BootResources {
     GeoConfig geoConfig {};
     UiState uiState {};
     GraphicsSettings graphics {};
     LightingSettings lighting {};
     HudSettings hud {};
+    OnlineSettings onlineSettings {};
+    SteamBuildConfig steamBuildConfig = defaultSteamBuildConfig();
+    SteamOnlineController steamController {};
+    SteamOnlineState steamOnline {};
     TerrainParams terrainParams = defaultTerrainParams();
     TerrainParams defaultTerrainParamsValues = defaultTerrainParams();
     AircraftProfile planeProfile {};
@@ -525,18 +638,28 @@ struct GamepadState {
 
 struct GameSession {
     std::optional<WorldStore> worldStore;
+    std::optional<WorldStore> mirrorWorldStore;
     std::string terrainWorldId = "native_default";
     std::optional<TerrainChunkBakeCache> terrainChunkBakeCache;
     std::shared_ptr<std::shared_mutex> terrainWorldMutex {};
     std::shared_ptr<TerrainVisualStreamState> terrainStream {};
     TerrainVisualCache terrainCache {};
     TerrainFieldContext terrainContext {};
+    OnlineSessionRole onlineRole = OnlineSessionRole::Offline;
+    bool worldStoreMirrored = false;
+    SteamOnlineState steamOnline {};
+    std::shared_ptr<INetTransport> netTransport {};
+    HostedWorldServer hostedServer {};
+    ClientReplicationState clientReplication {};
+    RemotePeerState localReplicationPeer {};
     std::mt19937 worldRng {};
     WindState windState {};
     CloudField cloudField {};
     FlightState plane {};
     FlightRuntimeState runtime {};
     ProceduralAudioState audioState {};
+    VoiceSessionState voice {};
+    SessionVoiceRuntime voiceRuntime {};
     float worldTime = 0.0f;
     bool flightMode = true;
     float walkYaw = 0.0f;
@@ -647,7 +770,7 @@ constexpr int kGraphicsSettingCount = 11;
 constexpr int kCameraSettingCount = 7;
 constexpr int kSoundSettingCount = 13;
 constexpr int kLightingSettingCount = 28;
-constexpr int kOnlineSettingCount = 5;
+constexpr int kOnlineSettingCount = 7;
 constexpr int kHudSettingCount = 12;
 constexpr int kHudVisibleRows = 12;
 constexpr int kControlsVisibleRows = 10;
@@ -930,7 +1053,7 @@ ControlProfile defaultControlProfile()
         { InputActionId::WalkBackward, "Walk Backward", "Move backward in walking mode.", true, true, { key(SDL_SCANCODE_S), {} } },
         { InputActionId::WalkLeft, "Strafe Left", "Strafe left in walking mode.", true, true, { key(SDL_SCANCODE_A), {} } },
         { InputActionId::WalkRight, "Strafe Right", "Strafe right in walking mode.", true, true, { key(SDL_SCANCODE_D), {} } },
-        { InputActionId::VoicePushToTalk, "Voice Push-To-Talk", "Networking and voice are not yet implemented in native.", true, false, { key(SDL_SCANCODE_V), {} } }
+        { InputActionId::VoicePushToTalk, "Voice Push-To-Talk", "Hold to transmit Steam voice when radio voice is set to push-to-talk.", true, true, { key(SDL_SCANCODE_V), {} } }
     };
     return profile;
 }
@@ -957,12 +1080,14 @@ ControlActionBinding* findControlAction(ControlProfile& profile, InputActionId a
 
 bool controlActionSupported(InputActionId actionId)
 {
-    return actionId != InputActionId::VoicePushToTalk;
+    (void)actionId;
+    return true;
 }
 
 bool controlActionConfigurable(InputActionId actionId)
 {
-    return actionId != InputActionId::VoicePushToTalk;
+    (void)actionId;
+    return true;
 }
 
 const char* controlActionStorageKey(InputActionId actionId)
@@ -4574,6 +4699,484 @@ float parseFloatValue(const std::string& value, float fallback)
     return parsed;
 }
 
+std::string normalizeOnlineSessionMode(std::string value)
+{
+    value = toLowerAscii(trimAscii(std::move(value)));
+    if (value == "host" || value == "server") {
+        return "host";
+    }
+    if (value == "client" || value == "join" || value == "guest") {
+        return "client";
+    }
+    return "offline";
+}
+
+void clampOnlineSettings(OnlineSettings& settings)
+{
+    settings.callsign = sanitizeCallsign(settings.callsign);
+    settings.radioChannel = normalizeRadioChannel(settings.radioChannel);
+    settings.sessionMode = normalizeOnlineSessionMode(settings.sessionMode);
+}
+
+OnlineSessionRole onlineRoleFromSettings(const OnlineSettings& settings)
+{
+    if (!settings.multiplayerEnabled) {
+        return OnlineSessionRole::Offline;
+    }
+    if (settings.sessionMode == "host") {
+        return OnlineSessionRole::Host;
+    }
+    if (settings.sessionMode == "client") {
+        return OnlineSessionRole::Client;
+    }
+    return OnlineSessionRole::Offline;
+}
+
+bool parseSteamId64(const std::string& value, std::uint64_t& outSteamId)
+{
+    const std::string trimmed = trimAscii(value);
+    if (trimmed.empty()) {
+        outSteamId = 0;
+        return false;
+    }
+
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(trimmed.c_str(), &end, 10);
+    if (end == nullptr || *end != '\0' || parsed == 0ull) {
+        outSteamId = 0;
+        return false;
+    }
+
+    outSteamId = static_cast<std::uint64_t>(parsed);
+    return true;
+}
+
+std::uint64_t parseConnectLobbyLaunchArgument(int argc, char** argv)
+{
+    auto parseLobbyId = [](std::string_view value) -> std::uint64_t {
+        const std::string trimmed = trimAscii(std::string(value));
+        if (trimmed.empty()) {
+            return 0ull;
+        }
+
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(trimmed.c_str(), &end, 10);
+        if (end == nullptr || *end != '\0' || parsed == 0ull) {
+            return 0ull;
+        }
+        return static_cast<std::uint64_t>(parsed);
+    };
+
+    if (argc <= 1 || argv == nullptr) {
+        return 0ull;
+    }
+
+    for (int index = 1; index < argc; ++index) {
+        if (argv[index] == nullptr) {
+            continue;
+        }
+
+        const std::string token = trimAscii(argv[index]);
+        if (token.empty()) {
+            continue;
+        }
+        if (token == "+connect_lobby" || token == "-connect_lobby" || token == "connect_lobby") {
+            if (index + 1 < argc && argv[index + 1] != nullptr) {
+                return parseLobbyId(argv[index + 1]);
+            }
+            continue;
+        }
+        if (token.rfind("+connect_lobby=", 0) == 0) {
+            return parseLobbyId(token.substr(std::strlen("+connect_lobby=")));
+        }
+        if (token.rfind("lobby:", 0) == 0) {
+            return parseLobbyId(token.substr(std::strlen("lobby:")));
+        }
+    }
+
+    return 0ull;
+}
+
+std::string sanitizeMirrorWorldToken(std::string_view value)
+{
+    std::string out;
+    out.reserve(value.size());
+    for (const unsigned char ch : value) {
+        if (std::isalnum(ch) != 0 || ch == '_' || ch == '-') {
+            out.push_back(static_cast<char>(ch));
+        } else {
+            out.push_back('_');
+        }
+    }
+    while (!out.empty() && out.size() > 63u) {
+        out.pop_back();
+    }
+    return out.empty() ? std::string("unknown") : out;
+}
+
+std::string buildMirroredWorldName(std::string_view hostSteamId, std::string_view worldId)
+{
+    return "mirror_" + sanitizeMirrorWorldToken(hostSteamId) + "_" + sanitizeMirrorWorldToken(worldId);
+}
+
+AvatarRoleConfig buildAvatarRoleConfigFromVisual(const PlaneVisualState& visual)
+{
+    AvatarRoleConfig config;
+    const std::string modelKey =
+        !visual.sourcePath.empty() ? visual.sourcePath.generic_string() :
+        (!visual.sourceModel.assetKey.empty() ? visual.sourceModel.assetKey : std::string("builtin:cube"));
+    config.modelHash = sha256Hex(modelKey);
+    config.scale = std::max(0.1f, visual.scale);
+    config.skinHash = visual.paintHash;
+    config.yawDegrees = visual.yawDegrees;
+    config.pitchDegrees = visual.pitchDegrees;
+    config.rollDegrees = visual.rollDegrees;
+    config.offset = visual.modelOffset;
+    return config;
+}
+
+AvatarManifest buildLocalAvatarManifest(
+    const OnlineSettings& settings,
+    const PlaneVisualState& planeVisual,
+    const PlaneVisualState& walkingVisual,
+    bool flightMode,
+    bool transmitting)
+{
+    AvatarManifest avatar = defaultAvatarManifest();
+    avatar.role = flightMode ? "plane" : "walking";
+    avatar.callsign = sanitizeCallsign(settings.callsign);
+    avatar.radioChannel = normalizeRadioChannel(settings.radioChannel);
+    avatar.radioTx = transmitting;
+    avatar.plane = buildAvatarRoleConfigFromVisual(planeVisual);
+    avatar.walking = buildAvatarRoleConfigFromVisual(walkingVisual);
+    return avatar;
+}
+
+NetPlayerInput buildNetPlayerInput(
+    int tick,
+    bool flightMode,
+    float walkYaw,
+    float walkPitch,
+    const FlightState& plane,
+    const InputState& input,
+    const WalkingInputState& walkingInput,
+    const AvatarManifest& avatar)
+{
+    NetPlayerInput packet;
+    packet.tick = std::max(1, tick);
+    packet.role = flightMode ? "plane" : "walking";
+    packet.walkYaw = walkYaw;
+    packet.walkPitch = walkPitch;
+    packet.throttle = clamp(plane.throttle, 0.0f, 1.0f);
+    packet.yokePitch = plane.yoke.pitch;
+    packet.yokeYaw = plane.yoke.yaw;
+    packet.yokeRoll = plane.yoke.roll;
+    packet.walkForward = walkingInput.forward || walkingInput.forwardAxis > 0.2f;
+    packet.walkBackward = walkingInput.backward || walkingInput.forwardAxis < -0.2f;
+    packet.walkStrafeLeft = walkingInput.left || walkingInput.rightAxis < -0.2f;
+    packet.walkStrafeRight = walkingInput.right || walkingInput.rightAxis > 0.2f;
+    packet.walkSprint = walkingInput.sprint;
+    packet.walkJump = walkingInput.jump;
+    packet.flightThrottleUp = input.flightThrottleUp;
+    packet.flightThrottleDown = input.flightThrottleDown;
+    packet.flightAirBrakes = input.flightAirBrakes;
+    packet.flightAfterburner = input.flightAfterburner;
+    packet.avatar = avatar;
+    packet.avatar.role = packet.role;
+    return packet;
+}
+
+SteamOnlineState snapshotSteamOnlineState(const SteamOnlineController& controller)
+{
+    SteamOnlineState state;
+    state.available = controller.available();
+    state.initialized = controller.initialized();
+    state.joinRequested = controller.hasPendingJoinRequest();
+    if (const std::uint64_t pendingLobbyId = controller.pendingJoinLobbyId(); pendingLobbyId != 0) {
+        state.pendingLobbyId = std::to_string(pendingLobbyId);
+    }
+
+    const SteamLobbyState& lobby = controller.lobby();
+    if (lobby.lobbyId != 0) {
+        state.lobbyId = std::to_string(lobby.lobbyId);
+    }
+    if (lobby.hostSteamId != 0) {
+        state.hostSteamId = std::to_string(lobby.hostSteamId);
+    }
+    state.transport = controller.transport();
+    const bool lobbyOwnsStatus =
+        lobby.role != SteamLobbyState::Role::Offline ||
+        !state.pendingLobbyId.empty() ||
+        !state.lobbyId.empty();
+    const std::string runtimeStatus = controller.runtimeState().status;
+    state.status = lobbyOwnsStatus
+        ? lobby.status
+        : (!runtimeStatus.empty()
+            ? runtimeStatus
+            : (!lobby.status.empty() ? lobby.status : (state.available ? std::string("Steam ready.") : std::string("Offline fallback active."))));
+    return state;
+}
+
+bool steamStatusLooksTerminal(std::string_view status)
+{
+    const std::string lowered = toLowerAscii(std::string(status));
+    return lowered.find("fail") != std::string::npos ||
+        lowered.find("mismatch") != std::string::npos ||
+        lowered.find("unavailable") != std::string::npos ||
+        lowered.find("timeout") != std::string::npos;
+}
+
+void moveVoiceFrames(std::vector<std::string>& destination, std::vector<std::string>& source)
+{
+    if (source.empty()) {
+        return;
+    }
+    destination.insert(
+        destination.end(),
+        std::make_move_iterator(source.begin()),
+        std::make_move_iterator(source.end()));
+    source.clear();
+}
+
+void clearVoiceQueues(VoiceSessionState& voice)
+{
+    voice.pendingOutboundCompressedFrames.clear();
+    voice.inboundCompressedFrames.clear();
+    voice.hostLocalReceiveFrames.clear();
+}
+
+void initializeSessionVoiceRuntime(SessionVoiceRuntime& runtime, bool audioSubsystemReady, std::string* statusText = nullptr)
+{
+    runtime.playbackFailed = false;
+    runtime.playbackSupported = false;
+    if (!audioSubsystemReady) {
+        return;
+    }
+
+    std::string playbackError;
+    if (runtime.playback.initialize(22050, 6, &playbackError)) {
+        runtime.playbackSupported = true;
+        if (statusText != nullptr && statusText->empty()) {
+            *statusText = "Steam voice playback ready.";
+        }
+    } else if (!playbackError.empty()) {
+        runtime.playbackFailed = true;
+        if (statusText != nullptr) {
+            *statusText = playbackError;
+        }
+    }
+}
+
+void shutdownSessionVoiceRuntime(SessionVoiceRuntime& runtime)
+{
+#if TRUEFLIGHT_ENABLE_STEAMWORKS
+    if (runtime.captureActive && SteamUser() != nullptr) {
+        SteamUser()->StopVoiceRecording();
+    }
+#endif
+    runtime.captureActive = false;
+    runtime.captureSupported = false;
+    runtime.captureFailed = false;
+    runtime.playback.shutdown();
+    runtime.playbackSupported = false;
+    runtime.playbackFailed = false;
+    runtime.captureScratch.clear();
+    runtime.decodeScratch.clear();
+}
+
+void captureSessionVoiceFrames(
+    SessionVoiceRuntime& runtime,
+    bool voiceEnabled,
+    bool transmitEnabled,
+    VoiceSessionState& voice,
+    std::string* statusText = nullptr)
+{
+    voice.pendingOutboundCompressedFrames.clear();
+    voice.captureEnabled = false;
+
+#if TRUEFLIGHT_ENABLE_STEAMWORKS
+    ISteamUser* user = SteamUser();
+    if (!voiceEnabled || user == nullptr) {
+        if (runtime.captureActive && user != nullptr) {
+            user->StopVoiceRecording();
+        }
+        runtime.captureActive = false;
+        runtime.captureSupported = false;
+        return;
+    }
+
+    if (!runtime.captureActive) {
+        user->StartVoiceRecording();
+        runtime.captureActive = true;
+    }
+    runtime.captureSupported = true;
+    voice.captureEnabled = true;
+
+    while (true) {
+        uint32 compressedBytes = 0;
+        const EVoiceResult available = user->GetAvailableVoice(&compressedBytes, nullptr, 0);
+        if (available != k_EVoiceResultOK || compressedBytes == 0u) {
+            if (available != k_EVoiceResultOK &&
+                available != k_EVoiceResultNoData &&
+                !runtime.captureFailed &&
+                statusText != nullptr) {
+                *statusText = "Steam voice capture unavailable.";
+                runtime.captureFailed = true;
+            }
+            break;
+        }
+
+        runtime.captureScratch.resize(compressedBytes);
+        uint32 written = 0;
+        const EVoiceResult result = user->GetVoice(
+            true,
+            runtime.captureScratch.data(),
+            static_cast<uint32>(runtime.captureScratch.size()),
+            &written,
+            false,
+            nullptr,
+            0,
+            nullptr,
+            0);
+        if (result != k_EVoiceResultOK || written == 0u) {
+            if (result != k_EVoiceResultNoData && !runtime.captureFailed && statusText != nullptr) {
+                *statusText = "Steam voice capture read failed.";
+                runtime.captureFailed = true;
+            }
+            break;
+        }
+
+        if (transmitEnabled) {
+            voice.pendingOutboundCompressedFrames.emplace_back(
+                reinterpret_cast<const char*>(runtime.captureScratch.data()),
+                reinterpret_cast<const char*>(runtime.captureScratch.data()) + written);
+        }
+    }
+#else
+    (void)runtime;
+    (void)voiceEnabled;
+    (void)transmitEnabled;
+    (void)statusText;
+#endif
+}
+
+void playSessionVoiceFrames(
+    SessionVoiceRuntime& runtime,
+    std::vector<std::string>& frames,
+    bool voiceEnabled,
+    float masterVolume,
+    std::string* statusText = nullptr)
+{
+    if (!voiceEnabled) {
+        frames.clear();
+        runtime.playback.clear();
+        return;
+    }
+    if (frames.empty() || !runtime.playback.available) {
+        frames.clear();
+        return;
+    }
+
+#if TRUEFLIGHT_ENABLE_STEAMWORKS
+    ISteamUser* user = SteamUser();
+    if (user == nullptr) {
+        frames.clear();
+        return;
+    }
+
+    if (runtime.decodeScratch.size() < 4096u) {
+        runtime.decodeScratch.resize(4096u);
+    }
+    for (const std::string& frame : frames) {
+        if (frame.empty()) {
+            continue;
+        }
+
+        uint32 written = 0;
+        while (true) {
+            const EVoiceResult result = user->DecompressVoice(
+                frame.data(),
+                static_cast<uint32>(frame.size()),
+                runtime.decodeScratch.data(),
+                static_cast<uint32>(runtime.decodeScratch.size()),
+                &written,
+                22050u);
+            if (result == k_EVoiceResultBufferTooSmall) {
+                runtime.decodeScratch.resize(runtime.decodeScratch.size() * 2u);
+                continue;
+            }
+            if (result != k_EVoiceResultOK || written == 0u) {
+                if (result != k_EVoiceResultNoData && !runtime.playbackFailed && statusText != nullptr) {
+                    *statusText = "Steam voice playback decode failed.";
+                    runtime.playbackFailed = true;
+                }
+                break;
+            }
+
+            runtime.playback.queuePcm(
+                reinterpret_cast<const std::int16_t*>(runtime.decodeScratch.data()),
+                static_cast<std::size_t>(written / sizeof(std::int16_t)),
+                masterVolume);
+            break;
+        }
+    }
+#else
+    (void)runtime;
+    (void)masterVolume;
+    (void)statusText;
+#endif
+
+    frames.clear();
+}
+
+AoiSubscription buildLocalAoiSubscription(const FlightState& plane, const TerrainFieldContext& terrainContext, float drawDistance)
+{
+    const float chunkSize = std::max(16.0f, terrainContext.params.chunkSize);
+    AoiSubscription subscription;
+    subscription.centerChunkX = static_cast<int>(std::floor(plane.pos.x / chunkSize));
+    subscription.centerChunkZ = static_cast<int>(std::floor(plane.pos.z / chunkSize));
+    subscription.radiusChunks = std::clamp(static_cast<int>(std::ceil(drawDistance / chunkSize)) + 1, 2, 96);
+    subscription.snapshotNearMeters = std::max(768.0f, drawDistance * 0.35f);
+    subscription.snapshotFarMeters = std::max(subscription.snapshotNearMeters, drawDistance * 1.1f);
+    return subscription;
+}
+
+bool terrainNetworkingParamsChanged(const TerrainParams& lhs, const TerrainParams& rhs)
+{
+    return lhs.seed != rhs.seed ||
+        std::fabs(lhs.chunkSize - rhs.chunkSize) > 0.01f ||
+        lhs.lod0Radius != rhs.lod0Radius ||
+        lhs.lod1Radius != rhs.lod1Radius ||
+        lhs.lod2Radius != rhs.lod2Radius ||
+        lhs.splitLodEnabled != rhs.splitLodEnabled ||
+        std::fabs(lhs.heightAmplitude - rhs.heightAmplitude) > 0.01f ||
+        std::fabs(lhs.heightFrequency - rhs.heightFrequency) > 1.0e-6f ||
+        lhs.caveEnabled != rhs.caveEnabled ||
+        lhs.tunnelCount != rhs.tunnelCount ||
+        lhs.dynamicCraters.size() != rhs.dynamicCraters.size();
+}
+
+Quat composeNetworkVisualRotation(const PlaneVisualState& visual, const AvatarRoleConfig& roleConfig)
+{
+    const Quat forwardAxis = quatFromAxisAngle({ 0.0f, 1.0f, 0.0f }, radians(visual.forwardAxisYawDegrees));
+    const Quat yaw = quatFromAxisAngle({ 0.0f, 1.0f, 0.0f }, radians(roleConfig.yawDegrees));
+    const Quat pitch = quatFromAxisAngle({ 1.0f, 0.0f, 0.0f }, radians(roleConfig.pitchDegrees));
+    const Quat roll = quatFromAxisAngle({ 0.0f, 0.0f, 1.0f }, radians(roleConfig.rollDegrees));
+    return quatNormalize(
+        quatMultiply(
+            quatMultiply(
+                quatMultiply(
+                    quatMultiply(visual.importRotationOffset, forwardAxis),
+                    yaw),
+                pitch),
+            roll));
+}
+
+float resolveNetworkVisualScale(const PlaneVisualState& visual, const AvatarRoleConfig& roleConfig)
+{
+    return std::max(0.1f, roleConfig.scale > 0.0f ? roleConfig.scale : visual.scale);
+}
+
 void clampUiStatePersistentValues(UiState& uiState)
 {
     uiState.mapZoomIndex = std::clamp(uiState.mapZoomIndex, 0, static_cast<int>(uiState.mapZoomExtents.size()) - 1);
@@ -5476,6 +6079,7 @@ bool savePreferences(
     const GraphicsSettings& graphicsSettings,
     const LightingSettings& lightingSettings,
     const HudSettings& hudSettings,
+    const OnlineSettings& onlineSettings,
     const ControlProfile& controls,
     const AircraftProfile& planeProfile,
     const TerrainParams& terrainParams,
@@ -5523,6 +6127,15 @@ bool savePreferences(
     file << "ui.master_volume=" << uiState.masterVolume << "\n";
     file << "ui.engine_volume=" << uiState.engineVolume << "\n";
     file << "ui.ambience_volume=" << uiState.ambienceVolume << "\n";
+    file << "online.steam_enabled=" << (onlineSettings.steamEnabled ? 1 : 0) << "\n";
+    file << "online.multiplayer_enabled=" << (onlineSettings.multiplayerEnabled ? 1 : 0) << "\n";
+    file << "online.voice_enabled=" << (onlineSettings.voiceEnabled ? 1 : 0) << "\n";
+    file << "online.push_to_talk=" << (onlineSettings.pushToTalk ? 1 : 0) << "\n";
+    file << "online.radio_channel=" << onlineSettings.radioChannel << "\n";
+    file << "online.callsign=" << sanitizeCallsign(onlineSettings.callsign) << "\n";
+    file << "online.session_mode=" << normalizeOnlineSessionMode(onlineSettings.sessionMode) << "\n";
+    file << "online.last_lobby_id=" << onlineSettings.lastLobbyId << "\n";
+    file << "online.last_join_host_id=" << onlineSettings.lastJoinHostId << "\n";
     file << "graphics.window_mode=" << windowModeToken(graphicsSettings.windowMode) << "\n";
     file << "graphics.resolution_width=" << graphicsSettings.resolutionWidth << "\n";
     file << "graphics.resolution_height=" << graphicsSettings.resolutionHeight << "\n";
@@ -5656,6 +6269,7 @@ bool loadPreferences(
     GraphicsSettings& graphicsSettings,
     LightingSettings& lightingSettings,
     HudSettings& hudSettings,
+    OnlineSettings& onlineSettings,
     ControlProfile& controls,
     AircraftProfile& planeProfile,
     TerrainParams& terrainParams,
@@ -5806,6 +6420,24 @@ bool loadPreferences(
             uiState.engineVolume = parseFloatValue(value, uiState.engineVolume);
         } else if (key == "ui.ambience_volume") {
             uiState.ambienceVolume = parseFloatValue(value, uiState.ambienceVolume);
+        } else if (key == "online.steam_enabled") {
+            onlineSettings.steamEnabled = parseBoolValue(value, onlineSettings.steamEnabled);
+        } else if (key == "online.multiplayer_enabled") {
+            onlineSettings.multiplayerEnabled = parseBoolValue(value, onlineSettings.multiplayerEnabled);
+        } else if (key == "online.voice_enabled") {
+            onlineSettings.voiceEnabled = parseBoolValue(value, onlineSettings.voiceEnabled);
+        } else if (key == "online.push_to_talk") {
+            onlineSettings.pushToTalk = parseBoolValue(value, onlineSettings.pushToTalk);
+        } else if (key == "online.radio_channel") {
+            onlineSettings.radioChannel = parseIntValue(value, onlineSettings.radioChannel);
+        } else if (key == "online.callsign") {
+            onlineSettings.callsign = value;
+        } else if (key == "online.session_mode") {
+            onlineSettings.sessionMode = value;
+        } else if (key == "online.last_lobby_id") {
+            onlineSettings.lastLobbyId = value;
+        } else if (key == "online.last_join_host_id") {
+            onlineSettings.lastJoinHostId = value;
         } else if (key == "graphics.window_mode") {
             graphicsSettings.windowMode = parseWindowModeToken(value);
         } else if (key == "graphics.resolution_width") {
@@ -5981,6 +6613,7 @@ bool loadPreferences(
     }
     clampHudSettings(hudSettings);
     syncUiStateFromHud(uiState, hudSettings);
+    clampOnlineSettings(onlineSettings);
     clampPropAudioConfigValues(propAudioConfig);
     clampTuningConfig(config);
     clampVisualPreferenceData(planePrefs);
@@ -9381,12 +10014,16 @@ const char* menuSettingsRowLabel(SettingsSubTab subTab, int localIndex)
         case 0:
             return "Multiplayer";
         case 1:
-            return "Hosted Server";
+            return "Session Role";
         case 2:
-            return "Relay";
+            return "Steam Status";
         case 3:
-            return "Voice";
+            return "Steam Join";
         case 4:
+            return "Invite Friends";
+        case 5:
+            return "Voice";
+        case 6:
             return "Radio";
         default:
             return "";
@@ -9401,12 +10038,32 @@ bool menuSettingsRowDisabled(SettingsSubTab subTab, int localIndex)
     if (subTab == SettingsSubTab::Graphics) {
         return localIndex == 10;
     }
-    return subTab == SettingsSubTab::Online;
+    return subTab == SettingsSubTab::Online && localIndex == 2;
 }
 
 bool menuSettingsRowAction(SettingsSubTab subTab, int localIndex)
 {
-    return subTab == SettingsSubTab::Graphics && localIndex == 2;
+    return (subTab == SettingsSubTab::Graphics && localIndex == 2) ||
+        (subTab == SettingsSubTab::Online && (localIndex == 3 || localIndex == 4));
+}
+
+bool onlineActionRowEnabled(
+    int localIndex,
+    const OnlineSettings& onlineSettings,
+    const SteamOnlineState& steamOnline,
+    bool sessionActive)
+{
+    switch (localIndex) {
+    case 3:
+        return steamOnline.joinRequested && !steamOnline.pendingLobbyId.empty();
+    case 4:
+        return sessionActive &&
+            onlineSettings.multiplayerEnabled &&
+            onlineSettings.sessionMode == "host" &&
+            !steamOnline.lobbyId.empty();
+    default:
+        return true;
+    }
 }
 
 std::string formatGraphicsRowValue(int localIndex, const GraphicsSettings& graphicsSettings, const UiState& uiState)
@@ -9524,9 +10181,54 @@ std::string formatLightingRowValue(int localIndex, const LightingSettings& light
     }
 }
 
-std::string formatOnlineRowValue(int)
+std::string formatOnlineRowValue(
+    int localIndex,
+    const OnlineSettings& onlineSettings,
+    const SteamOnlineState& steamOnline,
+    bool sessionActive)
 {
-    return "Unavailable";
+    switch (localIndex) {
+    case 0:
+        return onlineSettings.multiplayerEnabled ? "On" : "Off";
+    case 1:
+        if (!onlineSettings.multiplayerEnabled) {
+            return "Offline";
+        }
+        if (onlineSettings.sessionMode == "host") {
+            return "Host";
+        }
+        if (onlineSettings.sessionMode == "client") {
+            return "Client";
+        }
+        return "Offline";
+    case 2: {
+        std::string status = steamOnline.status.empty() ? "Offline fallback" : steamOnline.status;
+        if (!steamOnline.lobbyId.empty()) {
+            status += " | active #" + steamOnline.lobbyId;
+        }
+        if (!steamOnline.pendingLobbyId.empty()) {
+            status += " | join #" + steamOnline.pendingLobbyId;
+        }
+        return status;
+    }
+    case 3:
+        return onlineActionRowEnabled(localIndex, onlineSettings, steamOnline, sessionActive)
+            ? "Press Enter"
+            : "No Pending Invite";
+    case 4:
+        return onlineActionRowEnabled(localIndex, onlineSettings, steamOnline, sessionActive)
+            ? "Press Enter"
+            : "Unavailable";
+    case 5:
+        if (!onlineSettings.voiceEnabled) {
+            return "Off";
+        }
+        return onlineSettings.pushToTalk ? "PTT" : "Open";
+    case 6:
+        return "Ch " + std::to_string(normalizeRadioChannel(onlineSettings.radioChannel)) + " " + sanitizeCallsign(onlineSettings.callsign);
+    default:
+        return {};
+    }
 }
 
 std::string menuFormatSettingsRowValue(
@@ -9535,7 +10237,10 @@ std::string menuFormatSettingsRowValue(
     const UiState& uiState,
     const GraphicsSettings& graphicsSettings,
     const LightingSettings& lightingSettings,
-    const PropAudioConfig& propAudioConfig)
+    const PropAudioConfig& propAudioConfig,
+    const OnlineSettings& onlineSettings,
+    const SteamOnlineState& steamOnline,
+    bool sessionActive)
 {
     switch (subTab) {
     case SettingsSubTab::Graphics:
@@ -9547,7 +10252,7 @@ std::string menuFormatSettingsRowValue(
     case SettingsSubTab::Lighting:
         return formatLightingRowValue(localIndex, lightingSettings);
     case SettingsSubTab::Online:
-        return formatOnlineRowValue(localIndex);
+        return formatOnlineRowValue(localIndex, onlineSettings, steamOnline, sessionActive);
     default:
         return {};
     }
@@ -9661,9 +10366,26 @@ const char* lightingRowHelpText(int localIndex)
     }
 }
 
-const char* onlineRowHelpText(int)
+const char* onlineRowHelpText(int localIndex)
 {
-    return "Networking, relay, and voice flows are still unsupported in the native port.";
+    switch (localIndex) {
+    case 0:
+        return "Enable or disable hosted-world networking for the next session start.";
+    case 1:
+        return "Choose whether the next multiplayer session starts as a host or joins a pending Steam lobby invite.";
+    case 2:
+        return "Read-only Steamworks runtime, active lobby, and pending invite status.";
+    case 3:
+        return "Join the pending Steam lobby invite from the main menu. Active sessions must return to main menu first.";
+    case 4:
+        return "Open the Steam overlay invite dialog for the active hosted lobby.";
+    case 5:
+        return "Cycle radio voice between off, push-to-talk, and open mic.";
+    case 6:
+        return "Adjust the active radio channel used for voice routing and peer labels.";
+    default:
+        return "";
+    }
 }
 
 const char* menuSettingsRowHelpText(SettingsSubTab subTab, int localIndex)
@@ -10720,6 +11442,7 @@ void adjustMenuSettingsRowValue(
     GraphicsSettings& graphicsSettings,
     PropAudioConfig& propAudioConfig,
     LightingSettings& lightingSettings,
+    OnlineSettings& onlineSettings,
     SettingsSubTab subTab,
     int localIndex,
     int direction)
@@ -10742,6 +11465,49 @@ void adjustMenuSettingsRowValue(
         adjustLightingRowValue(lightingSettings, localIndex, direction);
         break;
     case SettingsSubTab::Online:
+        switch (localIndex) {
+        case 0:
+            if (direction != 0) {
+                onlineSettings.multiplayerEnabled = !onlineSettings.multiplayerEnabled;
+                if (!onlineSettings.multiplayerEnabled) {
+                    onlineSettings.sessionMode = "offline";
+                } else if (onlineSettings.sessionMode == "offline") {
+                    onlineSettings.sessionMode = "host";
+                }
+            }
+            break;
+        case 1:
+            if (!onlineSettings.multiplayerEnabled) {
+                onlineSettings.sessionMode = "offline";
+                break;
+            }
+            if (direction > 0) {
+                onlineSettings.sessionMode = onlineSettings.sessionMode == "host" ? "client" : "host";
+            } else if (direction < 0) {
+                onlineSettings.sessionMode = onlineSettings.sessionMode == "client" ? "host" : "client";
+            }
+            break;
+        case 5:
+            if (direction != 0) {
+                if (!onlineSettings.voiceEnabled) {
+                    onlineSettings.voiceEnabled = true;
+                    onlineSettings.pushToTalk = true;
+                } else if (onlineSettings.pushToTalk) {
+                    onlineSettings.pushToTalk = false;
+                } else {
+                    onlineSettings.voiceEnabled = false;
+                    onlineSettings.pushToTalk = true;
+                }
+            }
+            break;
+        case 6:
+            onlineSettings.radioChannel = normalizeRadioChannel(onlineSettings.radioChannel + direction);
+            break;
+        default:
+            break;
+        }
+        clampOnlineSettings(onlineSettings);
+        break;
     default:
         break;
     }
@@ -10756,6 +11522,8 @@ void resetMenuSettingsRowValue(
     const PropAudioConfig& defaultPropAudioConfigValues,
     LightingSettings& lightingSettings,
     const LightingSettings& defaultLightingSettingsValues,
+    OnlineSettings& onlineSettings,
+    const OnlineSettings& defaultOnlineSettingsValues,
     SettingsSubTab subTab,
     int localIndex)
 {
@@ -10777,6 +11545,26 @@ void resetMenuSettingsRowValue(
         resetLightingRowValue(lightingSettings, defaultLightingSettingsValues, localIndex);
         break;
     case SettingsSubTab::Online:
+        switch (localIndex) {
+        case 0:
+            onlineSettings.multiplayerEnabled = defaultOnlineSettingsValues.multiplayerEnabled;
+            break;
+        case 1:
+            onlineSettings.sessionMode = defaultOnlineSettingsValues.sessionMode;
+            break;
+        case 5:
+            onlineSettings.voiceEnabled = defaultOnlineSettingsValues.voiceEnabled;
+            onlineSettings.pushToTalk = defaultOnlineSettingsValues.pushToTalk;
+            break;
+        case 6:
+            onlineSettings.radioChannel = defaultOnlineSettingsValues.radioChannel;
+            onlineSettings.callsign = defaultOnlineSettingsValues.callsign;
+            break;
+        default:
+            break;
+        }
+        clampOnlineSettings(onlineSettings);
+        break;
     default:
         break;
     }
@@ -11353,6 +12141,8 @@ void drawMenuOverlay(
     const GraphicsSettings& graphicsSettings,
     const LightingSettings& lightingSettings,
     const HudSettings& hudSettings,
+    const OnlineSettings& onlineSettings,
+    const SteamOnlineState& steamOnline,
     const ControlProfile& controls,
     const FlightConfig& config,
     const PropAudioConfig& propAudioConfig,
@@ -11484,13 +12274,31 @@ void drawMenuOverlay(
                 const bool selected = index == pauseState.selectedIndex;
                 const bool disabled = menuSettingsRowDisabled(pauseState.settingsSubTab, index);
                 const bool actionRow = menuSettingsRowAction(pauseState.settingsSubTab, index);
+                const bool actionEnabled =
+                    !actionRow ||
+                    onlineActionRowEnabled(index, onlineSettings, steamOnline, pauseState.mode != MenuMode::MainMenu);
                 if (selected) {
                     canvas.fillRect(rowRect.x, rowRect.y, rowRect.w, rowRect.h, makeHudColor(46, 83, 124, 210));
                     canvas.strokeRect(rowRect.x, rowRect.y, rowRect.w, rowRect.h, makeHudColor(220, 238, 255, 255));
                 }
                 canvas.text(rowRect.x + 10.0f, rowRect.y + 8.0f, menuSettingsRowLabel(pauseState.settingsSubTab, index), makeHudColor(240, 247, 255, 255));
-                const HudColor valueColor = disabled ? makeHudColor(255, 196, 124, 255) : (actionRow ? makeHudColor(194, 226, 255, 255) : makeHudColor(162, 230, 186, 255));
-                canvas.text(rowRect.x + 290.0f, rowRect.y + 8.0f, menuFormatSettingsRowValue(pauseState.settingsSubTab, index, uiState, graphicsSettings, lightingSettings, propAudioConfig), valueColor);
+                const HudColor valueColor = (disabled || !actionEnabled)
+                    ? makeHudColor(255, 196, 124, 255)
+                    : (actionRow ? makeHudColor(194, 226, 255, 255) : makeHudColor(162, 230, 186, 255));
+                canvas.text(
+                    rowRect.x + 290.0f,
+                    rowRect.y + 8.0f,
+                    menuFormatSettingsRowValue(
+                        pauseState.settingsSubTab,
+                        index,
+                        uiState,
+                        graphicsSettings,
+                        lightingSettings,
+                        propAudioConfig,
+                        onlineSettings,
+                        steamOnline,
+                        pauseState.mode != MenuMode::MainMenu),
+                    valueColor);
             }
             if (count > kSettingsVisibleRows) {
                 canvas.text(
@@ -12190,6 +12998,7 @@ bool saveBootPreferences(const BootResources& boot, std::string* errorText)
         boot.graphics,
         boot.lighting,
         boot.hud,
+        boot.onlineSettings,
         boot.controls,
         boot.planeProfile,
         boot.terrainParams,
@@ -12247,12 +13056,29 @@ void restoreVisualFromPreferences(
     }
 }
 
-void shutdownGameSession(GameSession& session)
+void shutdownGameSession(GameSession& session, SteamOnlineController* steamController = nullptr)
 {
+    if (session.netTransport) {
+        for (const NetPeerId peerId : session.netTransport->peers()) {
+            session.netTransport->disconnectPeer(peerId);
+        }
+    }
+    shutdownSessionVoiceRuntime(session.voiceRuntime);
+    clearVoiceQueues(session.voice);
+    clearVoiceQueues(session.clientReplication.voice);
+    session.netTransport.reset();
+    session.clientReplication.transport.reset();
+    session.steamOnline.transport.reset();
     session.terrainStream.reset();
     session.audioState.shutdown();
+    if (steamController != nullptr) {
+        steamController->leaveLobby();
+    }
     if (session.worldStore.has_value()) {
         session.worldStore->flushDirty(nullptr);
+    }
+    if (session.mirrorWorldStore.has_value()) {
+        session.mirrorWorldStore->flushDirty(nullptr);
     }
 }
 
@@ -12266,12 +13092,25 @@ bool startGameSession(
     std::string* errorText)
 {
     session = {};
+    session.onlineRole = onlineRoleFromSettings(boot.onlineSettings);
+    boot.steamOnline = snapshotSteamOnlineState(boot.steamController);
+    session.steamOnline = boot.steamOnline;
     session.terrainWorldMutex = std::make_shared<std::shared_mutex>();
     session.terrainStream = std::make_shared<TerrainVisualStreamState>();
     beginLoadingUi(boot.loadingUi, "Loading World", static_cast<float>(SDL_GetTicks()) * 0.001f);
-    const std::string terrainWorldName = "native_default";
+    const std::string sourceWorldName = "native_default";
+    const std::uint64_t pendingJoinLobbyId =
+        session.onlineRole == OnlineSessionRole::Client ? boot.steamController.pendingJoinLobbyId() : 0ull;
+    const bool hasPendingJoinLobbyId = pendingJoinLobbyId != 0ull;
+    const bool useMirrorWorldStore = session.onlineRole == OnlineSessionRole::Client;
+    const std::string terrainWorldName = useMirrorWorldStore
+        ? buildMirroredWorldName(hasPendingJoinLobbyId ? std::to_string(pendingJoinLobbyId) : std::string("offline"), sourceWorldName)
+        : sourceWorldName;
 
     const auto stage = [&](const std::string& stageLabel, float progress, const std::string& detail) -> bool {
+        boot.steamController.pump();
+        boot.steamOnline = snapshotSteamOnlineState(boot.steamController);
+        session.steamOnline = boot.steamOnline;
         updateLoadingUi(boot.loadingUi, stageLabel, progress, detail);
         SDL_PumpEvents();
         std::string renderError;
@@ -12284,7 +13123,50 @@ bool startGameSession(
         return true;
     };
 
+    const auto waitForSteamLobbyReady = [&](const std::string& stageLabel, float progress, std::uint32_t timeoutMs) -> bool {
+        const std::uint64_t startedAt = SDL_GetTicks();
+        while (true) {
+            boot.steamController.pump();
+            boot.steamOnline = snapshotSteamOnlineState(boot.steamController);
+            session.steamOnline = boot.steamOnline;
+            session.netTransport = boot.steamController.transport();
+
+            const SteamLobbyState& lobby = boot.steamController.lobby();
+            const bool roleReady =
+                (session.onlineRole == OnlineSessionRole::Host && lobby.role == SteamLobbyState::Role::Host) ||
+                (session.onlineRole == OnlineSessionRole::Client && lobby.role == SteamLobbyState::Role::Client);
+            if (roleReady && lobby.lobbyReady && session.netTransport && session.netTransport->ready()) {
+                return true;
+            }
+
+            const std::string detail = session.steamOnline.status.empty()
+                ? std::string("Waiting for Steam lobby readiness.")
+                : session.steamOnline.status;
+            if (!stage(stageLabel, progress, detail)) {
+                return false;
+            }
+
+            if (steamStatusLooksTerminal(detail) || (SDL_GetTicks() - startedAt) >= timeoutMs) {
+                if (errorText != nullptr) {
+                    *errorText = steamStatusLooksTerminal(detail)
+                        ? detail
+                        : std::string("Steam lobby startup timed out.");
+                }
+                return false;
+            }
+
+            SDL_Delay(16);
+        }
+    };
+
     if (!stage("Opening World", 0.12f, "Opening world store metadata.")) {
+        return false;
+    }
+
+    if (session.onlineRole == OnlineSessionRole::Client && !hasPendingJoinLobbyId) {
+        if (errorText != nullptr) {
+            *errorText = "Client mode requires a pending Steam lobby invite.";
+        }
         return false;
     }
 
@@ -12299,13 +13181,23 @@ bool startGameSession(
 
         std::string worldError;
         if (auto openedWorld = WorldStore::open(worldOptions, &worldError); openedWorld.has_value()) {
-            session.worldStore = std::move(*openedWorld);
+            if (useMirrorWorldStore) {
+                session.mirrorWorldStore = std::move(*openedWorld);
+                session.worldStoreMirrored = true;
+            } else {
+                session.worldStore = std::move(*openedWorld);
+            }
             const WorldInfoSnapshot worldInfo = buildWorldInfoSnapshot(boot.terrainParams, terrainWorldName);
-            if (!session.worldStore->applyWorldInfo(worldInfo, &worldError) && !worldError.empty()) {
+            WorldStore* openedWorldPtr = useMirrorWorldStore ? &*session.mirrorWorldStore : &*session.worldStore;
+            if (!openedWorldPtr->applyWorldInfo(worldInfo, &worldError) && !worldError.empty()) {
                 SDL_Log("Native world metadata update failed: %s", worldError.c_str());
             }
-            boot.terrainParams = session.worldStore->buildGroundParams(boot.terrainParams).terrainParams;
-            session.terrainWorldId = session.worldStore->getMeta().worldId;
+            if (useMirrorWorldStore) {
+                session.clientReplication.mirroredTerrain = openedWorldPtr->buildGroundParams(boot.terrainParams).terrainParams;
+            } else {
+                boot.terrainParams = openedWorldPtr->buildGroundParams(boot.terrainParams).terrainParams;
+            }
+            session.terrainWorldId = openedWorldPtr->getMeta().worldId;
         } else if (!worldError.empty()) {
             SDL_Log("Native world store unavailable: %s", worldError.c_str());
             session.terrainWorldId = terrainWorldName;
@@ -12328,14 +13220,95 @@ bool startGameSession(
         return false;
     }
 
-    WorldStore* worldStorePtr = session.worldStore.has_value() ? &*session.worldStore : nullptr;
+    WorldStore* worldStorePtr =
+        session.worldStoreMirrored && session.mirrorWorldStore.has_value()
+            ? &*session.mirrorWorldStore
+            : (session.worldStore.has_value() ? &*session.worldStore : nullptr);
+    TerrainParams terrainParamsForSession = session.worldStoreMirrored ? session.clientReplication.mirroredTerrain : boot.terrainParams;
     refreshTerrainContext(
-        boot.terrainParams,
+        terrainParamsForSession,
         session.terrainContext,
         session.terrainCache,
         worldStorePtr,
         session.terrainWorldMutex,
         session.terrainStream.get());
+    if (session.worldStoreMirrored) {
+        session.clientReplication.mirroredTerrain = session.terrainContext.params;
+    } else {
+        boot.terrainParams = session.terrainContext.params;
+    }
+
+    if (!stage("Starting Network", 0.58f, "Preparing Steam transport and hosted-world state.")) {
+        return false;
+    }
+
+    SteamLobbySettings lobbySettings;
+    lobbySettings.appId = boot.steamBuildConfig.appId != 0 ? boot.steamBuildConfig.appId : TRUEFLIGHT_STEAM_APP_ID;
+    lobbySettings.worldId = sourceWorldName;
+    lobbySettings.worldSeed = static_cast<std::uint64_t>(boot.terrainParams.seed);
+    lobbySettings.voiceEnabled = boot.onlineSettings.voiceEnabled;
+    lobbySettings.joinable = true;
+
+    if (session.onlineRole == OnlineSessionRole::Host) {
+        if (!boot.steamController.available()) {
+            if (errorText != nullptr) {
+                *errorText = "Steam host mode requires Steam to be initialized.";
+            }
+            return false;
+        }
+
+        std::string netStatus;
+        if (!boot.steamController.createHostLobby(lobbySettings, &netStatus)) {
+            if (errorText != nullptr) {
+                *errorText = netStatus.empty() ? "Steam lobby creation failed." : netStatus;
+            }
+            return false;
+        }
+        if (!waitForSteamLobbyReady("Creating Lobby", 0.62f, 15000u)) {
+            return false;
+        }
+
+        session.netTransport = boot.steamController.transport();
+        session.hostedServer = HostedWorldServer(session.netTransport);
+        session.hostedServer.setLog([](const std::string& message) {
+            SDL_Log("%s", message.c_str());
+        });
+        session.steamOnline = snapshotSteamOnlineState(boot.steamController);
+        boot.onlineSettings.lastLobbyId = session.steamOnline.lobbyId;
+        boot.onlineSettings.lastJoinHostId = session.steamOnline.hostSteamId;
+    } else if (session.onlineRole == OnlineSessionRole::Client) {
+        if (!boot.steamController.available()) {
+            if (errorText != nullptr) {
+                *errorText = "Steam client mode requires Steam to be initialized.";
+            }
+            return false;
+        }
+        if (!hasPendingJoinLobbyId) {
+            if (errorText != nullptr) {
+                *errorText = "Steam client mode requires a pending Steam lobby invite.";
+            }
+            return false;
+        }
+
+        std::string netStatus;
+        if (!boot.steamController.joinLobbyAndConnectToHost(pendingJoinLobbyId, lobbySettings, &netStatus)) {
+            if (errorText != nullptr) {
+                *errorText = netStatus.empty() ? "Steam lobby join failed." : netStatus;
+            }
+            return false;
+        }
+        if (!waitForSteamLobbyReady("Joining Lobby", 0.62f, 20000u)) {
+            return false;
+        }
+        (void)boot.steamController.consumePendingJoinRequest();
+
+        session.netTransport = boot.steamController.transport();
+        session.clientReplication.transport = session.netTransport;
+        session.clientReplication.mirroredTerrain = session.terrainContext.params;
+        session.steamOnline = snapshotSteamOnlineState(boot.steamController);
+        boot.onlineSettings.lastLobbyId = session.steamOnline.lobbyId;
+        boot.onlineSettings.lastJoinHostId = session.steamOnline.hostSteamId;
+    }
 
     if (!stage("Clouds and Flight", 0.66f, "Initializing wind, clouds, and aircraft state.")) {
         return false;
@@ -12351,6 +13324,32 @@ bool startGameSession(
     resetFlight(session.plane, session.runtime, session.terrainContext);
     session.flightMode = true;
     syncWalkingLookFromRotation(session.plane.rot, session.walkYaw, session.walkPitch);
+    session.localReplicationPeer = {};
+    session.voice.radioChannel = normalizeRadioChannel(boot.onlineSettings.radioChannel);
+
+    {
+        const AvatarManifest avatar = buildLocalAvatarManifest(
+            boot.onlineSettings,
+            boot.planeVisual,
+            boot.walkingVisual,
+            session.flightMode,
+            false);
+        if (session.onlineRole == OnlineSessionRole::Host) {
+            session.hostedServer.setLocalAuthoritativeState(
+                session.plane,
+                session.runtime,
+                session.flightMode,
+                session.walkYaw,
+                session.walkPitch,
+                avatar);
+        } else if (session.onlineRole == OnlineSessionRole::Client) {
+            session.clientReplication.localAvatar = avatar;
+            session.clientReplication.helloPending = true;
+            session.clientReplication.serverPeerId = 0;
+            session.clientReplication.connected = false;
+            enqueueClientHello(session.clientReplication, avatar);
+        }
+    }
 
     if (!stage("Starting Audio", 0.82f, "Starting procedural audio synth.")) {
         return false;
@@ -12360,6 +13359,14 @@ bool startGameSession(
         std::string audioError;
         if (!session.audioState.initialize(22050, 1024, 8, &audioError) && !audioError.empty()) {
             SDL_Log("Native audio disabled: %s", audioError.c_str());
+        }
+    }
+
+    if (session.onlineRole != OnlineSessionRole::Offline) {
+        std::string voiceStatus;
+        initializeSessionVoiceRuntime(session.voiceRuntime, audioSubsystemReady, &voiceStatus);
+        if (!voiceStatus.empty() && !session.voiceRuntime.playbackSupported) {
+            SDL_Log("Native Steam voice playback disabled: %s", voiceStatus.c_str());
         }
     }
 
@@ -13305,6 +14312,7 @@ int main(int, char**)
     const FlightConfig defaultFlightConfigValues = defaultFlightConfig();
     const PropAudioConfig defaultPropAudioConfigValues = defaultPropAudioConfig();
     const TerrainParams defaultTerrainParamsValues = defaultTerrainParams();
+    const OnlineSettings defaultOnlineSettingsValues {};
 
     BootResources boot;
     boot.uiState = defaultUiStateValues;
@@ -13410,6 +14418,7 @@ int main(int, char**)
             boot.graphics,
             boot.lighting,
             boot.hud,
+            boot.onlineSettings,
             boot.controls,
             boot.planeProfile,
             boot.terrainParams,
@@ -13423,6 +14432,14 @@ int main(int, char**)
         SDL_Log("Native HUD preference load failed: %s", hudPreferenceError.c_str());
     }
     syncUiStateFromHud(boot.uiState, boot.hud);
+    boot.steamBuildConfig = defaultSteamBuildConfig();
+    boot.steamBuildConfig.requested = boot.onlineSettings.steamEnabled;
+    std::string steamStatus;
+    (void)boot.steamController.initialize(boot.steamBuildConfig, &steamStatus);
+    boot.steamOnline = snapshotSteamOnlineState(boot.steamController);
+    if (!steamStatus.empty()) {
+        boot.steamOnline.status = steamStatus;
+    }
 
     if (!bootStage("Applying Display", 0.32f, "Applying display mode and resolution.")) {
         nativeRenderer.shutdown();
@@ -13502,6 +14519,19 @@ int main(int, char**)
     };
 
     auto currentWorldStore = [&]() -> WorldStore* {
+        if (!session.has_value()) {
+            return nullptr;
+        }
+        if (session->worldStoreMirrored && session->mirrorWorldStore.has_value()) {
+            return &*session->mirrorWorldStore;
+        }
+        if (session->worldStore.has_value()) {
+            return &*session->worldStore;
+        }
+        return nullptr;
+    };
+
+    auto currentAuthoritativeWorldStore = [&]() -> WorldStore* {
         if (!session.has_value() || !session->worldStore.has_value()) {
             return nullptr;
         }
@@ -13778,20 +14808,29 @@ int main(int, char**)
             session->foliageImpactPulse = 1.0f;
         }
         if (terrainImpact) {
-            if (WorldStore* worldStore = currentWorldStore(); worldStore != nullptr) {
-                std::unique_lock<std::shared_mutex> worldWriteLock;
-                if (const auto worldMutex = currentWorldStoreMutex()) {
-                    worldWriteLock = std::unique_lock<std::shared_mutex>(*worldMutex);
-                }
-                const auto craterResult = worldStore->applyCrater(crater);
-                if (craterResult.first) {
-                    worldStore->flushDirty(nullptr);
-                    worldWriteLock.unlock();
+            if (session->onlineRole == OnlineSessionRole::Client) {
+                session->clientReplication.outboundReliable.push_back(buildCraterPacket(crater));
+            } else if (WorldStore* worldStore = currentAuthoritativeWorldStore(); worldStore != nullptr) {
+                const bool applied =
+                    session->onlineRole == OnlineSessionRole::Host
+                        ? session->hostedServer.addCrater(crater, worldStore, boot.terrainParams)
+                        : [&]() {
+                              std::unique_lock<std::shared_mutex> worldWriteLock;
+                              if (const auto worldMutex = currentWorldStoreMutex()) {
+                                  worldWriteLock = std::unique_lock<std::shared_mutex>(*worldMutex);
+                              }
+                              const auto craterResult = worldStore->applyCrater(crater);
+                              if (craterResult.first) {
+                                  worldStore->flushDirty(nullptr);
+                              }
+                              return craterResult.first;
+                          }();
+                if (applied) {
                     refreshTerrainContext(
                         boot.terrainParams,
                         session->terrainContext,
                         session->terrainCache,
-                        worldStore,
+                        currentWorldStore(),
                         currentWorldStoreMutex(),
                         currentTerrainStream());
                 }
@@ -13922,7 +14961,7 @@ int main(int, char**)
         gamepad.rudderLatched = false;
         gamepad.trimAccumulator = 0.0f;
         if (session.has_value()) {
-            shutdownGameSession(*session);
+            shutdownGameSession(*session, &boot.steamController);
             session.reset();
         }
 
@@ -13932,6 +14971,8 @@ int main(int, char**)
         if (startGameSession(*session, boot, audioSubsystemReady, window, nativeRenderer, rendererLabel, &sessionError)) {
             screen = AppScreen::InFlight;
             session->flightMode = true;
+            boot.steamOnline = session->steamOnline;
+            queueSave(nowSeconds);
             menuState.sessionFlightMode = true;
             menuState.active = false;
             menuState.mode = MenuMode::PauseOverlay;
@@ -13945,9 +14986,10 @@ int main(int, char**)
         }
 
         if (session.has_value()) {
-            shutdownGameSession(*session);
+            shutdownGameSession(*session, &boot.steamController);
             session.reset();
         }
+        boot.steamOnline = snapshotSteamOnlineState(boot.steamController);
         screen = AppScreen::MainMenu;
         menuState.active = true;
         menuState.mode = MenuMode::MainMenu;
@@ -13965,9 +15007,10 @@ int main(int, char**)
         gamepad.rudderLatched = false;
         gamepad.trimAccumulator = 0.0f;
         if (session.has_value()) {
-            shutdownGameSession(*session);
+            shutdownGameSession(*session, &boot.steamController);
             session.reset();
         }
+        boot.steamOnline = snapshotSteamOnlineState(boot.steamController);
         screen = AppScreen::MainMenu;
         menuState.active = true;
         menuState.mode = MenuMode::MainMenu;
@@ -13983,12 +15026,25 @@ int main(int, char**)
         setPauseStatus(menuState, "Returned to main menu.", nowSeconds, 2.0f);
     };
 
+    auto refreshSteamRuntimeState = [&]() {
+        boot.steamController.shutdown();
+        boot.steamBuildConfig = defaultSteamBuildConfig();
+        boot.steamBuildConfig.requested = boot.onlineSettings.steamEnabled;
+        std::string steamStatus;
+        (void)boot.steamController.initialize(boot.steamBuildConfig, &steamStatus);
+        boot.steamOnline = snapshotSteamOnlineState(boot.steamController);
+        if (!steamStatus.empty()) {
+            boot.steamOnline.status = steamStatus;
+        }
+    };
+
     auto restoreAllDefaults = [&](float nowSeconds) {
         clearMenuInteractions();
         boot.uiState = defaultUiStateValues;
         boot.graphics = defaultGraphicsSettingsValues;
         boot.lighting = defaultLightingSettingsValues;
         boot.hud = defaultHudSettingsValues;
+        boot.onlineSettings = defaultOnlineSettingsValues;
         boot.controls = defaultControlProfileValues;
         boot.terrainParams = defaultTerrainParamsValues;
         boot.defaultTerrainParamsValues = defaultTerrainParamsValues;
@@ -14003,6 +15059,7 @@ int main(int, char**)
         setBuiltinPlaneModel(boot.walkingVisual);
         boot.walkingVisual.label = "builtin player cube";
         syncHudUi();
+        refreshSteamRuntimeState();
         std::string displayError;
         if (!applyGraphicsSettingsToWindow(window, boot.graphics, &displayError) && !displayError.empty()) {
             SDL_Log("Display apply failed while restoring defaults: %s", displayError.c_str());
@@ -14141,6 +15198,8 @@ int main(int, char**)
                     defaultPropAudioConfigValues,
                     boot.lighting,
                     defaultLightingSettingsValues,
+                    boot.onlineSettings,
+                    defaultOnlineSettingsValues,
                     menuState.settingsSubTab,
                     menuState.selectedIndex);
                 if (menuState.settingsSubTab == SettingsSubTab::Camera && menuState.selectedIndex == 5) {
@@ -14219,6 +15278,7 @@ int main(int, char**)
                     boot.graphics,
                     boot.planeProfile.propAudioConfig,
                     boot.lighting,
+                    boot.onlineSettings,
                     menuState.settingsSubTab,
                     menuState.selectedIndex,
                     direction);
@@ -14289,6 +15349,8 @@ int main(int, char**)
                         defaultPropAudioConfigValues,
                         boot.lighting,
                         defaultLightingSettingsValues,
+                        boot.onlineSettings,
+                        defaultOnlineSettingsValues,
                         menuState.settingsSubTab,
                         index);
                 }
@@ -14343,6 +15405,36 @@ int main(int, char**)
         case PauseTab::Settings:
             if (menuState.settingsSubTab == SettingsSubTab::Graphics && menuState.selectedIndex == 2) {
                 applyDisplaySettings(nowSeconds);
+            } else if (menuState.settingsSubTab == SettingsSubTab::Online && menuState.selectedIndex == 3) {
+                if (!onlineActionRowEnabled(3, boot.onlineSettings, boot.steamOnline, menuState.mode != MenuMode::MainMenu)) {
+                    setPauseStatus(menuState, "No pending Steam lobby invite is waiting.", nowSeconds, 3.0f);
+                } else if (menuState.mode != MenuMode::MainMenu) {
+                    setPauseStatus(menuState, "Return to main menu before joining a different Steam lobby.", nowSeconds, 3.4f);
+                } else {
+                    boot.onlineSettings.multiplayerEnabled = true;
+                    boot.onlineSettings.sessionMode = "client";
+                    clampOnlineSettings(boot.onlineSettings);
+                    startFlight(nowSeconds);
+                }
+            } else if (menuState.settingsSubTab == SettingsSubTab::Online && menuState.selectedIndex == 4) {
+                if (!onlineActionRowEnabled(4, boot.onlineSettings, boot.steamOnline, menuState.mode != MenuMode::MainMenu)) {
+                    setPauseStatus(menuState, "Invite Friends is only available for an active hosted Steam lobby.", nowSeconds, 3.2f);
+                } else {
+                    std::string inviteStatus;
+                    if (boot.steamController.activateInviteOverlay(&inviteStatus)) {
+                        setPauseStatus(
+                            menuState,
+                            inviteStatus.empty() ? "Opened Steam invite overlay." : inviteStatus,
+                            nowSeconds,
+                            2.6f);
+                    } else {
+                        setPauseStatus(
+                            menuState,
+                            inviteStatus.empty() ? "Steam invite overlay unavailable." : inviteStatus,
+                            nowSeconds,
+                            3.4f);
+                    }
+                }
             } else {
                 resetSelectedRow(nowSeconds);
             }
@@ -15268,6 +16360,11 @@ int main(int, char**)
         refreshPauseStatus(menuState, uiNowSeconds);
         refreshMenuConfirmation(menuState, uiNowSeconds);
         clampHelpScroll();
+        boot.steamController.pump();
+        boot.steamOnline = snapshotSteamOnlineState(boot.steamController);
+        if (session.has_value()) {
+            session->steamOnline = boot.steamOnline;
+        }
         ensureGamepadOpen(uiNowSeconds, false);
         pollGamepadState(gamepad);
         handleGamepadGameplayButtons(uiNowSeconds);
@@ -15492,6 +16589,129 @@ int main(int, char**)
                 session->worldTime += dt;
             }
 
+            const bool voiceTransmitActive =
+                boot.onlineSettings.voiceEnabled &&
+                (!boot.onlineSettings.pushToTalk ||
+                 (!menuVisible() &&
+                  isControlActionHeld(boot.controls, InputActionId::VoicePushToTalk, keys, mouseButtons, modifiers)));
+            const AvatarManifest localAvatar = buildLocalAvatarManifest(
+                boot.onlineSettings,
+                boot.planeVisual,
+                boot.walkingVisual,
+                session->flightMode,
+                voiceTransmitActive);
+            session->voice.radioChannel = localAvatar.radioChannel;
+            session->voice.transmitting = localAvatar.radioTx;
+            captureSessionVoiceFrames(
+                session->voiceRuntime,
+                session->onlineRole != OnlineSessionRole::Offline && boot.onlineSettings.voiceEnabled,
+                voiceTransmitActive,
+                session->voice);
+
+            if (session->onlineRole == OnlineSessionRole::Host) {
+                session->hostedServer.setLocalAuthoritativeState(
+                    session->plane,
+                    session->runtime,
+                    session->flightMode,
+                    session->walkYaw,
+                    session->walkPitch,
+                    localAvatar);
+                session->hostedServer.serviceIncoming(boot.terrainParams, currentAuthoritativeWorldStore());
+                session->hostedServer.update(
+                    uiNowSeconds,
+                    dt,
+                    session->terrainContext,
+                    boot.planeProfile.flightConfig,
+                    currentAuthoritativeWorldStore());
+                for (const std::string& frame : session->voice.pendingOutboundCompressedFrames) {
+                    session->hostedServer.queueLocalVoiceFrame(localAvatar.radioChannel, frame);
+                }
+                session->voice.pendingOutboundCompressedFrames.clear();
+                std::vector<std::string> hostVoiceFrames = session->hostedServer.drainHostLocalVoiceFrames();
+                moveVoiceFrames(session->voice.hostLocalReceiveFrames, hostVoiceFrames);
+            } else if (session->onlineRole == OnlineSessionRole::Client) {
+                session->clientReplication.localAvatar = localAvatar;
+                if ((session->clientReplication.helloPending || !session->clientReplication.joinAcknowledged) &&
+                    uiNowSeconds >= session->clientReplication.nextHelloAt) {
+                    enqueueClientHello(session->clientReplication, localAvatar);
+                    session->clientReplication.nextHelloAt = uiNowSeconds + 1.0;
+                }
+
+                if (uiNowSeconds >= session->clientReplication.nextInputAt) {
+                    enqueueClientInput(
+                        session->clientReplication,
+                        buildNetPlayerInput(
+                            std::max(session->runtime.tick, session->plane.debug.tick) + 1,
+                            session->flightMode,
+                            session->walkYaw,
+                            session->walkPitch,
+                            session->plane,
+                            input,
+                            walkingInput,
+                            localAvatar));
+                    session->clientReplication.nextInputAt = uiNowSeconds + (1.0 / 60.0);
+                }
+
+                enqueueClientAoiSubscription(
+                    session->clientReplication,
+                    buildLocalAoiSubscription(session->plane, session->terrainContext, boot.graphics.drawDistance));
+
+                const bool voiceStateChanged =
+                    session->clientReplication.voice.radioChannel != localAvatar.radioChannel ||
+                    session->clientReplication.voice.transmitting != localAvatar.radioTx;
+                session->clientReplication.voice.radioChannel = localAvatar.radioChannel;
+                session->clientReplication.voice.transmitting = localAvatar.radioTx;
+                if (voiceStateChanged) {
+                    session->clientReplication.outboundReliable.push_back(buildVoiceStatePacket({
+                        session->clientReplication.localPlayerId,
+                        localAvatar.radioChannel,
+                        localAvatar.radioTx
+                    }));
+                }
+                for (const std::string& frame : session->voice.pendingOutboundCompressedFrames) {
+                    session->clientReplication.outboundUnreliable.push_back(buildVoiceFramePacket({
+                        localAvatar.radioChannel,
+                        frame
+                    }));
+                }
+                session->voice.pendingOutboundCompressedFrames.clear();
+
+                const TerrainParams previousMirroredTerrain = session->terrainContext.params;
+                serviceClientReplication(
+                    session->clientReplication,
+                    uiNowSeconds,
+                    session->clientReplication.mirroredTerrain,
+                    session->mirrorWorldStore.has_value() ? &*session->mirrorWorldStore : nullptr,
+                    &session->localReplicationPeer);
+
+                if (terrainNetworkingParamsChanged(previousMirroredTerrain, session->clientReplication.mirroredTerrain)) {
+                    refreshTerrainContext(
+                        session->clientReplication.mirroredTerrain,
+                        session->terrainContext,
+                        session->terrainCache,
+                        currentWorldStore(),
+                        currentWorldStoreMutex(),
+                        currentTerrainStream());
+                }
+
+                if (session->localReplicationPeer.connected) {
+                    session->plane.pos = lerp(session->plane.pos, session->localReplicationPeer.displayPos, 0.35f);
+                    session->plane.rot = nlerpQuat(session->plane.rot, session->localReplicationPeer.displayRot, 0.35f);
+                    session->plane.flightVel = session->localReplicationPeer.vel;
+                    session->plane.vel = session->localReplicationPeer.vel;
+                    session->plane.flightAngVel = session->localReplicationPeer.angVel;
+                }
+                moveVoiceFrames(session->voice.inboundCompressedFrames, session->clientReplication.voice.inboundCompressedFrames);
+            }
+            moveVoiceFrames(session->voice.inboundCompressedFrames, session->voice.hostLocalReceiveFrames);
+            playSessionVoiceFrames(
+                session->voiceRuntime,
+                session->voice.inboundCompressedFrames,
+                boot.onlineSettings.voiceEnabled,
+                boot.uiState.masterVolume);
+            session->steamOnline = snapshotSteamOnlineState(boot.steamController);
+            boot.steamOnline = session->steamOnline;
+
             const ProceduralAudioFrame audioFrame = buildProceduralAudioFrame(
                 session->plane,
                 session->runtime,
@@ -15544,8 +16764,27 @@ int main(int, char**)
             };
             const RendererMemoryStats rendererStats = nativeRenderer.memoryStats();
             const TerrainStreamStats terrainStreamStats = snapshotTerrainStreamStats(currentTerrainStream());
-            const std::vector<std::string> runtimeDebugLines =
+            int remotePeerCount = 0;
+            if (session->onlineRole == OnlineSessionRole::Host) {
+                for (const auto& [playerId, player] : session->hostedServer.players()) {
+                    if (playerId != 1 && player.connected) {
+                        ++remotePeerCount;
+                    }
+                }
+            } else if (session->onlineRole == OnlineSessionRole::Client) {
+                for (const auto& [peerId, peer] : session->clientReplication.peers) {
+                    (void)peerId;
+                    if (peer.connected) {
+                        ++remotePeerCount;
+                    }
+                }
+            }
+            std::vector<std::string> runtimeDebugLines =
                 buildRuntimeDebugLines(runtimeGovernor, rendererStats, terrainStreamStats);
+            runtimeDebugLines.push_back("Online Role: " + std::string(
+                session->onlineRole == OnlineSessionRole::Host ? "host" :
+                (session->onlineRole == OnlineSessionRole::Client ? "client" : "offline")));
+            runtimeDebugLines.push_back("Peers: " + std::to_string(remotePeerCount));
 
             std::vector<RenderObject> opaqueObjects;
             opaqueObjects.reserve(((terrainVisuals.nearTiles.size() + terrainVisuals.farTiles.size()) * 2u) + 4u);
@@ -15693,6 +16932,55 @@ int main(int, char**)
                 opaqueObjects.push_back(actorObject);
             }
 
+            const auto appendRemoteRenderObject = [&](const FlightState& peerPlane, const AvatarManifest& avatar, bool peerFlightMode) {
+                const PlaneVisualState& peerVisual = peerFlightMode ? boot.planeVisual : boot.walkingVisual;
+                const AvatarRoleConfig& roleConfig = peerFlightMode ? avatar.plane : avatar.walking;
+                const Quat peerRenderRotation = quatNormalize(quatMultiply(peerPlane.rot, composeNetworkVisualRotation(peerVisual, roleConfig)));
+                const Vec3 peerRenderPosition = peerPlane.pos + rotateVector(peerRenderRotation, roleConfig.offset);
+                const float peerScale = resolveNetworkVisualScale(peerVisual, roleConfig);
+                const float cullRadius = std::max(2.0f, peerScale * 3.5f);
+                if (!sphereWithinView(renderCamera, peerRenderPosition, cullRadius, effectiveGraphics.drawDistance + cullRadius)) {
+                    return;
+                }
+
+                RenderObject peerObject {
+                    &peerVisual.model,
+                    peerRenderPosition,
+                    peerRenderRotation,
+                    { peerScale, peerScale, peerScale },
+                    { 1.0f, 1.0f, 1.0f },
+                    1.0f,
+                    120.0f,
+                    3200.0f,
+                    true
+                };
+                applyFogSettings(peerObject, effectiveGraphics, effectiveLighting);
+                opaqueObjects.push_back(peerObject);
+            };
+
+            if (session->onlineRole == OnlineSessionRole::Host) {
+                for (const auto& [playerId, player] : session->hostedServer.players()) {
+                    if (playerId == 1 || !player.connected || !player.hasReceivedHello) {
+                        continue;
+                    }
+                    appendRemoteRenderObject(player.actor, player.avatar, player.flightMode);
+                }
+            } else if (session->onlineRole == OnlineSessionRole::Client) {
+                for (const auto& [peerId, peer] : session->clientReplication.peers) {
+                    (void)peerId;
+                    if (!peer.connected) {
+                        continue;
+                    }
+                    FlightState peerPlane {};
+                    peerPlane.pos = peer.displayPos;
+                    peerPlane.rot = peer.displayRot;
+                    peerPlane.flightVel = peer.vel;
+                    peerPlane.vel = peer.vel;
+                    peerPlane.flightAngVel = peer.angVel;
+                    appendRemoteRenderObject(peerPlane, peer.avatar, sanitizeRole(peer.avatar.role) != "walking");
+                }
+            }
+
             if (menuVisible() && (menuState.tab == PauseTab::Characters || menuState.tab == PauseTab::Paint)) {
                 const PlaneVisualState& previewVisual =
                     menuState.tab == PauseTab::Paint
@@ -15821,6 +17109,8 @@ int main(int, char**)
                     boot.graphics,
                     boot.lighting,
                     boot.hud,
+                    boot.onlineSettings,
+                    boot.steamOnline,
                     boot.controls,
                     boot.planeProfile.flightConfig,
                     boot.planeProfile.propAudioConfig,
@@ -15868,6 +17158,8 @@ int main(int, char**)
                 boot.graphics,
                 boot.lighting,
                 boot.hud,
+                boot.onlineSettings,
+                boot.steamOnline,
                 boot.controls,
                 boot.planeProfile.flightConfig,
                 boot.planeProfile.propAudioConfig,
@@ -15969,13 +17261,14 @@ int main(int, char**)
     }
 
     if (session.has_value()) {
-        shutdownGameSession(*session);
+        shutdownGameSession(*session, &boot.steamController);
         session.reset();
     }
 
     if (menuState.promptActive) {
         SDL_StopTextInput(window);
     }
+    boot.steamController.shutdown();
     closeGamepad();
     nativeRenderer.shutdown();
     SDL_DestroyWindow(window);

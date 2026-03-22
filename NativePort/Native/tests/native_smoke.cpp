@@ -1,5 +1,9 @@
 #include <SDL3/SDL.h>
 
+#include "NativeGame/BlobSync.hpp"
+#include "NativeGame/HostedNetworking.hpp"
+#include "NativeGame/NetProtocol.hpp"
+#include "NativeGame/NetTransport.hpp"
 #include "NativeGame/WorldStore.hpp"
 #include "NativeGame/WorldWire.hpp"
 
@@ -7,13 +11,19 @@
 #include <fstream>
 #include <iostream>
 #include <array>
+#include <deque>
+#include <memory>
+#include <optional>
 #include <string>
+#include <system_error>
 
 #define main trueflight_native_main
 #include "../src/main.cpp"
 #undef main
 
 namespace {
+
+using namespace NativeGame;
 
 std::filesystem::path repoRoot()
 {
@@ -44,6 +54,126 @@ void require(bool condition, const std::string& message, bool& failed)
 
     failed = true;
     std::cerr << "FAIL: " << message << "\n";
+}
+
+class RecordingTransport final : public INetTransport {
+public:
+    explicit RecordingTransport(std::vector<NetPeerId> peers)
+        : peers_(std::move(peers))
+    {
+        for (NetPeerId peerId : peers_) {
+            pendingEvents_.push_back({ NetEvent::Type::Connected, peerId, 0, true, {} });
+        }
+    }
+
+    struct SentPacket {
+        NetPeerId peerId = 0;
+        int lane = 0;
+        bool reliable = false;
+        std::string payload;
+    };
+
+    [[nodiscard]] bool ready() const override
+    {
+        return true;
+    }
+
+    bool send(NetPeerId peerId, int lane, std::string_view payload, bool reliable) override
+    {
+        sentPackets.push_back({ peerId, lane, reliable, std::string(payload) });
+        return std::find(peers_.begin(), peers_.end(), peerId) != peers_.end();
+    }
+
+    void disconnectPeer(NetPeerId peerId) override
+    {
+        const auto peerIt = std::find(peers_.begin(), peers_.end(), peerId);
+        if (peerIt == peers_.end()) {
+            return;
+        }
+        pendingEvents_.push_back({ NetEvent::Type::Disconnected, peerId, 0, true, {} });
+        peers_.erase(peerIt);
+    }
+
+    [[nodiscard]] std::vector<NetEvent> poll() override
+    {
+        std::vector<NetEvent> events;
+        while (!pendingEvents_.empty()) {
+            events.push_back(std::move(pendingEvents_.front()));
+            pendingEvents_.pop_front();
+        }
+        return events;
+    }
+
+    [[nodiscard]] std::vector<NetPeerId> peers() const override
+    {
+        return peers_;
+    }
+
+    void pushMessage(NetPeerId peerId, int lane, std::string payload, bool reliable)
+    {
+        pendingEvents_.push_back({ NetEvent::Type::Message, peerId, lane, reliable, std::move(payload) });
+    }
+
+    void clearSentPackets()
+    {
+        sentPackets.clear();
+    }
+
+    std::vector<SentPacket> sentPackets;
+
+private:
+    std::vector<NetPeerId> peers_;
+    std::deque<NetEvent> pendingEvents_;
+};
+
+template <typename ServerT>
+auto collectHostLocalVoiceFrames(ServerT& server)
+{
+    if constexpr (requires { server.drainLocalVoiceFrames(); }) {
+        return server.drainLocalVoiceFrames();
+    } else if constexpr (requires { server.takeLocalVoiceFrames(); }) {
+        return server.takeLocalVoiceFrames();
+    } else if constexpr (requires { server.consumeLocalVoiceFrames(); }) {
+        return server.consumeLocalVoiceFrames();
+    } else if constexpr (requires { server.receivedLocalVoiceFrames(); }) {
+        return server.receivedLocalVoiceFrames();
+    } else if constexpr (requires { server.pendingLocalVoiceFrames(); }) {
+        return server.pendingLocalVoiceFrames();
+    } else if constexpr (requires { server.localVoiceFrames(); }) {
+        return server.localVoiceFrames();
+    } else if constexpr (requires { server.hostVoiceFrames(); }) {
+        return server.hostVoiceFrames();
+    } else if constexpr (requires { server.hostLocalVoiceFrames(); }) {
+        return server.hostLocalVoiceFrames();
+    } else if constexpr (requires { server.voiceFrames(); }) {
+        return server.voiceFrames();
+    } else {
+        static_assert(sizeof(ServerT) == 0, "HostedWorldServer is missing a host-local voice frame accessor");
+    }
+}
+
+inline std::string voiceFramePayloadText(const std::string& frame)
+{
+    return frame;
+}
+
+template <typename FrameT>
+std::string voiceFramePayloadText(const FrameT& frame)
+{
+    if constexpr (requires { frame.data; }) {
+        return frame.data;
+    } else if constexpr (requires { frame.payload; }) {
+        return frame.payload;
+    } else {
+        return {};
+    }
+}
+
+HostedPlayerState* mutableHostedPlayer(HostedWorldServer& server, int playerId)
+{
+    auto& players = const_cast<std::unordered_map<int, HostedPlayerState>&>(server.players());
+    const auto it = players.find(playerId);
+    return it == players.end() ? nullptr : &it->second;
 }
 
 struct FlightRunResult {
@@ -769,6 +899,424 @@ void runTerrainDecorationChecks(bool& failed)
         failed);
 }
 
+std::string buildSmokeHelloPacket(const AvatarManifest& avatar)
+{
+    return encodePacket("HELLO", {
+        { "role", sanitizeRole(avatar.role) },
+        { "callsign", sanitizeCallsign(avatar.callsign) },
+        { "radio", std::to_string(normalizeRadioChannel(avatar.radioChannel)) },
+        { "ptt", avatar.radioTx ? "1" : "0" },
+        { "planeModelHash", avatar.plane.modelHash },
+        { "planeScale", formatNetFloat(avatar.plane.scale) },
+        { "planeSkinHash", avatar.plane.skinHash },
+        { "planeYaw", formatNetFloat(avatar.plane.yawDegrees) },
+        { "planePitch", formatNetFloat(avatar.plane.pitchDegrees) },
+        { "planeRoll", formatNetFloat(avatar.plane.rollDegrees) },
+        { "planeOffX", formatNetFloat(avatar.plane.offset.x) },
+        { "planeOffY", formatNetFloat(avatar.plane.offset.y) },
+        { "planeOffZ", formatNetFloat(avatar.plane.offset.z) },
+        { "walkingModelHash", avatar.walking.modelHash },
+        { "walkingScale", formatNetFloat(avatar.walking.scale) },
+        { "walkingSkinHash", avatar.walking.skinHash },
+        { "walkingYaw", formatNetFloat(avatar.walking.yawDegrees) },
+        { "walkingPitch", formatNetFloat(avatar.walking.pitchDegrees) },
+        { "walkingRoll", formatNetFloat(avatar.walking.rollDegrees) },
+        { "walkingOffX", formatNetFloat(avatar.walking.offset.x) },
+        { "walkingOffY", formatNetFloat(avatar.walking.offset.y) },
+        { "walkingOffZ", formatNetFloat(avatar.walking.offset.z) }
+    });
+}
+
+void runNetworkingSmokeChecks(bool& failed)
+{
+    AvatarManifest avatar = defaultAvatarManifest();
+    avatar.role = "walking";
+    avatar.callsign = "Smoke Pilot";
+    avatar.radioChannel = 3;
+    avatar.radioTx = true;
+    avatar.plane.modelHash = "plane-alpha";
+    avatar.plane.scale = 1.8f;
+    avatar.plane.skinHash = "paint-alpha";
+    avatar.plane.yawDegrees = 12.5f;
+    avatar.plane.pitchDegrees = -3.25f;
+    avatar.plane.rollDegrees = 4.75f;
+    avatar.walking.modelHash = "walker-alpha";
+    avatar.walking.scale = 1.2f;
+    avatar.walking.skinHash = "walk-paint";
+
+    {
+        const std::string helloPacket = buildSmokeHelloPacket(avatar);
+        const std::string manifestPacket = buildAvatarManifestPacket(7, avatar);
+
+        NetPlayerInput input {};
+        input.tick = 31;
+        input.role = "walking";
+        input.walkYaw = 1.75f;
+        input.walkPitch = -0.6f;
+        input.throttle = 0.85f;
+        input.yokePitch = -0.25f;
+        input.yokeYaw = 0.55f;
+        input.walkBackward = true;
+        input.walkStrafeLeft = true;
+        input.walkSprint = true;
+        input.flightThrottleUp = true;
+        input.flightAirBrakes = true;
+        input.flightAfterburner = true;
+        input.avatar = avatar;
+        const std::string inputPacket = buildInputPacket(input);
+
+        NetPlayerSnapshot snapshot {};
+        snapshot.id = 7;
+        snapshot.ack = 31;
+        snapshot.pos = { 12.0f, 24.0f, 36.0f };
+        snapshot.rot = quatNormalize(quatFromAxisAngle({ 0.0f, 1.0f, 0.0f }, radians(18.0f)));
+        snapshot.vel = { 3.0f, 4.0f, 5.0f };
+        snapshot.angVel = { 0.1f, 0.2f, 0.3f };
+        snapshot.throttle = 0.84f;
+        snapshot.elevator = -0.12f;
+        snapshot.aileron = 0.33f;
+        snapshot.rudder = -0.14f;
+        snapshot.simTick = 902;
+        snapshot.timestamp = 23.75;
+        snapshot.avatar = avatar;
+        const std::string snapshotPacket = buildSnapshotPacket(snapshot);
+
+        const std::string voicePacket = buildVoiceStatePacket({ 7, 3, true });
+        VoiceFramePacket voiceFrame {};
+        voiceFrame.channel = 3;
+        voiceFrame.data = std::string("VOICE_FRAME_SMOKE_PAYLOAD");
+        const std::string voiceFramePacket = buildVoiceFramePacket(voiceFrame);
+        const std::string craterPacket = buildCraterPacket({ 44.0f, 0.0f, -18.0f, 9.5f, 3.5f, 0.2f });
+        const std::string worldInfoPacket = buildWorldInfoPacket({
+            "smoke-world",
+            3,
+            4242,
+            256.0f,
+            8192.0f,
+            132.0f,
+            0.0024f,
+            -11.0f,
+            {
+                { 7.5f, true, { { 0.0f, 20.0f, 0.0f }, { 16.0f, 18.0f, 4.0f } } }
+            },
+            8.0f,
+            16.0f,
+            24.0f
+        });
+
+        require(!helloPacket.empty(), "HELLO packet builder returned an empty payload", failed);
+        require(manifestPacket.find("AVATAR_MANIFEST|") == 0, "Avatar manifest packet should keep its packet type prefix", failed);
+
+        int manifestId = 0;
+        const auto parsedManifest = parseAvatarManifestPacket(manifestPacket, &manifestId);
+        require(parsedManifest.has_value() && manifestId == 7, "Avatar manifest packet did not decode its player id", failed);
+        if (parsedManifest.has_value()) {
+            require(parsedManifest->callsign == avatar.callsign, "Avatar manifest callsign did not round-trip", failed);
+            require(parsedManifest->radioChannel == avatar.radioChannel, "Avatar manifest radio channel did not round-trip", failed);
+            require(parsedManifest->plane.modelHash == avatar.plane.modelHash, "Avatar manifest plane model hash did not round-trip", failed);
+        }
+
+        const auto parsedHello = parseAvatarManifestPacket("AVATAR_MANIFEST|" + helloPacket.substr(6));
+        require(parsedHello.has_value(), "HELLO packet fields could not be parsed as an avatar manifest", failed);
+
+        const auto parsedInput = parseInputPacket(inputPacket);
+        require(parsedInput.has_value(), "Input packet did not parse", failed);
+        if (parsedInput.has_value()) {
+            require(parsedInput->tick == 31, "Input tick did not round-trip", failed);
+            require(parsedInput->walkBackward && parsedInput->walkStrafeLeft && parsedInput->walkSprint, "Input button state did not round-trip", failed);
+            require(std::fabs(parsedInput->yokeYaw - 0.55f) < 1.0e-4f, "Input analog state did not round-trip", failed);
+        }
+
+        const auto parsedSnapshot = parseSnapshotPacket(snapshotPacket);
+        require(parsedSnapshot.has_value(), "Snapshot packet did not parse", failed);
+        if (parsedSnapshot.has_value()) {
+            require(parsedSnapshot->id == 7 && parsedSnapshot->ack == 31, "Snapshot ids did not round-trip", failed);
+            require(parsedSnapshot->avatar.role == "walking", "Snapshot avatar role did not round-trip", failed);
+            require(parsedSnapshot->avatar.radioTx, "Snapshot radio state did not round-trip", failed);
+        }
+
+        const auto parsedVoice = parseVoiceStatePacket(voicePacket);
+        require(parsedVoice.has_value() && parsedVoice->channel == 3 && parsedVoice->transmitting, "Voice state did not round-trip", failed);
+
+        const auto parsedVoiceFrame = parseVoiceFramePacket(voiceFramePacket);
+        require(parsedVoiceFrame.has_value(), "Voice frame packet did not parse", failed);
+        require(voiceFramePacket.find("sender=") == std::string::npos, "Voice frame packet should not include a sender id", failed);
+        if (parsedVoiceFrame.has_value()) {
+            require(parsedVoiceFrame->channel == voiceFrame.channel, "Voice frame channel did not round-trip", failed);
+            require(parsedVoiceFrame->data == voiceFrame.data, "Voice frame payload did not round-trip", failed);
+        }
+
+        const auto parsedCrater = parseCraterPacket(craterPacket);
+        require(parsedCrater.has_value() && std::fabs(parsedCrater->radius - 9.5f) < 1.0e-4f, "Crater packet did not round-trip", failed);
+
+        const auto parsedWorldInfo = parseWorldInfoPacket(worldInfoPacket);
+        require(parsedWorldInfo.has_value(), "World info packet did not parse", failed);
+        if (parsedWorldInfo.has_value()) {
+            require(parsedWorldInfo->worldId == "smoke-world", "World info packet world id did not round-trip", failed);
+            require(parsedWorldInfo->tunnelSeeds.size() == 1u, "World info packet tunnel seed list did not round-trip", failed);
+        }
+
+        RemotePeerState peer;
+        appendRemoteSnapshot(peer, { 1.0, { 0.0f, 10.0f, 0.0f }, quatIdentity(), { 2.0f, 0.0f, 0.0f }, { 0.0f, 0.1f, 0.0f } });
+        appendRemoteSnapshot(peer, { 2.0, { 2.0f, 10.0f, 0.0f }, quatIdentity(), { 2.0f, 0.0f, 0.0f }, { 0.0f, 0.1f, 0.0f } });
+        const bool sampled = sampleRemotePeer(peer, 1.5, 0.0f);
+        require(sampled, "Remote peer interpolation did not sample", failed);
+        require(std::fabs(peer.displayPos.x - 1.0f) < 0.25f, "Remote peer interpolation did not blend positions", failed);
+    }
+
+    {
+        auto [serverTransport, clientTransport] = LoopbackTransport::createLinkedPair();
+        require(serverTransport->ready() && clientTransport->ready(), "Loopback transport pair did not report readiness", failed);
+
+        const auto initialServerEvents = serverTransport->poll();
+        const auto initialClientEvents = clientTransport->poll();
+        require(
+            initialServerEvents.size() == 1u && initialServerEvents.front().type == NetEvent::Type::Connected &&
+                initialClientEvents.size() == 1u && initialClientEvents.front().type == NetEvent::Type::Connected,
+            "Loopback transport did not emit the expected connection events",
+            failed);
+
+        require(clientTransport->send(1, static_cast<int>(TransportLane::Control), "PING|lane=0", true), "Loopback transport failed to send a control payload", failed);
+        const auto serverEvents = serverTransport->poll();
+        require(serverEvents.size() == 1u && serverEvents.front().peerId == 2 && serverEvents.front().payload == "PING|lane=0", "Loopback transport did not deliver the sent payload", failed);
+
+        clientTransport->disconnectPeer(1);
+        const auto serverDisconnect = serverTransport->poll();
+        require(
+            !serverDisconnect.empty() && serverDisconnect.front().type == NetEvent::Type::Disconnected,
+            "Loopback transport did not propagate disconnect events",
+            failed);
+    }
+
+    {
+        BlobSyncState state = createBlobSyncState();
+        const std::string rawBlob = std::string("SMOKE\0BLOB\0PAYLOAD", 18);
+        const std::string blobHash = sha256Hex(rawBlob);
+        BlobMetaPacket baseMeta;
+        baseMeta.ownerId = "host";
+        baseMeta.role = "plane";
+        baseMeta.modelHash = "plane-alpha";
+
+        const BlobOutgoingTransfer outgoing = prepareOutgoingBlobTransfer(state, "paint", blobHash, rawBlob, baseMeta, 8);
+        require(outgoing.chunkCount > 0, "Outgoing blob transfer did not produce any chunks", failed);
+        require(state.outgoing.find(blobTransferKey("paint", blobHash)) != state.outgoing.end(), "Outgoing blob transfer was not cached", failed);
+
+        BlobSyncState receiver = createBlobSyncState();
+        require(acceptIncomingBlobMeta(receiver, outgoing.meta).has_value(), "Incoming blob meta was not accepted", failed);
+
+        std::optional<std::pair<BlobMetaPacket, std::string>> completed;
+        for (int index = 0; index < outgoing.chunkCount; ++index) {
+            BlobChunkPacket chunkPacket;
+            chunkPacket.kind = outgoing.kind;
+            chunkPacket.hash = outgoing.hash;
+            chunkPacket.index = index + 1;
+            chunkPacket.data = outgoing.chunks[static_cast<std::size_t>(index)];
+            completed = acceptIncomingBlobChunk(receiver, chunkPacket);
+        }
+        require(completed.has_value(), "Incoming blob transfer never completed", failed);
+        if (completed.has_value()) {
+            require(completed->first.hash == blobHash, "Incoming blob meta hash did not round-trip", failed);
+            require(completed->second == rawBlob, "Incoming blob payload did not round-trip", failed);
+        }
+
+        AvatarBlobCache cache;
+        AvatarBlobRecord record;
+        record.kind = "paint";
+        record.hash = blobHash;
+        record.raw = rawBlob;
+        record.meta = outgoing.meta;
+        cache.put(record);
+        require(cache.has("paint", blobHash), "Avatar blob cache did not store the completed blob", failed);
+        require(cache.get("paint", blobHash) != nullptr, "Avatar blob cache lookup failed", failed);
+    }
+
+    {
+        const std::filesystem::path root = repoRoot();
+        const std::filesystem::path tempRoot = root / "build/native-smoke-net-temp";
+        std::error_code ec;
+        std::filesystem::remove_all(tempRoot, ec);
+        std::filesystem::create_directories(tempRoot, ec);
+
+        WorldStoreOptions hostOptions;
+        hostOptions.name = "net_host";
+        hostOptions.storageRoot = tempRoot / "host-world";
+        hostOptions.createIfMissing = true;
+        hostOptions.regionSize = 8;
+        hostOptions.chunkResolution = 8;
+        hostOptions.groundParams = defaultTerrainParams();
+        hostOptions.groundParams.seed = 9090;
+        hostOptions.groundParams.chunkSize = 128.0f;
+        hostOptions.groundParams.tunnelCount = 1;
+
+        WorldStoreOptions mirrorOptions = hostOptions;
+        mirrorOptions.name = "net_client";
+        mirrorOptions.storageRoot = tempRoot / "client-world";
+
+        std::string hostError;
+        std::string mirrorError;
+        auto hostWorldOpt = WorldStore::open(hostOptions, &hostError);
+        auto mirrorWorldOpt = WorldStore::open(mirrorOptions, &mirrorError);
+        require(hostWorldOpt.has_value(), "Host world failed to open for networking smoke: " + hostError, failed);
+        require(mirrorWorldOpt.has_value(), "Mirror world failed to open for networking smoke: " + mirrorError, failed);
+        if (!hostWorldOpt.has_value() || !mirrorWorldOpt.has_value()) {
+            std::filesystem::remove_all(tempRoot, ec);
+            return;
+        }
+
+        WorldStore hostWorld = std::move(*hostWorldOpt);
+        WorldStore mirrorWorld = std::move(*mirrorWorldOpt);
+        const auto craterResult = hostWorld.applyCrater({ 32.0f, 0.0f, 24.0f, 10.0f, 4.0f, 0.15f });
+        require(craterResult.first && !craterResult.second.empty(), "Host networking world did not generate a dirty crater region", failed);
+
+        auto [hostTransport, clientTransport] = LoopbackTransport::createLinkedPair();
+        HostedWorldServer server(hostTransport);
+        server.setLocalAuthoritativeState(makeFlightState({ 0.0f, 220.0f, 0.0f }), FlightRuntimeState {}, false, 0.0f, 0.0f, avatar);
+
+        (void)clientTransport->poll();
+        server.serviceIncoming(hostOptions.groundParams, &hostWorld);
+
+        clientTransport->send(1, static_cast<int>(TransportLane::Control), buildSmokeHelloPacket(avatar), true);
+        server.serviceIncoming(hostOptions.groundParams, &hostWorld);
+
+        const std::vector<NetEvent> bootstrapEvents = clientTransport->poll();
+        bool sawJoin = false;
+        bool sawWorldInfo = false;
+        bool sawWorldSync = false;
+        bool sawChunk = false;
+        TerrainParams mirroredTerrain = defaultTerrainParams();
+        for (const NetEvent& event : bootstrapEvents) {
+            if (event.type != NetEvent::Type::Message) {
+                continue;
+            }
+
+            const std::string type = HostedNetworkingDetail::packetType(event.payload);
+            if (type == "JOIN_OK") {
+                sawJoin = true;
+            } else if (type == "WORLD_INFO") {
+                sawWorldInfo = true;
+                if (const auto info = parseWorldInfoPacket(event.payload); info.has_value()) {
+                    std::string worldError;
+                    require(mirrorWorld.applyWorldInfo(*info, &worldError), "Mirror world failed to apply WORLD_INFO: " + worldError, failed);
+                }
+            } else if (type == "WORLD_SYNC") {
+                sawWorldSync = true;
+                const auto kv = parseKeyValueFields(splitPacketFields(event.payload));
+                mirroredTerrain.seed = std::max(1, std::atoi(kv["seed"].c_str()));
+                mirroredTerrain.chunkSize = std::max(8.0f, std::strtof(kv["chunk"].c_str(), nullptr));
+                mirroredTerrain.lod0Radius = std::max(1, std::atoi(kv["lod0"].c_str()));
+                mirroredTerrain.lod1Radius = std::max(mirroredTerrain.lod0Radius, std::atoi(kv["lod1"].c_str()));
+                mirroredTerrain.lod2Radius = std::max(mirroredTerrain.lod1Radius, std::atoi(kv["lod2"].c_str()));
+                mirroredTerrain.splitLodEnabled = kv["splitLod"] == "1";
+                mirroredTerrain.highResSplitRatio = clampNetFloat(std::strtof(kv["splitRatio"].c_str(), nullptr), 0.0f, 1.0f);
+            } else if (type == "CHUNK_STATE" || type == "CHUNK_PATCH") {
+                sawChunk = true;
+                if (const auto chunk = parseChunkPacket(event.payload); chunk.has_value()) {
+                    require(mirrorWorld.applyChunkState(*chunk), "Mirror world failed to apply CHUNK_STATE/CHUNK_PATCH", failed);
+                }
+            }
+        }
+
+        require(sawJoin, "Hosted bootstrap did not emit JOIN_OK", failed);
+        require(sawWorldInfo, "Hosted bootstrap did not emit WORLD_INFO", failed);
+        require(sawWorldSync, "Hosted bootstrap did not emit WORLD_SYNC", failed);
+        require(sawChunk, "Hosted bootstrap did not emit any chunk state", failed);
+        require(mirroredTerrain.seed == hostOptions.groundParams.seed, "WORLD_SYNC seed did not round-trip into the mirrored terrain state", failed);
+        require(std::fabs(mirroredTerrain.chunkSize - hostOptions.groundParams.chunkSize) < 1.0e-4f, "WORLD_SYNC chunk size did not round-trip into the mirrored terrain state", failed);
+
+        const WorldMeta mirrorMeta = mirrorWorld.getMeta();
+        require(mirrorMeta.worldId == "net_host", "Mirror world did not adopt the host world id", failed);
+        require(mirrorWorld.sampleHeightDelta(32.0f, 24.0f) != 0.0f, "Mirror world did not receive the host crater terrain", failed);
+
+        server.update(1.0, 1.0f / 30.0f, createTerrainFieldContext(hostOptions.groundParams), defaultFlightConfig(), &hostWorld);
+        const std::vector<NetEvent> snapshotEvents = clientTransport->poll();
+        bool sawSnapshot = false;
+        for (const NetEvent& event : snapshotEvents) {
+            if (event.type == NetEvent::Type::Message && HostedNetworkingDetail::packetType(event.payload) == "SNAPSHOT") {
+                sawSnapshot = true;
+                const auto snapshot = parseSnapshotPacket(event.payload);
+                require(snapshot.has_value() && snapshot->id == 1, "Host snapshot did not encode the local player state", failed);
+            }
+        }
+        require(sawSnapshot, "Hosted server did not emit any snapshots", failed);
+
+        auto voiceTransport = std::make_shared<RecordingTransport>(std::vector<NetPeerId> { 2, 3 });
+        server.setTransport(voiceTransport);
+        server.serviceIncoming(hostOptions.groundParams, &hostWorld);
+
+        auto* peerTwo = mutableHostedPlayer(server, 2);
+        auto* peerThree = mutableHostedPlayer(server, 3);
+        require(peerTwo != nullptr && peerThree != nullptr, "Hosted server did not keep remote players alive for voice routing checks", failed);
+        if (peerTwo != nullptr && peerThree != nullptr) {
+            VoiceFramePacket relayFrame {};
+            relayFrame.channel = 3;
+            relayFrame.data = "HOSTED_VOICE_RELAY_SMOKE";
+            const std::string relayPacket = buildVoiceFramePacket(relayFrame);
+
+            voiceTransport->clearSentPackets();
+            peerTwo->avatar.radioChannel = 3;
+            peerThree->avatar.radioChannel = 3;
+            peerTwo->actor.pos = { 0.0f, 220.0f, 0.0f };
+            peerThree->actor.pos = { 8.0f, 220.0f, 0.0f };
+
+            voiceTransport->pushMessage(2, static_cast<int>(TransportLane::Voice), buildVoiceStatePacket({ 2, 3, true }), true);
+            voiceTransport->pushMessage(3, static_cast<int>(TransportLane::Voice), buildVoiceStatePacket({ 3, 3, true }), true);
+            voiceTransport->pushMessage(2, static_cast<int>(TransportLane::Voice), relayPacket, false);
+            server.serviceIncoming(hostOptions.groundParams, &hostWorld);
+
+            const auto localVoiceFrames = collectHostLocalVoiceFrames(server);
+            require(!localVoiceFrames.empty(), "Hosted server did not expose remote voice frames to the local host", failed);
+            if (!localVoiceFrames.empty()) {
+                const auto parsedLocalFrame = parseVoiceFramePacket(voiceFramePayloadText(localVoiceFrames.front()));
+                require(
+                    parsedLocalFrame.has_value() &&
+                        parsedLocalFrame->channel == relayFrame.channel &&
+                        parsedLocalFrame->data == relayFrame.data,
+                    "Hosted server did not preserve the remote voice frame for local playback",
+                    failed);
+            }
+
+            const auto relayedToPeerThree = std::find_if(
+                voiceTransport->sentPackets.begin(),
+                voiceTransport->sentPackets.end(),
+                [&relayPacket](const RecordingTransport::SentPacket& packet) {
+                    return packet.peerId == 3 && packet.lane == static_cast<int>(TransportLane::Voice) && packet.payload == relayPacket;
+                });
+            require(relayedToPeerThree != voiceTransport->sentPackets.end(), "Hosted server did not relay voice to the matching remote peer", failed);
+
+            voiceTransport->clearSentPackets();
+            peerThree->avatar.radioChannel = 4;
+            voiceTransport->pushMessage(2, static_cast<int>(TransportLane::Voice), relayPacket, false);
+            server.serviceIncoming(hostOptions.groundParams, &hostWorld);
+            require(
+                std::none_of(
+                    voiceTransport->sentPackets.begin(),
+                    voiceTransport->sentPackets.end(),
+                    [&relayPacket](const RecordingTransport::SentPacket& packet) {
+                        return packet.peerId == 3 && packet.lane == static_cast<int>(TransportLane::Voice) && packet.payload == relayPacket;
+                    }),
+                "Hosted server should not relay voice across mismatched radio channels",
+                failed);
+
+            voiceTransport->clearSentPackets();
+            peerThree->avatar.radioChannel = 3;
+            peerThree->actor.pos = { 250000.0f, 220.0f, 0.0f };
+            voiceTransport->pushMessage(2, static_cast<int>(TransportLane::Voice), relayPacket, false);
+            server.serviceIncoming(hostOptions.groundParams, &hostWorld);
+            require(
+                std::none_of(
+                    voiceTransport->sentPackets.begin(),
+                    voiceTransport->sentPackets.end(),
+                    [&relayPacket](const RecordingTransport::SentPacket& packet) {
+                        return packet.peerId == 3 && packet.lane == static_cast<int>(TransportLane::Voice) && packet.payload == relayPacket;
+                    }),
+                "Hosted server should not relay voice outside the active AOI",
+                failed);
+        }
+
+        std::filesystem::remove_all(tempRoot, ec);
+    }
+}
+
 }  // namespace
 
 int main()
@@ -850,7 +1398,7 @@ int main()
         file << "terrain.prop_collision=0\n";
         file << "terrain.prop_seed_offset=222\n";
         file << "controls.flight_pitch_down.primary=key:26\n";
-        file << "controls.voice_ptt.primary=key:999\n";
+        file << "controls.voice_ptt.primary=key:" << static_cast<int>(SDL_SCANCODE_B) << "\n";
     }
     {
         std::ofstream file(hudSettingsPath, std::ios::binary | std::ios::trunc);
@@ -865,7 +1413,8 @@ int main()
         file << "hud.style.debug.background_opacity=96\n";
         file << "hud.show_peer_indicators=1\n";
     }
-    require(loadPreferences(settingsPath, uiState, graphicsSettings, lightingSettings, hudSettings, controls, planeProfile, terrainParams, walkingPrefs, &preferenceError),
+    OnlineSettings onlineSettings {};
+    require(loadPreferences(settingsPath, uiState, graphicsSettings, lightingSettings, hudSettings, onlineSettings, controls, planeProfile, terrainParams, walkingPrefs, &preferenceError),
         "Preference file failed to load: " + preferenceError,
         failed);
     std::string hudPreferenceError;
@@ -924,8 +1473,12 @@ int main()
         const ControlActionBinding* voicePtt = findControlAction(controls, InputActionId::VoicePushToTalk);
         require(voicePtt != nullptr, "Voice push-to-talk control binding missing after preference load", failed);
         require(
-            voicePtt != nullptr && voicePtt->slots[0].scancode == SDL_SCANCODE_V,
-            "Unsupported control rows should ignore persisted values",
+            voicePtt != nullptr &&
+                voicePtt->supported &&
+                voicePtt->configurable &&
+                voicePtt->slots[0].kind == BindingKind::Key &&
+                voicePtt->slots[0].scancode == SDL_SCANCODE_B,
+            "Voice push-to-talk control binding should load, remain supported, and stay configurable",
             failed);
     }
 
@@ -950,6 +1503,17 @@ int main()
         require(
             controlActionTriggeredByKey(defaultControls, InputActionId::PaintUndo, SDL_SCANCODE_Z, SDL_KMOD_LCTRL),
             "Default ctrl+Z paint binding should trigger with left ctrl",
+            failed);
+
+        const ControlActionBinding* voicePtt = findControlAction(defaultControls, InputActionId::VoicePushToTalk);
+        require(voicePtt != nullptr, "Voice push-to-talk binding should exist in the default control profile", failed);
+        require(
+            controlActionSupported(InputActionId::VoicePushToTalk) &&
+                controlActionConfigurable(InputActionId::VoicePushToTalk) &&
+                voicePtt->supported &&
+                voicePtt->configurable &&
+                voicePtt->slots[0].kind == BindingKind::Key,
+            "Voice push-to-talk should be supported and configurable in native controls",
             failed);
     }
 
@@ -982,20 +1546,25 @@ int main()
             "Clearing a selected control slot should unbind that slot",
             failed);
 
-        int unsupportedIndex = -1;
+        int voiceIndex = -1;
         for (std::size_t actionIndex = 0; actionIndex < clearableControls.actions.size(); ++actionIndex) {
             if (clearableControls.actions[actionIndex].id == InputActionId::VoicePushToTalk) {
-                unsupportedIndex = static_cast<int>(actionIndex);
+                voiceIndex = static_cast<int>(actionIndex);
                 break;
             }
         }
-        require(unsupportedIndex >= 0, "Voice push-to-talk binding should exist for unsupported-row smoke checks", failed);
-        if (unsupportedIndex >= 0) {
-            controlsMenu.controlsSelection = unsupportedIndex;
+        require(voiceIndex >= 0, "Voice push-to-talk binding should exist for smoke checks", failed);
+        if (voiceIndex >= 0) {
+            controlsMenu.controlsSelection = voiceIndex;
             controlsMenu.controlsSlot = 0;
             require(
-                !clearSelectedControlBindingSlot(controlsMenu, clearableControls),
-                "Controls shortcut helper should ignore unsupported rows",
+                clearSelectedControlBindingSlot(controlsMenu, clearableControls),
+                "Controls shortcut helper should clear the voice push-to-talk slot",
+                failed);
+            const ControlActionBinding* voicePtt = findControlAction(clearableControls, InputActionId::VoicePushToTalk);
+            require(
+                voicePtt != nullptr && voicePtt->slots[0].kind == BindingKind::None,
+                "Voice push-to-talk should be clearable like the other supported bindings",
                 failed);
         }
     }
@@ -1018,7 +1587,7 @@ int main()
         const std::filesystem::path savedHudSettingsPath = tempRoot / "saved_hud_settings.ini";
         std::string savePreferenceError;
         require(
-            savePreferences(savedSettingsPath, uiState, graphicsSettings, lightingSettings, hudSettings, controls, planeProfile, terrainParams, planeVisual, walkingVisual, &savePreferenceError),
+            savePreferences(savedSettingsPath, uiState, graphicsSettings, lightingSettings, hudSettings, onlineSettings, controls, planeProfile, terrainParams, planeVisual, walkingVisual, &savePreferenceError),
             "Preference file failed to save: " + savePreferenceError,
             failed);
         require(
@@ -1053,9 +1622,9 @@ int main()
             "Saved preferences did not persist supported control bindings",
             failed);
         require(
-            savedContents.find("controls.voice_ptt.primary=") == std::string::npos &&
+            savedContents.find(std::string("controls.voice_ptt.primary=key:") + std::to_string(static_cast<int>(SDL_SCANCODE_B))) != std::string::npos &&
                 savedContents.find("hud.show_peer_indicators=") == std::string::npos,
-            "Disabled rows should not be written back to native_settings.ini",
+            "Supported voice push-to-talk bindings should be written back to native_settings.ini",
             failed);
         require(
             savedHudContents.find("hud.show_crosshair=0") != std::string::npos &&
@@ -1170,6 +1739,7 @@ int main()
     runTerrainStreamingChecks(failed);
     runPressureGovernorChecks(failed);
     runTerrainDecorationChecks(failed);
+    runNetworkingSmokeChecks(failed);
 
     WorldChunkState wireChunk;
     wireChunk.cx = 3;
@@ -1354,6 +1924,7 @@ int main()
                     graphicsSettings,
                     lightingSettings,
                     hudSettings,
+                    onlineSettings,
                     controls,
                     planeProfile,
                     terrainParams,
@@ -1378,6 +1949,7 @@ int main()
             AircraftProfile loadedPlaneProfile {};
             loadedPlaneProfile.visualPrefs.scale = 3.0f;
             TerrainParams loadedTerrainParams = defaultTerrainParams();
+            OnlineSettings loadedOnlineSettings {};
             VisualPreferenceData loadedWalkingPrefs {};
             loadedWalkingPrefs.scale = 1.0f;
             std::string loadPreferenceError;
@@ -1388,6 +1960,7 @@ int main()
                     loadedGraphicsSettings,
                     loadedLightingSettings,
                     loadedHudSettings,
+                    loadedOnlineSettings,
                     loadedControls,
                     loadedPlaneProfile,
                     loadedTerrainParams,

@@ -157,7 +157,7 @@ function audio.create(opts)
 			return
 		end
 
-		local dt = clamp(tonumber(frame.dt) or 1 / 60, 0, 0.25)
+		local dt = clamp((tonumber(frame.dt) or 1) / 60, 0, 0.25)
 		local masterVolume = clamp(tonumber(frame.masterVolume) or 1.0, 0.0, 1.5)
 		local engineVolume = clamp(tonumber(frame.engineVolume) or 1.0, 0.0, 1.5)
 		local ambienceVolume = clamp(tonumber(frame.ambienceVolume) or 1.0, 0.0, 1.5)

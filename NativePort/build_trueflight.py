@@ -29,6 +29,40 @@ def run_command(command: list[str], cwd: Path) -> None:
     subprocess.run(command, cwd=str(cwd), check=True)
 
 
+def normalize_steamworks_sdk_root(candidate: Path) -> Path | None:
+    candidate = candidate.resolve()
+    if (candidate / "public" / "steam" / "steam_api.h").exists():
+        return candidate
+    if (candidate / "sdk" / "public" / "steam" / "steam_api.h").exists():
+        return candidate / "sdk"
+    return None
+
+
+def detect_steamworks_sdk_root(source_dir: Path, explicit_root: str | None) -> Path | None:
+    if explicit_root:
+        resolved = normalize_steamworks_sdk_root(Path(explicit_root).expanduser())
+        if resolved is None:
+            raise FileNotFoundError(f"Steamworks SDK root was provided but could not be resolved: {explicit_root}")
+        return resolved
+
+    env_root = os.environ.get("STEAMWORKS_SDK_ROOT")
+    if env_root:
+        resolved = normalize_steamworks_sdk_root(Path(env_root).expanduser())
+        if resolved is not None:
+            return resolved
+
+    workspace_candidates = (
+        source_dir / "steamworks_sdk_164",
+        source_dir / "steamworks_sdk_164" / "sdk",
+    )
+    for candidate in workspace_candidates:
+        resolved = normalize_steamworks_sdk_root(candidate)
+        if resolved is not None:
+            return resolved
+
+    return None
+
+
 def configure_if_needed(
     cmake: str,
     source_dir: Path,
@@ -36,6 +70,7 @@ def configure_if_needed(
     generator: str | None,
     arch: str | None,
     reconfigure: bool,
+    cmake_defines: list[str],
 ) -> None:
     cache_path = build_dir / "CMakeCache.txt"
     if cache_path.exists() and not reconfigure:
@@ -43,6 +78,7 @@ def configure_if_needed(
 
     build_dir.mkdir(parents=True, exist_ok=True)
     command = [cmake, "-S", str(source_dir), "-B", str(build_dir)]
+    command.extend(cmake_defines)
     if generator:
         command.extend(["-G", generator])
     if arch:
@@ -124,6 +160,28 @@ def parse_args() -> argparse.Namespace:
         default="x64" if os.name == "nt" else None,
         help="Optional generator architecture. Defaults to x64 on Windows.",
     )
+    steamworks_group = parser.add_mutually_exclusive_group()
+    steamworks_group.add_argument(
+        "--enable-steamworks",
+        action="store_true",
+        help="Force Steamworks support on when a valid SDK root is available.",
+    )
+    steamworks_group.add_argument(
+        "--disable-steamworks",
+        action="store_true",
+        help="Force Steamworks support off, even if a local SDK root exists.",
+    )
+    parser.add_argument(
+        "--steamworks-sdk-root",
+        default=None,
+        help="Optional Steamworks SDK root or sdk/ directory. Defaults to auto-detecting steamworks_sdk_164 in the workspace or STEAMWORKS_SDK_ROOT.",
+    )
+    parser.add_argument(
+        "--steam-app-id",
+        default=480,
+        type=int,
+        help="Development Steam app id written to steam_appid.txt when Steamworks is enabled. Defaults to 480 (Spacewar).",
+    )
     parser.add_argument(
         "--reconfigure",
         action="store_true",
@@ -153,6 +211,36 @@ def main() -> int:
         print(str(error), file=sys.stderr)
         return 1
 
+    steamworks_sdk_root = None
+    steamworks_enabled = False
+    if args.disable_steamworks:
+        steamworks_enabled = False
+    else:
+        if args.enable_steamworks and os.name != "nt":
+            print("Steamworks support is currently supported on Windows only.", file=sys.stderr)
+            return 1
+        try:
+            steamworks_sdk_root = detect_steamworks_sdk_root(source_dir, args.steamworks_sdk_root)
+        except FileNotFoundError as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        steamworks_enabled = bool(steamworks_sdk_root is not None and os.name == "nt")
+        if args.enable_steamworks and steamworks_sdk_root is None:
+            print(
+                "Steamworks was explicitly enabled, but no SDK root was found. Pass --steamworks-sdk-root or set STEAMWORKS_SDK_ROOT.",
+                file=sys.stderr,
+            )
+            return 1
+        if args.enable_steamworks:
+            steamworks_enabled = True
+
+    cmake_defines = [
+        f"-DTRUEFLIGHT_ENABLE_STEAMWORKS={'ON' if steamworks_enabled else 'OFF'}",
+        f"-DTRUEFLIGHT_STEAM_APP_ID={args.steam_app_id}",
+    ]
+    if steamworks_sdk_root is not None:
+        cmake_defines.append(f"-DSTEAMWORKS_SDK_ROOT={steamworks_sdk_root}")
+
     try:
         configure_if_needed(
             cmake=cmake,
@@ -161,6 +249,7 @@ def main() -> int:
             generator=args.generator,
             arch=args.arch,
             reconfigure=args.reconfigure,
+            cmake_defines=cmake_defines,
         )
         build_target(
             cmake=cmake,
