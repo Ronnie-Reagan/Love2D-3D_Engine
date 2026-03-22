@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(TrueFlight LANGUAGES CXX)
+enable_testing()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -77,6 +78,8 @@ add_executable(TrueFlightNativeSmoke
     Native/src/VulkanRenderer.cpp
     Native/src/SteamSupport.cpp
 )
+
+add_test(NAME TrueFlightNativeSmoke COMMAND $<TARGET_FILE:TrueFlightNativeSmoke>)
 
 add_dependencies(TrueFlight NativeShaders)
 

@@ -1452,7 +1452,7 @@ int main()
     require(std::abs(hudSettings.mapPanel.widthScale - 1.4f) < 0.001f, "HUD map width scale did not load from HUD preferences", failed);
     require(hudSettings.mapPanel.textColor.r == 101, "HUD map text color did not load from HUD preferences", failed);
     require(hudSettings.debugFooter.backgroundOpacity == 96, "HUD debug background opacity did not load from HUD preferences", failed);
-    require(!hudSettings.showPeerIndicators, "Unsupported HUD rows should ignore persisted values", failed);
+    require(hudSettings.showPeerIndicators, "HUD peer-indicator toggle did not load from HUD preferences", failed);
     {
         const ControlActionBinding* pitchDown = findControlAction(controls, InputActionId::FlightPitchDown);
         require(pitchDown != nullptr, "Pitch down control binding missing after preference load", failed);
@@ -1528,6 +1528,17 @@ int main()
         require(insertMenuPromptText(promptState, "_patched"), "Model prompt text insertion should append at the cursor", failed);
         clearMenuPrompt(promptState);
         require(!promptState.promptActive && promptState.promptText.empty(), "Model prompt clear should fully reset transient prompt state", failed);
+
+        const char* launchArgv[] { "TrueFlight.exe", "+connect_lobby", "76561198000000000" };
+        require(
+            parseConnectLobbyLaunchArgument(static_cast<int>(std::size(launchArgv)), const_cast<char**>(launchArgv)) == 76561198000000000ull,
+            "Steam connect_lobby launch parsing should accept split arguments",
+            failed);
+        const char* inlineLaunchArgv[] { "TrueFlight.exe", "lobby:76561198000000001" };
+        require(
+            parseConnectLobbyLaunchArgument(static_cast<int>(std::size(inlineLaunchArgv)), const_cast<char**>(inlineLaunchArgv)) == 76561198000000001ull,
+            "Steam connect_lobby launch parsing should accept inline lobby tokens",
+            failed);
 
         PauseState confirmState;
         requestMenuConfirmation(confirmState, 2, "Confirm quit.", 10.0f, 1.0f);
@@ -1631,7 +1642,7 @@ int main()
                 savedHudContents.find("hud.style.map.x=0.42") != std::string::npos &&
                 savedHudContents.find("hud.style.map.width_scale=1.4") != std::string::npos &&
                 savedHudContents.find("hud.style.debug.background_opacity=96") != std::string::npos &&
-                savedHudContents.find("hud.show_peer_indicators=") == std::string::npos,
+                savedHudContents.find("hud.show_peer_indicators=1") != std::string::npos,
             "Saved HUD preferences did not persist element layout/style keys correctly",
             failed);
     }

@@ -29,6 +29,19 @@ def run_command(command: list[str], cwd: Path) -> None:
     subprocess.run(command, cwd=str(cwd), check=True)
 
 
+def find_ctest(cmake: str) -> str:
+    sibling_name = "ctest.exe" if os.name == "nt" else "ctest"
+    sibling = Path(cmake).with_name(sibling_name)
+    if sibling.exists():
+        return str(sibling)
+
+    ctest = shutil.which("ctest")
+    if ctest:
+        return ctest
+
+    raise FileNotFoundError("ctest was not found alongside cmake or on PATH")
+
+
 def normalize_steamworks_sdk_root(candidate: Path) -> Path | None:
     candidate = candidate.resolve()
     if (candidate / "public" / "steam" / "steam_api.h").exists():
@@ -98,6 +111,13 @@ def build_target(
         command.extend(["--config", config])
     if clean_first:
         command.append("--clean-first")
+    run_command(command, cwd=build_dir)
+
+
+def run_ctest(ctest: str, build_dir: Path, config: str) -> None:
+    command = [ctest, "--test-dir", str(build_dir), "--output-on-failure"]
+    if config:
+        command.extend(["-C", config])
     run_command(command, cwd=build_dir)
 
 
@@ -186,12 +206,17 @@ def parse_args() -> argparse.Namespace:
         "--reconfigure",
         action="store_true",
         help="Force a CMake configure pass even if the build directory is already configured.",
-        default=True
+        default=False,
     )
     parser.add_argument(
         "--clean-first",
         action="store_true",
         help="Pass --clean-first to the build step.",
+    )
+    parser.add_argument(
+        "--ctest",
+        action="store_true",
+        help="Run ctest --output-on-failure after the build completes.",
     )
     return parser.parse_args()
 
@@ -241,6 +266,8 @@ def main() -> int:
     if steamworks_sdk_root is not None:
         cmake_defines.append(f"-DSTEAMWORKS_SDK_ROOT={steamworks_sdk_root}")
 
+    print(f"Steamworks build mode: {'enabled' if steamworks_enabled else 'disabled'}")
+
     try:
         configure_if_needed(
             cmake=cmake,
@@ -258,8 +285,18 @@ def main() -> int:
             target=args.target,
             clean_first=args.clean_first,
         )
+        if args.ctest:
+            ctest = find_ctest(cmake)
+            run_ctest(
+                ctest=ctest,
+                build_dir=build_dir,
+                config=args.config,
+            )
     except subprocess.CalledProcessError as error:
         return error.returncode
+    except FileNotFoundError as error:
+        print(str(error), file=sys.stderr)
+        return 1
 
     executable = find_built_executable(build_dir, args.config, args.target)
     if executable is not None:

@@ -48,6 +48,17 @@ jobs:
             --target TrueFlight `
             --build-dir $env:BUILD_DIR
 
+      - name: Build And Run Native Smoke
+        shell: pwsh
+        run: |
+          python NativePort/build_trueflight.py `
+            --generator "Visual Studio 17 2022" `
+            --arch x64 `
+            --config Release `
+            --target TrueFlightNativeSmoke `
+            --build-dir $env:BUILD_DIR `
+            --ctest
+
       - name: Stage package
         shell: pwsh
         run: |

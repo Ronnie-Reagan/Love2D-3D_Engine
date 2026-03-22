@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <vector>
 
 #ifndef TRUEFLIGHT_ENABLE_STEAMWORKS
 #define TRUEFLIGHT_ENABLE_STEAMWORKS 0
@@ -31,7 +32,9 @@ struct SteamRuntimeState {
     bool overlayEnabled = false;
     std::uint32_t appId = 0;
     std::uint32_t runningAppId = 0;
+    std::uint64_t localSteamId = 0;
     std::string status = "Steamworks unavailable";
+    std::string personaName;
 };
 
 class SteamRuntime {
@@ -94,7 +97,11 @@ struct SteamLobbyState {
     std::uint64_t pendingLobbyId = 0;
     bool lobbyReady = false;
     bool transportReady = false;
+    int memberCount = 0;
     std::string status = "Offline";
+    std::string localPersonaName;
+    std::string hostPersonaName;
+    std::vector<std::string> memberNames;
     std::shared_ptr<INetTransport> transport;
 };
 

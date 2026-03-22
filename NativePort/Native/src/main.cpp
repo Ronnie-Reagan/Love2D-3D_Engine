@@ -670,6 +670,13 @@ struct GameSession {
     float foliageImpactPulse = 0.0f;
 };
 
+struct HudPeerIndicator {
+    Vec3 worldPos {};
+    std::string callsign;
+    int radioChannel = 1;
+    bool transmitting = false;
+};
+
 enum class HardwareTier {
     Requirement = 0,
     Suggested = 1
@@ -2081,9 +2088,9 @@ void appendTerrainPropPrism(
         const Vec3 b1 { std::cos(angle1) * radius, 0.0f, std::sin(angle1) * radius };
         const Vec3 t0 { b0.x, height, b0.z };
         const Vec3 t1 { b1.x, height, b1.z };
-        addTerrainPropQuad(model, origin, rotation, scale, b0, b1, t1, t0, sideColor);
-        addTerrainPropTriangle(model, origin, rotation, scale, topCenter, t0, t1, topColor);
-        addTerrainPropTriangle(model, origin, rotation, scale, bottomCenter, b1, b0, scaledColor(sideColor, 0.72f));
+        addTerrainPropQuad(model, origin, rotation, scale, b0, t0, t1, b1, sideColor);
+        addTerrainPropTriangle(model, origin, rotation, scale, t0, topCenter, t1, topColor);
+        addTerrainPropTriangle(model, origin, rotation, scale, b0, b1, bottomCenter, scaledColor(sideColor, 0.72f));
     }
 }
 
@@ -2106,8 +2113,8 @@ void appendTerrainPropCone(
         const float angle1 = static_cast<float>(faceIndex + 1) * angleStep;
         const Vec3 b0 { std::cos(angle0) * radius, 0.0f, std::sin(angle0) * radius };
         const Vec3 b1 { std::cos(angle1) * radius, 0.0f, std::sin(angle1) * radius };
-        addTerrainPropTriangle(model, origin, rotation, scale, apex, b0, b1, sideColor);
-        addTerrainPropTriangle(model, origin, rotation, scale, baseCenter, b1, b0, scaledColor(sideColor, 0.68f));
+        addTerrainPropTriangle(model, origin, rotation, scale, b0, apex, b1, sideColor);
+        addTerrainPropTriangle(model, origin, rotation, scale, b0, b1, baseCenter, scaledColor(sideColor, 0.68f));
     }
 }
 
@@ -2127,8 +2134,8 @@ void appendTerrainPropOctahedron(
         Vec3 { 0.0f, -1.0f, 0.0f }
     };
     constexpr std::array<std::array<int, 3>, 8> faces {{
-        { 0, 1, 2 }, { 0, 2, 3 }, { 0, 3, 4 }, { 0, 4, 1 },
-        { 5, 2, 1 }, { 5, 3, 2 }, { 5, 4, 3 }, { 5, 1, 4 }
+        { 0, 2, 1 }, { 0, 3, 2 }, { 0, 4, 3 }, { 0, 1, 4 },
+        { 5, 1, 2 }, { 5, 2, 3 }, { 5, 3, 4 }, { 5, 4, 1 }
     }};
     for (const auto& face : faces) {
         addTerrainPropTriangle(
@@ -4440,7 +4447,7 @@ int hudSubTabItemCount(HudSubTab subTab)
 {
     switch (subTab) {
     case HudSubTab::Info:
-        return 19;
+        return 20;
     case HudSubTab::Speedometer:
         return 22;
     case HudSubTab::Controls:
@@ -4732,6 +4739,52 @@ OnlineSessionRole onlineRoleFromSettings(const OnlineSettings& settings)
     return OnlineSessionRole::Offline;
 }
 
+std::string formatOnlineSessionRoleLabel(OnlineSessionRole role)
+{
+    switch (role) {
+    case OnlineSessionRole::Host:
+        return "Host";
+    case OnlineSessionRole::Client:
+        return "Client";
+    default:
+        return "Offline";
+    }
+}
+
+std::string formatCompactSteamId(std::string_view steamId)
+{
+    const std::string trimmed = trimAscii(std::string(steamId));
+    if (trimmed.empty()) {
+        return {};
+    }
+    if (trimmed.size() <= 10u) {
+        return trimmed;
+    }
+    return trimmed.substr(0, 4) + "..." + trimmed.substr(trimmed.size() - 4u);
+}
+
+std::string formatSteamIdentityLabel(std::string_view personaName, std::string_view steamId)
+{
+    const std::string name = trimAscii(std::string(personaName));
+    const std::string compactSteamId = formatCompactSteamId(steamId);
+    if (!name.empty() && !compactSteamId.empty()) {
+        return name + " (" + compactSteamId + ")";
+    }
+    if (!name.empty()) {
+        return name;
+    }
+    return compactSteamId;
+}
+
+bool steamStatusLooksTerminal(std::string_view status)
+{
+    const std::string lowered = toLowerAscii(std::string(status));
+    return lowered.find("fail") != std::string::npos ||
+        lowered.find("mismatch") != std::string::npos ||
+        lowered.find("unavailable") != std::string::npos ||
+        lowered.find("timeout") != std::string::npos;
+}
+
 bool parseSteamId64(const std::string& value, std::uint64_t& outSteamId)
 {
     const std::string trimmed = trimAscii(value);
@@ -4892,6 +4945,7 @@ SteamOnlineState snapshotSteamOnlineState(const SteamOnlineController& controlle
     state.available = controller.available();
     state.initialized = controller.initialized();
     state.joinRequested = controller.hasPendingJoinRequest();
+    state.overlayEnabled = controller.runtimeState().overlayEnabled;
     if (const std::uint64_t pendingLobbyId = controller.pendingJoinLobbyId(); pendingLobbyId != 0) {
         state.pendingLobbyId = std::to_string(pendingLobbyId);
     }
@@ -4903,11 +4957,25 @@ SteamOnlineState snapshotSteamOnlineState(const SteamOnlineController& controlle
     if (lobby.hostSteamId != 0) {
         state.hostSteamId = std::to_string(lobby.hostSteamId);
     }
+    if (lobby.localSteamId != 0) {
+        state.localSteamId = std::to_string(lobby.localSteamId);
+    }
+    if (state.localSteamId.empty() && controller.runtimeState().localSteamId != 0) {
+        state.localSteamId = std::to_string(controller.runtimeState().localSteamId);
+    }
+    state.localPersonaName = !lobby.localPersonaName.empty() ? lobby.localPersonaName : controller.runtimeState().personaName;
+    state.hostPersonaName = lobby.hostPersonaName;
+    state.memberNames = lobby.memberNames;
+    state.transportReady = lobby.transportReady;
+    state.memberCount = lobby.memberCount;
+    state.maxPlayers = lobby.maxPlayers;
     state.transport = controller.transport();
+    const bool lobbyHasTerminalError = steamStatusLooksTerminal(lobby.status);
     const bool lobbyOwnsStatus =
         lobby.role != SteamLobbyState::Role::Offline ||
         !state.pendingLobbyId.empty() ||
-        !state.lobbyId.empty();
+        !state.lobbyId.empty() ||
+        lobbyHasTerminalError;
     const std::string runtimeStatus = controller.runtimeState().status;
     state.status = lobbyOwnsStatus
         ? lobby.status
@@ -4915,15 +4983,6 @@ SteamOnlineState snapshotSteamOnlineState(const SteamOnlineController& controlle
             ? runtimeStatus
             : (!lobby.status.empty() ? lobby.status : (state.available ? std::string("Steam ready.") : std::string("Offline fallback active."))));
     return state;
-}
-
-bool steamStatusLooksTerminal(std::string_view status)
-{
-    const std::string lowered = toLowerAscii(std::string(status));
-    return lowered.find("fail") != std::string::npos ||
-        lowered.find("mismatch") != std::string::npos ||
-        lowered.find("unavailable") != std::string::npos ||
-        lowered.find("timeout") != std::string::npos;
 }
 
 void moveVoiceFrames(std::vector<std::string>& destination, std::vector<std::string>& source)
@@ -6739,6 +6798,7 @@ bool saveHudPreferences(const std::filesystem::path& path, const HudSettings& hu
     file << "hud.show_map=" << (hudSettings.showMap ? 1 : 0) << "\n";
     file << "hud.show_geo=" << (hudSettings.showGeoInfo ? 1 : 0) << "\n";
     file << "hud.show_crosshair=" << (hudSettings.showCrosshair ? 1 : 0) << "\n";
+    file << "hud.show_peer_indicators=" << (hudSettings.showPeerIndicators ? 1 : 0) << "\n";
     file << "hud.speedometer_max_kph=" << hudSettings.speedometerMaxKph << "\n";
     file << "hud.speedometer_minor_step_kph=" << hudSettings.speedometerMinorStepKph << "\n";
     file << "hud.speedometer_major_step_kph=" << hudSettings.speedometerMajorStepKph << "\n";
@@ -6841,6 +6901,8 @@ bool loadHudPreferences(const std::filesystem::path& path, HudSettings& hudSetti
             hudSettings.showGeoInfo = parseBoolValue(value, hudSettings.showGeoInfo);
         } else if (key == "hud.show_crosshair") {
             hudSettings.showCrosshair = parseBoolValue(value, hudSettings.showCrosshair);
+        } else if (key == "hud.show_peer_indicators") {
+            hudSettings.showPeerIndicators = parseBoolValue(value, hudSettings.showPeerIndicators);
         } else if (key == "hud.speedometer_max_kph") {
             hudSettings.speedometerMaxKph = parseIntValue(value, hudSettings.speedometerMaxKph);
         } else if (key == "hud.speedometer_minor_step_kph") {
@@ -10018,7 +10080,7 @@ const char* menuSettingsRowLabel(SettingsSubTab subTab, int localIndex)
         case 2:
             return "Steam Status";
         case 3:
-            return "Steam Join";
+            return "Join Invite";
         case 4:
             return "Invite Friends";
         case 5:
@@ -10203,6 +10265,16 @@ std::string formatOnlineRowValue(
         return "Offline";
     case 2: {
         std::string status = steamOnline.status.empty() ? "Offline fallback" : steamOnline.status;
+        if (steamOnline.memberCount > 0) {
+            status += " | " + std::to_string(steamOnline.memberCount);
+            if (steamOnline.maxPlayers > 0) {
+                status += "/" + std::to_string(steamOnline.maxPlayers);
+            }
+        }
+        const std::string hostLabel = formatSteamIdentityLabel(steamOnline.hostPersonaName, steamOnline.hostSteamId);
+        if (!hostLabel.empty()) {
+            status += " | host " + hostLabel;
+        }
         if (!steamOnline.lobbyId.empty()) {
             status += " | active #" + steamOnline.lobbyId;
         }
@@ -10213,7 +10285,7 @@ std::string formatOnlineRowValue(
     }
     case 3:
         return onlineActionRowEnabled(localIndex, onlineSettings, steamOnline, sessionActive)
-            ? "Press Enter"
+            ? (sessionActive ? "Switch & Join" : "Press Enter")
             : "No Pending Invite";
     case 4:
         return onlineActionRowEnabled(localIndex, onlineSettings, steamOnline, sessionActive)
@@ -10376,7 +10448,7 @@ const char* onlineRowHelpText(int localIndex)
     case 2:
         return "Read-only Steamworks runtime, active lobby, and pending invite status.";
     case 3:
-        return "Join the pending Steam lobby invite from the main menu. Active sessions must return to main menu first.";
+        return "Join the pending Steam lobby invite. If another session is active, the game will switch over to the invite target.";
     case 4:
         return "Open the Steam overlay invite dialog for the active hosted lobby.";
     case 5:
@@ -10947,6 +11019,8 @@ const char* hudRowLabel(HudSubTab subTab, int localIndex)
             return "Geo Readout";
         case 18:
             return "Throttle Bar";
+        case 19:
+            return "Peer Indicators";
         default:
             return "";
         }
@@ -10985,6 +11059,9 @@ std::string formatHudRowValue(HudSubTab subTab, int localIndex, const HudSetting
         if (localIndex == 18) {
             return hudSettings.showThrottle ? "On" : "Off";
         }
+        if (localIndex == 19) {
+            return hudSettings.showPeerIndicators ? "On" : "Off";
+        }
         break;
     case HudSubTab::Speedometer:
         switch (localIndex) {
@@ -11015,9 +11092,16 @@ const char* hudRowHelpText(HudSubTab subTab, int localIndex)
 
     switch (subTab) {
     case HudSubTab::Info:
-        return localIndex == 17
-            ? "Show or hide the latitude/longitude lines inside the info panel."
-            : "Show or hide the throttle progress bar inside the info panel.";
+        switch (localIndex) {
+        case 17:
+            return "Show or hide the latitude/longitude lines inside the info panel.";
+        case 18:
+            return "Show or hide the throttle progress bar inside the info panel.";
+        case 19:
+            return "Show or hide remote peer labels with callsign, radio channel, and transmit state.";
+        default:
+            return "";
+        }
     case HudSubTab::Speedometer:
         switch (localIndex) {
         case 17:
@@ -11116,6 +11200,8 @@ void adjustHudRowValue(HudSettings& hudSettings, HudSubTab subTab, int localInde
             hudSettings.showGeoInfo = !hudSettings.showGeoInfo;
         } else if (localIndex == 18) {
             hudSettings.showThrottle = !hudSettings.showThrottle;
+        } else if (localIndex == 19) {
+            hudSettings.showPeerIndicators = !hudSettings.showPeerIndicators;
         }
         break;
     case HudSubTab::Speedometer:
@@ -11217,6 +11303,8 @@ void resetHudRowValue(HudSettings& hudSettings, const HudSettings& defaults, Hud
             hudSettings.showGeoInfo = defaults.showGeoInfo;
         } else if (localIndex == 18) {
             hudSettings.showThrottle = defaults.showThrottle;
+        } else if (localIndex == 19) {
+            hudSettings.showPeerIndicators = defaults.showPeerIndicators;
         }
         break;
     case HudSubTab::Speedometer:
@@ -11272,7 +11360,7 @@ std::string formatHudRowValue(int hudIndex, const HudSettings& hudSettings)
     case 10:
         return hudSettings.showGeoInfo ? "On" : "Off";
     case 11:
-        return "Unavailable";
+        return hudSettings.showPeerIndicators ? "On" : "Off";
     default:
         return {};
     }
@@ -11336,7 +11424,7 @@ const char* hudRowHelpText2(int hudIndex)
     case 10:
         return "Show or hide geo information lines.";
     case 11:
-        return "Peer indicators depend on networking, which is not yet present in the native port.";
+        return "Show or hide remote peer labels with callsign, radio channel, and transmit state.";
     default:
         return "";
     }
@@ -11344,7 +11432,8 @@ const char* hudRowHelpText2(int hudIndex)
 
 bool hudRowDisabled(int hudIndex)
 {
-    return hudIndex == 11;
+    (void)hudIndex;
+    return false;
 }
 
 void adjustHudRowValue(HudSettings& hudSettings, int hudIndex, int direction)
@@ -11386,6 +11475,9 @@ void adjustHudRowValue(HudSettings& hudSettings, int hudIndex, int direction)
         break;
     case 10:
         hudSettings.showGeoInfo = !hudSettings.showGeoInfo;
+        break;
+    case 11:
+        hudSettings.showPeerIndicators = !hudSettings.showPeerIndicators;
         break;
     default:
         break;
@@ -12308,6 +12400,89 @@ void drawMenuOverlay(
                     makeHudColor(180, 214, 240, 255));
             }
             canvas.text(contentX, layout.panelY + layout.panelH - 62.0f, menuSettingsRowHelpText(pauseState.settingsSubTab, pauseState.selectedIndex), makeHudColor(205, 225, 242, 255));
+            if (pauseState.settingsSubTab == SettingsSubTab::Online) {
+                std::vector<std::string> detailLines;
+                detailLines.reserve(10);
+                detailLines.push_back(
+                    std::string("Configured: ") +
+                    (onlineSettings.multiplayerEnabled
+                        ? (onlineSettings.sessionMode == "host" ? "host next session" : "join pending invite")
+                        : "offline"));
+                detailLines.push_back(
+                    std::string("Steam: ") +
+                    (onlineSettings.steamEnabled ? "enabled" : "disabled") +
+                    (steamOnline.overlayEnabled ? " | overlay on" : " | overlay off"));
+
+                const std::string signedInLabel = formatSteamIdentityLabel(steamOnline.localPersonaName, steamOnline.localSteamId);
+                if (!signedInLabel.empty()) {
+                    detailLines.push_back("Signed in: " + signedInLabel);
+                }
+
+                if (!steamOnline.pendingLobbyId.empty()) {
+                    detailLines.push_back("Pending invite: #" + steamOnline.pendingLobbyId);
+                }
+
+                if (!steamOnline.lobbyId.empty()) {
+                    std::string lobbyLine = "Active lobby: #" + steamOnline.lobbyId;
+                    if (steamOnline.memberCount > 0) {
+                        lobbyLine += " | " + std::to_string(steamOnline.memberCount);
+                        if (steamOnline.maxPlayers > 0) {
+                            lobbyLine += "/" + std::to_string(steamOnline.maxPlayers);
+                        }
+                    }
+                    detailLines.push_back(std::move(lobbyLine));
+                }
+
+                const std::string hostLabel = formatSteamIdentityLabel(steamOnline.hostPersonaName, steamOnline.hostSteamId);
+                if (!hostLabel.empty()) {
+                    detailLines.push_back("Lobby host: " + hostLabel);
+                }
+
+                if (!onlineSettings.lastLobbyId.empty() || !onlineSettings.lastJoinHostId.empty()) {
+                    std::string recentLine = "Recent: ";
+                    if (!onlineSettings.lastLobbyId.empty()) {
+                        recentLine += "#" + onlineSettings.lastLobbyId;
+                    } else {
+                        recentLine += "no lobby";
+                    }
+                    const std::string recentHost = formatCompactSteamId(onlineSettings.lastJoinHostId);
+                    if (!recentHost.empty()) {
+                        recentLine += " | host " + recentHost;
+                    }
+                    detailLines.push_back(std::move(recentLine));
+                }
+
+                detailLines.push_back(
+                    std::string("Voice: ") +
+                    (onlineSettings.voiceEnabled
+                        ? (onlineSettings.pushToTalk ? "push-to-talk" : "open mic")
+                        : "off") +
+                    " | channel " + std::to_string(normalizeRadioChannel(onlineSettings.radioChannel)) +
+                    " | callsign " + sanitizeCallsign(onlineSettings.callsign));
+
+                if (!steamOnline.memberNames.empty()) {
+                    const std::size_t visibleMembers = std::min<std::size_t>(steamOnline.memberNames.size(), 3u);
+                    for (std::size_t memberIndex = 0; memberIndex < visibleMembers; ++memberIndex) {
+                        detailLines.push_back("Member: " + steamOnline.memberNames[memberIndex]);
+                    }
+                    if (steamOnline.memberNames.size() > visibleMembers) {
+                        detailLines.push_back("Members: +" + std::to_string(steamOnline.memberNames.size() - visibleMembers) + " more");
+                    }
+                }
+
+                const float visibleRows = static_cast<float>(std::min(count, kSettingsVisibleRows));
+                const float detailY =
+                    contentY + 38.0f + (visibleRows * 30.0f) + (count > kSettingsVisibleRows ? 22.0f : 10.0f);
+                const float detailW = pauseContentWidth(layout, pauseState.tab) - 12.0f;
+                const float detailH = 14.0f + (static_cast<float>(detailLines.size()) * 14.0f) + 10.0f;
+                canvas.fillRect(contentX, detailY, detailW, detailH, makeHudColor(10, 18, 28, 228));
+                canvas.strokeRect(contentX, detailY, detailW, detailH, makeHudColor(96, 132, 164, 255));
+                float detailTextY = detailY + 8.0f;
+                for (const std::string& detailLine : detailLines) {
+                    canvas.text(contentX + 10.0f, detailTextY, detailLine, makeHudColor(210, 228, 245, 255));
+                    detailTextY += 14.0f;
+                }
+            }
         }
     } else if (pauseState.tab == PauseTab::Characters) {
         canvas.text(contentX, contentY + 10.0f, "Per-role model selection, transforms, preview zoom, and turntable control.", makeHudColor(180, 214, 240, 255));
@@ -12597,6 +12772,12 @@ void drawHud(
     float fps,
     bool mouseCaptured,
     bool flightMode,
+    const Camera* renderCamera,
+    const SteamOnlineState* steamOnline,
+    const OnlineSettings* onlineSettings,
+    OnlineSessionRole onlineRole,
+    int remotePeerCount,
+    const std::vector<HudPeerIndicator>* peerIndicators,
     const std::vector<std::string>* extraDebugLines = nullptr)
 {
     const float ground = sampleGroundHeight(plane.pos.x, plane.pos.z, terrainContext);
@@ -12617,6 +12798,43 @@ void drawHud(
             style.heightScale * uiMultiplier,
             style.x * static_cast<float>(width),
             style.y * static_cast<float>(height));
+    };
+
+    const auto projectWorldToScreen = [&](const Vec3& worldPos, float* depthOut = nullptr) -> std::optional<Vec2> {
+        if (renderCamera == nullptr || height <= 0 || width <= 0) {
+            return std::nullopt;
+        }
+
+        const Vec3 relative = worldPos - renderCamera->pos;
+        const Vec3 right = rightFromRotation(renderCamera->rot);
+        const Vec3 up = upFromRotation(renderCamera->rot);
+        const Vec3 forward = forwardFromRotation(renderCamera->rot);
+        const float viewX = dot(relative, right);
+        const float viewY = dot(relative, up);
+        const float viewZ = dot(relative, forward);
+        if (depthOut != nullptr) {
+            *depthOut = viewZ;
+        }
+        if (viewZ <= renderCamera->nearClipMeters) {
+            return std::nullopt;
+        }
+
+        const float aspect = static_cast<float>(width) / static_cast<float>(height);
+        const float tanHalfFov = std::tan(renderCamera->fovRadians * 0.5f);
+        if (tanHalfFov <= 1.0e-5f) {
+            return std::nullopt;
+        }
+
+        const float ndcX = viewX / (viewZ * tanHalfFov * aspect);
+        const float ndcY = viewY / (viewZ * tanHalfFov);
+        if (std::fabs(ndcX) > 1.15f || std::fabs(ndcY) > 1.15f) {
+            return std::nullopt;
+        }
+
+        return Vec2 {
+            (ndcX * 0.5f + 0.5f) * static_cast<float>(width),
+            (0.5f - ndcY * 0.5f) * static_cast<float>(height)
+        };
     };
 
     const auto drawInfoPanel = [&]() {
@@ -12641,6 +12859,37 @@ void drawHud(
             lines.push_back(std::string("Vertical Speed: ") + std::to_string(static_cast<int>(std::round(plane.vel.y * 3.6f))) + " kph");
         }
         lines.push_back(std::string("Wind: ") + std::to_string(static_cast<int>(std::round(windState.speed))) + " u/s @ " + std::to_string(static_cast<int>(std::round(windState.angle * 57.29578f))));
+        if (steamOnline != nullptr && (onlineRole != OnlineSessionRole::Offline || steamOnline->joinRequested || !steamOnline->lobbyId.empty())) {
+            lines.push_back("Online: " + formatOnlineSessionRoleLabel(onlineRole) + " | peers " + std::to_string(std::max(0, remotePeerCount)));
+            std::string steamLine = "Steam: " + steamOnline->status;
+            if (!steamOnline->lobbyId.empty()) {
+                steamLine += " | #" + steamOnline->lobbyId;
+            }
+            if (steamOnline->memberCount > 0) {
+                steamLine += " | " + std::to_string(steamOnline->memberCount);
+                if (steamOnline->maxPlayers > 0) {
+                    steamLine += "/" + std::to_string(steamOnline->maxPlayers);
+                }
+            }
+            lines.push_back(std::move(steamLine));
+
+            const std::string hostLabel = formatSteamIdentityLabel(steamOnline->hostPersonaName, steamOnline->hostSteamId);
+            if (!hostLabel.empty()) {
+                lines.push_back("Lobby Host: " + hostLabel);
+            }
+            if (onlineSettings != nullptr) {
+                lines.push_back(
+                    std::string("Radio: Ch ") +
+                    std::to_string(normalizeRadioChannel(onlineSettings->radioChannel)) +
+                    " " + sanitizeCallsign(onlineSettings->callsign) +
+                    (onlineSettings->voiceEnabled
+                        ? (onlineSettings->pushToTalk ? " | PTT" : " | Open")
+                        : " | Voice Off"));
+            }
+            if (!steamOnline->pendingLobbyId.empty()) {
+                lines.push_back("Invite Pending: #" + steamOnline->pendingLobbyId);
+            }
+        }
         if (hudSettings.showGeoInfo) {
             lines.push_back(latBuffer);
             lines.push_back(lonBuffer);
@@ -12954,11 +13203,54 @@ void drawHud(
         canvas.resetTransform();
     };
 
+    const auto drawPeerIndicatorsOverlay = [&]() {
+        if (!hudSettings.showPeerIndicators || renderCamera == nullptr || peerIndicators == nullptr || peerIndicators->empty()) {
+            return;
+        }
+
+        const HudColor background = makeHudColor(hudSettings.infoPanel.backgroundColor, 192);
+        const HudColor text = makeHudColor(hudSettings.infoPanel.textColor, 255);
+        const HudColor accent = makeHudColor(hudSettings.infoPanel.accentColor, 255);
+        const HudColor txAccent = makeHudColor(255, 112, 90, 255);
+
+        for (const HudPeerIndicator& peer : *peerIndicators) {
+            const Vec3 anchor = peer.worldPos + Vec3 { 0.0f, 3.0f, 0.0f };
+            float depth = 0.0f;
+            const std::optional<Vec2> projected = projectWorldToScreen(anchor, &depth);
+            if (!projected.has_value()) {
+                continue;
+            }
+
+            const std::string callsign = sanitizeCallsign(peer.callsign);
+            const std::string title = callsign.empty() ? std::string("Pilot") : callsign;
+            const float distanceMeters = length(peer.worldPos - plane.pos);
+            std::string detail = "Ch " + std::to_string(normalizeRadioChannel(peer.radioChannel));
+            if (peer.transmitting) {
+                detail += " TX";
+            }
+            detail += " | " + std::to_string(static_cast<int>(std::round(distanceMeters))) + "m";
+
+            const float boxW = std::max(canvas.textWidth(title), canvas.textWidth(detail)) + 14.0f;
+            const float boxH = 30.0f;
+            const float boxX = clamp(projected->x - (boxW * 0.5f), 4.0f, static_cast<float>(width) - boxW - 4.0f);
+            const float boxY = clamp(projected->y - 40.0f, 4.0f, static_cast<float>(height) - boxH - 4.0f);
+            const HudColor border = peer.transmitting ? txAccent : accent;
+
+            canvas.fillRect(boxX, boxY, boxW, boxH, background);
+            canvas.strokeRect(boxX, boxY, boxW, boxH, border);
+            canvas.text(boxX + 6.0f, boxY + 6.0f, title, text);
+            canvas.text(boxX + 6.0f, boxY + 18.0f, detail, peer.transmitting ? txAccent : text);
+            canvas.line(projected->x, boxY + boxH, projected->x, projected->y, border);
+            canvas.point(projected->x, projected->y, border);
+        }
+    };
+
     drawInfoPanel();
     drawStyledSpeedometer();
     drawDebugFooter();
     drawStyledControls();
     drawStyledMap();
+    drawPeerIndicatorsOverlay();
     drawStyledCrosshair();
 }
 
@@ -13415,7 +13707,7 @@ bool startGameSession(
 }  // namespace
 
 #if 0
-int main(int, char**)
+int main(int argc, char** argv)
 {
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
         SDL_Log("SDL_Init failed: %s", SDL_GetError());
@@ -14288,7 +14580,7 @@ int main(int, char**)
 }
 #endif
 
-int main(int, char**)
+int main(int argc, char** argv)
 {
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
         SDL_Log("SDL_Init failed: %s", SDL_GetError());
@@ -14432,6 +14724,13 @@ int main(int, char**)
         SDL_Log("Native HUD preference load failed: %s", hudPreferenceError.c_str());
     }
     syncUiStateFromHud(boot.uiState, boot.hud);
+    const std::uint64_t bootConnectLobbyId = parseConnectLobbyLaunchArgument(argc, argv);
+    if (bootConnectLobbyId != 0) {
+        boot.onlineSettings.steamEnabled = true;
+        boot.onlineSettings.multiplayerEnabled = true;
+        boot.onlineSettings.sessionMode = "client";
+        clampOnlineSettings(boot.onlineSettings);
+    }
     boot.steamBuildConfig = defaultSteamBuildConfig();
     boot.steamBuildConfig.requested = boot.onlineSettings.steamEnabled;
     std::string steamStatus;
@@ -14439,6 +14738,14 @@ int main(int, char**)
     boot.steamOnline = snapshotSteamOnlineState(boot.steamController);
     if (!steamStatus.empty()) {
         boot.steamOnline.status = steamStatus;
+    }
+    if (bootConnectLobbyId != 0) {
+        std::string joinStatus;
+        boot.steamController.queuePendingJoinRequest(bootConnectLobbyId, &joinStatus);
+        boot.steamOnline = snapshotSteamOnlineState(boot.steamController);
+        if (!joinStatus.empty()) {
+            boot.steamOnline.status = joinStatus;
+        }
     }
 
     if (!bootStage("Applying Display", 0.32f, "Applying display mode and resolution.")) {
@@ -15138,6 +15445,11 @@ int main(int, char**)
         }
     };
 
+    if (bootConnectLobbyId != 0) {
+        setPauseStatus(menuState, "Joining Steam lobby invite from launch request.", bootStartSeconds, 4.5f);
+        startFlight(bootStartSeconds);
+    }
+
     auto applyMenuCommand = [&](MenuCommand command, float nowSeconds) {
         switch (command) {
         case MenuCommand::StartFlight:
@@ -15408,8 +15720,6 @@ int main(int, char**)
             } else if (menuState.settingsSubTab == SettingsSubTab::Online && menuState.selectedIndex == 3) {
                 if (!onlineActionRowEnabled(3, boot.onlineSettings, boot.steamOnline, menuState.mode != MenuMode::MainMenu)) {
                     setPauseStatus(menuState, "No pending Steam lobby invite is waiting.", nowSeconds, 3.0f);
-                } else if (menuState.mode != MenuMode::MainMenu) {
-                    setPauseStatus(menuState, "Return to main menu before joining a different Steam lobby.", nowSeconds, 3.4f);
                 } else {
                     boot.onlineSettings.multiplayerEnabled = true;
                     boot.onlineSettings.sessionMode = "client";
@@ -16765,10 +17075,17 @@ int main(int, char**)
             const RendererMemoryStats rendererStats = nativeRenderer.memoryStats();
             const TerrainStreamStats terrainStreamStats = snapshotTerrainStreamStats(currentTerrainStream());
             int remotePeerCount = 0;
+            std::vector<HudPeerIndicator> hudPeerIndicators;
             if (session->onlineRole == OnlineSessionRole::Host) {
                 for (const auto& [playerId, player] : session->hostedServer.players()) {
-                    if (playerId != 1 && player.connected) {
+                    if (playerId != 1 && player.connected && player.hasReceivedHello) {
                         ++remotePeerCount;
+                        hudPeerIndicators.push_back({
+                            player.actor.pos,
+                            player.avatar.callsign,
+                            player.avatar.radioChannel,
+                            player.avatar.radioTx
+                        });
                     }
                 }
             } else if (session->onlineRole == OnlineSessionRole::Client) {
@@ -16776,6 +17093,12 @@ int main(int, char**)
                     (void)peerId;
                     if (peer.connected) {
                         ++remotePeerCount;
+                        hudPeerIndicators.push_back({
+                            peer.displayPos,
+                            peer.avatar.callsign,
+                            peer.avatar.radioChannel,
+                            peer.avatar.radioTx
+                        });
                     }
                 }
             }
@@ -17098,6 +17421,12 @@ int main(int, char**)
                 fpsSmoothed,
                 mouseCaptured,
                 session->flightMode,
+                &renderCamera,
+                &session->steamOnline,
+                &boot.onlineSettings,
+                session->onlineRole,
+                remotePeerCount,
+                &hudPeerIndicators,
                 &runtimeDebugLines);
             if (menuVisible()) {
                 drawMenuOverlay(

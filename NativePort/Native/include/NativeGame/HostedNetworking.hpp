@@ -106,10 +106,18 @@ struct SteamOnlineState {
     bool available = false;
     bool initialized = false;
     bool joinRequested = false;
+    bool overlayEnabled = false;
+    bool transportReady = false;
+    int memberCount = 0;
+    int maxPlayers = 0;
     std::string status = "Offline";
     std::string lobbyId;
     std::string pendingLobbyId;
     std::string hostSteamId;
+    std::string localSteamId;
+    std::string localPersonaName;
+    std::string hostPersonaName;
+    std::vector<std::string> memberNames;
     std::shared_ptr<INetTransport> transport;
 };
 

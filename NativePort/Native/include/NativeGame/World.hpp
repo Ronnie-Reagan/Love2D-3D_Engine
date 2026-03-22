@@ -1068,8 +1068,8 @@ inline void addColoredQuad(Model& model, const Vec3& a, const Vec3& b, const Vec
     model.vertexNormals.push_back(normal);
     model.vertexNormals.push_back(normal);
     model.vertexNormals.push_back(normal);
-    addFace(model, { base, base + 2, base + 1 }, color);
-    addFace(model, { base, base + 3, base + 2 }, color);
+    addFace(model, { base, base + 1, base + 2 }, color);
+    addFace(model, { base, base + 2, base + 3 }, color);
 }
 
 inline void appendModel(Model& target, const Model& source)
@@ -1168,9 +1168,9 @@ inline void appendTerrainWater(Model& model, const TerrainFieldContext& context,
             addColoredQuad(
                 model,
                 { x0, w00, z0 },
-                { x1, w10, z0 },
-                { x1, w11, z1 },
                 { x0, w01, z1 },
+                { x1, w11, z1 },
+                { x1, w10, z0 },
                 color);
         }
     }

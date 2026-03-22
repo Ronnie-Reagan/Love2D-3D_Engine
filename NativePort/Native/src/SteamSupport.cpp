@@ -54,6 +54,15 @@ bool steamApisReady()
     return SteamUser() != nullptr && SteamNetworkingSockets() != nullptr && SteamNetworkingUtils() != nullptr;
 }
 
+std::string steamPersonaName(CSteamID steamId)
+{
+    if (steamId.IsValid() == false || SteamFriends() == nullptr) {
+        return {};
+    }
+    const char* name = SteamFriends()->GetFriendPersonaName(steamId);
+    return name != nullptr ? std::string(name) : std::string {};
+}
+
 std::string makeSessionNonce()
 {
     std::random_device rd;
@@ -653,12 +662,21 @@ bool SteamRuntime::initialize(const SteamBuildConfig& config, std::string* statu
         state_.runningAppId = static_cast<std::uint32_t>(SteamUtils()->GetAppID());
         state_.overlayEnabled = SteamUtils()->IsOverlayEnabled();
     }
+    if (SteamUser() != nullptr) {
+        const CSteamID localSteamId = SteamUser()->GetSteamID();
+        state_.localSteamId = localSteamId.ConvertToUint64();
+        state_.personaName = steamPersonaName(localSteamId);
+    }
     if (steamApisReady()) {
         SteamNetworkingUtils()->InitRelayNetworkAccess();
         std::ostringstream stream;
         stream << "Steam initialized";
-        if (SteamUser() != nullptr) {
-            stream << " as " << SteamUser()->GetSteamID().ConvertToUint64();
+        if (state_.localSteamId != 0) {
+            if (!state_.personaName.empty()) {
+                stream << " as " << state_.personaName << " (" << state_.localSteamId << ")";
+            } else {
+                stream << " as " << state_.localSteamId;
+            }
         }
         if (state_.runningAppId != 0 && state_.runningAppId != state_.appId) {
             stream << " (running app " << state_.runningAppId << ")";
@@ -710,6 +728,11 @@ void SteamRuntime::pump()
             state_.runningAppId = static_cast<std::uint32_t>(SteamUtils()->GetAppID());
             state_.overlayEnabled = SteamUtils()->IsOverlayEnabled();
         }
+        if (SteamUser() != nullptr) {
+            const CSteamID localSteamId = SteamUser()->GetSteamID();
+            state_.localSteamId = localSteamId.ConvertToUint64();
+            state_.personaName = steamPersonaName(localSteamId);
+        }
     }
 #endif
 }
@@ -723,13 +746,13 @@ std::shared_ptr<INetTransport> createSteamHostTransport(int virtualPort, std::st
     if (statusText != nullptr && statusText->empty()) {
         *statusText = "Steam host transport unavailable.";
     }
-    return std::make_shared<NullTransport>();
+    return {};
 #else
     (void)virtualPort;
     if (statusText != nullptr) {
         *statusText = "Steamworks not compiled; host transport unavailable.";
     }
-    return std::make_shared<NullTransport>();
+    return {};
 #endif
 }
 
@@ -742,14 +765,14 @@ std::shared_ptr<INetTransport> createSteamClientTransport(std::uint64_t hostStea
     if (statusText != nullptr && statusText->empty()) {
         *statusText = "Steam client transport unavailable.";
     }
-    return std::make_shared<NullTransport>();
+    return {};
 #else
     (void)hostSteamId;
     (void)virtualPort;
     if (statusText != nullptr) {
         *statusText = "Steamworks not compiled; client transport unavailable.";
     }
-    return std::make_shared<NullTransport>();
+    return {};
 #endif
 }
 
@@ -802,6 +825,50 @@ struct SteamOnlineController::Impl {
     CCallbackManual<Impl, LobbyDataUpdate_t> lobbyDataUpdateCallback;
     CCallResult<Impl, LobbyCreated_t> lobbyCreatedResult;
     CCallResult<Impl, LobbyEnter_t> lobbyEnteredResult;
+
+    void refreshLobbyMemberSnapshot()
+    {
+        lobby.memberCount = 0;
+        lobby.memberNames.clear();
+        lobby.localPersonaName = runtime.state().personaName;
+        lobby.hostPersonaName.clear();
+
+        if (lobby.hostSteamId != 0) {
+            lobby.hostPersonaName = steamPersonaName(CSteamID(lobby.hostSteamId));
+        }
+
+        if (SteamMatchmaking() == nullptr || lobby.lobbyId == 0) {
+            return;
+        }
+
+        const CSteamID lobbySteamId(lobby.lobbyId);
+        lobby.memberCount = std::max(0, SteamMatchmaking()->GetNumLobbyMembers(lobbySteamId));
+        if (lobby.maxPlayers <= 0) {
+            lobby.maxPlayers = std::max(1, SteamMatchmaking()->GetLobbyMemberLimit(lobbySteamId));
+        }
+        if (lobby.hostSteamId == 0) {
+            lobby.hostSteamId = SteamMatchmaking()->GetLobbyOwner(lobbySteamId).ConvertToUint64();
+        }
+        if (lobby.hostSteamId != 0 && lobby.hostPersonaName.empty()) {
+            lobby.hostPersonaName = steamPersonaName(CSteamID(lobby.hostSteamId));
+        }
+
+        lobby.memberNames.reserve(static_cast<std::size_t>(lobby.memberCount));
+        for (int index = 0; index < lobby.memberCount; ++index) {
+            const CSteamID memberSteamId = SteamMatchmaking()->GetLobbyMemberByIndex(lobbySteamId, index);
+            std::string name = steamPersonaName(memberSteamId);
+            if (name.empty()) {
+                name = std::to_string(memberSteamId.ConvertToUint64());
+            }
+            if (memberSteamId.ConvertToUint64() == lobby.hostSteamId) {
+                name += " [host]";
+            }
+            if (memberSteamId.ConvertToUint64() == lobby.localSteamId) {
+                name += " [you]";
+            }
+            lobby.memberNames.push_back(std::move(name));
+        }
+    }
 
     void registerCallbacks()
     {
@@ -957,6 +1024,7 @@ struct SteamOnlineController::Impl {
 
         lobby.transportReady = lobby.transport->ready();
         lobby.status = lobby.transportReady ? "Joined Steam lobby" : "Connecting to Steam host";
+        refreshLobbyMemberSnapshot();
         return true;
     }
 
@@ -985,6 +1053,7 @@ struct SteamOnlineController::Impl {
     {
         runtime.pump();
         lobby.transportReady = lobby.transport != nullptr && lobby.transport->ready();
+        refreshLobbyMemberSnapshot();
         if (lobby.role == SteamLobbyState::Role::Host && lobby.lobbyId != 0 && lobby.transportReady) {
             publishRichPresence();
         } else if (lobby.role == SteamLobbyState::Role::Host && lobby.lobbyId != 0) {
@@ -1207,6 +1276,7 @@ struct SteamOnlineController::Impl {
             (void)writeLobbyData(lobbySteamId, "voice_enabled", lobby.voiceEnabled ? "1" : "0");
             (void)writeLobbyData(lobbySteamId, "session_nonce", lobby.sessionNonce.empty() ? makeSessionNonce() : lobby.sessionNonce);
         }
+        refreshLobbyMemberSnapshot();
         publishRichPresence();
     }
 
@@ -1222,6 +1292,7 @@ struct SteamOnlineController::Impl {
         lobby.lobbyId = result->m_ulSteamIDLobby;
         lobby.localSteamId = SteamUser() != nullptr ? SteamUser()->GetSteamID().ConvertToUint64() : 0;
         lobby.lobbyReady = false;
+        refreshLobbyMemberSnapshot();
         clearRichPresence();
         if (!finalizeJoinedLobby(lobbySteamId)) {
             (void)SteamMatchmaking()->RequestLobbyData(lobbySteamId);
@@ -1252,6 +1323,9 @@ struct SteamOnlineController::Impl {
     {
         if (callback == nullptr || callback->m_ulSteamIDLobby == 0 || callback->m_bSuccess == 0) {
             return;
+        }
+        if (lobby.lobbyId == callback->m_ulSteamIDLobby) {
+            refreshLobbyMemberSnapshot();
         }
         if (lobby.role != SteamLobbyState::Role::Client || lobby.lobbyId != callback->m_ulSteamIDLobby || lobby.lobbyReady) {
             return;
