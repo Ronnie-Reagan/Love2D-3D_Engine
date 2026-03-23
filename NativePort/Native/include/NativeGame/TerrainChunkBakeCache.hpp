@@ -32,9 +32,16 @@ struct TerrainChunkData {
     int gridWidth = 0;
     int gridHeight = 0;
     std::vector<float> surfaceHeights;
+    std::vector<float> wetnessWeights;
     std::vector<float> snowWeights;
+    std::vector<float> rockWeights;
+    std::vector<float> biomeWeights;
     std::vector<float> waterHeights;
     std::vector<float> waterWeights;
+    std::vector<float> hardnessWeights;
+    std::vector<float> resourceWeights;
+    std::vector<float> erosionWeights;
+    std::vector<float> flowWeights;
 };
 
 struct CompiledTerrainChunk {
@@ -48,7 +55,7 @@ struct CompiledTerrainChunk {
 
 class TerrainChunkBakeCache {
 public:
-    static constexpr std::uint32_t kFormatVersion = 3u;
+    static constexpr std::uint32_t kFormatVersion = 5u;
 
     static std::optional<TerrainChunkBakeCache> open(const std::filesystem::path& rootPath, std::string* error = nullptr)
     {
@@ -321,9 +328,16 @@ private:
         writeValue(output, data.gridWidth);
         writeValue(output, data.gridHeight);
         writeFloatVector(output, data.surfaceHeights);
+        writeFloatVector(output, data.wetnessWeights);
         writeFloatVector(output, data.snowWeights);
+        writeFloatVector(output, data.rockWeights);
+        writeFloatVector(output, data.biomeWeights);
         writeFloatVector(output, data.waterHeights);
         writeFloatVector(output, data.waterWeights);
+        writeFloatVector(output, data.hardnessWeights);
+        writeFloatVector(output, data.resourceWeights);
+        writeFloatVector(output, data.erosionWeights);
+        writeFloatVector(output, data.flowWeights);
     }
 
     static bool readTerrainChunkData(std::istream& input, TerrainChunkData& data)
@@ -342,9 +356,16 @@ private:
             readValue(input, data.gridWidth) &&
             readValue(input, data.gridHeight) &&
             readFloatVector(input, data.surfaceHeights) &&
+            readFloatVector(input, data.wetnessWeights) &&
             readFloatVector(input, data.snowWeights) &&
+            readFloatVector(input, data.rockWeights) &&
+            readFloatVector(input, data.biomeWeights) &&
             readFloatVector(input, data.waterHeights) &&
-            readFloatVector(input, data.waterWeights);
+            readFloatVector(input, data.waterWeights) &&
+            readFloatVector(input, data.hardnessWeights) &&
+            readFloatVector(input, data.resourceWeights) &&
+            readFloatVector(input, data.erosionWeights) &&
+            readFloatVector(input, data.flowWeights);
     }
 
     static void writeMaterial(std::ostream& output, const Material& material)

@@ -5,6 +5,7 @@
 #include "NativeGame/NetTransport.hpp"
 
 #include <functional>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <string>
@@ -70,10 +71,38 @@ struct HostedPlayerState {
     float walkPitch = 0.0f;
     AvatarManifest avatar = defaultAvatarManifest();
     NetPlayerInput input {};
+    double inputTimeSeconds = 0.0;
     FlightState actor {};
     FlightRuntimeState runtime {};
     AreaOfInterestState aoi {};
     BlobSyncState blobSync = createBlobSyncState();
+    std::map<int, NetPlayerInput> pendingInputs;
+};
+
+struct ClientPredictedState {
+    int tick = 0;
+    bool flightMode = true;
+    FlightState plane {};
+    FlightRuntimeState runtime {};
+    float walkYaw = 0.0f;
+    float walkPitch = 0.0f;
+};
+
+struct LocalAuthoritativeState {
+    bool valid = false;
+    bool dirty = false;
+    int ack = 0;
+    int simTick = 0;
+    bool flightMode = true;
+    Vec3 pos {};
+    Quat rot = quatIdentity();
+    Vec3 vel {};
+    Vec3 angVel {};
+    float throttle = 0.0f;
+    float yokePitch = 0.0f;
+    float yokeYaw = 0.0f;
+    float yokeRoll = 0.0f;
+    AvatarManifest avatar = defaultAvatarManifest();
 };
 
 struct ClientReplicationState {
@@ -88,16 +117,23 @@ struct ClientReplicationState {
     AvatarManifest localAvatar = defaultAvatarManifest();
     AoiSubscription lastAoiSubscription {};
     bool hasAoiSubscription = false;
+    int nextOutboundTick = 1;
     int lastAckTick = 0;
+    int pendingControlTick = 0;
     double nextHelloAt = 0.0;
     double nextInputAt = 0.0;
     WorldInfoSnapshot lastWorldInfo {};
     TerrainParams mirroredTerrain = defaultTerrainParams();
+    bool mirrorTerrainDirty = false;
+    LocalAuthoritativeState localAuthoritative {};
     BlobSyncState blobSync = createBlobSyncState();
     AvatarBlobCache blobCache {};
     VoiceSessionState voice {};
     std::unordered_map<int, RemotePeerState> peers;
+    NetGameplayStatePacket gameplayState {};
+    bool gameplayStateDirty = false;
     std::map<int, NetPlayerInput> pendingInputs;
+    std::map<int, ClientPredictedState> predictedStates;
     std::vector<std::string> outboundReliable;
     std::vector<std::string> outboundUnreliable;
 };
@@ -110,14 +146,19 @@ struct SteamOnlineState {
     bool transportReady = false;
     int memberCount = 0;
     int maxPlayers = 0;
+    int discoveredLobbyCount = 0;
+    int selectedDiscoveredLobbyIndex = -1;
     std::string status = "Offline";
     std::string lobbyId;
     std::string pendingLobbyId;
     std::string hostSteamId;
     std::string localSteamId;
+    std::string selectedDiscoveredLobbyId;
+    std::string selectedDiscoveredLobbyLabel;
     std::string localPersonaName;
     std::string hostPersonaName;
     std::vector<std::string> memberNames;
+    std::vector<std::string> discoveredLobbyLabels;
     std::shared_ptr<INetTransport> transport;
 };
 
@@ -171,8 +212,8 @@ public:
         float walkPitch,
         const AvatarManifest& avatar);
 
-    void serviceIncoming(const TerrainParams& terrainParams, WorldStore* worldStore);
-    void update(double nowSeconds, float dt, const TerrainFieldContext& terrainContext, const FlightConfig& flightConfig, WorldStore* worldStore);
+    void serviceIncoming(const TerrainParams& terrainParams, const TerrainFieldContext& terrainContext, WorldStore* worldStore);
+    void update(double nowSeconds, float dt, const TerrainFieldContext& terrainContext, const FlightConfig& flightConfig, Vec3 wind, WorldStore* worldStore);
     bool addCrater(const TerrainCrater& crater, WorldStore* worldStore, const TerrainParams& terrainParams);
     void queueLocalVoiceFrame(int channel, std::string_view compressedFrame);
     [[nodiscard]] std::vector<std::string> drainLocalVoiceFrames();
@@ -198,8 +239,8 @@ private:
     void broadcastAvatarManifest(const HostedPlayerState& player, NetPeerId exceptPeer = 0);
     void broadcastSnapshots(double nowSeconds);
     void broadcastCloudSnapshot(double nowSeconds);
-    void handlePacket(const NetEvent& event, const TerrainParams& terrainParams, WorldStore* worldStore);
-    void simulateRemotePlayers(float dt, const TerrainFieldContext& terrainContext, const FlightConfig& flightConfig);
+    void handlePacket(const NetEvent& event, const TerrainParams& terrainParams, const TerrainFieldContext& terrainContext, WorldStore* worldStore);
+    void simulateRemotePlayers(float dt, const TerrainFieldContext& terrainContext, const FlightConfig& flightConfig, Vec3 wind);
     void fulfillBlobRequest(NetPeerId peerId, std::string_view kind, std::string_view hash);
 };
 
@@ -212,10 +253,25 @@ void serviceClientReplication(
 
 void enqueueClientHello(ClientReplicationState& client, const AvatarManifest& avatar);
 void enqueueClientInput(ClientReplicationState& client, const NetPlayerInput& input);
+void enqueueClientModeSwitch(ClientReplicationState& client, const ModeSwitchPacket& modeSwitch);
+void enqueueClientResetFlight(ClientReplicationState& client, const ResetFlightPacket& reset);
 void enqueueClientAoiSubscription(ClientReplicationState& client, const AoiSubscription& subscription);
 void flushClientOutbound(ClientReplicationState& client);
 
 namespace HostedNetworkingDetail {
+
+inline void networkStdoutLog(std::string_view message)
+{
+    std::cout << "[net] " << message << std::endl;
+}
+
+inline float sanitizeNetInputFrameDt(float value)
+{
+    if (!std::isfinite(value)) {
+        return 1.0f / 60.0f;
+    }
+    return std::clamp(value, 1.0f / 240.0f, 0.05f);
+}
 
 inline float distanceSq2(const Vec3& a, const Vec3& b)
 {
@@ -230,6 +286,14 @@ inline Quat composeWalkingRotation(float yaw, float pitch)
     const Vec3 right = rotateVector(yawQuat, { 1.0f, 0.0f, 0.0f });
     const Quat pitchQuat = quatFromAxisAngle(right, clamp(pitch, radians(-89.0f), radians(89.0f)));
     return quatNormalize(quatMultiply(pitchQuat, yawQuat));
+}
+
+inline void syncWalkingLookFromRotation(const Quat& rotation, float& walkYaw, float& walkPitch)
+{
+    const Vec3 forward = forwardFromRotation(rotation);
+    const float flatMagnitude = std::sqrt((forward.x * forward.x) + (forward.z * forward.z));
+    walkPitch = clamp(std::atan2(forward.y, std::max(flatMagnitude, 1.0e-6f)), radians(-89.0f), radians(89.0f));
+    walkYaw = wrapAngle(std::atan2(forward.x, forward.z));
 }
 
 inline void stepWalkingAuthoritative(
@@ -305,6 +369,56 @@ inline void resetRemoteFlightState(FlightState& plane, FlightRuntimeState& runti
     plane.collisionRadius = 3.2f;
 }
 
+inline void applyWalkingAuthoritativeState(
+    HostedPlayerState& player,
+    const TerrainFieldContext& terrainContext,
+    const Vec3& requestedPos,
+    float walkYaw,
+    float walkPitch)
+{
+    player.flightMode = false;
+    player.walkYaw = wrapAngle(walkYaw);
+    player.walkPitch = clamp(walkPitch, radians(-89.0f), radians(89.0f));
+    player.actor.pos = requestedPos;
+    const float ground = sampleSurfaceHeight(requestedPos.x, requestedPos.z, terrainContext);
+    if (player.actor.pos.y < ground + 1.8f) {
+        player.actor.pos.y = ground + 1.8f;
+    }
+    player.actor.rot = composeWalkingRotation(player.walkYaw, player.walkPitch);
+    player.actor.vel = {};
+    player.actor.flightVel = {};
+    player.actor.flightAngVel = {};
+    player.actor.yoke = {};
+    player.actor.throttle = 0.0f;
+    player.actor.onGround = player.actor.pos.y <= ground + 1.81f;
+    player.runtime.crashed = false;
+    player.runtime.hasPendingCrash = false;
+    player.avatar.role = "walking";
+    player.input.role = "walking";
+}
+
+inline void resetAuthoritativeFlightState(
+    HostedPlayerState& player,
+    const TerrainFieldContext& terrainContext,
+    float x,
+    float z)
+{
+    player.actor = {};
+    player.runtime = {};
+    const float ground = sampleSurfaceHeight(x, z, terrainContext);
+    player.actor.pos = { x, ground + 190.0f, z };
+    player.actor.rot = quatNormalize(quatFromAxisAngle({ 1.0f, 0.0f, 0.0f }, radians(1.5f)));
+    player.actor.flightVel = { 0.0f, 0.0f, 72.0f };
+    player.actor.vel = player.actor.flightVel;
+    player.actor.throttle = 0.64f;
+    player.actor.collisionRadius = 3.2f;
+    player.actor.onGround = false;
+    player.flightMode = true;
+    syncWalkingLookFromRotation(player.actor.rot, player.walkYaw, player.walkPitch);
+    player.avatar.role = "plane";
+    player.input.role = "plane";
+}
+
 inline std::string voiceFrameChannelKey(int channel)
 {
     return "voice:" + std::to_string(normalizeRadioChannel(channel));
@@ -326,6 +440,14 @@ inline AvatarManifest avatarFromLocalVisuals(const AvatarManifest& current, cons
     avatar.plane = update.plane;
     avatar.walking = update.walking;
     return avatar;
+}
+
+inline void applyReplicatedFlightControlState(FlightState& actor, const NetPlayerInput& input)
+{
+    actor.throttle = clamp(input.throttle, 0.0f, 1.0f);
+    actor.yoke.pitch = clamp(input.yokePitch, -1.0f, 1.0f);
+    actor.yoke.yaw = clamp(input.yokeYaw, -1.0f, 1.0f);
+    actor.yoke.roll = clamp(input.yokeRoll, -1.0f, 1.0f);
 }
 
 }  // namespace HostedNetworkingDetail
@@ -397,6 +519,11 @@ inline void HostedWorldServer::sendWorldBootstrap(HostedPlayerState& player, Wor
             true);
     }
     sendChunksForPlayer(player, worldStore, "hello");
+    log(
+        "[net] sent JOIN_OK/WORLD_INFO/WORLD_SYNC to player " +
+        std::to_string(player.id) +
+        " peer " +
+        std::to_string(player.peerId));
 }
 
 inline void HostedWorldServer::sendChunksForPlayer(HostedPlayerState& player, WorldStore* worldStore, std::string_view reason)
@@ -476,7 +603,11 @@ inline void HostedWorldServer::fulfillBlobRequest(NetPeerId peerId, std::string_
     }
 }
 
-inline void HostedWorldServer::handlePacket(const NetEvent& event, const TerrainParams& terrainParams, WorldStore* worldStore)
+inline void HostedWorldServer::handlePacket(
+    const NetEvent& event,
+    const TerrainParams& terrainParams,
+    const TerrainFieldContext& terrainContext,
+    WorldStore* worldStore)
 {
     HostedPlayerState& player = ensurePlayerForPeer(event.peerId);
     const std::string type = HostedNetworkingDetail::packetType(event.payload);
@@ -486,17 +617,120 @@ inline void HostedWorldServer::handlePacket(const NetEvent& event, const Terrain
         if (avatar.has_value()) {
             player.avatar = *avatar;
         }
+        log(
+            "[net] received HELLO from player " +
+            std::to_string(player.id) +
+            " peer " +
+            std::to_string(event.peerId) +
+            " callsign " +
+            sanitizeCallsign(player.avatar.callsign));
         sendWorldBootstrap(player, worldStore, terrainParams);
         broadcastAvatarManifest(player, player.peerId);
+        return;
+    }
+    if (type == "MODE_SWITCH") {
+        if (const auto modeSwitch = parseModeSwitchPacket(event.payload); modeSwitch.has_value()) {
+            player.hasReceivedInput = true;
+            player.input.tick = std::max(player.input.tick, modeSwitch->tick);
+            for (auto it = player.pendingInputs.begin(); it != player.pendingInputs.end();) {
+                if (it->first <= player.input.tick) {
+                    it = player.pendingInputs.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            if (sanitizeRole(modeSwitch->role) == "walking") {
+                HostedNetworkingDetail::applyWalkingAuthoritativeState(
+                    player,
+                    terrainContext,
+                    { modeSwitch->x, modeSwitch->y, modeSwitch->z },
+                    modeSwitch->walkYaw,
+                    modeSwitch->walkPitch);
+            } else {
+                HostedNetworkingDetail::resetAuthoritativeFlightState(
+                    player,
+                    terrainContext,
+                    modeSwitch->x,
+                    modeSwitch->z);
+            }
+            broadcastAvatarManifest(player, player.peerId);
+            log(
+                "[net] applied MODE_SWITCH for player " +
+                std::to_string(player.id) +
+                " role " +
+                sanitizeRole(modeSwitch->role) +
+                " tick " +
+                std::to_string(modeSwitch->tick));
+        }
+        return;
+    }
+    if (type == "RESET_FLIGHT") {
+        if (const auto reset = parseResetFlightPacket(event.payload); reset.has_value()) {
+            player.hasReceivedInput = true;
+            player.input.tick = std::max(player.input.tick, reset->tick);
+            for (auto it = player.pendingInputs.begin(); it != player.pendingInputs.end();) {
+                if (it->first <= player.input.tick) {
+                    it = player.pendingInputs.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            HostedNetworkingDetail::resetAuthoritativeFlightState(
+                player,
+                terrainContext,
+                reset->x,
+                reset->z);
+            broadcastAvatarManifest(player, player.peerId);
+            log(
+                "[net] applied RESET_FLIGHT for player " +
+                std::to_string(player.id) +
+                " tick " +
+                std::to_string(reset->tick));
+        }
         return;
     }
     if (type == "INPUT") {
         const auto input = parseInputPacket(event.payload);
         if (input.has_value()) {
+            if (player.hasReceivedInput && input->tick <= player.input.tick) {
+                return;
+            }
+            const bool wantsFlightMode = sanitizeRole(input->role) != "walking";
+            const bool modeChanged = wantsFlightMode != player.flightMode;
             player.hasReceivedInput = true;
             player.input = *input;
+            player.pendingInputs[input->tick] = *input;
+            while (player.pendingInputs.size() > 256u) {
+                player.pendingInputs.erase(player.pendingInputs.begin());
+            }
             player.avatar = HostedNetworkingDetail::avatarFromLocalVisuals(player.avatar, input->avatar);
-            player.flightMode = sanitizeRole(input->role) != "walking";
+            if (modeChanged) {
+                if (wantsFlightMode) {
+                    HostedNetworkingDetail::resetAuthoritativeFlightState(
+                        player,
+                        terrainContext,
+                        player.actor.pos.x,
+                        player.actor.pos.z);
+                } else {
+                    HostedNetworkingDetail::applyWalkingAuthoritativeState(
+                        player,
+                        terrainContext,
+                        player.actor.pos,
+                        input->walkYaw,
+                        input->walkPitch);
+                }
+                broadcastAvatarManifest(player, player.peerId);
+                log(
+                    "[net] applied INPUT fallback mode switch for player " +
+                    std::to_string(player.id) +
+                    " role " +
+                    sanitizeRole(input->role) +
+                    " tick " +
+                    std::to_string(input->tick));
+            } else {
+                player.flightMode = wantsFlightMode;
+                player.avatar.role = wantsFlightMode ? "plane" : "walking";
+            }
         }
         return;
     }
@@ -564,6 +798,24 @@ inline void HostedWorldServer::handlePacket(const NetEvent& event, const Terrain
         }
         return;
     }
+    if ((type == "CHUNK_STATE" || type == "CHUNK_PATCH") && worldStore != nullptr) {
+        if (const auto chunk = parseChunkPacket(event.payload); chunk.has_value() && worldStore->applyChunkState(*chunk)) {
+            worldStore->flushDirty(nullptr);
+            if (transport_) {
+                const std::optional<WorldChunkState> authoritativeChunk = worldStore->getChunkState(chunk->cx, chunk->cz);
+                if (authoritativeChunk.has_value()) {
+                    const std::string patchPacket = buildChunkPacket("CHUNK_PATCH", *authoritativeChunk, "client_edit");
+                    for (const auto& [otherId, other] : players_) {
+                        if (!other.connected || other.peerId == 0) {
+                            continue;
+                        }
+                        transport_->send(other.peerId, static_cast<int>(TransportLane::Control), patchPacket, true);
+                    }
+                }
+            }
+        }
+        return;
+    }
     if (type == "CRATER_EVENT" && worldStore != nullptr) {
         if (const auto crater = parseCraterPacket(event.payload); crater.has_value()) {
             (void)addCrater(*crater, worldStore, terrainParams);
@@ -571,7 +823,10 @@ inline void HostedWorldServer::handlePacket(const NetEvent& event, const Terrain
     }
 }
 
-inline void HostedWorldServer::serviceIncoming(const TerrainParams& terrainParams, WorldStore* worldStore)
+inline void HostedWorldServer::serviceIncoming(
+    const TerrainParams& terrainParams,
+    const TerrainFieldContext& terrainContext,
+    WorldStore* worldStore)
 {
     if (!transport_) {
         return;
@@ -605,56 +860,86 @@ inline void HostedWorldServer::serviceIncoming(const TerrainParams& terrainParam
             continue;
         }
         if (event.type == NetEvent::Type::Message) {
-            handlePacket(event, terrainParams, worldStore);
+            handlePacket(event, terrainParams, terrainContext, worldStore);
         }
     }
 }
 
-inline void HostedWorldServer::simulateRemotePlayers(float dt, const TerrainFieldContext& terrainContext, const FlightConfig& flightConfig)
+inline void HostedWorldServer::simulateRemotePlayers(
+    float dt,
+    const TerrainFieldContext& terrainContext,
+    const FlightConfig& flightConfig,
+    Vec3 wind)
 {
+    (void)dt;
+    constexpr int kMaxBufferedInputStepsPerUpdate = 32;
+
     for (auto& [playerId, player] : players_) {
         if (player.isLocalAuthority || !player.connected || !player.hasReceivedInput) {
             continue;
         }
 
-        if (sanitizeRole(player.input.role) == "walking") {
-            player.flightMode = false;
-            HostedNetworkingDetail::stepWalkingAuthoritative(player, dt, terrainContext);
-        } else {
-            player.flightMode = true;
-            InputState inputState {};
-            inputState.flightThrottleUp = player.input.flightThrottleUp;
-            inputState.flightThrottleDown = player.input.flightThrottleDown;
-            inputState.flightAirBrakes = player.input.flightAirBrakes;
-            inputState.flightAfterburner = player.input.flightAfterburner;
-            inputState.flightUseAnalogYoke = true;
-            inputState.flightYawLeft = player.input.yokeYaw < -0.12f;
-            inputState.flightYawRight = player.input.yokeYaw > 0.12f;
-            inputState.flightHoldYaw = std::fabs(player.input.yokeYaw) > 0.12f;
-            inputState.flightThrottleAnalog = clamp(player.input.throttle - player.actor.throttle, -1.0f, 1.0f);
-            inputState.flightPitchAnalog = player.input.yokePitch;
-            inputState.flightRollAnalog = player.input.yokeRoll;
-            player.actor.throttle = player.input.throttle;
-            player.actor.yoke.pitch = player.input.yokePitch;
-            player.actor.yoke.yaw = player.input.yokeYaw;
-            player.actor.yoke.roll = player.input.yokeRoll;
+        int processedSteps = 0;
+        while (!player.pendingInputs.empty() && processedSteps < kMaxBufferedInputStepsPerUpdate) {
+            auto nextInput = player.pendingInputs.begin();
+            player.input = nextInput->second;
+            player.pendingInputs.erase(nextInput);
 
-            FlightEnvironment environment {};
-            environment.wind = {};
-            environment.groundHeightAt = [&terrainContext](float x, float z) {
-                return sampleSurfaceHeight(x, z, terrainContext);
-            };
-            environment.waterHeightAt = [&terrainContext](float x, float z) {
-                return sampleWaterHeight(x, z, terrainContext);
-            };
-            environment.sampleSdf = [&terrainContext](float x, float y, float z) {
-                return sampleSdf(x, y, z, terrainContext);
-            };
-            environment.sampleNormal = [&terrainContext](float x, float y, float z) {
-                return sampleTerrainNormal(x, y, z, terrainContext);
-            };
-            environment.collisionRadius = player.actor.collisionRadius;
-            stepFlight(player.actor, player.runtime, dt, static_cast<float>(player.runtime.tick) / 60.0f, inputState, environment, flightConfig);
+            const float inputDt = HostedNetworkingDetail::sanitizeNetInputFrameDt(player.input.frameDt);
+            player.inputTimeSeconds += static_cast<double>(inputDt);
+
+            if (sanitizeRole(player.input.role) == "walking") {
+                player.flightMode = false;
+                HostedNetworkingDetail::stepWalkingAuthoritative(
+                    player,
+                    inputDt,
+                    terrainContext,
+                    std::clamp(player.input.walkMoveSpeed, 2.0f, 30.0f));
+            } else {
+                player.flightMode = true;
+                HostedNetworkingDetail::applyReplicatedFlightControlState(player.actor, player.input);
+                InputState inputState {};
+                inputState.flightAirBrakes = player.input.flightAirBrakes;
+                inputState.flightAfterburner = player.input.flightAfterburner;
+                inputState.flightUseAnalogYoke = true;
+                inputState.flightHoldYaw = true;
+                inputState.flightThrottleAnalog = 0.0f;
+                inputState.flightPitchAnalog = player.input.yokePitch;
+                inputState.flightRollAnalog = player.input.yokeRoll;
+
+                FlightEnvironment environment {};
+                environment.wind = wind;
+                environment.groundHeightAt = [&terrainContext](float x, float z) {
+                    return sampleSurfaceHeight(x, z, terrainContext);
+                };
+                environment.waterHeightAt = [&terrainContext](float x, float z) {
+                    return sampleWaterHeight(x, z, terrainContext);
+                };
+                environment.sampleSdf = [&terrainContext](float x, float y, float z) {
+                    return sampleSdf(x, y, z, terrainContext);
+                };
+                environment.sampleNormal = [&terrainContext](float x, float y, float z) {
+                    return sampleTerrainNormal(x, y, z, terrainContext);
+                };
+                environment.collisionRadius = player.actor.collisionRadius;
+                stepFlight(
+                    player.actor,
+                    player.runtime,
+                    inputDt,
+                    static_cast<float>(player.inputTimeSeconds),
+                    inputState,
+                    environment,
+                    flightConfig);
+            }
+
+            ++processedSteps;
+        }
+
+        if (player.pendingInputs.size() > static_cast<std::size_t>(kMaxBufferedInputStepsPerUpdate)) {
+            const auto latest = std::prev(player.pendingInputs.end());
+            const NetPlayerInput newest = latest->second;
+            player.pendingInputs.clear();
+            player.pendingInputs.emplace(newest.tick, newest);
         }
     }
 }
@@ -664,12 +949,34 @@ inline void enqueueClientHello(ClientReplicationState& client, const AvatarManif
     client.localAvatar = avatar;
     client.helloPending = true;
     client.outboundReliable.push_back(buildHelloPacket(avatar));
+    HostedNetworkingDetail::networkStdoutLog(
+        std::string("queued HELLO for callsign ") + sanitizeCallsign(avatar.callsign));
 }
 
 inline void enqueueClientInput(ClientReplicationState& client, const NetPlayerInput& input)
 {
     client.pendingInputs[input.tick] = input;
     client.outboundUnreliable.push_back(buildInputPacket(input));
+}
+
+inline void enqueueClientModeSwitch(ClientReplicationState& client, const ModeSwitchPacket& modeSwitch)
+{
+    client.pendingControlTick = std::max(client.pendingControlTick, modeSwitch.tick);
+    client.outboundReliable.push_back(buildModeSwitchPacket(modeSwitch));
+    HostedNetworkingDetail::networkStdoutLog(
+        std::string("queued MODE_SWITCH role=") +
+        sanitizeRole(modeSwitch.role) +
+        " tick=" +
+        std::to_string(std::max(0, modeSwitch.tick)));
+}
+
+inline void enqueueClientResetFlight(ClientReplicationState& client, const ResetFlightPacket& reset)
+{
+    client.pendingControlTick = std::max(client.pendingControlTick, reset.tick);
+    client.outboundReliable.push_back(buildResetFlightPacket(reset));
+    HostedNetworkingDetail::networkStdoutLog(
+        std::string("queued RESET_FLIGHT tick=") +
+        std::to_string(std::max(0, reset.tick)));
 }
 
 inline void enqueueClientAoiSubscription(ClientReplicationState& client, const AoiSubscription& subscription)
@@ -701,7 +1008,14 @@ inline void flushClientOutbound(ClientReplicationState& client)
             (type == "BLOB_META" || type == "BLOB_CHUNK" || type == "BLOB_REQUEST")
             ? static_cast<int>(TransportLane::Blob)
             : static_cast<int>(TransportLane::Control);
-        (void)client.transport->send(client.serverPeerId, lane, packet, true);
+        const bool sent = client.transport->send(client.serverPeerId, lane, packet, true);
+        if (type == "HELLO" || !sent) {
+            HostedNetworkingDetail::networkStdoutLog(
+                std::string(sent ? "sent " : "failed to send ") +
+                type +
+                " to peer " +
+                std::to_string(client.serverPeerId));
+        }
     }
     client.outboundReliable.clear();
 
@@ -731,13 +1045,20 @@ inline void serviceClientReplication(
         if (event.type == NetEvent::Type::Connected) {
             client.connected = true;
             client.serverPeerId = event.peerId;
+            HostedNetworkingDetail::networkStdoutLog("client transport connected to peer " + std::to_string(event.peerId));
             continue;
         }
         if (event.type == NetEvent::Type::Disconnected) {
             client.connected = false;
             client.joinAcknowledged = false;
             client.serverPeerId = 0;
+            client.pendingControlTick = 0;
+            client.mirrorTerrainDirty = false;
+            client.localAuthoritative = {};
             client.peers.clear();
+            client.pendingInputs.clear();
+            client.predictedStates.clear();
+            HostedNetworkingDetail::networkStdoutLog("client transport disconnected from peer " + std::to_string(event.peerId));
             continue;
         }
         if (event.type != NetEvent::Type::Message) {
@@ -750,6 +1071,7 @@ inline void serviceClientReplication(
                 client.localPlayerId = *id;
                 client.joinAcknowledged = true;
                 client.helloPending = false;
+                HostedNetworkingDetail::networkStdoutLog("received JOIN_OK as player " + std::to_string(*id));
             }
             continue;
         }
@@ -757,10 +1079,12 @@ inline void serviceClientReplication(
             if (const auto info = parseWorldInfoPacket(event.payload); info.has_value()) {
                 client.lastWorldInfo = *info;
                 client.worldInfoReceived = true;
+                HostedNetworkingDetail::networkStdoutLog("received WORLD_INFO");
                 if (mirrorWorldStore != nullptr) {
                     std::string error;
                     if (mirrorWorldStore->applyWorldInfo(*info, &error)) {
                         terrainParams = mirrorWorldStore->buildGroundParams(terrainParams).terrainParams;
+                        client.mirrorTerrainDirty = true;
                     }
                 }
             }
@@ -768,6 +1092,11 @@ inline void serviceClientReplication(
         }
         if (type == "WORLD_SYNC") {
             client.worldSyncReceived = applyWorldSyncPacket(event.payload, terrainParams);
+            if (client.worldSyncReceived) {
+                client.mirrorTerrainDirty = true;
+            }
+            HostedNetworkingDetail::networkStdoutLog(
+                std::string("received WORLD_SYNC: ") + (client.worldSyncReceived ? "applied" : "rejected"));
             continue;
         }
         if (type == "AVATAR_MANIFEST") {
@@ -795,26 +1124,38 @@ inline void serviceClientReplication(
                             ++it;
                         }
                     }
+                    if (client.pendingControlTick > 0 && snapshot->ack >= client.pendingControlTick) {
+                        client.pendingControlTick = 0;
+                    }
                     if (localPeer != nullptr) {
                         localPeer->id = snapshot->id;
                         localPeer->avatar = snapshot->avatar;
                         localPeer->connected = true;
-                        appendRemoteSnapshot(*localPeer, {
-                            snapshot->timestamp,
-                            snapshot->pos,
-                            snapshot->rot,
-                            snapshot->vel,
-                            snapshot->angVel
-                        });
-                        (void)sampleRemotePeer(*localPeer, nowSeconds, 0.0);
+                        if (client.pendingControlTick > 0 && snapshot->ack < client.pendingControlTick) {
+                            continue;
+                        }
                     }
+                    client.localAuthoritative.valid = true;
+                    client.localAuthoritative.dirty = true;
+                    client.localAuthoritative.ack = snapshot->ack;
+                    client.localAuthoritative.simTick = snapshot->simTick;
+                    client.localAuthoritative.flightMode = sanitizeRole(snapshot->avatar.role) != "walking";
+                    client.localAuthoritative.pos = snapshot->pos;
+                    client.localAuthoritative.rot = snapshot->rot;
+                    client.localAuthoritative.vel = snapshot->vel;
+                    client.localAuthoritative.angVel = snapshot->angVel;
+                    client.localAuthoritative.throttle = snapshot->throttle;
+                    client.localAuthoritative.yokePitch = snapshot->elevator;
+                    client.localAuthoritative.yokeYaw = snapshot->rudder;
+                    client.localAuthoritative.yokeRoll = snapshot->aileron;
+                    client.localAuthoritative.avatar = snapshot->avatar;
                 } else {
                     RemotePeerState& peer = client.peers[snapshot->id];
                     peer.id = snapshot->id;
                     peer.avatar = snapshot->avatar;
                     peer.connected = true;
                     appendRemoteSnapshot(peer, {
-                        snapshot->timestamp,
+                        nowSeconds,
                         snapshot->pos,
                         snapshot->rot,
                         snapshot->vel,
@@ -827,13 +1168,24 @@ inline void serviceClientReplication(
         }
         if ((type == "CHUNK_STATE" || type == "CHUNK_PATCH") && mirrorWorldStore != nullptr) {
             if (const auto chunk = parseChunkPacket(event.payload); chunk.has_value()) {
-                (void)mirrorWorldStore->applyChunkState(*chunk);
+                if (mirrorWorldStore->applyChunkState(*chunk)) {
+                    client.mirrorTerrainDirty = true;
+                }
+            }
+            continue;
+        }
+        if (type == "GAMEPLAY_STATE") {
+            if (const auto gameplayState = parseGameplayStatePacket(event.payload); gameplayState.has_value()) {
+                client.gameplayState = *gameplayState;
+                client.gameplayStateDirty = true;
             }
             continue;
         }
         if (type == "CRATER_EVENT" && mirrorWorldStore != nullptr) {
             if (const auto crater = parseCraterPacket(event.payload); crater.has_value()) {
-                (void)mirrorWorldStore->applyCrater(*crater);
+                if (mirrorWorldStore->applyCrater(*crater).first) {
+                    client.mirrorTerrainDirty = true;
+                }
             }
             continue;
         }
@@ -905,7 +1257,6 @@ inline void HostedWorldServer::broadcastSnapshots(double nowSeconds)
         if (!target.connected || target.peerId == 0) {
             continue;
         }
-        const float nearMeters = target.aoi.snapshotNearMeters;
         const float farMeters = target.aoi.snapshotFarMeters;
         for (const auto& [playerId, player] : players_) {
             if (!player.connected || !player.hasReceivedHello) {
@@ -918,9 +1269,6 @@ inline void HostedWorldServer::broadcastSnapshots(double nowSeconds)
             if (playerId != targetId) {
                 const float distSq = HostedNetworkingDetail::distanceSq2(target.actor.pos, player.actor.pos);
                 if (distSq > (farMeters * farMeters)) {
-                    continue;
-                }
-                if (distSq > (nearMeters * nearMeters) && (snapshotSequence_ % 3) != 0) {
                     continue;
                 }
             }
@@ -969,13 +1317,14 @@ inline void HostedWorldServer::update(
     float dt,
     const TerrainFieldContext& terrainContext,
     const FlightConfig& flightConfig,
+    Vec3 wind,
     WorldStore* worldStore)
 {
-    simulateRemotePlayers(dt, terrainContext, flightConfig);
+    simulateRemotePlayers(dt, terrainContext, flightConfig, wind);
     snapshotAccumulator_ += dt;
     cloudAccumulator_ += dt;
-    if (snapshotAccumulator_ >= (1.0 / 30.0)) {
-        snapshotAccumulator_ = std::fmod(snapshotAccumulator_, 1.0 / 30.0);
+    if (snapshotAccumulator_ >= (1.0 / 90.0)) {
+        snapshotAccumulator_ = std::fmod(snapshotAccumulator_, 1.0 / 90.0);
         broadcastSnapshots(nowSeconds);
     }
     if (cloudAccumulator_ >= 1.0) {

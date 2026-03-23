@@ -1171,12 +1171,13 @@ void runNetworkingSmokeChecks(bool& failed)
         auto [hostTransport, clientTransport] = LoopbackTransport::createLinkedPair();
         HostedWorldServer server(hostTransport);
         server.setLocalAuthoritativeState(makeFlightState({ 0.0f, 220.0f, 0.0f }), FlightRuntimeState {}, false, 0.0f, 0.0f, avatar);
+        const TerrainFieldContext hostTerrainContext = createTerrainFieldContext(hostOptions.groundParams);
 
         (void)clientTransport->poll();
-        server.serviceIncoming(hostOptions.groundParams, &hostWorld);
+        server.serviceIncoming(hostOptions.groundParams, hostTerrainContext, &hostWorld);
 
         clientTransport->send(1, static_cast<int>(TransportLane::Control), buildSmokeHelloPacket(avatar), true);
-        server.serviceIncoming(hostOptions.groundParams, &hostWorld);
+        server.serviceIncoming(hostOptions.groundParams, hostTerrainContext, &hostWorld);
 
         const std::vector<NetEvent> bootstrapEvents = clientTransport->poll();
         bool sawJoin = false;
@@ -1227,7 +1228,7 @@ void runNetworkingSmokeChecks(bool& failed)
         require(mirrorMeta.worldId == "net_host", "Mirror world did not adopt the host world id", failed);
         require(mirrorWorld.sampleHeightDelta(32.0f, 24.0f) != 0.0f, "Mirror world did not receive the host crater terrain", failed);
 
-        server.update(1.0, 1.0f / 30.0f, createTerrainFieldContext(hostOptions.groundParams), defaultFlightConfig(), &hostWorld);
+        server.update(1.0, 1.0f / 30.0f, createTerrainFieldContext(hostOptions.groundParams), defaultFlightConfig(), {}, &hostWorld);
         const std::vector<NetEvent> snapshotEvents = clientTransport->poll();
         bool sawSnapshot = false;
         for (const NetEvent& event : snapshotEvents) {
@@ -1241,7 +1242,7 @@ void runNetworkingSmokeChecks(bool& failed)
 
         auto voiceTransport = std::make_shared<RecordingTransport>(std::vector<NetPeerId> { 2, 3 });
         server.setTransport(voiceTransport);
-        server.serviceIncoming(hostOptions.groundParams, &hostWorld);
+        server.serviceIncoming(hostOptions.groundParams, hostTerrainContext, &hostWorld);
 
         auto* peerTwo = mutableHostedPlayer(server, 2);
         auto* peerThree = mutableHostedPlayer(server, 3);
@@ -1261,7 +1262,7 @@ void runNetworkingSmokeChecks(bool& failed)
             voiceTransport->pushMessage(2, static_cast<int>(TransportLane::Voice), buildVoiceStatePacket({ 2, 3, true }), true);
             voiceTransport->pushMessage(3, static_cast<int>(TransportLane::Voice), buildVoiceStatePacket({ 3, 3, true }), true);
             voiceTransport->pushMessage(2, static_cast<int>(TransportLane::Voice), relayPacket, false);
-            server.serviceIncoming(hostOptions.groundParams, &hostWorld);
+            server.serviceIncoming(hostOptions.groundParams, hostTerrainContext, &hostWorld);
 
             const auto localVoiceFrames = collectHostLocalVoiceFrames(server);
             require(!localVoiceFrames.empty(), "Hosted server did not expose remote voice frames to the local host", failed);
@@ -1286,7 +1287,7 @@ void runNetworkingSmokeChecks(bool& failed)
             voiceTransport->clearSentPackets();
             peerThree->avatar.radioChannel = 4;
             voiceTransport->pushMessage(2, static_cast<int>(TransportLane::Voice), relayPacket, false);
-            server.serviceIncoming(hostOptions.groundParams, &hostWorld);
+            server.serviceIncoming(hostOptions.groundParams, hostTerrainContext, &hostWorld);
             require(
                 std::none_of(
                     voiceTransport->sentPackets.begin(),
@@ -1301,7 +1302,7 @@ void runNetworkingSmokeChecks(bool& failed)
             peerThree->avatar.radioChannel = 3;
             peerThree->actor.pos = { 250000.0f, 220.0f, 0.0f };
             voiceTransport->pushMessage(2, static_cast<int>(TransportLane::Voice), relayPacket, false);
-            server.serviceIncoming(hostOptions.groundParams, &hostWorld);
+            server.serviceIncoming(hostOptions.groundParams, hostTerrainContext, &hostWorld);
             require(
                 std::none_of(
                     voiceTransport->sentPackets.begin(),

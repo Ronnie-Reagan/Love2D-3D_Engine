@@ -21,8 +21,8 @@
 
 namespace NativeGame {
 
-constexpr float kRemoteInterpolationDelaySeconds = 0.080f;
-constexpr float kRemoteExtrapolationCapSeconds = 0.180f;
+constexpr float kRemoteInterpolationDelaySeconds = 0.055f;
+constexpr float kRemoteExtrapolationCapSeconds = 0.120f;
 constexpr std::size_t kRemoteSnapshotBufferLimit = 48u;
 constexpr int kVoiceChannelCount = 8;
 
@@ -73,8 +73,10 @@ struct AvatarManifest {
 struct NetPlayerInput {
     int tick = 0;
     std::string role = "plane";
+    float frameDt = 1.0f / 60.0f;
     float walkYaw = 0.0f;
     float walkPitch = 0.0f;
+    float walkMoveSpeed = 10.0f;
     float throttle = 0.0f;
     float yokePitch = 0.0f;
     float yokeYaw = 0.0f;
@@ -89,6 +91,11 @@ struct NetPlayerInput {
     bool flightThrottleDown = false;
     bool flightAirBrakes = false;
     bool flightAfterburner = false;
+    bool firePrimary = false;
+    bool dropBomb = false;
+    bool terrainGunAdd = false;
+    bool terrainGunRemove = false;
+    bool terraformMode = false;
     AvatarManifest avatar {};
 };
 
@@ -147,6 +154,22 @@ struct AoiSubscription {
     float snapshotFarMeters = 4096.0f;
 };
 
+struct ModeSwitchPacket {
+    int tick = 0;
+    std::string role = "plane";
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    float walkYaw = 0.0f;
+    float walkPitch = 0.0f;
+};
+
+struct ResetFlightPacket {
+    int tick = 0;
+    float x = 0.0f;
+    float z = 0.0f;
+};
+
 struct RemoteSnapshotSample {
     double timestamp = 0.0;
     Vec3 pos {};
@@ -164,8 +187,40 @@ struct RemotePeerState {
     Quat displayRot = quatIdentity();
     Vec3 vel {};
     Vec3 angVel {};
+    float hullStrength = 100.0f;
+    float fuselageStrength = 100.0f;
+    float wear = 0.0f;
+    bool terraformMode = false;
     bool connected = false;
     std::deque<RemoteSnapshotSample> snapshots;
+};
+
+struct NetGameplayPlayerState {
+    int id = 0;
+    float hullStrength = 100.0f;
+    float fuselageStrength = 100.0f;
+    float wear = 0.0f;
+    bool terraformMode = false;
+    int targetsDestroyed = 0;
+};
+
+struct NetGameplayObjectState {
+    std::string kind = "projectile";
+    int id = 0;
+    int ownerId = 0;
+    bool active = true;
+    Vec3 pos {};
+    Vec3 vel {};
+    float radius = 0.5f;
+    float ttl = 0.0f;
+    float health = 0.0f;
+    float maxHealth = 0.0f;
+};
+
+struct NetGameplayStatePacket {
+    double timestamp = 0.0;
+    std::vector<NetGameplayPlayerState> players;
+    std::vector<NetGameplayObjectState> objects;
 };
 
 inline float clampNetFloat(float value, float minValue, float maxValue)
@@ -651,9 +706,11 @@ inline std::string buildInputPacket(const NetPlayerInput& input)
     return encodePacket("INPUT", {
         { "tick", std::to_string(input.tick) },
         { "role", sanitizeRole(input.role) },
+        { "frameDt", formatNetFloat(input.frameDt) },
         { "callsign", sanitizeCallsign(input.avatar.callsign) },
         { "walkYaw", formatNetFloat(input.walkYaw) },
         { "walkPitch", formatNetFloat(input.walkPitch) },
+        { "walkMoveSpeed", formatNetFloat(input.walkMoveSpeed) },
         { "throttle", formatNetFloat(input.throttle) },
         { "yokePitch", formatNetFloat(input.yokePitch) },
         { "yokeYaw", formatNetFloat(input.yokeYaw) },
@@ -668,6 +725,11 @@ inline std::string buildInputPacket(const NetPlayerInput& input)
         { "flightThrottleDown", input.flightThrottleDown ? "1" : "0" },
         { "flightAirBrakes", input.flightAirBrakes ? "1" : "0" },
         { "flightAfterburner", input.flightAfterburner ? "1" : "0" },
+        { "firePrimary", input.firePrimary ? "1" : "0" },
+        { "dropBomb", input.dropBomb ? "1" : "0" },
+        { "terrainGunAdd", input.terrainGunAdd ? "1" : "0" },
+        { "terrainGunRemove", input.terrainGunRemove ? "1" : "0" },
+        { "terraformMode", input.terraformMode ? "1" : "0" },
         { "radio", std::to_string(normalizeRadioChannel(input.avatar.radioChannel)) },
         { "ptt", input.avatar.radioTx ? "1" : "0" },
         { "planeModelHash", input.avatar.plane.modelHash },
@@ -688,6 +750,75 @@ inline std::string buildInputPacket(const NetPlayerInput& input)
         { "walkingOffX", formatNetFloat(input.avatar.walking.offset.x) },
         { "walkingOffY", formatNetFloat(input.avatar.walking.offset.y) },
         { "walkingOffZ", formatNetFloat(input.avatar.walking.offset.z) }
+    });
+}
+
+inline std::string buildGameplayStatePacket(const NetGameplayStatePacket& packet)
+{
+    std::ostringstream playerStream;
+    for (std::size_t index = 0; index < packet.players.size(); ++index) {
+        const NetGameplayPlayerState& player = packet.players[index];
+        if (index > 0u) {
+            playerStream << ';';
+        }
+        playerStream
+            << player.id << ','
+            << formatNetFloat(player.hullStrength) << ','
+            << formatNetFloat(player.fuselageStrength) << ','
+            << formatNetFloat(player.wear) << ','
+            << (player.terraformMode ? '1' : '0') << ','
+            << player.targetsDestroyed;
+    }
+
+    std::ostringstream objectStream;
+    for (std::size_t index = 0; index < packet.objects.size(); ++index) {
+        const NetGameplayObjectState& object = packet.objects[index];
+        if (index > 0u) {
+            objectStream << ';';
+        }
+        objectStream
+            << object.kind << ','
+            << object.id << ','
+            << object.ownerId << ','
+            << (object.active ? '1' : '0') << ','
+            << formatNetFloat(object.pos.x) << ','
+            << formatNetFloat(object.pos.y) << ','
+            << formatNetFloat(object.pos.z) << ','
+            << formatNetFloat(object.vel.x) << ','
+            << formatNetFloat(object.vel.y) << ','
+            << formatNetFloat(object.vel.z) << ','
+            << formatNetFloat(object.radius) << ','
+            << formatNetFloat(object.ttl) << ','
+            << formatNetFloat(object.health) << ','
+            << formatNetFloat(object.maxHealth);
+    }
+
+    return encodePacket("GAMEPLAY_STATE", {
+        { "ts", formatNetFloat(packet.timestamp) },
+        { "players", playerStream.str() },
+        { "objects", objectStream.str() }
+    });
+}
+
+inline std::string buildModeSwitchPacket(const ModeSwitchPacket& packet)
+{
+    return encodePacket("MODE_SWITCH", {
+        { "tick", std::to_string(std::max(0, packet.tick)) },
+        { "role", sanitizeRole(packet.role) },
+        { "x", formatNetFloat(packet.x) },
+        { "y", formatNetFloat(packet.y) },
+        { "z", formatNetFloat(packet.z) },
+        { "walkYaw", formatNetFloat(packet.walkYaw) },
+        { "walkPitch", formatNetFloat(packet.walkPitch) }
+    });
+}
+
+inline std::string buildResetFlightPacket(const ResetFlightPacket& packet)
+{
+    return encodePacket("RESET_FLIGHT", {
+        { "tick", std::to_string(std::max(0, packet.tick)) },
+        { "x", formatNetFloat(packet.x) },
+        { "z", formatNetFloat(packet.z) }
     });
 }
 
@@ -972,8 +1103,12 @@ inline std::optional<NetPlayerInput> parseInputPacket(const std::string& packet)
     NetPlayerInput input;
     input.tick = std::atoi(kv["tick"].c_str());
     input.role = sanitizeRole(kv["role"]);
+    const auto frameDtIt = kv.find("frameDt");
+    const float frameDt = frameDtIt == kv.end() ? (1.0f / 60.0f) : std::strtof(frameDtIt->second.c_str(), nullptr);
+    input.frameDt = std::clamp(frameDt, 1.0f / 240.0f, 0.05f);
     input.walkYaw = std::strtof(kv["walkYaw"].c_str(), nullptr);
     input.walkPitch = std::strtof(kv["walkPitch"].c_str(), nullptr);
+    input.walkMoveSpeed = std::clamp(std::strtof(kv["walkMoveSpeed"].c_str(), nullptr), 2.0f, 30.0f);
     input.throttle = clampNetFloat(std::strtof(kv["throttle"].c_str(), nullptr), 0.0f, 1.0f);
     input.yokePitch = clampNetFloat(std::strtof(kv["yokePitch"].c_str(), nullptr), -1.0f, 1.0f);
     input.yokeYaw = clampNetFloat(std::strtof(kv["yokeYaw"].c_str(), nullptr), -1.0f, 1.0f);
@@ -988,6 +1123,11 @@ inline std::optional<NetPlayerInput> parseInputPacket(const std::string& packet)
     input.flightThrottleDown = kv["flightThrottleDown"] == "1";
     input.flightAirBrakes = kv["flightAirBrakes"] == "1";
     input.flightAfterburner = kv["flightAfterburner"] == "1";
+    input.firePrimary = kv["firePrimary"] == "1";
+    input.dropBomb = kv["dropBomb"] == "1";
+    input.terrainGunAdd = kv["terrainGunAdd"] == "1";
+    input.terrainGunRemove = kv["terrainGunRemove"] == "1";
+    input.terraformMode = kv["terraformMode"] == "1";
     input.avatar.role = input.role;
     input.avatar.callsign = sanitizeCallsign(kv["callsign"]);
     input.avatar.radioChannel = normalizeRadioChannel(std::atoi(kv["radio"].c_str()));
@@ -1015,6 +1155,102 @@ inline std::optional<NetPlayerInput> parseInputPacket(const std::string& packet)
         std::strtof(kv["walkingOffZ"].c_str(), nullptr)
     };
     return input;
+}
+
+inline std::optional<NetGameplayStatePacket> parseGameplayStatePacket(const std::string& packet)
+{
+    const std::vector<std::string> fields = splitPacketFields(packet);
+    if (fields.empty() || fields[0] != "GAMEPLAY_STATE") {
+        return std::nullopt;
+    }
+
+    const auto kv = parseKeyValueFields(fields);
+    NetGameplayStatePacket state;
+    state.timestamp = std::strtod(kv["ts"].c_str(), nullptr);
+
+    for (const std::string& token : splitPacketFields(kv["players"], ';')) {
+        if (token.empty()) {
+            continue;
+        }
+        const std::vector<std::string> parts = splitPacketFields(token, ',');
+        if (parts.size() != 6u) {
+            continue;
+        }
+        NetGameplayPlayerState player;
+        player.id = std::atoi(parts[0].c_str());
+        player.hullStrength = std::strtof(parts[1].c_str(), nullptr);
+        player.fuselageStrength = std::strtof(parts[2].c_str(), nullptr);
+        player.wear = std::strtof(parts[3].c_str(), nullptr);
+        player.terraformMode = parts[4] == "1";
+        player.targetsDestroyed = std::atoi(parts[5].c_str());
+        state.players.push_back(player);
+    }
+
+    for (const std::string& token : splitPacketFields(kv["objects"], ';')) {
+        if (token.empty()) {
+            continue;
+        }
+        const std::vector<std::string> parts = splitPacketFields(token, ',');
+        if (parts.size() != 14u) {
+            continue;
+        }
+        NetGameplayObjectState object;
+        object.kind = parts[0];
+        object.id = std::atoi(parts[1].c_str());
+        object.ownerId = std::atoi(parts[2].c_str());
+        object.active = parts[3] == "1";
+        object.pos = {
+            std::strtof(parts[4].c_str(), nullptr),
+            std::strtof(parts[5].c_str(), nullptr),
+            std::strtof(parts[6].c_str(), nullptr)
+        };
+        object.vel = {
+            std::strtof(parts[7].c_str(), nullptr),
+            std::strtof(parts[8].c_str(), nullptr),
+            std::strtof(parts[9].c_str(), nullptr)
+        };
+        object.radius = std::strtof(parts[10].c_str(), nullptr);
+        object.ttl = std::strtof(parts[11].c_str(), nullptr);
+        object.health = std::strtof(parts[12].c_str(), nullptr);
+        object.maxHealth = std::strtof(parts[13].c_str(), nullptr);
+        state.objects.push_back(object);
+    }
+
+    return state;
+}
+
+inline std::optional<ModeSwitchPacket> parseModeSwitchPacket(const std::string& packet)
+{
+    const std::vector<std::string> fields = splitPacketFields(packet);
+    if (fields.empty() || fields[0] != "MODE_SWITCH") {
+        return std::nullopt;
+    }
+
+    const auto kv = parseKeyValueFields(fields);
+    ModeSwitchPacket modeSwitch;
+    modeSwitch.tick = std::max(0, std::atoi(kv["tick"].c_str()));
+    modeSwitch.role = sanitizeRole(kv["role"]);
+    modeSwitch.x = std::strtof(kv["x"].c_str(), nullptr);
+    modeSwitch.y = std::strtof(kv["y"].c_str(), nullptr);
+    modeSwitch.z = std::strtof(kv["z"].c_str(), nullptr);
+    modeSwitch.walkYaw = std::strtof(kv["walkYaw"].c_str(), nullptr);
+    modeSwitch.walkPitch = std::strtof(kv["walkPitch"].c_str(), nullptr);
+    return modeSwitch;
+}
+
+inline std::optional<ResetFlightPacket> parseResetFlightPacket(const std::string& packet)
+{
+    const std::vector<std::string> fields = splitPacketFields(packet);
+    if (fields.empty() || fields[0] != "RESET_FLIGHT") {
+        return std::nullopt;
+    }
+
+    const auto kv = parseKeyValueFields(fields);
+    ResetFlightPacket reset;
+    reset.tick = std::max(0, std::atoi(kv["tick"].c_str()));
+    reset.x = std::strtof(kv["x"].c_str(), nullptr);
+    reset.z = std::strtof(kv["z"].c_str(), nullptr);
+    return reset;
 }
 
 inline std::optional<AvatarManifest> parseAvatarManifestPacket(const std::string& packet, int* idOut = nullptr)

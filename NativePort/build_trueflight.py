@@ -43,13 +43,13 @@ def find_ctest(cmake: str) -> str:
 
 
 def normalize_steamworks_sdk_root(candidate: Path) -> Path | None:
+    
     candidate = candidate.resolve()
     if (candidate / "public" / "steam" / "steam_api.h").exists():
         return candidate
     if (candidate / "sdk" / "public" / "steam" / "steam_api.h").exists():
         return candidate / "sdk"
     return None
-
 
 def detect_steamworks_sdk_root(source_dir: Path, explicit_root: str | None) -> Path | None:
     if explicit_root:
@@ -75,7 +75,6 @@ def detect_steamworks_sdk_root(source_dir: Path, explicit_root: str | None) -> P
 
     return None
 
-
 def configure_if_needed(
     cmake: str,
     source_dir: Path,
@@ -98,7 +97,6 @@ def configure_if_needed(
         command.extend(["-A", arch])
     run_command(command, cwd=source_dir)
 
-
 def build_target(
     cmake: str,
     build_dir: Path,
@@ -113,13 +111,11 @@ def build_target(
         command.append("--clean-first")
     run_command(command, cwd=build_dir)
 
-
 def run_ctest(ctest: str, build_dir: Path, config: str) -> None:
     command = [ctest, "--test-dir", str(build_dir), "--output-on-failure"]
     if config:
         command.extend(["-C", config])
     run_command(command, cwd=build_dir)
-
 
 def find_built_executable(build_dir: Path, config: str, target: str) -> Path | None:
     extensions = [".exe"] if os.name == "nt" else [""]

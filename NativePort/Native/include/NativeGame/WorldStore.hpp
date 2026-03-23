@@ -18,6 +18,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -101,7 +102,10 @@ public:
     bool applyWorldInfo(const WorldInfoSnapshot& info, std::string* error = nullptr);
     bool applyChunkState(const WorldChunkState& state);
     float sampleHeightDelta(float x, float z);
+    float sampleVolumetricAdditiveSdf(float x, float y, float z);
+    float sampleVolumetricSubtractiveSdf(float x, float y, float z);
     float sampleVolumetricOverrideSdf(float x, float y, float z);
+    bool hasVolumetricOverridesInBounds(float x0, float z0, float x1, float z1, int neighborRing = 1);
     std::uint64_t revisionSignatureForBounds(float x0, float z0, float x1, float z1, int neighborRing = 1);
     std::vector<WorldChunkState> collectEditedChunks(int centerCx, int centerCz, int radiusChunks);
     std::pair<bool, std::vector<WorldChunkState>> applyCrater(const TerrainCrater& craterSpec);
@@ -133,7 +137,10 @@ private:
     static WorldChunkState buildEmptyChunk(int cx, int cz, int resolution);
     static WorldChunkState normalizeChunkState(const WorldChunkState& chunk, int fallbackResolution);
     static bool chunkHasMeaningfulData(const WorldChunkState& chunk);
-    static float sampleOverrideDistance(float x, float y, float z, const std::vector<WorldVolumetricOverride>& overrides);
+    static std::string normalizeOverrideKind(std::string_view kind);
+    static bool overrideKindIsAdditive(std::string_view kind);
+    static bool overrideKindIsSubtractive(std::string_view kind);
+    static float sampleOverrideDistance(float x, float y, float z, const std::vector<WorldVolumetricOverride>& overrides, bool additive);
     static std::string timestampUtc();
 
     std::filesystem::path metaPath() const;
@@ -271,7 +278,7 @@ inline WorldChunkState WorldStore::normalizeChunkState(const WorldChunkState& ch
     normalized.volumetricOverrides.reserve(chunk.volumetricOverrides.size());
     for (const WorldVolumetricOverride& override : chunk.volumetricOverrides) {
         normalized.volumetricOverrides.push_back({
-            override.kind.empty() ? "sphere" : override.kind,
+            normalizeOverrideKind(override.kind),
             sanitize(override.x, 0.0f),
             sanitize(override.y, 0.0f),
             sanitize(override.z, 0.0f),
@@ -294,11 +301,41 @@ inline bool WorldStore::chunkHasMeaningfulData(const WorldChunkState& chunk)
     return !chunk.volumetricOverrides.empty();
 }
 
-inline float WorldStore::sampleOverrideDistance(float x, float y, float z, const std::vector<WorldVolumetricOverride>& overrides)
+inline std::string WorldStore::normalizeOverrideKind(std::string_view kind)
+{
+    std::string normalized;
+    normalized.reserve(kind.size());
+    for (char ch : kind) {
+        normalized.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+    }
+
+    if (normalized == "sphere_add" || normalized == "add_sphere" || normalized == "sphere_plus") {
+        return "sphere_add";
+    }
+    if (normalized == "sphere_sub" || normalized == "sphere_remove" || normalized == "sphere_subtract" || normalized == "subtract_sphere") {
+        return "sphere_sub";
+    }
+    if (normalized == "sphere") {
+        return "sphere_sub";
+    }
+    return "sphere_sub";
+}
+
+inline bool WorldStore::overrideKindIsAdditive(std::string_view kind)
+{
+    return normalizeOverrideKind(kind) == "sphere_add";
+}
+
+inline bool WorldStore::overrideKindIsSubtractive(std::string_view kind)
+{
+    return normalizeOverrideKind(kind) == "sphere_sub";
+}
+
+inline float WorldStore::sampleOverrideDistance(float x, float y, float z, const std::vector<WorldVolumetricOverride>& overrides, bool additive)
 {
     float minDistance = std::numeric_limits<float>::infinity();
     for (const WorldVolumetricOverride& override : overrides) {
-        if (override.kind != "sphere") {
+        if (additive ? !overrideKindIsAdditive(override.kind) : !overrideKindIsSubtractive(override.kind)) {
             continue;
         }
         const float dx = x - override.x;
@@ -494,6 +531,11 @@ inline float WorldStore::sampleHeightDelta(float x, float z)
 
 inline float WorldStore::sampleVolumetricOverrideSdf(float x, float y, float z)
 {
+    return sampleVolumetricSubtractiveSdf(x, y, z);
+}
+
+inline float WorldStore::sampleVolumetricAdditiveSdf(float x, float y, float z)
+{
     const int cx = static_cast<int>(std::floor(x / std::max(1.0f, chunkSize_)));
     const int cz = static_cast<int>(std::floor(z / std::max(1.0f, chunkSize_)));
     float minDistance = std::numeric_limits<float>::infinity();
@@ -503,10 +545,59 @@ inline float WorldStore::sampleVolumetricOverrideSdf(float x, float y, float z)
             if (chunk == nullptr || chunk->volumetricOverrides.empty()) {
                 continue;
             }
-            minDistance = std::min(minDistance, sampleOverrideDistance(x, y, z, chunk->volumetricOverrides));
+            minDistance = std::min(minDistance, sampleOverrideDistance(x, y, z, chunk->volumetricOverrides, true));
         }
     }
     return minDistance;
+}
+
+inline float WorldStore::sampleVolumetricSubtractiveSdf(float x, float y, float z)
+{
+    const int cx = static_cast<int>(std::floor(x / std::max(1.0f, chunkSize_)));
+    const int cz = static_cast<int>(std::floor(z / std::max(1.0f, chunkSize_)));
+    float minDistance = std::numeric_limits<float>::infinity();
+    for (int dz = -1; dz <= 1; ++dz) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            WorldChunkState* chunk = getChunk(cx + dx, cz + dz, false);
+            if (chunk == nullptr || chunk->volumetricOverrides.empty()) {
+                continue;
+            }
+            minDistance = std::min(minDistance, sampleOverrideDistance(x, y, z, chunk->volumetricOverrides, false));
+        }
+    }
+    return minDistance;
+}
+
+inline bool WorldStore::hasVolumetricOverridesInBounds(float x0, float z0, float x1, float z1, int neighborRing)
+{
+    const float chunkSize = std::max(1.0f, chunkSize_);
+    const int ring = std::max(0, neighborRing);
+    const float minX = std::min(x0, x1);
+    const float maxX = std::max(x0, x1);
+    const float minZ = std::min(z0, z1);
+    const float maxZ = std::max(z0, z1);
+    const int minCx = static_cast<int>(std::floor(minX / chunkSize)) - ring;
+    const int maxCx = static_cast<int>(std::floor(maxX / chunkSize)) + ring;
+    const int minCz = static_cast<int>(std::floor(minZ / chunkSize)) - ring;
+    const int maxCz = static_cast<int>(std::floor(maxZ / chunkSize)) + ring;
+
+    for (int cz = minCz; cz <= maxCz; ++cz) {
+        for (int cx = minCx; cx <= maxCx; ++cx) {
+            WorldChunkState* chunk = getChunk(cx, cz, false);
+            if (chunk == nullptr || chunk->volumetricOverrides.empty()) {
+                continue;
+            }
+            for (const WorldVolumetricOverride& override : chunk->volumetricOverrides) {
+                const float radius = std::max(0.1f, override.radius);
+                if ((override.x + radius) < minX || (override.x - radius) > maxX ||
+                    (override.z + radius) < minZ || (override.z - radius) > maxZ) {
+                    continue;
+                }
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 inline std::uint64_t WorldStore::revisionSignatureForBounds(float x0, float z0, float x1, float z1, int neighborRing)

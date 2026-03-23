@@ -23,9 +23,11 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstdio>
+#include <exception>
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -84,6 +86,110 @@ constexpr float kGamepadWalkingLookYawSpeed = 2.8f;
 constexpr float kGamepadWalkingLookPitchSpeed = 2.4f;
 constexpr float kGamepadTrimStepsPerSecond = 8.0f;
 constexpr float kGamepadProjectileCooldownSec = 0.2f;
+constexpr float kPrimaryFireCooldownSec = 0.085f;
+constexpr float kBombDropCooldownSec = 0.9f;
+constexpr float kTerrainGunCooldownSec = 0.12f;
+constexpr float kGameplaySnapshotIntervalSec = 1.0f / 20.0f;
+constexpr float kProjectileLifetimeSec = 5.0f;
+constexpr float kBombLifetimeSec = 14.0f;
+constexpr int kEnemyTargetCount = 18;
+constexpr float kPlaneHullMaxStrength = 100.0f;
+constexpr float kPlaneFuselageMaxStrength = 100.0f;
+constexpr float kPlaneWearMax = 100.0f;
+
+std::mutex& stdoutLogMutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+
+void logToStdout(std::string_view message)
+{
+    std::lock_guard<std::mutex> lock(stdoutLogMutex());
+    std::cout << message << std::endl;
+}
+
+const char* sdlLogPriorityLabel(SDL_LogPriority priority)
+{
+    switch (priority) {
+    case SDL_LOG_PRIORITY_VERBOSE:
+        return "verbose";
+    case SDL_LOG_PRIORITY_DEBUG:
+        return "debug";
+    case SDL_LOG_PRIORITY_INFO:
+        return "info";
+    case SDL_LOG_PRIORITY_WARN:
+        return "warn";
+    case SDL_LOG_PRIORITY_ERROR:
+        return "error";
+    case SDL_LOG_PRIORITY_CRITICAL:
+        return "critical";
+    default:
+        return "log";
+    }
+}
+
+SDL_LogOutputFunction gPreviousSdlLogOutput = nullptr;
+void* gPreviousSdlLogUserdata = nullptr;
+
+void SDLCALL mirrorSdlLogToStdout(void*, int category, SDL_LogPriority priority, const char* message)
+{
+    {
+        std::lock_guard<std::mutex> lock(stdoutLogMutex());
+        std::cout << "[sdl][" << category << "][" << sdlLogPriorityLabel(priority) << "] "
+                  << (message != nullptr ? message : "") << std::endl;
+    }
+    if (gPreviousSdlLogOutput != nullptr) {
+        gPreviousSdlLogOutput(gPreviousSdlLogUserdata, category, priority, message);
+    }
+}
+
+void installStdoutLogMirror()
+{
+    std::cout.setf(std::ios::unitbuf);
+    SDL_GetLogOutputFunction(&gPreviousSdlLogOutput, &gPreviousSdlLogUserdata);
+    SDL_SetLogOutputFunction(&mirrorSdlLogToStdout, nullptr);
+}
+
+void installTerminateLogging()
+{
+    std::set_terminate([] {
+        try {
+            if (const std::exception_ptr current = std::current_exception(); current) {
+                std::rethrow_exception(current);
+            }
+        } catch (const std::exception& exception) {
+            logToStdout(std::string("[fatal] unhandled exception: ") + exception.what());
+        } catch (...) {
+            logToStdout("[fatal] unhandled non-standard exception");
+        }
+        std::abort();
+    });
+}
+
+#ifdef _WIN32
+LONG WINAPI trueFlightUnhandledExceptionFilter(EXCEPTION_POINTERS* exceptionPointers)
+{
+    std::ostringstream stream;
+    stream << "[fatal] unhandled structured exception 0x"
+           << std::hex
+           << std::uppercase
+           << (exceptionPointers != nullptr && exceptionPointers->ExceptionRecord != nullptr
+                   ? exceptionPointers->ExceptionRecord->ExceptionCode
+                   : 0u);
+    logToStdout(stream.str());
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+void installStructuredExceptionLogging()
+{
+    SetUnhandledExceptionFilter(&trueFlightUnhandledExceptionFilter);
+}
+#else
+void installStructuredExceptionLogging()
+{
+}
+#endif
 
 enum class AppScreen {
     BootLoading = 0,
@@ -144,7 +250,8 @@ enum class PaintMode {
 
 enum class MenuPromptMode {
     None = 0,
-    ModelPath = 1
+    ModelPath = 1,
+    WorldName = 2
 };
 
 enum class BindingKind {
@@ -356,6 +463,86 @@ struct PauseState {
     float rowDragLastX = 0.0f;
     std::string statusText;
     float statusUntil = 0.0f;
+};
+
+struct WorldInstanceSummary {
+    std::string worldId = "native_default";
+    int seed = 1;
+    float chunkSize = 128.0f;
+    float worldRadius = 2048.0f;
+    float waterLevel = -12.0f;
+    int tunnelCount = 0;
+    std::string createdAt;
+    std::string updatedAt;
+    std::uintmax_t cacheBytes = 0u;
+    bool persistent = false;
+};
+
+struct HudNotification {
+    std::string text;
+    float until = 0.0f;
+};
+
+struct PeerStatComparison {
+    std::string callsign;
+    float distanceMeters = 0.0f;
+    float peerSpeedKph = 0.0f;
+    float localSpeedKph = 0.0f;
+    float peerAltitudeAgl = 0.0f;
+    float localAltitudeAgl = 0.0f;
+    float hullStrength = kPlaneHullMaxStrength;
+    float fuselageStrength = kPlaneFuselageMaxStrength;
+    float wear = 0.0f;
+    int targetsDestroyed = 0;
+};
+
+struct PlaneDurabilityState {
+    float hullStrength = kPlaneHullMaxStrength;
+    float fuselageStrength = kPlaneFuselageMaxStrength;
+    float wear = 0.0f;
+    int targetsDestroyed = 0;
+};
+
+struct WeaponCooldownState {
+    float nextPrimaryFireAt = -1000.0f;
+    float nextBombDropAt = -1000.0f;
+    float nextTerrainShotAt = -1000.0f;
+    bool terraformMode = false;
+};
+
+enum class GameplayObjectKind {
+    Projectile = 0,
+    Bomb = 1,
+    TerrainAdd = 2,
+    TerrainRemove = 3
+};
+
+struct GameplayObjectState {
+    GameplayObjectKind kind = GameplayObjectKind::Projectile;
+    int id = 0;
+    int ownerId = 0;
+    Vec3 pos {};
+    Vec3 vel {};
+    float radius = 0.35f;
+    float ttl = 1.0f;
+    float damage = 10.0f;
+    float drag = 0.02f;
+    float gravityScale = 1.0f;
+    float blastRadius = 0.0f;
+    float craterRadius = 0.0f;
+    float craterDepth = 0.0f;
+    bool active = true;
+};
+
+struct EnemyTargetState {
+    int id = 0;
+    Vec3 pos {};
+    float yawRadians = 0.0f;
+    float radius = 2.6f;
+    float halfHeight = 3.6f;
+    float health = 80.0f;
+    float maxHealth = 80.0f;
+    float respawnAt = -1.0f;
 };
 
 struct RectF {
@@ -615,6 +802,11 @@ struct BootResources {
     HudCanvas hudCanvas { 1280, 720 };
     std::filesystem::path preferencesPath {};
     std::filesystem::path hudPreferencesPath {};
+    std::string selectedWorldId = "native_default";
+    std::vector<WorldInstanceSummary> worldInstances;
+    std::deque<HudNotification> notifications;
+    SteamOnlineState previousSteamOnline {};
+    bool previousSteamOnlineValid = false;
     bool preferencesDirty = false;
     float preferencesNextSaveAt = 0.0f;
 };
@@ -668,6 +860,14 @@ struct GameSession {
     float flightLookPitch = 0.0f;
     float foliageBrushAmount = 0.0f;
     float foliageImpactPulse = 0.0f;
+    std::vector<GameplayObjectState> gameplayObjects;
+    std::vector<EnemyTargetState> enemyTargets;
+    std::unordered_map<int, PlaneDurabilityState> planeDurabilityByPlayerId;
+    std::unordered_map<int, WeaponCooldownState> weaponStateByPlayerId;
+    std::unordered_map<int, PlaneDurabilityState> replicatedDurabilityByPlayerId;
+    int nextGameplayObjectId = 1;
+    float nextGameplaySnapshotAt = 0.0f;
+    std::map<int, std::string> knownRemotePeers;
 };
 
 struct HudPeerIndicator {
@@ -675,6 +875,25 @@ struct HudPeerIndicator {
     std::string callsign;
     int radioChannel = 1;
     bool transmitting = false;
+    float peerSpeedKph = 0.0f;
+    float localSpeedKph = 0.0f;
+    float peerAltitudeAgl = 0.0f;
+    float localAltitudeAgl = 0.0f;
+    float hullStrength = kPlaneHullMaxStrength;
+    float fuselageStrength = kPlaneFuselageMaxStrength;
+    float wear = 0.0f;
+    int targetsDestroyed = 0;
+    bool terraformMode = false;
+};
+
+struct HudTargetIndicator {
+    int id = 0;
+    Vec3 worldPos {};
+    float halfHeight = 0.0f;
+    float distanceMeters = 0.0f;
+    float health = 0.0f;
+    float maxHealth = 1.0f;
+    bool highlighted = false;
 };
 
 enum class HardwareTier {
@@ -777,7 +996,7 @@ constexpr int kGraphicsSettingCount = 11;
 constexpr int kCameraSettingCount = 7;
 constexpr int kSoundSettingCount = 13;
 constexpr int kLightingSettingCount = 28;
-constexpr int kOnlineSettingCount = 7;
+constexpr int kOnlineSettingCount = 8;
 constexpr int kHudSettingCount = 12;
 constexpr int kHudVisibleRows = 12;
 constexpr int kControlsVisibleRows = 10;
@@ -792,18 +1011,20 @@ struct HelpLine {
 };
 
 constexpr float kHelpLineHeight = 16.0f;
-constexpr std::array<HelpLine, 26> kMenuHelpLines {
+constexpr std::array<HelpLine, 28> kMenuHelpLines {
     HelpLine { "Flight Mode", true },
     HelpLine { "W / S or Left Stick Y: Pitch the aircraft nose down or up." },
     HelpLine { "A / D or Left Stick X: Roll left or right." },
     HelpLine { "Q / E or D-Pad Left/Right: Yaw and rudder adjustments." },
     HelpLine { "Up / Down, wheel, or RT/LT: Increase or decrease throttle." },
     HelpLine { "Ctrl + Wheel or D-Pad Up/Down: Adjust trim without also touching throttle." },
-    HelpLine { "Space / B: Hold the air brakes. A: afterburner. RB: projectile trigger log." },
+    HelpLine { "Space: air brakes. LMB / RB: fire projectiles. B: drop bombs. A: afterburner." },
     HelpLine { "" },
     HelpLine { "Walking Mode", true },
     HelpLine { "W A S D or Left Stick: Move and strafe when on foot." },
-    HelpLine { "Mouse X / Y or Right Stick: FPS look with clamped pitch." },
+    HelpLine { "Mouse X / Y or Right Stick: FPS look with clamped pitch. T toggles terraform mode." },
+    HelpLine { "Terraform: LMB / RB deposits terrain, RMB / LB removes terrain." },
+    HelpLine { "Flight alt-look: hold Left Alt for freelook, Right Alt releases the cursor." },
     HelpLine { "Shift: Sprint while held." },
     HelpLine { "Space or A: Jump while grounded." },
     HelpLine { "" },
@@ -811,7 +1032,7 @@ constexpr std::array<HelpLine, 26> kMenuHelpLines {
     HelpLine { "C: Toggle between cockpit and chase cameras." },
     HelpLine { "M: Toggle the mini-map overlay." },
     HelpLine { "Hold M with Up/Down or wheel: Change map zoom without toggling it." },
-    HelpLine { "Left Alt: Release mouse capture temporarily without pausing." },
+    HelpLine { "Right Alt: Release mouse capture temporarily without pausing." },
     HelpLine { "" },
     HelpLine { "Menu and Paint", true },
     HelpLine { "Tab / H: Cycle top pages. [ / ] or Q / E: change sub-pages." },
@@ -832,6 +1053,7 @@ enum class MenuCommand {
 GraphicsSettings defaultGraphicsSettings();
 LightingSettings defaultLightingSettings();
 HudSettings defaultHudSettings();
+OnlineSettings defaultOnlineSettings();
 ControlProfile defaultControlProfile();
 void syncUiStateFromHud(UiState& uiState, const HudSettings& hudSettings);
 void syncHudFromUiState(HudSettings& hudSettings, const UiState& uiState);
@@ -897,12 +1119,16 @@ void refreshMenuConfirmation(PauseState& pauseState, float nowSeconds);
 bool menuConfirmationMatches(const PauseState& pauseState, int selectedIndex, float nowSeconds);
 void clearMenuPrompt(PauseState& pauseState);
 void beginModelPathPrompt(PauseState& pauseState, CharacterSubTab role, std::string initialText = {});
+void beginWorldNamePrompt(PauseState& pauseState, std::string initialText = {});
 bool insertMenuPromptText(PauseState& pauseState, std::string_view text);
 bool eraseMenuPromptText(PauseState& pauseState, bool backspace);
 void moveMenuPromptCursor(PauseState& pauseState, int delta);
 bool clearSelectedControlBindingSlot(PauseState& pauseState, ControlProfile& controls);
 int maxMenuHelpScroll(const PauseLayout& layout);
 std::string formatFixed(float value, int precision);
+TerrainMaterialSample sampleTerrainMaterialFromChunkData(const TerrainChunkData& data, float x, float z);
+float sampleTerrainSlopeFromChunkData(const TerrainChunkData& data, float x, float z);
+void pushHudNotification(BootResources& boot, std::string text, float nowSeconds, float duration);
 void applyWalkingMouseInput(
     UiState& uiState,
     const ControlProfile& controls,
@@ -938,6 +1164,11 @@ LightingSettings defaultLightingSettings()
 }
 
 HudSettings defaultHudSettings()
+{
+    return {};
+}
+
+OnlineSettings defaultOnlineSettings()
 {
     return {};
 }
@@ -1740,6 +1971,9 @@ bool applyLocalizedTerrainCrater(
     float depth,
     float rim)
 {
+    (void)terrainParams;
+    (void)terrainCache;
+    (void)streamState;
     if (worldStore == nullptr) {
         return false;
     }
@@ -1763,7 +1997,6 @@ bool applyLocalizedTerrainCrater(
 
     worldStore->flushDirty(nullptr);
     worldWriteLock.unlock();
-    refreshTerrainContext(terrainParams, terrainContext, terrainCache, worldStore, std::move(worldStoreMutex), streamState);
     keepPlaneAboveTerrain(plane, terrainContext);
     return true;
 }
@@ -2232,7 +2465,8 @@ TerrainTileDecorationResult buildTerrainTileDecoration(
     const TerrainChunkKey& key,
     const TerrainPatchBounds& bounds,
     TerrainFarTileBand band,
-    const TerrainFieldContext& terrainContext)
+    const TerrainFieldContext& terrainContext,
+    const TerrainChunkData* sourceData = nullptr)
 {
     TerrainTileDecorationResult result;
     const TerrainParams& params = terrainContext.params;
@@ -2266,8 +2500,14 @@ TerrainTileDecorationResult buildTerrainTileDecoration(
             const float jitterZ = terrainPropSignedFloat(baseHash ^ 0x02e5be93u) * (cellZ * 0.32f);
             const float x = bounds.x0 + ((static_cast<float>(gx) + 0.5f) * cellX) + jitterX;
             const float z = bounds.z0 + ((static_cast<float>(gz) + 0.5f) * cellZ) + jitterZ;
-            const TerrainMaterialSample material = sampleTerrainMaterial(x, 0.0f, z, terrainContext);
-            const float slope = sampleTerrainSlope01(x, z, terrainContext);
+            const TerrainMaterialSample material =
+                sourceData != nullptr
+                    ? sampleTerrainMaterialFromChunkData(*sourceData, x, z)
+                    : sampleTerrainMaterial(x, 0.0f, z, terrainContext);
+            const float slope =
+                sourceData != nullptr
+                    ? sampleTerrainSlopeFromChunkData(*sourceData, x, z)
+                    : sampleTerrainSlope01(x, z, terrainContext);
             const float waterClearance = material.surfaceHeight - material.waterHeight;
             if (waterClearance < -0.1f) {
                 continue;
@@ -2278,25 +2518,40 @@ TerrainTileDecorationResult buildTerrainTileDecoration(
             const float lowSlope = clamp(1.0f - (slope * 1.6f), 0.0f, 1.0f);
             const float belowTreeline = clamp((treeline + 90.0f - material.surfaceHeight) / 140.0f, 0.0f, 1.0f);
             const float aboveWater = clamp((waterClearance + 0.4f) / 4.5f, 0.0f, 1.0f);
+            const float vegetationRichness = clamp(
+                ((1.0f - material.hardnessWeight) * 0.34f) +
+                    (material.resourceWeight * 0.18f) +
+                    (material.flowWeight * 0.24f) +
+                    (material.wetness * 0.20f),
+                0.0f,
+                1.0f);
             const float coniferWeight =
                 greenBand *
                 lowSlope *
                 aboveWater *
-                clamp(0.55f + ((1.0f - material.biomeBlend) * 0.7f) + (material.snowWeight * 0.35f), 0.0f, 1.0f);
+                clamp(0.55f + ((1.0f - material.biomeBlend) * 0.7f) + (material.snowWeight * 0.35f) + (vegetationRichness * 0.22f), 0.0f, 1.0f);
             const float broadleafWeight =
                 greenBand *
                 lowSlope *
                 aboveWater *
                 belowTreeline *
-                clamp(((material.biomeBlend - 0.36f) * 1.45f) + (1.0f - material.rockWeight) * 0.25f, 0.0f, 1.0f);
+                clamp(((material.biomeBlend - 0.36f) * 1.45f) + (1.0f - material.rockWeight) * 0.25f + (vegetationRichness * 0.28f), 0.0f, 1.0f);
             const float shrubWeight =
                 params.decoration.shoreBrushDensity *
-                clamp(material.wetness * 1.55f, 0.0f, 1.0f) *
-                clamp(1.0f - (slope * 1.9f), 0.0f, 1.0f) *
+                clamp((material.wetness * 1.2f) + (material.flowWeight * 0.55f), 0.0f, 1.0f) *
+                clamp(1.0f - (slope * 1.9f) + (vegetationRichness * 0.12f), 0.0f, 1.0f) *
                 clamp((waterClearance + 0.1f) / 2.0f, 0.0f, 1.0f);
             const float rockWeight =
                 params.decoration.rockDensity *
-                clamp((material.rockWeight * 0.95f) + (material.snowWeight * 0.45f) + clamp((material.surfaceHeight - treeline + 28.0f) / 120.0f, 0.0f, 1.0f) * 0.35f, 0.0f, 1.0f) *
+                clamp(
+                    (material.rockWeight * 0.85f) +
+                        (material.snowWeight * 0.45f) +
+                        (material.hardnessWeight * 0.36f) +
+                        (material.resourceWeight * 0.28f) +
+                        (material.erosionWeight * 0.26f) +
+                        clamp((material.surfaceHeight - treeline + 28.0f) / 120.0f, 0.0f, 1.0f) * 0.35f,
+                    0.0f,
+                    1.0f) *
                 clamp(0.45f + (slope * 0.7f), 0.0f, 1.0f);
 
             float weightedTotal = coniferWeight + broadleafWeight + shrubWeight + rockWeight;
@@ -2408,6 +2663,254 @@ void configureTerrainWaterMaterial(Model& waterModel)
     }
 }
 
+std::size_t terrainChunkGridIndex(const TerrainChunkData& data, int ix, int iz)
+{
+    const int clampedX = std::clamp(ix, 0, std::max(0, data.gridWidth - 1));
+    const int clampedZ = std::clamp(iz, 0, std::max(0, data.gridHeight - 1));
+    return static_cast<std::size_t>(clampedZ * std::max(1, data.gridWidth) + clampedX);
+}
+
+float terrainChunkGridValue(const std::vector<float>& values, const TerrainChunkData& data, int ix, int iz, float fallback = 0.0f)
+{
+    if (values.empty()) {
+        return fallback;
+    }
+    const std::size_t index = terrainChunkGridIndex(data, ix, iz);
+    return index < values.size() ? values[index] : fallback;
+}
+
+float sampleTerrainChunkField(const std::vector<float>& values, const TerrainChunkData& data, float x, float z, float fallback = 0.0f)
+{
+    if (values.empty() || data.gridWidth <= 1 || data.gridHeight <= 1) {
+        return fallback;
+    }
+
+    const float spanX = std::max(1.0f, data.bounds.x1 - data.bounds.x0);
+    const float spanZ = std::max(1.0f, data.bounds.z1 - data.bounds.z0);
+    const float gx = clamp(((x - data.bounds.x0) / spanX) * static_cast<float>(data.gridWidth - 1), 0.0f, static_cast<float>(data.gridWidth - 1));
+    const float gz = clamp(((z - data.bounds.z0) / spanZ) * static_cast<float>(data.gridHeight - 1), 0.0f, static_cast<float>(data.gridHeight - 1));
+    const int ix0 = static_cast<int>(std::floor(gx));
+    const int iz0 = static_cast<int>(std::floor(gz));
+    const int ix1 = std::min(data.gridWidth - 1, ix0 + 1);
+    const int iz1 = std::min(data.gridHeight - 1, iz0 + 1);
+    const float tx = gx - static_cast<float>(ix0);
+    const float tz = gz - static_cast<float>(iz0);
+    const float v00 = terrainChunkGridValue(values, data, ix0, iz0, fallback);
+    const float v10 = terrainChunkGridValue(values, data, ix1, iz0, fallback);
+    const float v01 = terrainChunkGridValue(values, data, ix0, iz1, fallback);
+    const float v11 = terrainChunkGridValue(values, data, ix1, iz1, fallback);
+    return mix(mix(v00, v10, tx), mix(v01, v11, tx), tz);
+}
+
+TerrainMaterialSample sampleTerrainMaterialFromChunkData(const TerrainChunkData& data, float x, float z)
+{
+    TerrainMaterialSample material;
+    material.surfaceHeight = sampleTerrainChunkField(data.surfaceHeights, data, x, z, 0.0f);
+    material.waterHeight = sampleTerrainChunkField(data.waterHeights, data, x, z, material.surfaceHeight);
+    material.wetness = sampleTerrainChunkField(data.wetnessWeights, data, x, z, 0.0f);
+    material.snowWeight = sampleTerrainChunkField(data.snowWeights, data, x, z, 0.0f);
+    material.rockWeight = sampleTerrainChunkField(data.rockWeights, data, x, z, 0.0f);
+    material.biomeBlend = sampleTerrainChunkField(data.biomeWeights, data, x, z, 0.0f);
+    material.hardnessWeight = sampleTerrainChunkField(data.hardnessWeights, data, x, z, 0.0f);
+    material.resourceWeight = sampleTerrainChunkField(data.resourceWeights, data, x, z, 0.0f);
+    material.erosionWeight = sampleTerrainChunkField(data.erosionWeights, data, x, z, 0.0f);
+    material.flowWeight = sampleTerrainChunkField(data.flowWeights, data, x, z, 0.0f);
+    return material;
+}
+
+float sampleTerrainSlopeFromChunkData(const TerrainChunkData& data, float x, float z)
+{
+    const float epsilon = std::max(1.0f, data.cellSize * 0.5f);
+    const float hL = sampleTerrainChunkField(data.surfaceHeights, data, x - epsilon, z, 0.0f);
+    const float hR = sampleTerrainChunkField(data.surfaceHeights, data, x + epsilon, z, 0.0f);
+    const float hD = sampleTerrainChunkField(data.surfaceHeights, data, x, z - epsilon, 0.0f);
+    const float hU = sampleTerrainChunkField(data.surfaceHeights, data, x, z + epsilon, 0.0f);
+    return clamp(std::sqrt(((hR - hL) * (hR - hL)) + ((hU - hD) * (hU - hD))) * 0.18f, 0.0f, 1.0f);
+}
+
+Vec3 composeTerrainColorFromWeights(float x, float z, const TerrainMaterialSample& material, const TerrainFieldContext& terrainContext)
+{
+    const TerrainParams& params = terrainContext.params;
+    const Vec3 grass { 0.24f, 0.48f, 0.25f };
+    const Vec3 forest { 0.16f, 0.33f, 0.20f };
+    const Vec3 sand { 0.70f, 0.64f, 0.47f };
+    const Vec3 rock { 0.47f, 0.45f, 0.43f };
+    const Vec3 mineral { 0.58f, 0.44f, 0.34f };
+    const Vec3 snowColor { 0.88f, 0.89f, 0.92f };
+
+    Vec3 base = lerp(grass, forest, material.biomeBlend);
+    base = lerp(base, sand, material.wetness * 0.72f);
+    base = lerp(base, rock, material.rockWeight);
+    base = lerp(base, mineral, material.resourceWeight * material.hardnessWeight * 0.45f);
+    const Vec3 dampened {
+        clamp(base.x * (1.0f - (material.wetness * 0.18f)), 0.0f, 1.0f),
+        clamp(base.y * (1.0f - (material.wetness * 0.12f)), 0.0f, 1.0f),
+        clamp(base.z * (1.0f - (material.wetness * 0.08f)), 0.0f, 1.0f)
+    };
+    base = lerp(base, dampened, material.wetness * 0.55f);
+    base = lerp(base, { 0.22f, 0.26f, 0.29f }, material.flowWeight * material.erosionWeight * 0.35f);
+    base = lerp(base, snowColor, material.snowWeight);
+
+    const float micro = (valueNoise2(x * 0.013f, z * 0.013f, params.seed + 331) * 2.0f) - 1.0f;
+    base.x = clamp(base.x + (micro * 0.05f), 0.0f, 1.0f);
+    base.y = clamp(base.y + (micro * 0.06f), 0.0f, 1.0f);
+    base.z = clamp(base.z + (micro * 0.04f), 0.0f, 1.0f);
+    return base;
+}
+
+Vec3 composeTerrainWaterColorFromChunkData(
+    const TerrainChunkData& data,
+    float x,
+    float z,
+    float surfaceHeight,
+    float waterHeight,
+    const TerrainFieldContext& terrainContext)
+{
+    const TerrainParams& params = terrainContext.params;
+    const float foam = clamp((waterHeight + 0.8f - surfaceHeight) / std::max(0.1f, params.shorelineBand), 0.0f, 1.0f);
+    const float waveTint = (valueNoise2(x * 0.021f, z * 0.021f, params.seed + 1431) * 2.0f) - 1.0f;
+    (void)data;
+    return {
+        clamp(params.waterColor.x + (waveTint * 0.02f) + (foam * 0.12f), 0.0f, 1.0f),
+        clamp(params.waterColor.y + (waveTint * 0.04f) + (foam * 0.16f), 0.0f, 1.0f),
+        clamp(params.waterColor.z + (waveTint * 0.06f) + (foam * 0.18f), 0.0f, 1.0f)
+    };
+}
+
+Model buildSurfaceTerrainPatchFromChunkData(const TerrainChunkData& data, const TerrainFieldContext& terrainContext)
+{
+    Model model;
+    if (data.gridWidth <= 1 || data.gridHeight <= 1 || data.surfaceHeights.empty()) {
+        return model;
+    }
+
+    const TerrainParams& params = terrainContext.params;
+    const int nx = data.gridWidth - 1;
+    const int nz = data.gridHeight - 1;
+    const float spanX = std::max(1.0f, data.bounds.x1 - data.bounds.x0);
+    const float spanZ = std::max(1.0f, data.bounds.z1 - data.bounds.z0);
+    const float xStep = spanX / static_cast<float>(nx);
+    const float zStep = spanZ / static_cast<float>(nz);
+
+    std::vector<int> grid(static_cast<std::size_t>(data.gridWidth * data.gridHeight), 0);
+    auto gridIndex = [nx](int ix, int iz) {
+        return static_cast<std::size_t>(iz * (nx + 1) + ix);
+    };
+
+    for (int iz = 0; iz <= nz; ++iz) {
+        const float z = data.bounds.z0 + (static_cast<float>(iz) * zStep);
+        for (int ix = 0; ix <= nx; ++ix) {
+            const float x = data.bounds.x0 + (static_cast<float>(ix) * xStep);
+            const float y = terrainChunkGridValue(data.surfaceHeights, data, ix, iz, 0.0f);
+            grid[gridIndex(ix, iz)] = static_cast<int>(model.vertices.size());
+            model.vertices.push_back({ x, y, z });
+        }
+    }
+
+    model.vertexNormals.resize(model.vertices.size(), { 0.0f, 1.0f, 0.0f });
+    for (int iz = 0; iz <= nz; ++iz) {
+        const int iz0 = std::max(0, iz - 1);
+        const int iz1 = std::min(nz, iz + 1);
+        for (int ix = 0; ix <= nx; ++ix) {
+            const int ix0 = std::max(0, ix - 1);
+            const int ix1 = std::min(nx, ix + 1);
+            const float hL = terrainChunkGridValue(data.surfaceHeights, data, ix0, iz, 0.0f);
+            const float hR = terrainChunkGridValue(data.surfaceHeights, data, ix1, iz, 0.0f);
+            const float hD = terrainChunkGridValue(data.surfaceHeights, data, ix, iz0, 0.0f);
+            const float hU = terrainChunkGridValue(data.surfaceHeights, data, ix, iz1, 0.0f);
+            const float dx = xStep * static_cast<float>(std::max(1, ix1 - ix0));
+            const float dz = zStep * static_cast<float>(std::max(1, iz1 - iz0));
+            const Vec3 tangentZ { 0.0f, hU - hD, dz };
+            const Vec3 tangentX { dx, hR - hL, 0.0f };
+            model.vertexNormals[static_cast<std::size_t>(grid[gridIndex(ix, iz)])] =
+                normalize(cross(tangentZ, tangentX), { 0.0f, 1.0f, 0.0f });
+        }
+    }
+
+    auto addSurfaceTri = [&](int ia, int ib, int ic) {
+        const Vec3& a = model.vertices[static_cast<std::size_t>(ia)];
+        const Vec3& b = model.vertices[static_cast<std::size_t>(ib)];
+        const Vec3& c = model.vertices[static_cast<std::size_t>(ic)];
+        const float centerX = (a.x + b.x + c.x) / 3.0f;
+        const float centerZ = (a.z + b.z + c.z) / 3.0f;
+        if (pointInsideHole(centerX, centerZ, data.bounds)) {
+            return;
+        }
+        const TerrainMaterialSample material = sampleTerrainMaterialFromChunkData(data, centerX, centerZ);
+        addFace(model, { ia, ib, ic }, composeTerrainColorFromWeights(centerX, centerZ, material, terrainContext));
+    };
+
+    for (int iz = 0; iz < nz; ++iz) {
+        for (int ix = 0; ix < nx; ++ix) {
+            const int i00 = grid[gridIndex(ix, iz)];
+            const int i10 = grid[gridIndex(ix + 1, iz)];
+            const int i01 = grid[gridIndex(ix, iz + 1)];
+            const int i11 = grid[gridIndex(ix + 1, iz + 1)];
+            addSurfaceTri(i00, i11, i10);
+            addSurfaceTri(i00, i01, i11);
+        }
+    }
+
+    if (params.enableSkirts) {
+        appendSkirtQuads(model, terrainContext, data.bounds, data.cellSize, params.skirtDepth);
+    }
+    return model;
+}
+
+void appendTerrainWaterFromChunkData(Model& model, const TerrainChunkData& data, const TerrainFieldContext& terrainContext)
+{
+    if (data.gridWidth <= 1 || data.gridHeight <= 1 || data.surfaceHeights.empty() || data.waterHeights.empty()) {
+        return;
+    }
+
+    const int nx = data.gridWidth - 1;
+    const int nz = data.gridHeight - 1;
+    const float spanX = std::max(1.0f, data.bounds.x1 - data.bounds.x0);
+    const float spanZ = std::max(1.0f, data.bounds.z1 - data.bounds.z0);
+    const float xStep = spanX / static_cast<float>(nx);
+    const float zStep = spanZ / static_cast<float>(nz);
+
+    for (int iz = 0; iz < nz; ++iz) {
+        const float z0 = data.bounds.z0 + (static_cast<float>(iz) * zStep);
+        const float z1 = z0 + zStep;
+        for (int ix = 0; ix < nx; ++ix) {
+            const float x0 = data.bounds.x0 + (static_cast<float>(ix) * xStep);
+            const float x1 = x0 + xStep;
+            const float cellCenterX = (x0 + x1) * 0.5f;
+            const float cellCenterZ = (z0 + z1) * 0.5f;
+            if (pointInsideHole(cellCenterX, cellCenterZ, data.bounds)) {
+                continue;
+            }
+
+            const float s00 = terrainChunkGridValue(data.surfaceHeights, data, ix, iz, 0.0f);
+            const float s10 = terrainChunkGridValue(data.surfaceHeights, data, ix + 1, iz, 0.0f);
+            const float s01 = terrainChunkGridValue(data.surfaceHeights, data, ix, iz + 1, 0.0f);
+            const float s11 = terrainChunkGridValue(data.surfaceHeights, data, ix + 1, iz + 1, 0.0f);
+            const float w00 = terrainChunkGridValue(data.waterHeights, data, ix, iz, s00);
+            const float w10 = terrainChunkGridValue(data.waterHeights, data, ix + 1, iz, s10);
+            const float w01 = terrainChunkGridValue(data.waterHeights, data, ix, iz + 1, s01);
+            const float w11 = terrainChunkGridValue(data.waterHeights, data, ix + 1, iz + 1, s11);
+            if (w00 <= (s00 + 0.12f) &&
+                w10 <= (s10 + 0.12f) &&
+                w01 <= (s01 + 0.12f) &&
+                w11 <= (s11 + 0.12f)) {
+                continue;
+            }
+
+            const float centerSurface = (s00 + s10 + s01 + s11) * 0.25f;
+            const float centerWater = (w00 + w10 + w01 + w11) * 0.25f;
+            const Vec3 color = composeTerrainWaterColorFromChunkData(data, cellCenterX, cellCenterZ, centerSurface, centerWater, terrainContext);
+            addColoredQuad(
+                model,
+                { x0, w00, z0 },
+                { x0, w01, z1 },
+                { x1, w11, z1 },
+                { x1, w10, z0 },
+                color);
+        }
+    }
+}
+
 TerrainChunkData buildTerrainChunkSourceData(
     const TerrainChunkKey& key,
     const TerrainPatchBounds& bounds,
@@ -2433,9 +2936,16 @@ TerrainChunkData buildTerrainChunkSourceData(
     data.gridHeight = nz + 1;
     const std::size_t valueCount = static_cast<std::size_t>(data.gridWidth * data.gridHeight);
     data.surfaceHeights.reserve(valueCount);
+    data.wetnessWeights.reserve(valueCount);
     data.snowWeights.reserve(valueCount);
+    data.rockWeights.reserve(valueCount);
+    data.biomeWeights.reserve(valueCount);
     data.waterHeights.reserve(valueCount);
     data.waterWeights.reserve(valueCount);
+    data.hardnessWeights.reserve(valueCount);
+    data.resourceWeights.reserve(valueCount);
+    data.erosionWeights.reserve(valueCount);
+    data.flowWeights.reserve(valueCount);
 
     for (int iz = 0; iz <= nz; ++iz) {
         const float z = bounds.z0 + (static_cast<float>(iz) * zStep);
@@ -2443,13 +2953,109 @@ TerrainChunkData buildTerrainChunkSourceData(
             const float x = bounds.x0 + (static_cast<float>(ix) * xStep);
             const TerrainMaterialSample material = sampleTerrainMaterial(x, 0.0f, z, terrainContext);
             data.surfaceHeights.push_back(material.surfaceHeight);
+            data.wetnessWeights.push_back(material.wetness);
             data.snowWeights.push_back(material.snowWeight);
+            data.rockWeights.push_back(material.rockWeight);
+            data.biomeWeights.push_back(material.biomeBlend);
             data.waterHeights.push_back(material.waterHeight);
             data.waterWeights.push_back(clamp((material.waterHeight - material.surfaceHeight + 0.12f) / std::max(0.1f, params.shorelineBand), 0.0f, 1.0f));
+            data.hardnessWeights.push_back(material.hardnessWeight);
+            data.resourceWeights.push_back(material.resourceWeight);
+            data.erosionWeights.push_back(material.erosionWeight);
+            data.flowWeights.push_back(material.flowWeight);
         }
     }
 
     return data;
+}
+
+TerrainFarTileDetail initialTerrainTileDetailForBand(TerrainFarTileBand band);
+
+bool terrainPatchIntersectsTunnel(const TerrainPatchBounds& bounds, const TerrainTunnelSeed& tunnel, float padding = 0.0f)
+{
+    const float expandedX0 = bounds.x0 - padding;
+    const float expandedX1 = bounds.x1 + padding;
+    const float expandedZ0 = bounds.z0 - padding;
+    const float expandedZ1 = bounds.z1 + padding;
+    for (std::size_t index = 1; index < tunnel.points.size(); ++index) {
+        const Vec3& a = tunnel.points[index - 1];
+        const Vec3& b = tunnel.points[index];
+        const float radius = tunnel.radius + padding;
+        const float minX = std::min(a.x, b.x) - radius;
+        const float maxX = std::max(a.x, b.x) + radius;
+        const float minZ = std::min(a.z, b.z) - radius;
+        const float maxZ = std::max(a.z, b.z) + radius;
+        if (maxX >= expandedX0 && minX <= expandedX1 && maxZ >= expandedZ0 && minZ <= expandedZ1) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool terrainPatchNeedsTunnelVolumetrics(const TerrainPatchBounds& bounds, const TerrainFieldContext& terrainContext)
+{
+    const float padding = std::max(terrainContext.params.lod1CellSize, terrainContext.params.tunnelRadiusMax);
+    for (const TerrainTunnelSeed& tunnel : terrainContext.tunnelSeeds) {
+        if (terrainPatchIntersectsTunnel(bounds, tunnel, padding)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool terrainPatchNeedsWorldVolumetrics(const TerrainPatchBounds& bounds, const TerrainFieldContext& terrainContext)
+{
+    if (!terrainContext.hasVolumetricOverridesInBounds) {
+        return false;
+    }
+
+    const float padding = std::max(terrainContext.params.lod0CellSize * 1.5f, terrainContext.params.lod1CellSize);
+    return terrainContext.hasVolumetricOverridesInBounds(
+        bounds.x0 - padding,
+        bounds.z0 - padding,
+        bounds.x1 + padding,
+        bounds.z1 + padding);
+}
+
+bool terrainPatchNeedsLocalVolumetrics(const TerrainPatchBounds& bounds, const TerrainFieldContext& terrainContext)
+{
+    return terrainPatchNeedsTunnelVolumetrics(bounds, terrainContext) ||
+        terrainPatchNeedsWorldVolumetrics(bounds, terrainContext);
+}
+
+TerrainFarTileDetail preferredTerrainTileDetail(
+    TerrainFarTileBand band,
+    const TerrainPatchBounds& bounds,
+    const TerrainFieldContext& terrainContext)
+{
+    if (terrainPatchNeedsLocalVolumetrics(bounds, terrainContext)) {
+        if (band == TerrainFarTileBand::Near || band == TerrainFarTileBand::Mid) {
+            return TerrainFarTileDetail::Lod1;
+        }
+    }
+    return initialTerrainTileDetailForBand(band);
+}
+
+bool terrainTileNeedsVolumetricGround(
+    TerrainFarTileBand band,
+    TerrainFarTileDetail detail,
+    const TerrainPatchBounds& bounds,
+    const TerrainFieldContext& terrainContext)
+{
+    if (terrainPatchNeedsLocalVolumetrics(bounds, terrainContext)) {
+        if (band == TerrainFarTileBand::Near) {
+            return detail != TerrainFarTileDetail::Lod2;
+        }
+        if (band == TerrainFarTileBand::Mid) {
+            return detail == TerrainFarTileDetail::Lod1;
+        }
+    }
+
+    if (terrainContext.params.surfaceOnlyMeshing) {
+        return false;
+    }
+
+    return band == TerrainFarTileBand::Near && detail == TerrainFarTileDetail::Lod0;
 }
 
 CompiledTerrainChunk loadOrBuildTerrainChunk(
@@ -2466,10 +3072,10 @@ CompiledTerrainChunk loadOrBuildTerrainChunk(
         bool buildDecoration = false;
     };
 
-    const auto buildPlanForRequest = [](TerrainFarTileBand tileBand, TerrainFarTileDetail detail) {
+    const auto buildPlanForRequest = [&](TerrainFarTileBand tileBand, TerrainFarTileDetail detail) {
         TerrainChunkBuildPlan plan;
+        plan.buildVolumetricGround = terrainTileNeedsVolumetricGround(tileBand, detail, bounds, terrainContext);
         if (tileBand == TerrainFarTileBand::Near) {
-            plan.buildVolumetricGround = detail == TerrainFarTileDetail::Lod0;
             plan.buildDecoration = detail == TerrainFarTileDetail::Lod0;
         } else if (tileBand == TerrainFarTileBand::Mid) {
             plan.buildDecoration = detail == TerrainFarTileDetail::Lod1;
@@ -2493,7 +3099,7 @@ CompiledTerrainChunk loadOrBuildTerrainChunk(
     chunk.key = key;
     chunk.sourceData = buildTerrainChunkSourceData(key, bounds, cellSize, terrainContext);
 
-    if (buildPlan.buildVolumetricGround && !terrainContext.params.surfaceOnlyMeshing) {
+    if (buildPlan.buildVolumetricGround) {
         const float overlap = cellSize;
         const TerrainVolumeBounds tileVolume {
             bounds.x0 - overlap,
@@ -2509,15 +3115,15 @@ CompiledTerrainChunk loadOrBuildTerrainChunk(
         if (band == TerrainFarTileBand::Near) {
             tileContext.params.enableSkirts = false;
         }
-        chunk.terrainModel = buildSurfaceTerrainPatch(tileContext, bounds, cellSize);
+        chunk.terrainModel = buildSurfaceTerrainPatchFromChunkData(chunk.sourceData, tileContext);
     }
 
     if (buildPlan.buildWater) {
-        appendTerrainWater(chunk.waterModel, terrainContext, bounds, std::max(cellSize, terrainContext.params.lod1CellSize));
+        appendTerrainWaterFromChunkData(chunk.waterModel, chunk.sourceData, terrainContext);
         configureTerrainWaterMaterial(chunk.waterModel);
     }
     if (buildPlan.buildDecoration) {
-        TerrainTileDecorationResult decoration = buildTerrainTileDecoration(key, bounds, band, terrainContext);
+        TerrainTileDecorationResult decoration = buildTerrainTileDecoration(key, bounds, band, terrainContext, &chunk.sourceData);
         chunk.propModel = std::move(decoration.propModel);
         chunk.propColliders = std::move(decoration.propColliders);
     }
@@ -3530,14 +4136,30 @@ const TerrainVisualCache& ensureTerrainVisualCache(
 
     for (int tileZ = tileIndexBegin(nearZ0, lod0TileSize); tileZ < tileIndexEnd(nearZ1, lod0TileSize); ++tileZ) {
         for (int tileX = tileIndexBegin(nearX0, lod0TileSize); tileX < tileIndexEnd(nearX1, lod0TileSize); ++tileX) {
+            const TerrainPatchBounds tileBounds {
+                static_cast<float>(tileX) * lod0TileSize,
+                (static_cast<float>(tileX) + 1.0f) * lod0TileSize,
+                static_cast<float>(tileZ) * lod0TileSize,
+                (static_cast<float>(tileZ) + 1.0f) * lod0TileSize,
+                false,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f
+            };
+            const TerrainFarTileDetail requiredDetail = preferredTerrainTileDetail(TerrainFarTileBand::Near, tileBounds, terrainContext);
             const std::uint64_t sourceSignature = tileSourceSignature(TerrainFarTileBand::Near, tileX, tileZ);
             TerrainFarTile* tile = findTerrainTile(terrainCache.nearTiles, TerrainFarTileBand::Near, tileX, tileZ);
             if (tile != nullptr) {
                 tile->active = true;
+                const TerrainFarTileDetail requestDetail =
+                    terrainTileDetailRank(tile->detail) > terrainTileDetailRank(requiredDetail)
+                        ? requiredDetail
+                        : tile->detail;
                 if (tile->paramsSignature != paramsSignature || tile->sourceSignature != sourceSignature) {
                     missingTiles.push_back({
                         TerrainFarTileBand::Near,
-                        tile->detail,
+                        requestDetail,
                         tileX,
                         tileZ,
                         paramsSignature,
@@ -3546,7 +4168,17 @@ const TerrainVisualCache& ensureTerrainVisualCache(
                             terrainTilePriorityBias(TerrainFarTileBand::Near)
                     });
                 } else if (allowUpgrades) {
-                    if (const auto nextDetail = nextTerrainTileDetail(TerrainFarTileBand::Near, tile->detail); nextDetail.has_value()) {
+                    if (terrainTileDetailRank(tile->detail) > terrainTileDetailRank(requiredDetail)) {
+                        upgradeTiles.push_back({
+                            TerrainFarTileBand::Near,
+                            requiredDetail,
+                            tileX,
+                            tileZ,
+                            paramsSignature,
+                            sourceSignature,
+                            tileCenterDistanceSquared(prefetchCenter, lod0TileSize, tileX, tileZ)
+                        });
+                    } else if (const auto nextDetail = nextTerrainTileDetail(TerrainFarTileBand::Near, tile->detail); nextDetail.has_value()) {
                         upgradeTiles.push_back({
                             TerrainFarTileBand::Near,
                             *nextDetail,
@@ -3563,7 +4195,7 @@ const TerrainVisualCache& ensureTerrainVisualCache(
 
             missingTiles.push_back({
                 TerrainFarTileBand::Near,
-                initialTerrainTileDetailForBand(TerrainFarTileBand::Near),
+                requiredDetail,
                 tileX,
                 tileZ,
                 paramsSignature,
@@ -3580,14 +4212,30 @@ const TerrainVisualCache& ensureTerrainVisualCache(
                 continue;
             }
 
+            const TerrainPatchBounds tileBounds {
+                static_cast<float>(tileX) * lod1TileSize,
+                (static_cast<float>(tileX) + 1.0f) * lod1TileSize,
+                static_cast<float>(tileZ) * lod1TileSize,
+                (static_cast<float>(tileZ) + 1.0f) * lod1TileSize,
+                false,
+                0.0f,
+                0.0f,
+                0.0f,
+                0.0f
+            };
+            const TerrainFarTileDetail requiredDetail = preferredTerrainTileDetail(TerrainFarTileBand::Mid, tileBounds, terrainContext);
             const std::uint64_t sourceSignature = tileSourceSignature(TerrainFarTileBand::Mid, tileX, tileZ);
             TerrainFarTile* tile = findTerrainTile(terrainCache.farTiles, TerrainFarTileBand::Mid, tileX, tileZ);
             if (tile != nullptr) {
                 tile->active = true;
+                const TerrainFarTileDetail requestDetail =
+                    terrainTileDetailRank(tile->detail) > terrainTileDetailRank(requiredDetail)
+                        ? requiredDetail
+                        : tile->detail;
                 if (allowMidBand && (tile->paramsSignature != paramsSignature || tile->sourceSignature != sourceSignature)) {
                     missingTiles.push_back({
                         TerrainFarTileBand::Mid,
-                        tile->detail,
+                        requestDetail,
                         tileX,
                         tileZ,
                         paramsSignature,
@@ -3596,7 +4244,17 @@ const TerrainVisualCache& ensureTerrainVisualCache(
                             terrainTilePriorityBias(TerrainFarTileBand::Mid)
                     });
                 } else if (allowMidBand && allowUpgrades) {
-                    if (const auto nextDetail = nextTerrainTileDetail(TerrainFarTileBand::Mid, tile->detail); nextDetail.has_value()) {
+                    if (terrainTileDetailRank(tile->detail) > terrainTileDetailRank(requiredDetail)) {
+                        upgradeTiles.push_back({
+                            TerrainFarTileBand::Mid,
+                            requiredDetail,
+                            tileX,
+                            tileZ,
+                            paramsSignature,
+                            sourceSignature,
+                            tileCenterDistanceSquared(prefetchCenter, lod1TileSize, tileX, tileZ)
+                        });
+                    } else if (const auto nextDetail = nextTerrainTileDetail(TerrainFarTileBand::Mid, tile->detail); nextDetail.has_value()) {
                         upgradeTiles.push_back({
                             TerrainFarTileBand::Mid,
                             *nextDetail,
@@ -3614,7 +4272,7 @@ const TerrainVisualCache& ensureTerrainVisualCache(
             if (allowMidBand) {
                 missingTiles.push_back({
                     TerrainFarTileBand::Mid,
-                    initialTerrainTileDetailForBand(TerrainFarTileBand::Mid),
+                    requiredDetail,
                     tileX,
                     tileZ,
                     paramsSignature,
@@ -4907,19 +5565,28 @@ AvatarManifest buildLocalAvatarManifest(
 
 NetPlayerInput buildNetPlayerInput(
     int tick,
+    float frameDt,
     bool flightMode,
     float walkYaw,
     float walkPitch,
+    float walkMoveSpeed,
     const FlightState& plane,
     const InputState& input,
     const WalkingInputState& walkingInput,
-    const AvatarManifest& avatar)
+    const AvatarManifest& avatar,
+    bool firePrimary,
+    bool dropBomb,
+    bool terrainGunAdd,
+    bool terrainGunRemove,
+    bool terraformMode)
 {
     NetPlayerInput packet;
     packet.tick = std::max(1, tick);
     packet.role = flightMode ? "plane" : "walking";
+    packet.frameDt = HostedNetworkingDetail::sanitizeNetInputFrameDt(frameDt);
     packet.walkYaw = walkYaw;
     packet.walkPitch = walkPitch;
+    packet.walkMoveSpeed = clamp(walkMoveSpeed, 2.0f, 30.0f);
     packet.throttle = clamp(plane.throttle, 0.0f, 1.0f);
     packet.yokePitch = plane.yoke.pitch;
     packet.yokeYaw = plane.yoke.yaw;
@@ -4934,6 +5601,11 @@ NetPlayerInput buildNetPlayerInput(
     packet.flightThrottleDown = input.flightThrottleDown;
     packet.flightAirBrakes = input.flightAirBrakes;
     packet.flightAfterburner = input.flightAfterburner;
+    packet.firePrimary = firePrimary;
+    packet.dropBomb = dropBomb;
+    packet.terrainGunAdd = terrainGunAdd;
+    packet.terrainGunRemove = terrainGunRemove;
+    packet.terraformMode = terraformMode;
     packet.avatar = avatar;
     packet.avatar.role = packet.role;
     return packet;
@@ -4970,6 +5642,34 @@ SteamOnlineState snapshotSteamOnlineState(const SteamOnlineController& controlle
     state.memberCount = lobby.memberCount;
     state.maxPlayers = lobby.maxPlayers;
     state.transport = controller.transport();
+    const std::vector<SteamDiscoveredLobby>& discoveredLobbies = controller.discoveredLobbies();
+    state.discoveredLobbyCount = static_cast<int>(discoveredLobbies.size());
+    const std::size_t selectedDiscoveredLobbyIndex = controller.selectedDiscoveredLobbyIndex();
+    state.selectedDiscoveredLobbyIndex =
+        selectedDiscoveredLobbyIndex < discoveredLobbies.size() ? static_cast<int>(selectedDiscoveredLobbyIndex) : -1;
+    state.discoveredLobbyLabels.reserve(discoveredLobbies.size());
+    for (std::size_t index = 0; index < discoveredLobbies.size(); ++index) {
+        const SteamDiscoveredLobby& discovered = discoveredLobbies[index];
+        const std::string hostLabel =
+            formatSteamIdentityLabel(
+                !discovered.hostPersonaName.empty() ? discovered.hostPersonaName : discovered.sourceFriendPersonaName,
+                discovered.hostSteamId != 0 ? std::to_string(discovered.hostSteamId) : std::string {});
+        std::string label = hostLabel.empty() ? ("Lobby #" + std::to_string(discovered.lobbyId)) : hostLabel;
+        if (!discovered.worldId.empty()) {
+            label += " | " + discovered.worldId;
+        }
+        if (discovered.maxPlayers > 0) {
+            label += " | max " + std::to_string(discovered.maxPlayers);
+        }
+        if (!discovered.joinable) {
+            label += " | locked";
+        }
+        state.discoveredLobbyLabels.push_back(label);
+        if (index == selectedDiscoveredLobbyIndex) {
+            state.selectedDiscoveredLobbyId = std::to_string(discovered.lobbyId);
+            state.selectedDiscoveredLobbyLabel = label;
+        }
+    }
     const bool lobbyHasTerminalError = steamStatusLooksTerminal(lobby.status);
     const bool lobbyOwnsStatus =
         lobby.role != SteamLobbyState::Role::Offline ||
@@ -4983,6 +5683,587 @@ SteamOnlineState snapshotSteamOnlineState(const SteamOnlineController& controlle
             ? runtimeStatus
             : (!lobby.status.empty() ? lobby.status : (state.available ? std::string("Steam ready.") : std::string("Offline fallback active."))));
     return state;
+}
+
+void pruneHudNotifications(BootResources& boot, float nowSeconds)
+{
+    while (!boot.notifications.empty() && boot.notifications.front().until <= nowSeconds) {
+        boot.notifications.pop_front();
+    }
+}
+
+void updateOnlineNotifications(BootResources& boot, GameSession* session, float nowSeconds)
+{
+    pruneHudNotifications(boot, nowSeconds);
+
+    if (!boot.previousSteamOnlineValid) {
+        boot.previousSteamOnline = boot.steamOnline;
+        boot.previousSteamOnlineValid = true;
+    }
+
+    const SteamOnlineState previous = boot.previousSteamOnline;
+    if (previous.pendingLobbyId.empty() && !boot.steamOnline.pendingLobbyId.empty()) {
+        pushHudNotification(boot, "Pending Steam invite #" + boot.steamOnline.pendingLobbyId + ". Open Online settings to join.", nowSeconds, 4.5f);
+    }
+    if (previous.lobbyId != boot.steamOnline.lobbyId && !boot.steamOnline.lobbyId.empty()) {
+        pushHudNotification(boot, "Active Steam lobby #" + boot.steamOnline.lobbyId + ".", nowSeconds, 3.8f);
+    }
+    if (previous.memberNames != boot.steamOnline.memberNames) {
+        for (const std::string& name : boot.steamOnline.memberNames) {
+            if (std::find(previous.memberNames.begin(), previous.memberNames.end(), name) == previous.memberNames.end()) {
+                pushHudNotification(boot, sanitizeCallsign(name) + " joined the lobby.", nowSeconds, 3.2f);
+            }
+        }
+        for (const std::string& name : previous.memberNames) {
+            if (std::find(boot.steamOnline.memberNames.begin(), boot.steamOnline.memberNames.end(), name) == boot.steamOnline.memberNames.end()) {
+                pushHudNotification(boot, sanitizeCallsign(name) + " left the lobby.", nowSeconds, 3.2f);
+            }
+        }
+    }
+
+    if (session != nullptr) {
+        std::map<int, std::string> currentPeers;
+        if (session->onlineRole == OnlineSessionRole::Host) {
+            for (const auto& [playerId, player] : session->hostedServer.players()) {
+                if (playerId == 1 || !player.connected || !player.hasReceivedHello) {
+                    continue;
+                }
+                currentPeers[playerId] = sanitizeCallsign(player.avatar.callsign);
+            }
+        } else if (session->onlineRole == OnlineSessionRole::Client) {
+            for (const auto& [peerId, peer] : session->clientReplication.peers) {
+                (void)peerId;
+                if (!peer.connected) {
+                    continue;
+                }
+                currentPeers[peer.id] = sanitizeCallsign(peer.avatar.callsign);
+            }
+        }
+
+        for (const auto& [peerId, callsign] : currentPeers) {
+            if (session->knownRemotePeers.find(peerId) == session->knownRemotePeers.end()) {
+                pushHudNotification(boot, callsign + " joined the world.", nowSeconds, 3.0f);
+            }
+        }
+        for (const auto& [peerId, callsign] : session->knownRemotePeers) {
+            if (currentPeers.find(peerId) == currentPeers.end()) {
+                pushHudNotification(boot, callsign + " left the world.", nowSeconds, 3.0f);
+            }
+        }
+        session->knownRemotePeers = std::move(currentPeers);
+    }
+
+    boot.previousSteamOnline = boot.steamOnline;
+    boot.previousSteamOnlineValid = true;
+}
+
+PlaneDurabilityState sanitizePlaneDurabilityState(const PlaneDurabilityState& state)
+{
+    PlaneDurabilityState out = state;
+    out.hullStrength = clamp(sanitize(out.hullStrength, kPlaneHullMaxStrength), 0.0f, kPlaneHullMaxStrength);
+    out.fuselageStrength = clamp(sanitize(out.fuselageStrength, kPlaneFuselageMaxStrength), 0.0f, kPlaneFuselageMaxStrength);
+    out.wear = clamp(sanitize(out.wear, 0.0f), 0.0f, kPlaneWearMax);
+    out.targetsDestroyed = std::max(0, out.targetsDestroyed);
+    return out;
+}
+
+PlaneDurabilityState& ensurePlaneDurabilityState(std::unordered_map<int, PlaneDurabilityState>& states, int playerId)
+{
+    return states[playerId] = sanitizePlaneDurabilityState(states[playerId]);
+}
+
+PlaneDurabilityState lookupPlaneDurabilityState(const GameSession& session, int playerId)
+{
+    const auto authoritativeIt = session.planeDurabilityByPlayerId.find(playerId);
+    if (authoritativeIt != session.planeDurabilityByPlayerId.end()) {
+        return sanitizePlaneDurabilityState(authoritativeIt->second);
+    }
+    const auto replicatedIt = session.replicatedDurabilityByPlayerId.find(playerId);
+    if (replicatedIt != session.replicatedDurabilityByPlayerId.end()) {
+        return sanitizePlaneDurabilityState(replicatedIt->second);
+    }
+    return {};
+}
+
+bool lookupTerraformMode(const GameSession& session, int playerId)
+{
+    if (const auto it = session.weaponStateByPlayerId.find(playerId); it != session.weaponStateByPlayerId.end()) {
+        return it->second.terraformMode;
+    }
+    return false;
+}
+
+std::vector<PeerStatComparison> buildPeerStatComparisons(const GameSession& session)
+{
+    std::vector<PeerStatComparison> comparisons;
+    const float localGround = sampleGroundHeight(session.plane.pos.x, session.plane.pos.z, session.terrainContext);
+    const float localSpeedKph = (session.flightMode ? session.plane.debug.speed : length(session.plane.vel)) * 3.6f;
+    const float localAltitudeAgl = session.plane.pos.y - localGround;
+
+    if (session.onlineRole == OnlineSessionRole::Host) {
+        for (const auto& [playerId, player] : session.hostedServer.players()) {
+            if (playerId == 1 || !player.connected || !player.hasReceivedHello) {
+                continue;
+            }
+            const PlaneDurabilityState durability = lookupPlaneDurabilityState(session, playerId);
+            const float peerGround = sampleGroundHeight(player.actor.pos.x, player.actor.pos.z, session.terrainContext);
+            comparisons.push_back({
+                sanitizeCallsign(player.avatar.callsign),
+                length(player.actor.pos - session.plane.pos),
+                (player.flightMode ? player.actor.debug.speed : length(player.actor.vel)) * 3.6f,
+                localSpeedKph,
+                player.actor.pos.y - peerGround,
+                localAltitudeAgl,
+                durability.hullStrength,
+                durability.fuselageStrength,
+                durability.wear,
+                durability.targetsDestroyed
+            });
+        }
+    } else if (session.onlineRole == OnlineSessionRole::Client) {
+        for (const auto& [peerId, peer] : session.clientReplication.peers) {
+            (void)peerId;
+            if (!peer.connected) {
+                continue;
+            }
+            const PlaneDurabilityState durability = lookupPlaneDurabilityState(session, peer.id);
+            const float peerGround = sampleGroundHeight(peer.displayPos.x, peer.displayPos.z, session.terrainContext);
+            comparisons.push_back({
+                sanitizeCallsign(peer.avatar.callsign),
+                length(peer.displayPos - session.plane.pos),
+                length(peer.vel) * 3.6f,
+                localSpeedKph,
+                peer.displayPos.y - peerGround,
+                localAltitudeAgl,
+                durability.hullStrength,
+                durability.fuselageStrength,
+                durability.wear,
+                durability.targetsDestroyed
+            });
+        }
+    }
+
+    std::sort(
+        comparisons.begin(),
+        comparisons.end(),
+        [](const PeerStatComparison& lhs, const PeerStatComparison& rhs) {
+            return lhs.distanceMeters < rhs.distanceMeters;
+        });
+    if (comparisons.size() > 3u) {
+        comparisons.resize(3u);
+    }
+    return comparisons;
+}
+
+const char* gameplayObjectKindToken(GameplayObjectKind kind)
+{
+    switch (kind) {
+    case GameplayObjectKind::Bomb:
+        return "bomb";
+    case GameplayObjectKind::TerrainAdd:
+        return "terrain_add";
+    case GameplayObjectKind::TerrainRemove:
+        return "terrain_remove";
+    case GameplayObjectKind::Projectile:
+    default:
+        return "projectile";
+    }
+}
+
+GameplayObjectKind gameplayObjectKindFromToken(std::string_view token)
+{
+    if (token == "bomb") {
+        return GameplayObjectKind::Bomb;
+    }
+    if (token == "terrain_add") {
+        return GameplayObjectKind::TerrainAdd;
+    }
+    if (token == "terrain_remove") {
+        return GameplayObjectKind::TerrainRemove;
+    }
+    return GameplayObjectKind::Projectile;
+}
+
+FlightConfig buildEffectiveFlightConfig(const FlightConfig& baseConfig, const PlaneDurabilityState& durabilityInput)
+{
+    const PlaneDurabilityState durability = sanitizePlaneDurabilityState(durabilityInput);
+    const float structural =
+        clamp(((durability.hullStrength * 0.58f) + (durability.fuselageStrength * 0.42f)) / 100.0f, 0.12f, 1.0f);
+    const float wearAlpha = clamp(durability.wear / 100.0f, 0.0f, 1.0f);
+
+    FlightConfig config = baseConfig;
+    config.maxThrustSeaLevel *= mix(0.52f, 1.0f, structural) * mix(1.0f, 0.82f, wearAlpha);
+    config.afterburnerMultiplier = mix(1.0f, baseConfig.afterburnerMultiplier, structural);
+    config.pitchControlScale *= mix(0.38f, 1.0f, structural) * mix(1.0f, 0.88f, wearAlpha);
+    config.rollControlScale *= mix(0.42f, 1.0f, structural) * mix(1.0f, 0.90f, wearAlpha);
+    config.yawControlScale *= mix(0.46f, 1.0f, structural) * mix(1.0f, 0.92f, wearAlpha);
+    config.CD0 *= mix(1.95f, 1.0f, structural) * mix(1.0f, 1.28f, wearAlpha);
+    config.maxLinearSpeed *= mix(0.64f, 1.0f, structural) * mix(1.0f, 0.93f, wearAlpha);
+    config.crashNormalSpeed *= mix(0.72f, 1.0f, structural);
+    config.crashTotalSpeed *= mix(0.74f, 1.0f, structural);
+    return config;
+}
+
+FlightConfig buildRuntimeFlightConfig(const FlightConfig& baseConfig)
+{
+    FlightConfig config = baseConfig;
+    config.physicsHz = std::max(config.physicsHz, 180.0f);
+    config.maxSubsteps = std::max(config.maxSubsteps, 10);
+    return config;
+}
+
+void applyDurabilityWear(
+    PlaneDurabilityState& durability,
+    const FlightState& plane,
+    const FlightRuntimeState& runtime,
+    bool flightMode,
+    float dt)
+{
+    PlaneDurabilityState next = sanitizePlaneDurabilityState(durability);
+    if (flightMode) {
+        const float overspeed = std::max(0.0f, plane.debug.speed - 112.0f);
+        const float qbarStress = std::max(0.0f, runtime.lastDynamicPressure - 2900.0f);
+        const float aoaStress = std::max(0.0f, std::fabs(degrees(runtime.lastAlpha)) - 12.0f);
+        next.wear += ((overspeed * 0.010f) + (qbarStress * 0.00035f) + (aoaStress * 0.018f)) * dt;
+        if (plane.onGround && plane.debug.speed > 45.0f) {
+            next.wear += plane.debug.speed * 0.014f * dt;
+        }
+    } else {
+        next.wear = std::max(0.0f, next.wear - (dt * 0.4f));
+    }
+    durability = sanitizePlaneDurabilityState(next);
+}
+
+void applyPlaneDamage(PlaneDurabilityState& durability, float hullDamage, float fuselageDamage, float wearDamage)
+{
+    durability = sanitizePlaneDurabilityState({
+        durability.hullStrength - hullDamage,
+        durability.fuselageStrength - fuselageDamage,
+        durability.wear + wearDamage,
+        durability.targetsDestroyed
+    });
+}
+
+NetGameplayStatePacket buildGameplayStateSnapshot(const GameSession& session)
+{
+    NetGameplayStatePacket packet;
+    packet.timestamp = session.worldTime;
+    for (const auto& [playerId, durability] : session.planeDurabilityByPlayerId) {
+        const auto cooldownIt = session.weaponStateByPlayerId.find(playerId);
+        packet.players.push_back({
+            playerId,
+            sanitizePlaneDurabilityState(durability).hullStrength,
+            sanitizePlaneDurabilityState(durability).fuselageStrength,
+            sanitizePlaneDurabilityState(durability).wear,
+            cooldownIt != session.weaponStateByPlayerId.end() ? cooldownIt->second.terraformMode : false,
+            sanitizePlaneDurabilityState(durability).targetsDestroyed
+        });
+    }
+    for (const GameplayObjectState& object : session.gameplayObjects) {
+        if (!object.active) {
+            continue;
+        }
+        packet.objects.push_back({
+            gameplayObjectKindToken(object.kind),
+            object.id,
+            object.ownerId,
+            object.active,
+            object.pos,
+            object.vel,
+            object.radius,
+            object.ttl,
+            object.damage,
+            object.damage
+        });
+    }
+    for (const EnemyTargetState& target : session.enemyTargets) {
+        packet.objects.push_back({
+            "target",
+            target.id,
+            0,
+            target.health > 0.0f,
+            target.pos,
+            {},
+            target.radius,
+            std::max(0.0f, target.respawnAt - session.worldTime),
+            target.health,
+            target.maxHealth
+        });
+    }
+    return packet;
+}
+
+void applyReplicatedGameplayState(GameSession& session)
+{
+    if (!session.clientReplication.gameplayStateDirty) {
+        return;
+    }
+
+    session.clientReplication.gameplayStateDirty = false;
+    session.replicatedDurabilityByPlayerId.clear();
+    session.gameplayObjects.clear();
+    session.enemyTargets.clear();
+
+    for (const NetGameplayPlayerState& player : session.clientReplication.gameplayState.players) {
+        session.replicatedDurabilityByPlayerId[player.id] = sanitizePlaneDurabilityState({
+            player.hullStrength,
+            player.fuselageStrength,
+            player.wear,
+            player.targetsDestroyed
+        });
+        session.weaponStateByPlayerId[player.id].terraformMode = player.terraformMode;
+    }
+    if (session.clientReplication.localPlayerId > 0) {
+        if (const auto localIt = session.replicatedDurabilityByPlayerId.find(session.clientReplication.localPlayerId);
+            localIt != session.replicatedDurabilityByPlayerId.end()) {
+            session.planeDurabilityByPlayerId[session.clientReplication.localPlayerId] = localIt->second;
+        }
+    }
+
+    for (const NetGameplayObjectState& object : session.clientReplication.gameplayState.objects) {
+        if (object.kind == "target") {
+            session.enemyTargets.push_back({
+                object.id,
+                object.pos,
+                0.0f,
+                std::max(0.8f, object.radius),
+                std::max(1.2f, object.radius * 1.4f),
+                std::max(0.0f, object.health),
+                std::max(0.0f, object.maxHealth),
+                object.active ? -1.0f : (session.worldTime + std::max(0.0f, object.ttl))
+            });
+            continue;
+        }
+
+        session.gameplayObjects.push_back({
+            gameplayObjectKindFromToken(object.kind),
+            object.id,
+            object.ownerId,
+            object.pos,
+            object.vel,
+            std::max(0.1f, object.radius),
+            std::max(0.0f, object.ttl),
+            std::max(0.0f, object.health),
+            object.kind == "bomb" ? 0.05f : 0.02f,
+            object.kind == "bomb" ? 1.0f : 0.2f,
+            object.kind == "bomb" ? 16.0f : 0.0f,
+            object.kind == "bomb" ? 10.0f : 0.0f,
+            object.kind == "bomb" ? 4.2f : 0.0f,
+            object.active
+        });
+    }
+}
+
+bool segmentHitsSphere(const Vec3& start, const Vec3& end, const Vec3& center, float radius, float* tOut = nullptr)
+{
+    const Vec3 delta = end - start;
+    const Vec3 rel = start - center;
+    const float a = dot(delta, delta);
+    const float b = 2.0f * dot(rel, delta);
+    const float c = dot(rel, rel) - (radius * radius);
+    const float discriminant = (b * b) - (4.0f * a * c);
+    if (a <= 1.0e-6f || discriminant < 0.0f) {
+        return false;
+    }
+    const float sqrtDisc = std::sqrt(discriminant);
+    const float invDenom = 0.5f / a;
+    const float t0 = (-b - sqrtDisc) * invDenom;
+    const float t1 = (-b + sqrtDisc) * invDenom;
+    const float t = (t0 >= 0.0f && t0 <= 1.0f) ? t0 : ((t1 >= 0.0f && t1 <= 1.0f) ? t1 : -1.0f);
+    if (t < 0.0f) {
+        return false;
+    }
+    if (tOut != nullptr) {
+        *tOut = t;
+    }
+    return true;
+}
+
+bool segmentHitsVerticalCapsule(
+    const Vec3& start,
+    const Vec3& end,
+    const Vec3& center,
+    float radius,
+    float halfHeight,
+    Vec3* hitPoint = nullptr)
+{
+    const Vec3 top = center + Vec3 { 0.0f, halfHeight, 0.0f };
+    const Vec3 bottom = center - Vec3 { 0.0f, halfHeight, 0.0f };
+    float bestT = std::numeric_limits<float>::infinity();
+    bool hit = false;
+    for (const Vec3& sphereCenter : { center, top, bottom }) {
+        float t = 0.0f;
+        if (segmentHitsSphere(start, end, sphereCenter, radius, &t) && t < bestT) {
+            bestT = t;
+            hit = true;
+        }
+    }
+    if (hit && hitPoint != nullptr) {
+        *hitPoint = start + ((end - start) * bestT);
+    }
+    return hit;
+}
+
+std::vector<WorldChunkState> applyTerrainBrushEdit(
+    WorldStore* worldStore,
+    const Vec3& center,
+    float radius,
+    float magnitude,
+    const Vec3& surfaceNormal)
+{
+    std::vector<WorldChunkState> changedChunks;
+    if (worldStore == nullptr) {
+        return changedChunks;
+    }
+
+    const WorldMeta meta = worldStore->getMeta();
+    const float chunkSize = std::max(8.0f, meta.terrainProfile.chunkSize);
+    const int resolution = normalizeWorldChunkResolution(meta.chunkResolution);
+    const int minCx = static_cast<int>(std::floor((center.x - radius) / chunkSize));
+    const int maxCx = static_cast<int>(std::floor((center.x + radius) / chunkSize));
+    const int minCz = static_cast<int>(std::floor((center.z - radius) / chunkSize));
+    const int maxCz = static_cast<int>(std::floor((center.z + radius) / chunkSize));
+    const float radiusSq = radius * radius;
+    const int ownerCx = static_cast<int>(std::floor(center.x / chunkSize));
+    const int ownerCz = static_cast<int>(std::floor(center.z / chunkSize));
+    const Vec3 normal = normalize(surfaceNormal, { 0.0f, 1.0f, 0.0f });
+    const bool additive = magnitude >= 0.0f;
+    const float verticalBias = clamp(normal.y, 0.0f, 1.0f);
+    const float surfaceMagnitude =
+        magnitude *
+        (additive
+            ? (verticalBias * 0.45f)
+            : mix(0.14f, 0.40f, verticalBias));
+    const std::string volumetricKind = additive ? "sphere_add" : "sphere_sub";
+    const Vec3 tangentReference = std::fabs(normal.y) < 0.82f ? Vec3 { 0.0f, 1.0f, 0.0f } : Vec3 { 0.0f, 0.0f, 1.0f };
+    const Vec3 tangent = normalize(cross(tangentReference, normal), { 1.0f, 0.0f, 0.0f });
+    const Vec3 bitangent = normalize(cross(normal, tangent), { 0.0f, 0.0f, 1.0f });
+    const auto pushVolumetricOverride = [&](WorldChunkState& chunk, const Vec3& overrideCenter, float overrideRadius) {
+        chunk.volumetricOverrides.push_back({
+            volumetricKind,
+            overrideCenter.x,
+            overrideCenter.y,
+            overrideCenter.z,
+            std::max(0.75f, overrideRadius)
+        });
+        constexpr std::size_t kMaxVolumetricOverridesPerChunk = 96u;
+        if (chunk.volumetricOverrides.size() > kMaxVolumetricOverridesPerChunk) {
+            chunk.volumetricOverrides.erase(chunk.volumetricOverrides.begin());
+        }
+    };
+
+    for (int cz = minCz; cz <= maxCz; ++cz) {
+        for (int cx = minCx; cx <= maxCx; ++cx) {
+            WorldChunkState chunk = worldStore->getChunkState(cx, cz).value_or(WorldChunkState {});
+            if (chunk.resolution <= 0) {
+                chunk.cx = cx;
+                chunk.cz = cz;
+                chunk.resolution = resolution;
+                chunk.heightDeltas.assign(static_cast<std::size_t>((resolution + 1) * (resolution + 1)), 0.0f);
+            }
+            const int axis = chunk.resolution + 1;
+            if (chunk.heightDeltas.size() != static_cast<std::size_t>(axis * axis)) {
+                chunk.heightDeltas.resize(static_cast<std::size_t>(axis * axis), 0.0f);
+            }
+
+            const float x0 = static_cast<float>(cx) * chunkSize;
+            const float z0 = static_cast<float>(cz) * chunkSize;
+            bool touched = false;
+            for (int gz = 0; gz <= chunk.resolution; ++gz) {
+                const float worldZ = z0 + (static_cast<float>(gz) / static_cast<float>(chunk.resolution)) * chunkSize;
+                for (int gx = 0; gx <= chunk.resolution; ++gx) {
+                    const float worldX = x0 + (static_cast<float>(gx) / static_cast<float>(chunk.resolution)) * chunkSize;
+                    const float dx = worldX - center.x;
+                    const float dz = worldZ - center.z;
+                    const float distSq = (dx * dx) + (dz * dz);
+                    if (distSq > radiusSq) {
+                        continue;
+                    }
+                    const float alpha = 1.0f - clamp(distSq / std::max(1.0f, radiusSq), 0.0f, 1.0f);
+                    chunk.heightDeltas[static_cast<std::size_t>(gz * axis + gx)] += surfaceMagnitude * alpha * alpha;
+                    touched = true;
+                }
+            }
+
+            if (cx == ownerCx && cz == ownerCz) {
+                const Vec3 anchor =
+                    additive
+                        ? center + (normal * (radius * 0.55f))
+                        : center - (normal * (radius * 0.20f));
+                pushVolumetricOverride(chunk, anchor, radius * (additive ? 0.74f : 0.82f));
+                pushVolumetricOverride(
+                    chunk,
+                    anchor + (tangent * (radius * 0.34f)) + (bitangent * (radius * 0.16f)),
+                    radius * 0.48f);
+                pushVolumetricOverride(
+                    chunk,
+                    anchor - (tangent * (radius * 0.28f)) + ((additive ? normal : (normal * -1.0f)) * (radius * 0.22f)),
+                    radius * 0.42f);
+                touched = true;
+            }
+
+            if (!touched) {
+                continue;
+            }
+
+            chunk.revision = std::max(0, chunk.revision) + 1;
+            chunk.materialRevision = std::max(0, chunk.materialRevision) + 1;
+            if (worldStore->applyChunkState(chunk)) {
+                changedChunks.push_back(chunk);
+            }
+        }
+    }
+
+    if (!changedChunks.empty()) {
+        worldStore->flushDirty(nullptr);
+    }
+    return changedChunks;
+}
+
+void ensureEnemyTargetsGenerated(GameSession& session)
+{
+    if (!session.enemyTargets.empty()) {
+        return;
+    }
+
+    const TerrainParams& params = session.terrainContext.params;
+    const float ringRadius = std::max(220.0f, params.gameplayRadiusMeters * 0.82f);
+    const int maxAttempts = kEnemyTargetCount * 6;
+    for (int attempt = 0; attempt < maxAttempts && static_cast<int>(session.enemyTargets.size()) < kEnemyTargetCount; ++attempt) {
+        const int index = static_cast<int>(session.enemyTargets.size());
+        const float angle =
+            ((static_cast<float>(attempt) + (hash01(attempt, params.seed, 17, 91) * 0.45f)) / static_cast<float>(kEnemyTargetCount)) *
+            (2.0f * kPi);
+        const float radialJitter = ((hash01(attempt, 7, params.seed, 23) * 2.0f) - 1.0f) * ringRadius * 0.24f;
+        const float offsetX = std::sin(angle) * (ringRadius + radialJitter);
+        const float offsetZ = std::cos(angle) * (ringRadius + radialJitter);
+        const float x = offsetX;
+        const float z = offsetZ;
+        const float ground = sampleGroundHeight(x, z, session.terrainContext);
+        const float water = sampleWaterHeight(x, z, session.terrainContext);
+        if (ground <= (water + 1.0f)) {
+            continue;
+        }
+        const bool overlapsExisting = std::any_of(
+            session.enemyTargets.begin(),
+            session.enemyTargets.end(),
+            [&](const EnemyTargetState& target) {
+                return lengthSquared(Vec3 { target.pos.x - x, 0.0f, target.pos.z - z }) < (110.0f * 110.0f);
+            });
+        if (overlapsExisting) {
+            continue;
+        }
+        session.enemyTargets.push_back({
+            index + 1,
+            { x, ground + 3.0f, z },
+            wrapAngle(angle + radians(hash01(attempt, params.seed, 17, 99) * 360.0f)),
+            2.6f + (hash01(attempt, params.seed, 41, 13) * 1.1f),
+            3.2f + (hash01(attempt, params.seed, 83, 5) * 2.0f),
+            90.0f,
+            90.0f,
+            -1.0f
+        });
+    }
 }
 
 void moveVoiceFrames(std::vector<std::string>& destination, std::vector<std::string>& source)
@@ -5202,17 +6483,289 @@ AoiSubscription buildLocalAoiSubscription(const FlightState& plane, const Terrai
 
 bool terrainNetworkingParamsChanged(const TerrainParams& lhs, const TerrainParams& rhs)
 {
-    return lhs.seed != rhs.seed ||
-        std::fabs(lhs.chunkSize - rhs.chunkSize) > 0.01f ||
-        lhs.lod0Radius != rhs.lod0Radius ||
-        lhs.lod1Radius != rhs.lod1Radius ||
-        lhs.lod2Radius != rhs.lod2Radius ||
-        lhs.splitLodEnabled != rhs.splitLodEnabled ||
-        std::fabs(lhs.heightAmplitude - rhs.heightAmplitude) > 0.01f ||
-        std::fabs(lhs.heightFrequency - rhs.heightFrequency) > 1.0e-6f ||
-        lhs.caveEnabled != rhs.caveEnabled ||
-        lhs.tunnelCount != rhs.tunnelCount ||
-        lhs.dynamicCraters.size() != rhs.dynamicCraters.size();
+    return !terrainParamsEquivalent(lhs, rhs);
+}
+
+void resetFlight(FlightState& plane, FlightRuntimeState& runtime, const TerrainFieldContext& terrainContext, float x, float z);
+
+int nextLocalNetworkTick(GameSession& session)
+{
+    return std::max(1, session.clientReplication.nextOutboundTick++);
+}
+
+void recordClientPredictedState(GameSession& session, int tick)
+{
+    ClientPredictedState sample;
+    sample.tick = std::max(0, tick);
+    sample.flightMode = session.flightMode;
+    sample.plane = session.plane;
+    sample.runtime = session.runtime;
+    sample.walkYaw = session.walkYaw;
+    sample.walkPitch = session.walkPitch;
+
+    auto& predictedStates = session.clientReplication.predictedStates;
+    predictedStates[sample.tick] = std::move(sample);
+    while (predictedStates.size() > 512u) {
+        predictedStates.erase(predictedStates.begin());
+    }
+}
+
+float quatAbsDot(const Quat& a, const Quat& b)
+{
+    return std::fabs((a.w * b.w) + (a.x * b.x) + (a.y * b.y) + (a.z * b.z));
+}
+
+WalkingInputState buildWalkingPredictionInput(const NetPlayerInput& input)
+{
+    WalkingInputState walking {};
+    walking.forward = input.walkForward;
+    walking.backward = input.walkBackward;
+    walking.left = input.walkStrafeLeft;
+    walking.right = input.walkStrafeRight;
+    walking.sprint = input.walkSprint;
+    walking.jump = input.walkJump;
+    return walking;
+}
+
+InputState buildFlightPredictionInput(const NetPlayerInput& input)
+{
+    InputState predicted {};
+    predicted.flightAirBrakes = input.flightAirBrakes;
+    predicted.flightAfterburner = input.flightAfterburner;
+    predicted.flightUseAnalogYoke = true;
+    predicted.flightHoldYaw = true;
+    predicted.flightPitchAnalog = input.yokePitch;
+    predicted.flightRollAnalog = input.yokeRoll;
+    return predicted;
+}
+
+void applyReplicatedFlightControls(FlightState& plane, const NetPlayerInput& input)
+{
+    plane.throttle = clamp(input.throttle, 0.0f, 1.0f);
+    plane.yoke.pitch = clamp(input.yokePitch, -1.0f, 1.0f);
+    plane.yoke.yaw = clamp(input.yokeYaw, -1.0f, 1.0f);
+    plane.yoke.roll = clamp(input.yokeRoll, -1.0f, 1.0f);
+}
+
+void stepPredictedNetInput(
+    FlightState& plane,
+    FlightRuntimeState& runtime,
+    bool& flightMode,
+    float& walkYaw,
+    float& walkPitch,
+    double& simulatedTimeSeconds,
+    const NetPlayerInput& input,
+    const TerrainFieldContext& terrainContext,
+    const FlightConfig& flightConfig,
+    Vec3 wind)
+{
+    const float stepDt = HostedNetworkingDetail::sanitizeNetInputFrameDt(input.frameDt);
+    simulatedTimeSeconds += static_cast<double>(stepDt);
+    const bool wantsFlightMode = sanitizeRole(input.role) != "walking";
+    if (!wantsFlightMode) {
+        if (flightMode) {
+            flightMode = false;
+            plane.throttle = 0.0f;
+            plane.vel = plane.flightVel;
+            plane.flightAngVel = {};
+            const float ground = sampleGroundHeight(plane.pos.x, plane.pos.z, terrainContext);
+            if (plane.pos.y < ground + kWalkingHalfHeight) {
+                plane.pos.y = ground + kWalkingHalfHeight;
+            }
+        }
+        walkYaw = wrapAngle(input.walkYaw);
+        walkPitch = clamp(input.walkPitch, -kWalkingPitchLimitRadians, kWalkingPitchLimitRadians);
+        plane.rot = composeWalkingRotation(walkYaw, walkPitch);
+        stepWalking(
+            plane,
+            stepDt,
+            buildWalkingPredictionInput(input),
+            terrainContext,
+            clamp(input.walkMoveSpeed, 2.0f, 30.0f),
+            nullptr,
+            nullptr);
+        plane.flightVel = plane.vel;
+        plane.flightAngVel = {};
+        runtime.crashed = false;
+        runtime.hasPendingCrash = false;
+        return;
+    }
+
+    if (!flightMode) {
+        flightMode = true;
+        resetFlight(plane, runtime, terrainContext, plane.pos.x, plane.pos.z);
+    }
+
+    applyReplicatedFlightControls(plane, input);
+    FlightEnvironment environment {};
+    environment.wind = wind;
+    environment.groundHeightAt = [&terrainContext](float x, float z) {
+        return sampleGroundHeight(x, z, terrainContext);
+    };
+    environment.waterHeightAt = [&terrainContext](float x, float z) {
+        return sampleWaterHeight(x, z, terrainContext);
+    };
+    environment.sampleSdf = [&terrainContext](float x, float y, float z) {
+        return sampleSdf(x, y, z, terrainContext);
+    };
+    environment.sampleNormal = [&terrainContext](float x, float y, float z) {
+        return sampleTerrainNormal(x, y, z, terrainContext);
+    };
+    environment.collisionRadius = plane.collisionRadius;
+    stepFlight(
+        plane,
+        runtime,
+        stepDt,
+        static_cast<float>(simulatedTimeSeconds),
+        buildFlightPredictionInput(input),
+        environment,
+        flightConfig);
+    plane.vel = plane.flightVel;
+}
+
+void applyClientAuthoritativeCorrection(GameSession& session, const FlightConfig& flightConfig)
+{
+    ClientReplicationState& client = session.clientReplication;
+    if (!client.localAuthoritative.valid || !client.localAuthoritative.dirty) {
+        return;
+    }
+
+    const LocalAuthoritativeState authoritative = client.localAuthoritative;
+    client.localAuthoritative.dirty = false;
+
+    auto prunePredictedThroughAck = [&]() {
+        for (auto it = client.predictedStates.begin(); it != client.predictedStates.end();) {
+            if (it->first < authoritative.ack) {
+                it = client.predictedStates.erase(it);
+            } else {
+                break;
+            }
+        }
+    };
+
+    const auto predictedIt = client.predictedStates.find(authoritative.ack);
+    if (predictedIt == client.predictedStates.end()) {
+        const float currentError = length(authoritative.pos - session.plane.pos);
+        if (currentError > (authoritative.flightMode ? 260.0f : 30.0f)) {
+            session.flightMode = authoritative.flightMode;
+            session.plane.pos = authoritative.pos;
+            session.plane.rot = authoritative.rot;
+            session.plane.flightVel = authoritative.vel;
+            session.plane.vel = authoritative.vel;
+            session.plane.flightAngVel = authoritative.angVel;
+            if (!session.flightMode) {
+                session.plane.throttle = 0.0f;
+                syncWalkingLookFromRotation(session.plane.rot, session.walkYaw, session.walkPitch);
+            }
+        }
+        prunePredictedThroughAck();
+        return;
+    }
+
+    const ClientPredictedState predicted = predictedIt->second;
+    prunePredictedThroughAck();
+
+    const bool authoritativeFlightMode = authoritative.flightMode;
+    const bool modeChanged = authoritativeFlightMode != predicted.flightMode;
+    const Vec3 predictedVel = predicted.flightMode ? predicted.plane.flightVel : predicted.plane.vel;
+    const Vec3 positionError = authoritative.pos - predicted.plane.pos;
+    const Vec3 velocityError = authoritative.vel - predictedVel;
+    const float positionErrorMag = length(positionError);
+    const float velocityErrorMag = length(velocityError);
+    const float rotationDot = quatAbsDot(predicted.plane.rot, authoritative.rot);
+    const float pendingLead = static_cast<float>(client.pendingInputs.size());
+    const float predictedSpeed = length(predictedVel);
+    const float positionTolerance =
+        authoritativeFlightMode
+            ? (6.0f + (pendingLead * 0.9f) + (predictedSpeed * 0.025f))
+            : (0.45f + (pendingLead * 0.20f) + (predictedSpeed * 0.02f));
+    const float velocityTolerance =
+        authoritativeFlightMode
+            ? (12.0f + (pendingLead * 1.5f))
+            : (2.5f + (pendingLead * 0.45f));
+    const float rotationToleranceDegrees =
+        authoritativeFlightMode
+            ? (4.5f + (pendingLead * 0.35f))
+            : (8.0f + (pendingLead * 0.7f));
+    const float rotationToleranceDot = std::cos(radians(rotationToleranceDegrees) * 0.5f);
+    const float hardSnapDistance =
+        authoritativeFlightMode
+            ? (220.0f + (pendingLead * 12.0f))
+            : (24.0f + (pendingLead * 2.5f));
+
+    session.flightMode = authoritativeFlightMode;
+
+    if (modeChanged || positionErrorMag > hardSnapDistance || rotationDot < 0.15f) {
+        session.plane.pos = authoritative.pos;
+        session.plane.rot = authoritative.rot;
+        session.plane.flightVel = authoritative.vel;
+        session.plane.vel = authoritative.vel;
+        session.plane.flightAngVel = authoritative.angVel;
+        session.plane.throttle = authoritative.throttle;
+        session.plane.yoke.pitch = authoritative.yokePitch;
+        session.plane.yoke.yaw = authoritative.yokeYaw;
+        session.plane.yoke.roll = authoritative.yokeRoll;
+        session.runtime.tick = authoritative.simTick;
+        if (!authoritativeFlightMode) {
+            session.plane.throttle = 0.0f;
+            syncWalkingLookFromRotation(session.plane.rot, session.walkYaw, session.walkPitch);
+        }
+        return;
+    }
+
+    if (positionErrorMag <= positionTolerance &&
+        velocityErrorMag <= velocityTolerance &&
+        rotationDot >= rotationToleranceDot) {
+        return;
+    }
+
+    bool replayFlightMode = authoritativeFlightMode;
+    FlightState replayPlane = predicted.plane;
+    FlightRuntimeState replayRuntime = predicted.runtime;
+    float replayWalkYaw = predicted.walkYaw;
+    float replayWalkPitch = predicted.walkPitch;
+
+    replayPlane.pos = authoritative.pos;
+    replayPlane.rot = authoritative.rot;
+    replayPlane.flightVel = authoritative.vel;
+    replayPlane.vel = authoritative.vel;
+    replayPlane.flightAngVel = authoritative.angVel;
+    replayPlane.throttle = authoritative.throttle;
+    replayPlane.yoke.pitch = authoritative.yokePitch;
+    replayPlane.yoke.yaw = authoritative.yokeYaw;
+    replayPlane.yoke.roll = authoritative.yokeRoll;
+    replayRuntime.tick = authoritative.simTick;
+
+    if (!replayFlightMode) {
+        replayPlane.throttle = 0.0f;
+        syncWalkingLookFromRotation(replayPlane.rot, replayWalkYaw, replayWalkPitch);
+    }
+
+    const Vec3 wind = getWindVector3(session.windState);
+    double replayTimeSeconds =
+        static_cast<double>(std::max(0, replayRuntime.tick)) / static_cast<double>(std::max(1.0f, flightConfig.physicsHz));
+    for (const auto& [tick, input] : client.pendingInputs) {
+        if (tick <= authoritative.ack) {
+            continue;
+        }
+        stepPredictedNetInput(
+            replayPlane,
+            replayRuntime,
+            replayFlightMode,
+            replayWalkYaw,
+            replayWalkPitch,
+            replayTimeSeconds,
+            input,
+            session.terrainContext,
+            flightConfig,
+            wind);
+    }
+
+    session.flightMode = replayFlightMode;
+    session.plane = replayPlane;
+    session.runtime = replayRuntime;
+    session.walkYaw = replayWalkYaw;
+    session.walkPitch = replayWalkPitch;
 }
 
 Quat composeNetworkVisualRotation(const PlaneVisualState& visual, const AvatarRoleConfig& roleConfig)
@@ -5777,7 +7330,260 @@ std::filesystem::path getTerrainChunkCacheDirectory()
     return root.empty() ? std::filesystem::path {} : root / "terrain_chunk_cache";
 }
 
-WorldInfoSnapshot buildWorldInfoSnapshot(const TerrainParams& terrainParams, std::string_view worldId, const Vec3& spawn = {})
+std::string sanitizeWorldInstanceName(std::string_view value)
+{
+    std::string out;
+    out.reserve(value.size());
+    const std::string fallback = value.empty() ? std::string("native_default") : std::string(value);
+    for (const unsigned char ch : fallback) {
+        if (std::isalnum(ch) != 0 || ch == '_' || ch == '-') {
+            out.push_back(static_cast<char>(std::tolower(ch)));
+        } else {
+            out.push_back('_');
+        }
+    }
+    while (out.find("__") != std::string::npos) {
+        out.erase(out.find("__"), 1u);
+    }
+    while (!out.empty() && out.front() == '_') {
+        out.erase(out.begin());
+    }
+    while (!out.empty() && out.back() == '_') {
+        out.pop_back();
+    }
+    return out.empty() ? std::string("native_default") : out;
+}
+
+std::uintmax_t directorySizeBytes(const std::filesystem::path& root)
+{
+    if (root.empty()) {
+        return 0u;
+    }
+
+    std::error_code ec;
+    if (!std::filesystem::exists(root, ec)) {
+        return 0u;
+    }
+
+    std::uintmax_t totalBytes = 0u;
+    for (std::filesystem::recursive_directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+        if (ec || !it->is_regular_file(ec)) {
+            continue;
+        }
+        totalBytes += it->file_size(ec);
+    }
+    return totalBytes;
+}
+
+std::vector<WorldInstanceSummary> scanWorldInstances()
+{
+    std::vector<WorldInstanceSummary> worlds;
+    const std::filesystem::path storageRoot = getWorldStorageDirectory();
+    std::error_code ec;
+    if (!storageRoot.empty() && std::filesystem::exists(storageRoot, ec)) {
+        for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(storageRoot, ec)) {
+            if (ec || !entry.is_directory()) {
+                continue;
+            }
+
+            WorldStoreOptions options;
+            options.name = entry.path().filename().string();
+            options.storageRoot = storageRoot;
+            options.createIfMissing = false;
+            options.regionSize = 8;
+            options.chunkResolution = 16;
+            options.groundParams = defaultTerrainParams();
+
+            std::string worldError;
+            const std::optional<WorldStore> openedWorld = WorldStore::open(options, &worldError);
+            if (!openedWorld.has_value()) {
+                continue;
+            }
+
+            const WorldMeta meta = openedWorld->getMeta();
+            WorldInstanceSummary summary;
+            summary.worldId = meta.worldId.empty() ? options.name : meta.worldId;
+            summary.seed = meta.seed;
+            summary.chunkSize = meta.terrainProfile.chunkSize;
+            summary.worldRadius = meta.terrainProfile.worldRadius;
+            summary.waterLevel = meta.terrainProfile.waterLevel;
+            summary.tunnelCount = static_cast<int>(meta.tunnelSeeds.size());
+            summary.createdAt = meta.createdAt;
+            summary.updatedAt = meta.updatedAt;
+            summary.cacheBytes = directorySizeBytes(getTerrainChunkCacheDirectory() / summary.worldId);
+            summary.persistent = true;
+            worlds.push_back(std::move(summary));
+        }
+    }
+
+    std::sort(
+        worlds.begin(),
+        worlds.end(),
+        [](const WorldInstanceSummary& lhs, const WorldInstanceSummary& rhs) {
+            if (lhs.updatedAt != rhs.updatedAt) {
+                return lhs.updatedAt > rhs.updatedAt;
+            }
+            return lhs.worldId < rhs.worldId;
+        });
+
+    if (worlds.empty()) {
+        worlds.push_back({});
+    }
+    return worlds;
+}
+
+void refreshWorldInstanceCatalog(BootResources& boot)
+{
+    boot.worldInstances = scanWorldInstances();
+    const std::string desiredWorldId = sanitizeWorldInstanceName(boot.selectedWorldId);
+    const auto selectedIt = std::find_if(
+        boot.worldInstances.begin(),
+        boot.worldInstances.end(),
+        [&](const WorldInstanceSummary& summary) {
+            return summary.worldId == desiredWorldId;
+        });
+    if (selectedIt != boot.worldInstances.end()) {
+        boot.selectedWorldId = selectedIt->worldId;
+        return;
+    }
+    boot.selectedWorldId = boot.worldInstances.empty() ? std::string("native_default") : boot.worldInstances.front().worldId;
+}
+
+int selectedWorldInstanceIndex(const BootResources& boot)
+{
+    for (std::size_t index = 0; index < boot.worldInstances.size(); ++index) {
+        if (boot.worldInstances[index].worldId == boot.selectedWorldId) {
+            return static_cast<int>(index);
+        }
+    }
+    return boot.worldInstances.empty() ? -1 : 0;
+}
+
+const WorldInstanceSummary* selectedWorldInstance(const BootResources& boot)
+{
+    const int index = selectedWorldInstanceIndex(boot);
+    return index >= 0 && index < static_cast<int>(boot.worldInstances.size())
+        ? &boot.worldInstances[static_cast<std::size_t>(index)]
+        : nullptr;
+}
+
+void cycleSelectedWorldInstance(BootResources& boot, int direction)
+{
+    if (boot.worldInstances.empty() || direction == 0) {
+        return;
+    }
+    const int count = static_cast<int>(boot.worldInstances.size());
+    const int currentIndex = std::max(0, selectedWorldInstanceIndex(boot));
+    const int nextIndex = (currentIndex + direction + count) % count;
+    boot.selectedWorldId = boot.worldInstances[static_cast<std::size_t>(nextIndex)].worldId;
+}
+
+std::string makeSuggestedWorldId(const BootResources& boot)
+{
+    for (int attempt = 1; attempt <= 999; ++attempt) {
+        const std::string candidate = std::string("world_") + (attempt < 10 ? "0" : "") + std::to_string(attempt);
+        const auto it = std::find_if(
+            boot.worldInstances.begin(),
+            boot.worldInstances.end(),
+            [&](const WorldInstanceSummary& summary) {
+                return summary.worldId == candidate;
+            });
+        if (it == boot.worldInstances.end()) {
+            return candidate;
+        }
+    }
+    return "world_" + std::to_string(static_cast<int>(boot.worldInstances.size()) + 1);
+}
+
+WorldInfoSnapshot buildWorldInfoSnapshot(const TerrainParams& terrainParams, std::string_view worldId, const Vec3& spawn = {});
+
+bool createWorldInstance(BootResources& boot, const std::string& requestedName, std::string* errorText)
+{
+    const std::string worldId = sanitizeWorldInstanceName(requestedName);
+    if (worldId.empty()) {
+        if (errorText != nullptr) {
+            *errorText = "Enter a world name first.";
+        }
+        return false;
+    }
+
+    WorldStoreOptions options;
+    options.name = worldId;
+    options.storageRoot = getWorldStorageDirectory();
+    options.createIfMissing = true;
+    options.regionSize = 8;
+    options.chunkResolution = 16;
+    options.groundParams = boot.terrainParams;
+
+    std::string worldError;
+    std::optional<WorldStore> world = WorldStore::open(options, &worldError);
+    if (!world.has_value()) {
+        if (errorText != nullptr) {
+            *errorText = worldError.empty() ? std::string("Failed to create world instance.") : worldError;
+        }
+        return false;
+    }
+
+    const WorldInfoSnapshot info = buildWorldInfoSnapshot(boot.terrainParams, worldId);
+    if (!world->applyWorldInfo(info, &worldError) && !worldError.empty()) {
+        if (errorText != nullptr) {
+            *errorText = worldError;
+        }
+        return false;
+    }
+
+    boot.selectedWorldId = worldId;
+    refreshWorldInstanceCatalog(boot);
+    return true;
+}
+
+bool deleteWorldInstance(BootResources& boot, std::string_view worldId, std::string* errorText)
+{
+    const std::string sanitized = sanitizeWorldInstanceName(worldId);
+    if (sanitized.empty()) {
+        if (errorText != nullptr) {
+            *errorText = "No world is selected.";
+        }
+        return false;
+    }
+
+    std::error_code ec;
+    const std::uintmax_t removedWorldEntries = std::filesystem::remove_all(getWorldStorageDirectory() / sanitized, ec);
+    if (ec) {
+        if (errorText != nullptr) {
+            *errorText = "Failed to delete world storage for " + sanitized + ".";
+        }
+        return false;
+    }
+
+    std::filesystem::remove_all(getTerrainChunkCacheDirectory() / sanitized, ec);
+    if (ec) {
+        if (errorText != nullptr) {
+            *errorText = "World removed, but its terrain cache could not be fully deleted.";
+        }
+        return false;
+    }
+
+    if (removedWorldEntries == 0u && errorText != nullptr) {
+        *errorText = "World instance was not found on disk.";
+    }
+
+    refreshWorldInstanceCatalog(boot);
+    return removedWorldEntries > 0u;
+}
+
+void pushHudNotification(BootResources& boot, std::string text, float nowSeconds, float duration)
+{
+    if (text.empty()) {
+        return;
+    }
+    boot.notifications.push_back({ std::move(text), nowSeconds + std::max(1.0f, duration) });
+    while (boot.notifications.size() > 6u) {
+        boot.notifications.pop_front();
+    }
+}
+
+WorldInfoSnapshot buildWorldInfoSnapshot(const TerrainParams& terrainParams, std::string_view worldId, const Vec3& spawn)
 {
     WorldInfoSnapshot info;
     info.worldId = worldId.empty() ? std::string("default") : std::string(worldId);
@@ -5802,7 +7608,9 @@ void bindTerrainContextWorldStore(
 {
     if (worldStore == nullptr) {
         terrainContext.sampleHeightDeltaAt = {};
-        terrainContext.sampleVolumetricOverrideSdfAt = {};
+        terrainContext.sampleVolumetricAdditiveSdfAt = {};
+        terrainContext.sampleVolumetricSubtractiveSdfAt = {};
+        terrainContext.hasVolumetricOverridesInBounds = {};
         terrainContext.sampleChunkRevisionSignature = {};
         return;
     }
@@ -5814,12 +7622,26 @@ void bindTerrainContextWorldStore(
         }
         return worldStore->sampleHeightDelta(x, z);
     };
-    terrainContext.sampleVolumetricOverrideSdfAt = [worldStore, worldStoreMutex](float x, float y, float z) {
+    terrainContext.sampleVolumetricAdditiveSdfAt = [worldStore, worldStoreMutex](float x, float y, float z) {
         std::shared_lock<std::shared_mutex> lock;
         if (worldStoreMutex) {
             lock = std::shared_lock<std::shared_mutex>(*worldStoreMutex);
         }
-        return worldStore->sampleVolumetricOverrideSdf(x, y, z);
+        return worldStore->sampleVolumetricAdditiveSdf(x, y, z);
+    };
+    terrainContext.sampleVolumetricSubtractiveSdfAt = [worldStore, worldStoreMutex](float x, float y, float z) {
+        std::shared_lock<std::shared_mutex> lock;
+        if (worldStoreMutex) {
+            lock = std::shared_lock<std::shared_mutex>(*worldStoreMutex);
+        }
+        return worldStore->sampleVolumetricSubtractiveSdf(x, y, z);
+    };
+    terrainContext.hasVolumetricOverridesInBounds = [worldStore, worldStoreMutex](float x0, float z0, float x1, float z1) {
+        std::shared_lock<std::shared_mutex> lock;
+        if (worldStoreMutex) {
+            lock = std::shared_lock<std::shared_mutex>(*worldStoreMutex);
+        }
+        return worldStore->hasVolumetricOverridesInBounds(x0, z0, x1, z1, 1);
     };
     terrainContext.sampleChunkRevisionSignature = [worldStore, worldStoreMutex](float x0, float z0, float x1, float z1) {
         std::shared_lock<std::shared_mutex> lock;
@@ -6142,6 +7964,7 @@ bool savePreferences(
     const ControlProfile& controls,
     const AircraftProfile& planeProfile,
     const TerrainParams& terrainParams,
+    std::string_view selectedWorldId,
     const PlaneVisualState& planeVisual,
     const PlaneVisualState& walkingVisual,
     std::string* errorText)
@@ -6195,6 +8018,7 @@ bool savePreferences(
     file << "online.session_mode=" << normalizeOnlineSessionMode(onlineSettings.sessionMode) << "\n";
     file << "online.last_lobby_id=" << onlineSettings.lastLobbyId << "\n";
     file << "online.last_join_host_id=" << onlineSettings.lastJoinHostId << "\n";
+    file << "world.selected=" << sanitizeWorldInstanceName(selectedWorldId) << "\n";
     file << "graphics.window_mode=" << windowModeToken(graphicsSettings.windowMode) << "\n";
     file << "graphics.resolution_width=" << graphicsSettings.resolutionWidth << "\n";
     file << "graphics.resolution_height=" << graphicsSettings.resolutionHeight << "\n";
@@ -6322,6 +8146,61 @@ bool savePreferences(
     return true;
 }
 
+bool savePreferences(
+    const std::filesystem::path& path,
+    const UiState& uiState,
+    const GraphicsSettings& graphicsSettings,
+    const LightingSettings& lightingSettings,
+    const HudSettings& hudSettings,
+    const OnlineSettings& onlineSettings,
+    const ControlProfile& controls,
+    const AircraftProfile& planeProfile,
+    const TerrainParams& terrainParams,
+    const PlaneVisualState& planeVisual,
+    const PlaneVisualState& walkingVisual,
+    std::string* errorText)
+{
+    return savePreferences(
+        path,
+        uiState,
+        graphicsSettings,
+        lightingSettings,
+        hudSettings,
+        onlineSettings,
+        controls,
+        planeProfile,
+        terrainParams,
+        std::string_view("native_default"),
+        planeVisual,
+        walkingVisual,
+        errorText);
+}
+
+bool savePreferences(
+    const std::filesystem::path& path,
+    const UiState& uiState,
+    const AircraftProfile& planeProfile,
+    const TerrainParams& terrainParams,
+    const PlaneVisualState& planeVisual,
+    const PlaneVisualState& walkingVisual,
+    std::string* errorText)
+{
+    return savePreferences(
+        path,
+        uiState,
+        defaultGraphicsSettings(),
+        defaultLightingSettings(),
+        defaultHudSettings(),
+        defaultOnlineSettings(),
+        defaultControlProfile(),
+        planeProfile,
+        terrainParams,
+        std::string_view("native_default"),
+        planeVisual,
+        walkingVisual,
+        errorText);
+}
+
 bool loadPreferences(
     const std::filesystem::path& path,
     UiState& uiState,
@@ -6333,6 +8212,7 @@ bool loadPreferences(
     AircraftProfile& planeProfile,
     TerrainParams& terrainParams,
     VisualPreferenceData& walkingPrefs,
+    std::string* selectedWorldIdOut,
     std::string* errorText)
 {
     if (path.empty()) {
@@ -6497,6 +8377,10 @@ bool loadPreferences(
             onlineSettings.lastLobbyId = value;
         } else if (key == "online.last_join_host_id") {
             onlineSettings.lastJoinHostId = value;
+        } else if (key == "world.selected") {
+            if (selectedWorldIdOut != nullptr) {
+                *selectedWorldIdOut = sanitizeWorldInstanceName(value);
+            }
         } else if (key == "graphics.window_mode") {
             graphicsSettings.windowMode = parseWindowModeToken(value);
         } else if (key == "graphics.resolution_width") {
@@ -6679,6 +8563,62 @@ bool loadPreferences(
     clampVisualPreferenceData(walkingPrefs);
     terrainParams = normalizeTerrainParams(terrainParams);
     return true;
+}
+
+bool loadPreferences(
+    const std::filesystem::path& path,
+    UiState& uiState,
+    GraphicsSettings& graphicsSettings,
+    LightingSettings& lightingSettings,
+    HudSettings& hudSettings,
+    OnlineSettings& onlineSettings,
+    ControlProfile& controls,
+    AircraftProfile& planeProfile,
+    TerrainParams& terrainParams,
+    VisualPreferenceData& walkingPrefs,
+    std::string* errorText)
+{
+    return loadPreferences(
+        path,
+        uiState,
+        graphicsSettings,
+        lightingSettings,
+        hudSettings,
+        onlineSettings,
+        controls,
+        planeProfile,
+        terrainParams,
+        walkingPrefs,
+        nullptr,
+        errorText);
+}
+
+bool loadPreferences(
+    const std::filesystem::path& path,
+    UiState& uiState,
+    AircraftProfile& planeProfile,
+    TerrainParams& terrainParams,
+    VisualPreferenceData& walkingPrefs,
+    std::string* errorText)
+{
+    GraphicsSettings graphicsSettings = defaultGraphicsSettings();
+    LightingSettings lightingSettings = defaultLightingSettings();
+    HudSettings hudSettings = defaultHudSettings();
+    OnlineSettings onlineSettings = defaultOnlineSettings();
+    ControlProfile controls = defaultControlProfile();
+    return loadPreferences(
+        path,
+        uiState,
+        graphicsSettings,
+        lightingSettings,
+        hudSettings,
+        onlineSettings,
+        controls,
+        planeProfile,
+        terrainParams,
+        walkingPrefs,
+        nullptr,
+        errorText);
 }
 
 void saveHudStylePreferences(std::ofstream& file, std::string_view styleKey, const HudElementStyle& style)
@@ -7021,6 +8961,15 @@ void beginModelPathPrompt(PauseState& pauseState, CharacterSubTab role, std::str
     pauseState.promptActive = true;
     pauseState.promptMode = MenuPromptMode::ModelPath;
     pauseState.promptRole = role;
+    pauseState.promptText = std::move(initialText);
+    pauseState.promptCursor = static_cast<int>(pauseState.promptText.size());
+}
+
+void beginWorldNamePrompt(PauseState& pauseState, std::string initialText)
+{
+    pauseState.promptActive = true;
+    pauseState.promptMode = MenuPromptMode::WorldName;
+    pauseState.promptRole = CharacterSubTab::Plane;
     pauseState.promptText = std::move(initialText);
     pauseState.promptCursor = static_cast<int>(pauseState.promptText.size());
 }
@@ -9323,6 +11272,35 @@ void applyFlightMouseInput(
     plane.yokeLastMouseInputAt = nowSeconds;
 }
 
+void applyFlightMouseLook(
+    const UiState& uiState,
+    float& lookYaw,
+    float& lookPitch,
+    float mouseDx,
+    float mouseDy)
+{
+    float clampedDx = clamp(mouseDx, -42.0f, 42.0f);
+    float clampedDy = clamp(mouseDy, -42.0f, 42.0f);
+    if (std::fabs(clampedDx) < 0.2f) {
+        clampedDx = 0.0f;
+    }
+    if (std::fabs(clampedDy) < 0.2f) {
+        clampedDy = 0.0f;
+    }
+
+    if (clampedDx == 0.0f && clampedDy == 0.0f) {
+        return;
+    }
+
+    const float sensitivity = kFlightMouseSensitivity * uiState.mouseSensitivity * 0.65f;
+    const float pitchAxis = uiState.invertLookY ? clampedDy : -clampedDy;
+    lookYaw = wrapAngle(lookYaw + (-clampedDx * sensitivity * 4.4f));
+    lookPitch = clamp(
+        lookPitch + (pitchAxis * sensitivity * 3.6f),
+        -kGamepadFlightLookPitchLimitRadians,
+        kGamepadFlightLookPitchLimitRadians);
+}
+
 std::array<std::string, 6> buildPauseMainItems(const UiState& uiState)
 {
     return {
@@ -10080,12 +12058,14 @@ const char* menuSettingsRowLabel(SettingsSubTab subTab, int localIndex)
         case 2:
             return "Steam Status";
         case 3:
-            return "Join Invite";
+            return "Friend Lobby";
         case 4:
-            return "Invite Friends";
+            return "Join Lobby";
         case 5:
-            return "Voice";
+            return "Invite Friends";
         case 6:
+            return "Voice";
+        case 7:
             return "Radio";
         default:
             return "";
@@ -10106,7 +12086,7 @@ bool menuSettingsRowDisabled(SettingsSubTab subTab, int localIndex)
 bool menuSettingsRowAction(SettingsSubTab subTab, int localIndex)
 {
     return (subTab == SettingsSubTab::Graphics && localIndex == 2) ||
-        (subTab == SettingsSubTab::Online && (localIndex == 3 || localIndex == 4));
+        (subTab == SettingsSubTab::Online && (localIndex == 4 || localIndex == 5));
 }
 
 bool onlineActionRowEnabled(
@@ -10116,9 +12096,11 @@ bool onlineActionRowEnabled(
     bool sessionActive)
 {
     switch (localIndex) {
-    case 3:
-        return steamOnline.joinRequested && !steamOnline.pendingLobbyId.empty();
     case 4:
+        return
+            (steamOnline.joinRequested && !steamOnline.pendingLobbyId.empty()) ||
+            !steamOnline.selectedDiscoveredLobbyId.empty();
+    case 5:
         return sessionActive &&
             onlineSettings.multiplayerEnabled &&
             onlineSettings.sessionMode == "host" &&
@@ -10284,19 +12266,26 @@ std::string formatOnlineRowValue(
         return status;
     }
     case 3:
-        return onlineActionRowEnabled(localIndex, onlineSettings, steamOnline, sessionActive)
-            ? (sessionActive ? "Switch & Join" : "Press Enter")
-            : "No Pending Invite";
+        if (!steamOnline.selectedDiscoveredLobbyLabel.empty()) {
+            return steamOnline.selectedDiscoveredLobbyLabel;
+        }
+        return steamOnline.available ? "No Friend Sessions" : "Steam Unavailable";
     case 4:
+        return onlineActionRowEnabled(localIndex, onlineSettings, steamOnline, sessionActive)
+            ? ((steamOnline.joinRequested && !steamOnline.pendingLobbyId.empty())
+                    ? (sessionActive ? "Switch To Invite" : "Join Invite")
+                    : (sessionActive ? "Switch & Join" : "Join Selected"))
+            : "No Join Target";
+    case 5:
         return onlineActionRowEnabled(localIndex, onlineSettings, steamOnline, sessionActive)
             ? "Press Enter"
             : "Unavailable";
-    case 5:
+    case 6:
         if (!onlineSettings.voiceEnabled) {
             return "Off";
         }
         return onlineSettings.pushToTalk ? "PTT" : "Open";
-    case 6:
+    case 7:
         return "Ch " + std::to_string(normalizeRadioChannel(onlineSettings.radioChannel)) + " " + sanitizeCallsign(onlineSettings.callsign);
     default:
         return {};
@@ -10448,12 +12437,14 @@ const char* onlineRowHelpText(int localIndex)
     case 2:
         return "Read-only Steamworks runtime, active lobby, and pending invite status.";
     case 3:
-        return "Join the pending Steam lobby invite. If another session is active, the game will switch over to the invite target.";
+        return "Browse Steam friend lobbies discovered without relying on the overlay. Use left/right to cycle available sessions.";
     case 4:
-        return "Open the Steam overlay invite dialog for the active hosted lobby.";
+        return "Join the pending Steam invite, or join the currently selected discovered friend lobby.";
     case 5:
-        return "Cycle radio voice between off, push-to-talk, and open mic.";
+        return "Open the Steam overlay invite dialog for the active hosted lobby.";
     case 6:
+        return "Cycle radio voice between off, push-to-talk, and open mic.";
+    case 7:
         return "Adjust the active radio channel used for voice routing and peer labels.";
     default:
         return "";
@@ -11579,7 +13570,7 @@ void adjustMenuSettingsRowValue(
                 onlineSettings.sessionMode = onlineSettings.sessionMode == "client" ? "host" : "client";
             }
             break;
-        case 5:
+        case 6:
             if (direction != 0) {
                 if (!onlineSettings.voiceEnabled) {
                     onlineSettings.voiceEnabled = true;
@@ -11592,7 +13583,7 @@ void adjustMenuSettingsRowValue(
                 }
             }
             break;
-        case 6:
+        case 7:
             onlineSettings.radioChannel = normalizeRadioChannel(onlineSettings.radioChannel + direction);
             break;
         default:
@@ -11644,11 +13635,11 @@ void resetMenuSettingsRowValue(
         case 1:
             onlineSettings.sessionMode = defaultOnlineSettingsValues.sessionMode;
             break;
-        case 5:
+        case 6:
             onlineSettings.voiceEnabled = defaultOnlineSettingsValues.voiceEnabled;
             onlineSettings.pushToTalk = defaultOnlineSettingsValues.pushToTalk;
             break;
-        case 6:
+        case 7:
             onlineSettings.radioChannel = defaultOnlineSettingsValues.radioChannel;
             onlineSettings.callsign = defaultOnlineSettingsValues.callsign;
             break;
@@ -11676,7 +13667,7 @@ int menuItemCount(const PauseState& pauseState, const ControlProfile& controls, 
 {
     switch (pauseState.tab) {
     case PauseTab::Main:
-        return pauseState.mode == MenuMode::MainMenu ? 3 : 5;
+        return pauseState.mode == MenuMode::MainMenu ? 6 : 5;
     case PauseTab::Settings:
         return settingsSubTabItemCount(pauseState.settingsSubTab);
     case PauseTab::Characters:
@@ -12239,6 +14230,8 @@ void drawMenuOverlay(
     const FlightConfig& config,
     const PropAudioConfig& propAudioConfig,
     const TerrainParams& terrainParams,
+    const std::vector<WorldInstanceSummary>& worldInstances,
+    std::string_view selectedWorldId,
     const std::vector<AssetEntry>& assetCatalog,
     const PlaneVisualState& planeVisual,
     const PlaneVisualState& walkingVisual,
@@ -12295,11 +14288,24 @@ void drawMenuOverlay(
     const PlaneVisualState& paintVisual = visualForRole(pauseState.paintSubTab, planeVisual, walkingVisual);
     const float contentX = layout.contentX;
     const float contentY = layout.contentY;
+    const auto selectedWorld = std::find_if(
+        worldInstances.begin(),
+        worldInstances.end(),
+        [&](const WorldInstanceSummary& summary) {
+            return summary.worldId == selectedWorldId;
+        });
 
     if (pauseState.tab == PauseTab::Main) {
         std::vector<std::string> items;
         if (pauseState.mode == MenuMode::MainMenu) {
-            items = { "Start Flight", "Restore Defaults", "Quit" };
+            items = {
+                "Start World",
+                "World: " + std::string(selectedWorldId.empty() ? std::string_view("native_default") : selectedWorldId),
+                "Create World",
+                "Delete World",
+                "Restore Defaults",
+                "Quit"
+            };
         } else {
             items = {
                 "Resume",
@@ -12321,7 +14327,43 @@ void drawMenuOverlay(
             if (pauseState.confirmPending && pauseState.confirmSelectedIndex == static_cast<int>(i)) {
                 itemLabel += " [Confirm]";
             }
+            if (pauseState.mode == MenuMode::MainMenu && i == 1u) {
+                itemLabel += "  <A / D>";
+            }
             canvas.text(rowRect.x + 12.0f, rowRect.y + 9.0f, itemLabel, makeHudColor(240, 247, 255, 255));
+        }
+
+        if (pauseState.mode == MenuMode::MainMenu) {
+            std::vector<std::string> detailLines;
+            detailLines.push_back("World Instances");
+            if (selectedWorld != worldInstances.end()) {
+                detailLines.push_back("ID: " + selectedWorld->worldId);
+                detailLines.push_back("Seed: " + std::to_string(selectedWorld->seed));
+                detailLines.push_back("Radius: " + std::to_string(static_cast<int>(std::round(selectedWorld->worldRadius))) + " u");
+                detailLines.push_back("Water: " + std::to_string(static_cast<int>(std::round(selectedWorld->waterLevel))) + " u");
+                detailLines.push_back("Tunnels: " + std::to_string(selectedWorld->tunnelCount));
+                detailLines.push_back("Cache: " + std::to_string(static_cast<int>(selectedWorld->cacheBytes / (1024u * 1024u))) + " MiB");
+                if (!selectedWorld->updatedAt.empty()) {
+                    detailLines.push_back("Updated: " + selectedWorld->updatedAt);
+                } else if (!selectedWorld->persistent) {
+                    detailLines.push_back("Created on first world start.");
+                }
+            } else {
+                detailLines.push_back("No persistent world metadata found yet.");
+            }
+            detailLines.push_back("Each world keeps its own terrain state and chunk cache.");
+
+            const float detailX = contentX;
+            const float detailY = contentY + 244.0f;
+            const float detailW = pauseContentWidth(layout, pauseState.tab);
+            const float detailH = 18.0f + static_cast<float>(detailLines.size()) * 14.0f;
+            canvas.fillRect(detailX, detailY, detailW, detailH, makeHudColor(12, 20, 30, 216));
+            canvas.strokeRect(detailX, detailY, detailW, detailH, makeHudColor(90, 124, 156, 255));
+            float detailRowY = detailY + 8.0f;
+            for (const std::string& line : detailLines) {
+                canvas.text(detailX + 10.0f, detailRowY, line, makeHudColor(205, 225, 242, 255));
+                detailRowY += 14.0f;
+            }
         }
     } else if (pauseState.tab == PauseTab::Settings) {
         if (pauseState.settingsSubTab == SettingsSubTab::Flight) {
@@ -12402,7 +14444,7 @@ void drawMenuOverlay(
             canvas.text(contentX, layout.panelY + layout.panelH - 62.0f, menuSettingsRowHelpText(pauseState.settingsSubTab, pauseState.selectedIndex), makeHudColor(205, 225, 242, 255));
             if (pauseState.settingsSubTab == SettingsSubTab::Online) {
                 std::vector<std::string> detailLines;
-                detailLines.reserve(10);
+                detailLines.reserve(14);
                 detailLines.push_back(
                     std::string("Configured: ") +
                     (onlineSettings.multiplayerEnabled
@@ -12420,6 +14462,18 @@ void drawMenuOverlay(
 
                 if (!steamOnline.pendingLobbyId.empty()) {
                     detailLines.push_back("Pending invite: #" + steamOnline.pendingLobbyId);
+                }
+                if (steamOnline.discoveredLobbyCount > 0) {
+                    detailLines.push_back("Friend sessions: " + std::to_string(steamOnline.discoveredLobbyCount));
+                    const std::size_t visibleDiscovered = std::min<std::size_t>(steamOnline.discoveredLobbyLabels.size(), 3u);
+                    for (std::size_t discoveredIndex = 0; discoveredIndex < visibleDiscovered; ++discoveredIndex) {
+                        detailLines.push_back(
+                            std::string(discoveredIndex == static_cast<std::size_t>(std::max(steamOnline.selectedDiscoveredLobbyIndex, 0)) ? "> " : "  ") +
+                            steamOnline.discoveredLobbyLabels[discoveredIndex]);
+                    }
+                    if (steamOnline.discoveredLobbyLabels.size() > visibleDiscovered) {
+                        detailLines.push_back("Friend sessions: +" + std::to_string(steamOnline.discoveredLobbyLabels.size() - visibleDiscovered) + " more");
+                    }
                 }
 
                 if (!steamOnline.lobbyId.empty()) {
@@ -12640,7 +14694,12 @@ void drawMenuOverlay(
 
     const char* footer = pauseState.mode == MenuMode::MainMenu ? "Tab/H switch tabs | Enter activate | Esc quit" : "Tab/H switch tabs | Esc resume";
     if (pauseState.promptActive) {
-        footer = "Type model path | Enter load | Ctrl+V paste | Esc cancel";
+        footer =
+            pauseState.promptMode == MenuPromptMode::WorldName
+                ? "Type world name | Enter create | Ctrl+V paste | Esc cancel"
+                : "Type model path | Enter load | Ctrl+V paste | Esc cancel";
+    } else if (pauseState.mode == MenuMode::MainMenu && pauseState.tab == PauseTab::Main) {
+        footer = "Tab/H switch tabs | W/S select | A/D change world | Enter activate | Esc quit";
     } else if (pauseState.confirmPending && pauseState.tab == PauseTab::Main) {
         footer = "Enter or re-click confirm | Esc cancel";
     } else if (pauseState.tab == PauseTab::Settings) {
@@ -12663,17 +14722,22 @@ void drawMenuOverlay(
         const float promptH = 112.0f;
         const float promptX = layout.panelX + (layout.panelW - promptW) * 0.5f;
         const float promptY = layout.panelY + (layout.panelH - promptH) * 0.5f;
+        const bool worldPrompt = pauseState.promptMode == MenuPromptMode::WorldName;
         canvas.fillRect(promptX, promptY, promptW, promptH, makeHudColor(10, 16, 24, 245));
         canvas.strokeRect(promptX, promptY, promptW, promptH, makeHudColor(214, 234, 255, 255));
         canvas.text(
             promptX + 14.0f,
             promptY + 12.0f,
-            pauseState.promptRole == CharacterSubTab::Plane ? "Load Plane Model" : "Load Walking Model",
+            worldPrompt
+                ? "Create World Instance"
+                : (pauseState.promptRole == CharacterSubTab::Plane ? "Load Plane Model" : "Load Walking Model"),
             makeHudColor(240, 247, 255, 255));
         canvas.text(
             promptX + 14.0f,
             promptY + 28.0f,
-            "Type a STL, GLB, or GLTF path. The prompt stays open if loading fails so you can correct it.",
+            worldPrompt
+                ? "Type a world name. The new instance gets its own world store, settings snapshot, and terrain cache."
+                : "Type a STL, GLB, or GLTF path. The prompt stays open if loading fails so you can correct it.",
             makeHudColor(180, 214, 240, 255));
         canvas.fillRect(promptX + 14.0f, promptY + 52.0f, promptW - 28.0f, 28.0f, makeHudColor(18, 28, 40, 255));
         canvas.strokeRect(promptX + 14.0f, promptY + 52.0f, promptW - 28.0f, 28.0f, makeHudColor(96, 132, 164, 255));
@@ -12681,7 +14745,13 @@ void drawMenuOverlay(
         const int cursor = std::clamp(pauseState.promptCursor, 0, static_cast<int>(promptText.size()));
         promptText.insert(static_cast<std::size_t>(cursor), "|");
         canvas.text(promptX + 20.0f, promptY + 60.0f, promptText, makeHudColor(240, 247, 255, 255));
-        canvas.text(promptX + 14.0f, promptY + 88.0f, "Enter load | Ctrl+V paste | Backspace/Delete edit | Esc cancel", makeHudColor(180, 214, 240, 255));
+        canvas.text(
+            promptX + 14.0f,
+            promptY + 88.0f,
+            worldPrompt
+                ? "Enter create | Ctrl+V paste | Backspace/Delete edit | Esc cancel"
+                : "Enter load | Ctrl+V paste | Backspace/Delete edit | Esc cancel",
+            makeHudColor(180, 214, 240, 255));
     }
     canvas.resetTransform();
 }
@@ -12778,6 +14848,9 @@ void drawHud(
     OnlineSessionRole onlineRole,
     int remotePeerCount,
     const std::vector<HudPeerIndicator>* peerIndicators,
+    const std::vector<PeerStatComparison>* peerComparisons,
+    const std::vector<HudTargetIndicator>* targetIndicators,
+    const std::deque<HudNotification>* notifications,
     const std::vector<std::string>* extraDebugLines = nullptr)
 {
     const float ground = sampleGroundHeight(plane.pos.x, plane.pos.z, terrainContext);
@@ -12791,6 +14864,13 @@ void drawHud(
     char lonBuffer[64] {};
     std::snprintf(latBuffer, sizeof(latBuffer), "Lat %.6f", latLon.x);
     std::snprintf(lonBuffer, sizeof(lonBuffer), "Lon %.6f", latLon.y);
+    struct ProjectedHudPoint {
+        Vec2 screen {};
+        float depth = 0.0f;
+        float ndcX = 0.0f;
+        float ndcY = 0.0f;
+        bool onScreen = false;
+    };
     const auto beginElement = [&](const HudElementStyle& style) {
         const float uiMultiplier = uiState.scaleHudWithUi ? effectiveUiScale(uiState) : 1.0f;
         canvas.setTransform(
@@ -12800,7 +14880,7 @@ void drawHud(
             style.y * static_cast<float>(height));
     };
 
-    const auto projectWorldToScreen = [&](const Vec3& worldPos, float* depthOut = nullptr) -> std::optional<Vec2> {
+    const auto projectWorldToViewport = [&](const Vec3& worldPos) -> std::optional<ProjectedHudPoint> {
         if (renderCamera == nullptr || height <= 0 || width <= 0) {
             return std::nullopt;
         }
@@ -12809,14 +14889,14 @@ void drawHud(
         const Vec3 right = rightFromRotation(renderCamera->rot);
         const Vec3 up = upFromRotation(renderCamera->rot);
         const Vec3 forward = forwardFromRotation(renderCamera->rot);
-        const float viewX = dot(relative, right);
-        const float viewY = dot(relative, up);
-        const float viewZ = dot(relative, forward);
-        if (depthOut != nullptr) {
-            *depthOut = viewZ;
-        }
+        float viewX = dot(relative, right);
+        float viewY = dot(relative, up);
+        const float rawDepth = dot(relative, forward);
+        float viewZ = rawDepth;
         if (viewZ <= renderCamera->nearClipMeters) {
-            return std::nullopt;
+            viewX = -viewX;
+            viewY = -viewY;
+            viewZ = std::max(renderCamera->nearClipMeters, std::fabs(viewZ));
         }
 
         const float aspect = static_cast<float>(width) / static_cast<float>(height);
@@ -12827,14 +14907,38 @@ void drawHud(
 
         const float ndcX = viewX / (viewZ * tanHalfFov * aspect);
         const float ndcY = viewY / (viewZ * tanHalfFov);
-        if (std::fabs(ndcX) > 1.15f || std::fabs(ndcY) > 1.15f) {
+        const bool onScreen = rawDepth > renderCamera->nearClipMeters && std::fabs(ndcX) <= 1.0f && std::fabs(ndcY) <= 1.0f;
+        float offscreenNdcX = ndcX;
+        float offscreenNdcY = ndcY;
+        if (!onScreen && std::fabs(offscreenNdcX) < 0.15f && std::fabs(offscreenNdcY) < 0.15f) {
+            offscreenNdcY = offscreenNdcY <= 0.0f ? -1.0f : 1.0f;
+        }
+        const float edgeScale = onScreen
+            ? 1.0f
+            : (0.92f / std::max({ std::fabs(offscreenNdcX), std::fabs(offscreenNdcY), 0.35f }));
+        const float clampedNdcX = onScreen ? ndcX : offscreenNdcX * edgeScale;
+        const float clampedNdcY = onScreen ? ndcY : offscreenNdcY * edgeScale;
+        return ProjectedHudPoint {
+            {
+                (clampedNdcX * 0.5f + 0.5f) * static_cast<float>(width),
+                (0.5f - clampedNdcY * 0.5f) * static_cast<float>(height)
+            },
+            rawDepth,
+            ndcX,
+            ndcY,
+            onScreen
+        };
+    };
+
+    const auto projectWorldToScreen = [&](const Vec3& worldPos, float* depthOut = nullptr) -> std::optional<Vec2> {
+        const std::optional<ProjectedHudPoint> projected = projectWorldToViewport(worldPos);
+        if (!projected.has_value() || !projected->onScreen) {
             return std::nullopt;
         }
-
-        return Vec2 {
-            (ndcX * 0.5f + 0.5f) * static_cast<float>(width),
-            (0.5f - ndcY * 0.5f) * static_cast<float>(height)
-        };
+        if (depthOut != nullptr) {
+            *depthOut = projected->depth;
+        }
+        return projected->screen;
     };
 
     const auto drawInfoPanel = [&]() {
@@ -12888,6 +14992,12 @@ void drawHud(
             }
             if (!steamOnline->pendingLobbyId.empty()) {
                 lines.push_back("Invite Pending: #" + steamOnline->pendingLobbyId);
+                lines.push_back("Hint: Pause > Settings > Online > Join Pending Invite");
+            } else if (!steamOnline->selectedDiscoveredLobbyId.empty()) {
+                lines.push_back("Friend Lobby: " + steamOnline->selectedDiscoveredLobbyLabel);
+                lines.push_back("Hint: Pause > Settings > Online > Join Lobby");
+            } else if (onlineRole == OnlineSessionRole::Host && !steamOnline->lobbyId.empty()) {
+                lines.push_back("Hint: Pause > Settings > Online > Invite Friends");
             }
         }
         if (hudSettings.showGeoInfo) {
@@ -12960,11 +15070,11 @@ void drawHud(
         const std::vector<std::string> lines {
             debugBuffer,
             flightMode
-                ? "Flight: Mouse/RS look  LS yoke  D-Pad rudder/trim  RT/LT throttle  A burner  B brakes"
-                : "Walk: Mouse/RS look  LS move  A jump  C/X view  Y mode swap  R relaunch",
+                ? "Flight: Mouse yoke  Left Alt freelook  LS yoke  D-Pad rudder/trim  RT/LT throttle  A burner"
+                : "Walk: Mouse/RS look  LS move  A jump  T terraform  C/X view  Y mode swap  R relaunch",
             flightMode
-                ? "View: RMB/LB zoom  C/X camera  Y mode  RB shoot log  M map  F3 debug  Start/Esc pause"
-                : "View: C/X camera  Y mode  M map  F3 debug  Start/Esc pause",
+                ? "Combat: LMB/RB fire  B bomb  RMB/LB zoom  C/X camera  Y mode  M map  F3 debug"
+                : "Combat: LMB/RB fire  Terraform LMB/RMB  C/X camera  Y mode  M map  F3 debug",
             mouseCaptured ? "Mouse locked" : "Cursor free"
         };
         std::vector<std::string> debugLines(lines.begin(), lines.end());
@@ -13170,6 +15280,28 @@ void drawHud(
         canvas.line(nose.x, nose.y, left.x, left.y, accent);
         canvas.line(nose.x, nose.y, right.x, right.y, accent);
         canvas.line(left.x, left.y, right.x, right.y, accent);
+        if (targetIndicators != nullptr) {
+            for (const HudTargetIndicator& target : *targetIndicators) {
+                const Vec2 mapDelta = worldToMapDelta(
+                    target.worldPos.x - plane.pos.x,
+                    target.worldPos.z - plane.pos.z,
+                    heading,
+                    uiState.mapNorthUp);
+                const float px = clamp(centerX + (mapDelta.x / extent) * (panelSize * 0.5f), 4.0f, panelSize - 4.0f);
+                const float py = clamp(centerY - (mapDelta.y / extent) * (panelSize * 0.5f), 4.0f, panelSize - 4.0f);
+                const bool inside =
+                    std::fabs(mapDelta.x) <= extent &&
+                    std::fabs(mapDelta.y) <= extent;
+                const HudColor markerColor = target.highlighted
+                    ? makeHudColor(255, 214, 96, 255)
+                    : makeHudColor(255, 112, 90, 245);
+                const float markerSize = inside ? 4.0f : 6.0f;
+                canvas.fillRect(px - (markerSize * 0.5f), py - (markerSize * 0.5f), markerSize, markerSize, markerColor);
+                if (target.highlighted) {
+                    canvas.strokeRect(px - 5.0f, py - 5.0f, 10.0f, 10.0f, markerColor);
+                }
+            }
+        }
         if (style.accentOpacity > 0) {
             canvas.strokeRect(0.0f, 0.0f, panelSize, panelSize, accent);
         }
@@ -13180,6 +15312,15 @@ void drawHud(
             panelSize + 6.0f,
             std::string("Map ") + zoomLabels[zoomIndex] + (uiState.mapNorthUp ? " North-Up" : " Heading-Up"),
             text);
+        if (targetIndicators != nullptr && !targetIndicators->empty()) {
+            canvas.text(
+                0.0f,
+                panelSize + 18.0f,
+                std::string("Nearest Target ") +
+                    std::to_string(static_cast<int>(std::round(targetIndicators->front().distanceMeters))) +
+                    "m",
+                targetIndicators->front().highlighted ? makeHudColor(255, 214, 96, 255) : text);
+        }
         canvas.resetTransform();
     };
 
@@ -13229,19 +15370,160 @@ void drawHud(
                 detail += " TX";
             }
             detail += " | " + std::to_string(static_cast<int>(std::round(distanceMeters))) + "m";
+            const float altitudeDelta = peer.peerAltitudeAgl - peer.localAltitudeAgl;
+            std::string compareLine =
+                std::to_string(static_cast<int>(std::round(peer.peerSpeedKph))) + "/" +
+                std::to_string(static_cast<int>(std::round(peer.localSpeedKph))) + "kph | dAlt " +
+                (altitudeDelta >= 0.0f ? "+" : "") +
+                std::to_string(static_cast<int>(std::round(altitudeDelta)));
+            std::string damageLine =
+                "H " + std::to_string(static_cast<int>(std::round(peer.hullStrength))) +
+                " F " + std::to_string(static_cast<int>(std::round(peer.fuselageStrength))) +
+                " W " + std::to_string(static_cast<int>(std::round(peer.wear)));
+            if (peer.terraformMode) {
+                damageLine += " T";
+            }
 
-            const float boxW = std::max(canvas.textWidth(title), canvas.textWidth(detail)) + 14.0f;
-            const float boxH = 30.0f;
+            const float boxW =
+                std::max(
+                    std::max(canvas.textWidth(title), canvas.textWidth(detail)),
+                    std::max(canvas.textWidth(compareLine), canvas.textWidth(damageLine))) + 14.0f;
+            const float boxH = 54.0f;
             const float boxX = clamp(projected->x - (boxW * 0.5f), 4.0f, static_cast<float>(width) - boxW - 4.0f);
-            const float boxY = clamp(projected->y - 40.0f, 4.0f, static_cast<float>(height) - boxH - 4.0f);
+            const float boxY = clamp(projected->y - 62.0f, 4.0f, static_cast<float>(height) - boxH - 4.0f);
             const HudColor border = peer.transmitting ? txAccent : accent;
 
             canvas.fillRect(boxX, boxY, boxW, boxH, background);
             canvas.strokeRect(boxX, boxY, boxW, boxH, border);
             canvas.text(boxX + 6.0f, boxY + 6.0f, title, text);
             canvas.text(boxX + 6.0f, boxY + 18.0f, detail, peer.transmitting ? txAccent : text);
+            canvas.text(boxX + 6.0f, boxY + 30.0f, compareLine, makeHudColor(182, 218, 240, 255));
+            canvas.text(boxX + 6.0f, boxY + 42.0f, damageLine, makeHudColor(234, 244, 255, 255));
             canvas.line(projected->x, boxY + boxH, projected->x, projected->y, border);
             canvas.point(projected->x, projected->y, border);
+        }
+    };
+
+    const auto drawTargetIndicatorsOverlay = [&]() {
+        if (renderCamera == nullptr || targetIndicators == nullptr || targetIndicators->empty()) {
+            return;
+        }
+
+        const HudColor background = makeHudColor(8, 14, 22, 212);
+        const HudColor text = makeHudColor(236, 244, 255, 255);
+        const std::size_t indicatorCount = std::min<std::size_t>(targetIndicators->size(), 10u);
+        const float screenCenterX = static_cast<float>(width) * 0.5f;
+        const float screenCenterY = static_cast<float>(height) * 0.5f;
+
+        for (std::size_t index = 0; index < indicatorCount; ++index) {
+            const HudTargetIndicator& target = (*targetIndicators)[index];
+            const Vec3 anchor = target.worldPos + Vec3 { 0.0f, target.halfHeight + 2.4f, 0.0f };
+            const std::optional<ProjectedHudPoint> projected = projectWorldToViewport(anchor);
+            if (!projected.has_value()) {
+                continue;
+            }
+
+            const float healthAlpha = clamp(target.health / std::max(1.0f, target.maxHealth), 0.0f, 1.0f);
+            const HudColor border = target.highlighted
+                ? makeHudColor(255, 214, 96, 255)
+                : makeHudColor(255, 122, 92, 255);
+            const HudColor healthColor = makeHudColor(
+                static_cast<std::uint8_t>(std::lround(mix(255.0f, 78.0f, healthAlpha))),
+                static_cast<std::uint8_t>(std::lround(mix(88.0f, 224.0f, healthAlpha))),
+                static_cast<std::uint8_t>(std::lround(mix(74.0f, 110.0f, healthAlpha))),
+                255);
+            const std::string title = std::string("Target ") + std::to_string(target.id);
+            const std::string detail =
+                std::to_string(static_cast<int>(std::round(target.distanceMeters))) +
+                "m | " +
+                std::to_string(static_cast<int>(std::round(healthAlpha * 100.0f))) +
+                "%";
+            const float boxW = std::max(canvas.textWidth(title), canvas.textWidth(detail)) + 16.0f;
+            const float boxH = 30.0f;
+
+            if (projected->onScreen) {
+                const float boxX = clamp(projected->screen.x - (boxW * 0.5f), 6.0f, static_cast<float>(width) - boxW - 6.0f);
+                const float boxY = clamp(projected->screen.y - 44.0f, 6.0f, static_cast<float>(height) - boxH - 6.0f);
+                canvas.fillRect(boxX, boxY, boxW, boxH, background);
+                canvas.strokeRect(boxX, boxY, boxW, boxH, border);
+                canvas.text(boxX + 6.0f, boxY + 5.0f, title, text);
+                canvas.text(boxX + 6.0f, boxY + 17.0f, detail, healthColor);
+                canvas.line(projected->screen.x, boxY + boxH, projected->screen.x, projected->screen.y, border);
+                canvas.point(projected->screen.x, projected->screen.y, border);
+                continue;
+            }
+
+            const float edgeX = clamp(projected->screen.x, 24.0f, static_cast<float>(width) - 24.0f);
+            const float edgeY = clamp(projected->screen.y, 24.0f, static_cast<float>(height) - 24.0f);
+            Vec2 direction { edgeX - screenCenterX, edgeY - screenCenterY };
+            const float directionLength = std::max(1.0f, std::sqrt((direction.x * direction.x) + (direction.y * direction.y)));
+            direction.x /= directionLength;
+            direction.y /= directionLength;
+            const Vec2 side { -direction.y, direction.x };
+            canvas.line(edgeX, edgeY, edgeX - (direction.x * 12.0f), edgeY - (direction.y * 12.0f), border);
+            canvas.line(edgeX, edgeY, edgeX - (direction.x * 8.0f) + (side.x * 5.0f), edgeY - (direction.y * 8.0f) + (side.y * 5.0f), border);
+            canvas.line(edgeX, edgeY, edgeX - (direction.x * 8.0f) - (side.x * 5.0f), edgeY - (direction.y * 8.0f) - (side.y * 5.0f), border);
+
+            const float boxX = clamp(
+                edgeX + (direction.x >= 0.0f ? 10.0f : -boxW - 10.0f),
+                6.0f,
+                static_cast<float>(width) - boxW - 6.0f);
+            const float boxY = clamp(edgeY - (boxH * 0.5f), 6.0f, static_cast<float>(height) - boxH - 6.0f);
+            canvas.fillRect(boxX, boxY, boxW, boxH, background);
+            canvas.strokeRect(boxX, boxY, boxW, boxH, border);
+            canvas.text(boxX + 6.0f, boxY + 5.0f, title, text);
+            canvas.text(boxX + 6.0f, boxY + 17.0f, detail, healthColor);
+        }
+    };
+
+    const auto drawPeerComparisonPanel = [&]() {
+        if (peerComparisons == nullptr || peerComparisons->empty()) {
+            return;
+        }
+
+        const float panelW = 320.0f;
+        const float rowH = 28.0f;
+        const float panelH = 18.0f + rowH * static_cast<float>(peerComparisons->size()) + 12.0f;
+        const float panelX = static_cast<float>(width) - panelW - 22.0f;
+        const float panelY = 22.0f;
+        canvas.fillRect(panelX, panelY, panelW, panelH, makeHudColor(8, 14, 22, 214));
+        canvas.strokeRect(panelX, panelY, panelW, panelH, makeHudColor(96, 132, 164, 255));
+        canvas.text(panelX + 10.0f, panelY + 8.0f, "Peer Compare", makeHudColor(240, 247, 255, 255));
+
+        float rowY = panelY + 24.0f;
+        for (const PeerStatComparison& comparison : *peerComparisons) {
+            const float altitudeDelta = comparison.peerAltitudeAgl - comparison.localAltitudeAgl;
+            std::string detail =
+                std::to_string(static_cast<int>(std::round(comparison.distanceMeters))) + "m | " +
+                std::to_string(static_cast<int>(std::round(comparison.peerSpeedKph))) + "/" +
+                std::to_string(static_cast<int>(std::round(comparison.localSpeedKph))) + " kph | dAlt " +
+                (altitudeDelta >= 0.0f ? "+" : "") +
+                std::to_string(static_cast<int>(std::round(altitudeDelta))) + " u | H " +
+                std::to_string(static_cast<int>(std::round(comparison.hullStrength))) + " F " +
+                std::to_string(static_cast<int>(std::round(comparison.fuselageStrength)));
+            canvas.text(panelX + 10.0f, rowY, comparison.callsign, makeHudColor(230, 240, 255, 255));
+            canvas.text(panelX + 10.0f, rowY + 12.0f, detail, makeHudColor(180, 214, 240, 255));
+            rowY += rowH;
+        }
+    };
+
+    const auto drawNotificationsOverlay = [&]() {
+        if (notifications == nullptr || notifications->empty()) {
+            return;
+        }
+
+        float y = static_cast<float>(height) - 28.0f;
+        for (auto it = notifications->rbegin(); it != notifications->rend(); ++it) {
+            const float boxW = std::min(420.0f, canvas.textWidth(it->text) + 22.0f);
+            const float boxX = static_cast<float>(width) - boxW - 18.0f;
+            const float boxY = y - 26.0f;
+            canvas.fillRect(boxX, boxY, boxW, 22.0f, makeHudColor(12, 20, 30, 224));
+            canvas.strokeRect(boxX, boxY, boxW, 22.0f, makeHudColor(82, 224, 142, 255));
+            canvas.text(boxX + 8.0f, boxY + 7.0f, it->text, makeHudColor(236, 246, 255, 255));
+            y -= 28.0f;
+            if (y < 120.0f) {
+                break;
+            }
         }
     };
 
@@ -13250,8 +15532,54 @@ void drawHud(
     drawDebugFooter();
     drawStyledControls();
     drawStyledMap();
+    drawPeerComparisonPanel();
+    drawTargetIndicatorsOverlay();
     drawPeerIndicatorsOverlay();
+    drawNotificationsOverlay();
     drawStyledCrosshair();
+}
+
+void drawHud(
+    HudCanvas& canvas,
+    int width,
+    int height,
+    const FlightState& plane,
+    const FlightRuntimeState& runtime,
+    const TerrainFieldContext& terrainContext,
+    const GeoConfig& geoConfig,
+    const WindState& windState,
+    const UiState& uiState,
+    const std::string& modelLabel,
+    const std::string& rendererLabel,
+    float fps,
+    bool mouseCaptured)
+{
+    drawHud(
+        canvas,
+        width,
+        height,
+        plane,
+        runtime,
+        terrainContext,
+        geoConfig,
+        windState,
+        uiState,
+        defaultHudSettings(),
+        modelLabel,
+        rendererLabel,
+        fps,
+        mouseCaptured,
+        true,
+        nullptr,
+        nullptr,
+        nullptr,
+        OnlineSessionRole::Offline,
+        0,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr);
 }
 
 bool isControlActionHeld(
@@ -13294,6 +15622,7 @@ bool saveBootPreferences(const BootResources& boot, std::string* errorText)
         boot.controls,
         boot.planeProfile,
         boot.terrainParams,
+        boot.selectedWorldId,
         boot.planeVisual,
         boot.walkingVisual,
         &settingsError)) {
@@ -13390,7 +15719,7 @@ bool startGameSession(
     session.terrainWorldMutex = std::make_shared<std::shared_mutex>();
     session.terrainStream = std::make_shared<TerrainVisualStreamState>();
     beginLoadingUi(boot.loadingUi, "Loading World", static_cast<float>(SDL_GetTicks()) * 0.001f);
-    const std::string sourceWorldName = "native_default";
+    const std::string sourceWorldName = sanitizeWorldInstanceName(boot.selectedWorldId);
     const std::uint64_t pendingJoinLobbyId =
         session.onlineRole == OnlineSessionRole::Client ? boot.steamController.pendingJoinLobbyId() : 0ull;
     const bool hasPendingJoinLobbyId = pendingJoinLobbyId != 0ull;
@@ -13427,7 +15756,14 @@ bool startGameSession(
             const bool roleReady =
                 (session.onlineRole == OnlineSessionRole::Host && lobby.role == SteamLobbyState::Role::Host) ||
                 (session.onlineRole == OnlineSessionRole::Client && lobby.role == SteamLobbyState::Role::Client);
-            if (roleReady && lobby.lobbyReady && session.netTransport && session.netTransport->ready()) {
+            const bool clientLobbyBootstrapReady =
+                session.onlineRole == OnlineSessionRole::Client &&
+                roleReady &&
+                lobby.lobbyReady &&
+                session.netTransport != nullptr &&
+                !steamStatusLooksTerminal(lobby.status);
+            if ((roleReady && lobby.lobbyReady && session.netTransport && session.netTransport->ready()) ||
+                clientLobbyBootstrapReady) {
                 return true;
             }
 
@@ -13618,6 +15954,11 @@ bool startGameSession(
     syncWalkingLookFromRotation(session.plane.rot, session.walkYaw, session.walkPitch);
     session.localReplicationPeer = {};
     session.voice.radioChannel = normalizeRadioChannel(boot.onlineSettings.radioChannel);
+    session.planeDurabilityByPlayerId[1] = {};
+    session.weaponStateByPlayerId[1] = {};
+    if (session.onlineRole != OnlineSessionRole::Client) {
+        ensureEnemyTargetsGenerated(session);
+    }
 
     {
         const AvatarManifest avatar = buildLocalAvatarManifest(
@@ -13708,7 +16049,13 @@ bool startGameSession(
 
 #if 0
 int main(int argc, char** argv)
+try
 {
+    installStdoutLogMirror();
+    installTerminateLogging();
+    installStructuredExceptionLogging();
+    logToStdout("[boot] TrueFlight startup");
+
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
         SDL_Log("SDL_Init failed: %s", SDL_GetError());
         return 1;
@@ -14578,10 +16925,24 @@ int main(int argc, char** argv)
     SDL_Quit();
     return 0;
 }
+catch (const std::exception& exception) {
+    logToStdout(std::string("[fatal] top-level exception: ") + exception.what());
+    return 1;
+}
+catch (...) {
+    logToStdout("[fatal] top-level non-standard exception");
+    return 1;
+}
 #endif
 
 int main(int argc, char** argv)
+try
 {
+    installStdoutLogMirror();
+    installTerminateLogging();
+    installStructuredExceptionLogging();
+    logToStdout("[boot] TrueFlight startup");
+
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
         SDL_Log("SDL_Init failed: %s", SDL_GetError());
         return 1;
@@ -14715,6 +17076,7 @@ int main(int argc, char** argv)
             boot.planeProfile,
             boot.terrainParams,
             boot.walkingPrefs,
+            &boot.selectedWorldId,
             &preferenceError) &&
         !preferenceError.empty()) {
         SDL_Log("Native preference load failed: %s", preferenceError.c_str());
@@ -14724,6 +17086,7 @@ int main(int argc, char** argv)
         SDL_Log("Native HUD preference load failed: %s", hudPreferenceError.c_str());
     }
     syncUiStateFromHud(boot.uiState, boot.hud);
+    refreshWorldInstanceCatalog(boot);
     const std::uint64_t bootConnectLobbyId = parseConnectLobbyLaunchArgument(argc, argv);
     if (bootConnectLobbyId != 0) {
         boot.onlineSettings.steamEnabled = true;
@@ -14937,6 +17300,19 @@ int main(int argc, char** argv)
             4.5f);
     };
 
+    auto beginWorldPrompt = [&](float nowSeconds) {
+        clearControlBindingCapture(menuState);
+        clearMenuConfirmation(menuState);
+        menuState.rowDragActive = false;
+        beginWorldNamePrompt(menuState, makeSuggestedWorldId(boot));
+        SDL_StartTextInput(window);
+        setPauseStatus(
+            menuState,
+            "World name: Enter to create, Esc to cancel.",
+            nowSeconds,
+            4.5f);
+    };
+
     auto clampHelpScroll = [&]() {
         int menuWidth = 0;
         int menuHeight = 0;
@@ -15053,6 +17429,60 @@ int main(int argc, char** argv)
         setPauseStatus(menuState, loadStatus, nowSeconds, 3.4f);
     };
 
+    auto submitWorldPrompt = [&](float nowSeconds) {
+        const std::string worldName = sanitizeWorldInstanceName(trimAscii(menuState.promptText));
+        if (worldName.empty()) {
+            setPauseStatus(menuState, "Enter a world name first.", nowSeconds, 3.0f);
+            return;
+        }
+
+        std::string worldStatus;
+        if (!createWorldInstance(boot, worldName, &worldStatus)) {
+            setPauseStatus(
+                menuState,
+                worldStatus.empty() ? "World creation failed. Correct the name and try again." : worldStatus,
+                nowSeconds,
+                4.2f);
+            return;
+        }
+
+        stopPromptTextInput();
+        menuState.tab = PauseTab::Main;
+        menuState.selectedIndex = 1;
+        queueSave(nowSeconds);
+        setPauseStatus(menuState, "Created world instance " + boot.selectedWorldId + ".", nowSeconds, 3.4f);
+    };
+
+    auto queueClientModeSwitchPacket = [&]() {
+        if (!session.has_value() || session->onlineRole != OnlineSessionRole::Client) {
+            return;
+        }
+        const int tick = nextLocalNetworkTick(*session);
+        recordClientPredictedState(*session, tick);
+        enqueueClientModeSwitch(session->clientReplication, {
+            tick,
+            session->flightMode ? "plane" : "walking",
+            session->plane.pos.x,
+            session->plane.pos.y,
+            session->plane.pos.z,
+            session->walkYaw,
+            session->walkPitch
+        });
+    };
+
+    auto queueClientResetFlightPacket = [&](float x, float z) {
+        if (!session.has_value() || session->onlineRole != OnlineSessionRole::Client) {
+            return;
+        }
+        const int tick = nextLocalNetworkTick(*session);
+        recordClientPredictedState(*session, tick);
+        enqueueClientResetFlight(session->clientReplication, {
+            tick,
+            x,
+            z
+        });
+    };
+
     auto switchSessionToWalking = [&](float nowSeconds, const std::string& statusText, bool snapToGround) {
         if (!session.has_value()) {
             return;
@@ -15080,7 +17510,10 @@ int main(int argc, char** argv)
         gamepad.rudderLatched = false;
         gamepad.trimAccumulator = 0.0f;
         menuState.sessionFlightMode = false;
-        setPauseStatus(menuState, statusText, nowSeconds, 3.0f);
+        queueClientModeSwitchPacket();
+        if (!statusText.empty()) {
+            setPauseStatus(menuState, statusText, nowSeconds, 3.0f);
+        }
     };
 
     auto switchSessionToFlight = [&](float nowSeconds, float x, float z, const std::string& statusText) {
@@ -15096,7 +17529,10 @@ int main(int argc, char** argv)
         gamepad.rudderLatched = false;
         gamepad.trimAccumulator = 0.0f;
         menuState.sessionFlightMode = true;
-        setPauseStatus(menuState, statusText, nowSeconds, 2.6f);
+        queueClientResetFlightPacket(x, z);
+        if (!statusText.empty()) {
+            setPauseStatus(menuState, statusText, nowSeconds, 2.6f);
+        }
     };
 
     auto handleCrashTransition = [&](const FlightCrashEvent& crashEvent, float nowSeconds) {
@@ -15132,15 +17568,7 @@ int main(int argc, char** argv)
                               }
                               return craterResult.first;
                           }();
-                if (applied) {
-                    refreshTerrainContext(
-                        boot.terrainParams,
-                        session->terrainContext,
-                        session->terrainCache,
-                        currentWorldStore(),
-                        currentWorldStoreMutex(),
-                        currentTerrainStream());
-                }
+                (void)applied;
             }
         }
 
@@ -15185,11 +17613,420 @@ int main(int argc, char** argv)
         session->runtime.crashed = false;
         session->runtime.hasPendingCrash = false;
         menuState.sessionFlightMode = false;
+        queueClientModeSwitchPacket();
         setPauseStatus(
             menuState,
             terrainImpact ? "Crash detected: switched to walking mode beside the impact crater." : "Crash detected: switched to walking mode beside the obstacle impact.",
             nowSeconds,
             4.0f);
+    };
+
+    auto localGameplayPlayerId = [&]() -> int {
+        if (!session.has_value()) {
+            return 1;
+        }
+        if (session->onlineRole == OnlineSessionRole::Client && session->clientReplication.localPlayerId > 0) {
+            return session->clientReplication.localPlayerId;
+        }
+        return 1;
+    };
+
+    auto localDurabilityState = [&]() -> PlaneDurabilityState& {
+        return ensurePlaneDurabilityState(session->planeDurabilityByPlayerId, localGameplayPlayerId());
+    };
+
+    auto localWeaponState = [&]() -> WeaponCooldownState& {
+        return session->weaponStateByPlayerId[localGameplayPlayerId()];
+    };
+
+    auto broadcastChunkPatches = [&](const std::vector<WorldChunkState>& chunks, std::string_view reason, NetPeerId exceptPeer = 0) {
+        if (!session.has_value() || session->onlineRole != OnlineSessionRole::Host || chunks.empty()) {
+            return;
+        }
+        const std::shared_ptr<INetTransport> transport = session->hostedServer.transport();
+        if (!transport) {
+            return;
+        }
+        for (const auto& [playerId, player] : session->hostedServer.players()) {
+            if (playerId == 1 || !player.connected || player.peerId == 0 || player.peerId == exceptPeer) {
+                continue;
+            }
+            for (const WorldChunkState& chunk : chunks) {
+                transport->send(
+                    player.peerId,
+                    static_cast<int>(TransportLane::Control),
+                    buildChunkPacket("CHUNK_PATCH", chunk, reason),
+                    true);
+            }
+        }
+    };
+
+    auto applyAuthoritativeCrater = [&](const TerrainCrater& crater) -> bool {
+        if (!session.has_value()) {
+            return false;
+        }
+        WorldStore* worldStore = currentAuthoritativeWorldStore();
+        if (worldStore == nullptr) {
+            return false;
+        }
+
+        const bool applied =
+            session->onlineRole == OnlineSessionRole::Host
+                ? session->hostedServer.addCrater(crater, worldStore, boot.terrainParams)
+                : [&]() {
+                      std::unique_lock<std::shared_mutex> worldWriteLock;
+                      if (const auto worldMutex = currentWorldStoreMutex()) {
+                          worldWriteLock = std::unique_lock<std::shared_mutex>(*worldMutex);
+                      }
+                      const auto craterResult = worldStore->applyCrater(crater);
+                      if (craterResult.first) {
+                          worldStore->flushDirty(nullptr);
+                      }
+                      return craterResult.first;
+                  }();
+        if (!applied) {
+            return false;
+        }
+        return true;
+    };
+
+    auto applyAuthoritativeTerrainBrush = [&](const Vec3& center, float radius, float magnitude, const Vec3& surfaceNormal, std::string_view reason, NetPeerId exceptPeer = 0) -> bool {
+        if (!session.has_value()) {
+            return false;
+        }
+        WorldStore* worldStore = currentAuthoritativeWorldStore();
+        if (worldStore == nullptr) {
+            return false;
+        }
+
+        std::vector<WorldChunkState> changedChunks;
+        {
+            std::unique_lock<std::shared_mutex> worldWriteLock;
+            if (const auto worldMutex = currentWorldStoreMutex()) {
+                worldWriteLock = std::unique_lock<std::shared_mutex>(*worldMutex);
+            }
+            changedChunks = applyTerrainBrushEdit(worldStore, center, radius, magnitude, surfaceNormal);
+        }
+        if (changedChunks.empty()) {
+            return false;
+        }
+
+        if (session->onlineRole == OnlineSessionRole::Host) {
+            broadcastChunkPatches(changedChunks, reason, exceptPeer);
+        }
+        return true;
+    };
+
+    auto spawnGameplayObject = [&](GameplayObjectKind kind, int ownerId, const Vec3& pos, const Vec3& vel, float radius, float ttl, float damage, float drag, float gravityScale, float blastRadius, float craterRadius, float craterDepth) {
+        session->gameplayObjects.push_back({
+            kind,
+            session->nextGameplayObjectId++,
+            ownerId,
+            pos,
+            vel,
+            radius,
+            ttl,
+            damage,
+            drag,
+            gravityScale,
+            blastRadius,
+            craterRadius,
+            craterDepth,
+            true
+        });
+    };
+
+    auto spawnPrimaryShot = [&](float nowSeconds, int ownerId, const FlightState& actor, bool actorFlightMode, float walkYaw, float walkPitch, bool terrainAdd, bool terrainRemove) {
+        if (!session.has_value()) {
+            return;
+        }
+
+        WeaponCooldownState& weaponState = session->weaponStateByPlayerId[ownerId];
+        const bool terrainShot = terrainAdd || terrainRemove;
+        float& cooldown = terrainShot ? weaponState.nextTerrainShotAt : weaponState.nextPrimaryFireAt;
+        if (nowSeconds < cooldown) {
+            return;
+        }
+
+        const Quat aimRotation = actorFlightMode ? actor.rot : composeWalkingRotation(walkYaw, walkPitch);
+        const Vec3 forward = forwardFromRotation(aimRotation);
+        const Vec3 up = upFromRotation(aimRotation);
+        const Vec3 muzzlePos =
+            actorFlightMode
+                ? actor.pos + (forward * 4.8f) + (up * 0.35f)
+                : actor.pos + (forward * 1.2f) + (up * 0.2f);
+        const Vec3 inheritedVelocity = actorFlightMode ? actor.flightVel : actor.vel;
+        const GameplayObjectKind kind =
+            terrainAdd ? GameplayObjectKind::TerrainAdd :
+            (terrainRemove ? GameplayObjectKind::TerrainRemove : GameplayObjectKind::Projectile);
+        const float muzzleSpeed = terrainShot ? 72.0f : (actorFlightMode ? 340.0f : 185.0f);
+        const float radius = terrainShot ? 0.42f : 0.22f;
+        const float ttl = terrainShot ? 2.2f : kProjectileLifetimeSec;
+        const float damage = terrainShot ? 0.0f : (actorFlightMode ? 18.0f : 12.0f);
+        const float drag = terrainShot ? 0.03f : 0.012f;
+        const float gravityScale = terrainShot ? 0.18f : 0.12f;
+        spawnGameplayObject(
+            kind,
+            ownerId,
+            muzzlePos,
+            inheritedVelocity + (forward * muzzleSpeed),
+            radius,
+            ttl,
+            damage,
+            drag,
+            gravityScale,
+            0.0f,
+            0.0f,
+            0.0f);
+        cooldown = nowSeconds + (terrainShot ? kTerrainGunCooldownSec : kPrimaryFireCooldownSec);
+    };
+
+    auto spawnBomb = [&](float nowSeconds, int ownerId, const FlightState& actor) {
+        if (!session.has_value()) {
+            return;
+        }
+
+        WeaponCooldownState& weaponState = session->weaponStateByPlayerId[ownerId];
+        if (nowSeconds < weaponState.nextBombDropAt) {
+            return;
+        }
+
+        const Vec3 forward = forwardFromRotation(actor.rot);
+        const Vec3 up = upFromRotation(actor.rot);
+        spawnGameplayObject(
+            GameplayObjectKind::Bomb,
+            ownerId,
+            actor.pos - (up * 0.9f) - (forward * 0.6f),
+            actor.flightVel - (up * 2.0f),
+            0.62f,
+            kBombLifetimeSec,
+            46.0f,
+            0.05f,
+            1.0f,
+            18.0f,
+            12.0f,
+            4.6f);
+        weaponState.nextBombDropAt = nowSeconds + kBombDropCooldownSec;
+    };
+
+    auto simulateAuthoritativeGameplay = [&](float dt, float nowSeconds, bool localFirePrimary, bool localDropBomb, bool localTerrainAdd, bool localTerrainRemove) {
+        if (!session.has_value() || session->onlineRole == OnlineSessionRole::Client) {
+            return;
+        }
+
+        ensureEnemyTargetsGenerated(*session);
+        applyDurabilityWear(localDurabilityState(), session->plane, session->runtime, session->flightMode, dt);
+
+        if (localTerrainAdd || localTerrainRemove) {
+            spawnPrimaryShot(nowSeconds, localGameplayPlayerId(), session->plane, false, session->walkYaw, session->walkPitch, localTerrainAdd, localTerrainRemove);
+        } else if (localFirePrimary) {
+            spawnPrimaryShot(nowSeconds, localGameplayPlayerId(), session->plane, session->flightMode, session->walkYaw, session->walkPitch, false, false);
+        }
+        if (localDropBomb && session->flightMode) {
+            spawnBomb(nowSeconds, localGameplayPlayerId(), session->plane);
+        }
+
+        if (session->onlineRole == OnlineSessionRole::Host) {
+            for (const auto& [playerId, player] : session->hostedServer.players()) {
+                if (playerId == 1 || !player.connected || !player.hasReceivedHello) {
+                    continue;
+                }
+                applyDurabilityWear(ensurePlaneDurabilityState(session->planeDurabilityByPlayerId, playerId), player.actor, player.runtime, player.flightMode, dt);
+                session->weaponStateByPlayerId[playerId].terraformMode = player.input.terraformMode;
+                if (player.input.terrainGunAdd || player.input.terrainGunRemove) {
+                    spawnPrimaryShot(nowSeconds, playerId, player.actor, false, player.walkYaw, player.walkPitch, player.input.terrainGunAdd, player.input.terrainGunRemove);
+                } else if (player.input.firePrimary) {
+                    spawnPrimaryShot(nowSeconds, playerId, player.actor, player.flightMode, player.walkYaw, player.walkPitch, false, false);
+                }
+                if (player.input.dropBomb && player.flightMode) {
+                    spawnBomb(nowSeconds, playerId, player.actor);
+                }
+            }
+        }
+
+        for (EnemyTargetState& target : session->enemyTargets) {
+            if (target.health <= 0.0f && target.respawnAt >= 0.0f && session->worldTime >= target.respawnAt) {
+                target.health = target.maxHealth;
+                target.respawnAt = -1.0f;
+            }
+        }
+
+        const auto applyBlastDamage = [&](int ownerId, const Vec3& center, float blastRadius, float maxDamage) {
+            for (EnemyTargetState& target : session->enemyTargets) {
+                if (target.health <= 0.0f) {
+                    continue;
+                }
+                const float distance = length(target.pos - center);
+                if (distance > (blastRadius + target.radius)) {
+                    continue;
+                }
+                const float alpha = 1.0f - clamp(distance / std::max(1.0f, blastRadius + target.radius), 0.0f, 1.0f);
+                target.health -= maxDamage * alpha;
+                if (target.health <= 0.0f) {
+                    target.health = 0.0f;
+                    target.respawnAt = session->worldTime + 8.0f;
+                    ensurePlaneDurabilityState(session->planeDurabilityByPlayerId, ownerId).targetsDestroyed += 1;
+                }
+            }
+
+            auto applyPlayerBlastDamage = [&](int playerId, const FlightState& actor, bool actorFlightMode) {
+                if (playerId == ownerId) {
+                    return;
+                }
+                const float radius = actorFlightMode ? std::max(1.6f, actor.collisionRadius * 1.45f) : 1.2f;
+                const float distance = length(actor.pos - center);
+                if (distance > (blastRadius + radius)) {
+                    return;
+                }
+                const float alpha = 1.0f - clamp(distance / std::max(1.0f, blastRadius + radius), 0.0f, 1.0f);
+                applyPlaneDamage(ensurePlaneDurabilityState(session->planeDurabilityByPlayerId, playerId), 26.0f * alpha, 33.0f * alpha, 14.0f * alpha);
+            };
+
+            applyPlayerBlastDamage(localGameplayPlayerId(), session->plane, session->flightMode);
+            if (session->onlineRole == OnlineSessionRole::Host) {
+                for (const auto& [playerId, player] : session->hostedServer.players()) {
+                    if (playerId == 1 || !player.connected || !player.hasReceivedHello) {
+                        continue;
+                    }
+                    applyPlayerBlastDamage(playerId, player.actor, player.flightMode);
+                }
+            }
+        };
+
+        for (GameplayObjectState& object : session->gameplayObjects) {
+            if (!object.active) {
+                continue;
+            }
+
+            object.ttl -= dt;
+            if (object.ttl <= 0.0f) {
+                object.active = false;
+                continue;
+            }
+
+            const int substeps = std::max(1, static_cast<int>(std::ceil((length(object.vel) * dt) / 18.0f)));
+            const float stepDt = dt / static_cast<float>(substeps);
+            for (int substep = 0; substep < substeps && object.active; ++substep) {
+                const Vec3 start = object.pos;
+                object.vel.y += -9.80665f * object.gravityScale * stepDt;
+                object.vel *= clamp(1.0f - (object.drag * stepDt), 0.0f, 1.0f);
+                object.pos += object.vel * stepDt;
+
+                for (EnemyTargetState& target : session->enemyTargets) {
+                    if (!object.active || target.health <= 0.0f) {
+                        continue;
+                    }
+                    if (!segmentHitsVerticalCapsule(start, object.pos, target.pos, target.radius, target.halfHeight)) {
+                        continue;
+                    }
+                    if (object.kind == GameplayObjectKind::Projectile || object.kind == GameplayObjectKind::Bomb) {
+                        target.health -= object.damage;
+                        if (target.health <= 0.0f) {
+                            target.health = 0.0f;
+                            target.respawnAt = session->worldTime + 8.0f;
+                            ensurePlaneDurabilityState(session->planeDurabilityByPlayerId, object.ownerId).targetsDestroyed += 1;
+                        }
+                    }
+                    if (object.kind == GameplayObjectKind::Bomb) {
+                        applyBlastDamage(object.ownerId, target.pos, object.blastRadius, object.damage);
+                    }
+                    object.active = false;
+                }
+
+                auto tryHitPlane = [&](int playerId, const FlightState& actor, bool actorFlightMode, float walkYaw, float walkPitch) {
+                    (void)walkYaw;
+                    (void)walkPitch;
+                    if (!object.active || playerId == object.ownerId) {
+                        return;
+                    }
+                    const float radius = actorFlightMode ? std::max(1.8f, actor.collisionRadius * 1.4f) : 0.9f;
+                    const float halfHeight = actorFlightMode ? radius : 1.4f;
+                    if (!segmentHitsVerticalCapsule(start, object.pos, actor.pos, radius, halfHeight)) {
+                        return;
+                    }
+                    if (object.kind == GameplayObjectKind::Projectile || object.kind == GameplayObjectKind::Bomb) {
+                        applyPlaneDamage(
+                            ensurePlaneDurabilityState(session->planeDurabilityByPlayerId, playerId),
+                            object.damage * 0.72f,
+                            object.damage,
+                            object.damage * 0.35f);
+                    }
+                    if (object.kind == GameplayObjectKind::Bomb) {
+                        applyBlastDamage(object.ownerId, actor.pos, object.blastRadius, object.damage);
+                    }
+                    object.active = false;
+                };
+
+                tryHitPlane(localGameplayPlayerId(), session->plane, session->flightMode, session->walkYaw, session->walkPitch);
+                if (session->onlineRole == OnlineSessionRole::Host) {
+                    for (const auto& [playerId, player] : session->hostedServer.players()) {
+                        if (playerId == 1 || !player.connected || !player.hasReceivedHello) {
+                            continue;
+                        }
+                        tryHitPlane(playerId, player.actor, player.flightMode, player.walkYaw, player.walkPitch);
+                    }
+                }
+
+                if (!object.active) {
+                    continue;
+                }
+
+                const int terrainChecks = std::max(2, static_cast<int>(std::ceil(length(object.pos - start) / 2.5f)));
+                for (int sampleIndex = 1; sampleIndex <= terrainChecks && object.active; ++sampleIndex) {
+                    const float alpha = static_cast<float>(sampleIndex) / static_cast<float>(terrainChecks);
+                    const Vec3 samplePos = start + ((object.pos - start) * alpha);
+                    if (sampleSdf(samplePos.x, samplePos.y, samplePos.z, session->terrainContext) > object.radius) {
+                        continue;
+                    }
+
+                    if (object.kind == GameplayObjectKind::Bomb) {
+                        const TerrainCrater crater {
+                            samplePos.x,
+                            sampleGroundHeight(samplePos.x, samplePos.z, session->terrainContext),
+                            samplePos.z,
+                            object.craterRadius,
+                            object.craterDepth,
+                            0.16f
+                        };
+                        (void)applyAuthoritativeCrater(crater);
+                        applyBlastDamage(object.ownerId, samplePos, object.blastRadius, object.damage);
+                    } else if (object.kind == GameplayObjectKind::TerrainAdd || object.kind == GameplayObjectKind::TerrainRemove) {
+                        const Vec3 impactNormal = sampleTerrainNormal(samplePos.x, samplePos.y, samplePos.z, session->terrainContext);
+                        const float magnitude = object.kind == GameplayObjectKind::TerrainAdd ? 3.4f : -3.8f;
+                        (void)applyAuthoritativeTerrainBrush(
+                            samplePos,
+                            object.kind == GameplayObjectKind::TerrainAdd ? 7.0f : 6.0f,
+                            magnitude,
+                            impactNormal,
+                            object.kind == GameplayObjectKind::TerrainAdd ? "terrain_add" : "terrain_remove");
+                    }
+                    object.active = false;
+                }
+            }
+        }
+
+        session->gameplayObjects.erase(
+            std::remove_if(
+                session->gameplayObjects.begin(),
+                session->gameplayObjects.end(),
+                [](const GameplayObjectState& object) {
+                    return !object.active || object.ttl <= 0.0f;
+                }),
+            session->gameplayObjects.end());
+
+        if (session->onlineRole == OnlineSessionRole::Host && nowSeconds >= session->nextGameplaySnapshotAt) {
+            const std::shared_ptr<INetTransport> transport = session->hostedServer.transport();
+            if (transport) {
+                const std::string packet = buildGameplayStatePacket(buildGameplayStateSnapshot(*session));
+                for (const auto& [playerId, player] : session->hostedServer.players()) {
+                    if (playerId == 1 || !player.connected || player.peerId == 0) {
+                        continue;
+                    }
+                    transport->send(player.peerId, static_cast<int>(TransportLane::Snapshot), packet, false);
+                }
+            }
+            session->nextGameplaySnapshotAt = nowSeconds + kGameplaySnapshotIntervalSec;
+        }
     };
 
     auto applyDisplaySettings = [&](float nowSeconds) {
@@ -15279,6 +18116,7 @@ int main(int argc, char** argv)
             screen = AppScreen::InFlight;
             session->flightMode = true;
             boot.steamOnline = session->steamOnline;
+            refreshWorldInstanceCatalog(boot);
             queueSave(nowSeconds);
             menuState.sessionFlightMode = true;
             menuState.active = false;
@@ -15297,6 +18135,7 @@ int main(int argc, char** argv)
             session.reset();
         }
         boot.steamOnline = snapshotSteamOnlineState(boot.steamController);
+        refreshWorldInstanceCatalog(boot);
         screen = AppScreen::MainMenu;
         menuState.active = true;
         menuState.mode = MenuMode::MainMenu;
@@ -15362,10 +18201,12 @@ int main(int argc, char** argv)
         boot.walkingPrefs = {};
         boot.walkingPrefs.scale = 1.0f;
         boot.paintUi = {};
+        boot.selectedWorldId = "native_default";
         setBuiltinPlaneModel(boot.planeVisual);
         setBuiltinPlaneModel(boot.walkingVisual);
         boot.walkingVisual.label = "builtin player cube";
         syncHudUi();
+        refreshWorldInstanceCatalog(boot);
         refreshSteamRuntimeState();
         std::string displayError;
         if (!applyGraphicsSettingsToWindow(window, boot.graphics, &displayError) && !displayError.empty()) {
@@ -15382,6 +18223,36 @@ int main(int argc, char** argv)
                 clearMenuConfirmation(menuState);
                 return MenuCommand::StartFlight;
             case 1:
+                clearMenuConfirmation(menuState);
+                cycleSelectedWorldInstance(boot, 1);
+                queueSave(nowSeconds);
+                return MenuCommand::None;
+            case 2:
+                clearMenuConfirmation(menuState);
+                beginWorldPrompt(nowSeconds);
+                return MenuCommand::None;
+            case 3:
+                if (!menuConfirmationMatches(menuState, menuState.selectedIndex, nowSeconds)) {
+                    requestMenuConfirmation(menuState, menuState.selectedIndex, "Confirm delete selected world.", nowSeconds, 3.2f);
+                    setPauseStatus(menuState, menuState.confirmText, nowSeconds, 3.0f);
+                    return MenuCommand::None;
+                }
+                clearMenuConfirmation(menuState);
+                {
+                    std::string deleteStatus;
+                    if (deleteWorldInstance(boot, boot.selectedWorldId, &deleteStatus)) {
+                        queueSave(nowSeconds);
+                        setPauseStatus(menuState, "Deleted world instance. Selected " + boot.selectedWorldId + ".", nowSeconds, 3.2f);
+                    } else {
+                        setPauseStatus(
+                            menuState,
+                            deleteStatus.empty() ? "World deletion failed." : deleteStatus,
+                            nowSeconds,
+                            3.8f);
+                    }
+                }
+                return MenuCommand::None;
+            case 4:
                 if (!menuConfirmationMatches(menuState, menuState.selectedIndex, nowSeconds)) {
                     requestMenuConfirmation(menuState, menuState.selectedIndex, "Confirm restore defaults.", nowSeconds, 3.0f);
                     setPauseStatus(menuState, menuState.confirmText, nowSeconds, 3.0f);
@@ -15390,7 +18261,7 @@ int main(int argc, char** argv)
                 clearMenuConfirmation(menuState);
                 restoreAllDefaults(nowSeconds);
                 return MenuCommand::None;
-            case 2:
+            case 5:
                 if (!menuConfirmationMatches(menuState, menuState.selectedIndex, nowSeconds)) {
                     requestMenuConfirmation(menuState, menuState.selectedIndex, "Confirm quit.", nowSeconds, 2.8f);
                     setPauseStatus(menuState, menuState.confirmText, nowSeconds, 2.8f);
@@ -15418,9 +18289,7 @@ int main(int argc, char** argv)
             return MenuCommand::ToggleFlightMode;
         case 2:
             clearMenuConfirmation(menuState);
-            resetFlight(session->plane, session->runtime, session->terrainContext, session->plane.pos.x, session->plane.pos.z);
-            session->flightMode = true;
-            menuState.sessionFlightMode = true;
+            switchSessionToFlight(nowSeconds, session->plane.pos.x, session->plane.pos.z, "Flight reset.");
             clearControlBindingCapture(menuState);
             setPauseActive(menuState, boot.uiState, false);
             return MenuCommand::None;
@@ -15566,6 +18435,12 @@ int main(int argc, char** argv)
         }
 
         switch (menuState.tab) {
+        case PauseTab::Main:
+            if (menuState.mode == MenuMode::MainMenu && menuState.selectedIndex == 1) {
+                cycleSelectedWorldInstance(boot, direction);
+                queueSave(nowSeconds);
+            }
+            break;
         case PauseTab::Settings:
             if (menuState.settingsSubTab == SettingsSubTab::Flight) {
                 adjustTuningValue(boot.planeProfile.flightConfig, menuState.selectedIndex, direction);
@@ -15583,6 +18458,9 @@ int main(int argc, char** argv)
                         currentTerrainStream());
                 }
                 queueSave(nowSeconds);
+            } else if (menuState.settingsSubTab == SettingsSubTab::Online && menuState.selectedIndex == 3) {
+                boot.steamController.selectNextDiscoveredLobby(direction);
+                boot.steamOnline = snapshotSteamOnlineState(boot.steamController);
             } else if (!menuSettingsRowDisabled(menuState.settingsSubTab, menuState.selectedIndex) &&
                        !menuSettingsRowAction(menuState.settingsSubTab, menuState.selectedIndex)) {
                 adjustMenuSettingsRowValue(
@@ -15717,17 +18595,25 @@ int main(int argc, char** argv)
         case PauseTab::Settings:
             if (menuState.settingsSubTab == SettingsSubTab::Graphics && menuState.selectedIndex == 2) {
                 applyDisplaySettings(nowSeconds);
-            } else if (menuState.settingsSubTab == SettingsSubTab::Online && menuState.selectedIndex == 3) {
-                if (!onlineActionRowEnabled(3, boot.onlineSettings, boot.steamOnline, menuState.mode != MenuMode::MainMenu)) {
-                    setPauseStatus(menuState, "No pending Steam lobby invite is waiting.", nowSeconds, 3.0f);
+            } else if (menuState.settingsSubTab == SettingsSubTab::Online && menuState.selectedIndex == 4) {
+                if (!onlineActionRowEnabled(4, boot.onlineSettings, boot.steamOnline, menuState.mode != MenuMode::MainMenu)) {
+                    setPauseStatus(menuState, "No pending or discovered Steam lobby is available.", nowSeconds, 3.2f);
                 } else {
+                    if (boot.steamOnline.pendingLobbyId.empty() && !boot.steamOnline.selectedDiscoveredLobbyId.empty()) {
+                        std::uint64_t discoveredLobbyId = 0;
+                        if (parseSteamId64(boot.steamOnline.selectedDiscoveredLobbyId, discoveredLobbyId) && discoveredLobbyId != 0) {
+                            std::string joinStatus;
+                            boot.steamController.queuePendingJoinRequest(discoveredLobbyId, &joinStatus);
+                            boot.steamOnline = snapshotSteamOnlineState(boot.steamController);
+                        }
+                    }
                     boot.onlineSettings.multiplayerEnabled = true;
                     boot.onlineSettings.sessionMode = "client";
                     clampOnlineSettings(boot.onlineSettings);
                     startFlight(nowSeconds);
                 }
-            } else if (menuState.settingsSubTab == SettingsSubTab::Online && menuState.selectedIndex == 4) {
-                if (!onlineActionRowEnabled(4, boot.onlineSettings, boot.steamOnline, menuState.mode != MenuMode::MainMenu)) {
+            } else if (menuState.settingsSubTab == SettingsSubTab::Online && menuState.selectedIndex == 5) {
+                if (!onlineActionRowEnabled(5, boot.onlineSettings, boot.steamOnline, menuState.mode != MenuMode::MainMenu)) {
                     setPauseStatus(menuState, "Invite Friends is only available for an active hosted Steam lobby.", nowSeconds, 3.2f);
                 } else {
                     std::string inviteStatus;
@@ -15829,9 +18715,7 @@ int main(int argc, char** argv)
             if (!session.has_value() || menuVisible()) {
                 return false;
             }
-            resetFlight(session->plane, session->runtime, session->terrainContext, session->plane.pos.x, session->plane.pos.z);
-            session->flightMode = true;
-            menuState.sessionFlightMode = true;
+            switchSessionToFlight(nowSeconds, session->plane.pos.x, session->plane.pos.z, "Flight reset.");
             return true;
         case InputActionId::PaintBrush:
             if (!menuVisible() || menuState.tab != PauseTab::Paint) {
@@ -15939,7 +18823,11 @@ int main(int argc, char** argv)
     auto handleGamepadMenuBack = [&](float nowSeconds) {
         if (menuState.promptActive) {
             stopPromptTextInput();
-            setPauseStatus(menuState, "Cancelled model path entry.", nowSeconds, 2.2f);
+            setPauseStatus(
+                menuState,
+                menuState.promptMode == MenuPromptMode::WorldName ? "Cancelled world creation." : "Cancelled model path entry.",
+                nowSeconds,
+                2.2f);
             return;
         }
         if (menuState.controlsCapturing) {
@@ -15978,7 +18866,11 @@ int main(int argc, char** argv)
 
         if (menuState.promptActive) {
             if (gamepadButtonPressed(gamepad, SDL_GAMEPAD_BUTTON_SOUTH)) {
-                submitModelPrompt(nowSeconds);
+                if (menuState.promptMode == MenuPromptMode::WorldName) {
+                    submitWorldPrompt(nowSeconds);
+                } else {
+                    submitModelPrompt(nowSeconds);
+                }
             } else if (gamepadButtonPressed(gamepad, SDL_GAMEPAD_BUTTON_EAST)) {
                 handleGamepadMenuBack(nowSeconds);
             }
@@ -16074,11 +18966,13 @@ int main(int argc, char** argv)
                 switchSessionToFlight(nowSeconds, session->plane.pos.x, session->plane.pos.z, "Flight mode restored.");
             }
         }
-        if (session->flightMode &&
-            gamepadButtonPressed(gamepad, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER) &&
-            (nowSeconds - gamepad.lastProjectileTriggerAt) >= kGamepadProjectileCooldownSec) {
-            gamepad.lastProjectileTriggerAt = nowSeconds;
-            SDL_Log("Projectile fire input received (projectile spawning not implemented yet).");
+        if (!session->flightMode && gamepadButtonPressed(gamepad, SDL_GAMEPAD_BUTTON_DPAD_UP)) {
+            localWeaponState().terraformMode = !localWeaponState().terraformMode;
+            setPauseStatus(
+                menuState,
+                localWeaponState().terraformMode ? "Terraform mode enabled." : "Terraform mode disabled.",
+                nowSeconds,
+                2.6f);
         }
     };
 
@@ -16091,6 +18985,7 @@ int main(int argc, char** argv)
         float frameMouseDy = 0.0f;
         int throttleWheelSteps = 0;
         int trimWheelSteps = 0;
+        bool toggleTerraformRequested = false;
 
         SDL_Event event {};
         while (SDL_PollEvent(&event)) {
@@ -16147,9 +19042,17 @@ int main(int argc, char** argv)
                     const SDL_Keymod modifiers = static_cast<SDL_Keymod>(event.key.mod);
                     if (scancode == SDL_SCANCODE_ESCAPE) {
                         stopPromptTextInput();
-                        setPauseStatus(menuState, "Cancelled model path entry.", uiNowSeconds, 2.2f);
+                        setPauseStatus(
+                            menuState,
+                            menuState.promptMode == MenuPromptMode::WorldName ? "Cancelled world creation." : "Cancelled model path entry.",
+                            uiNowSeconds,
+                            2.2f);
                     } else if (scancode == SDL_SCANCODE_RETURN || scancode == SDL_SCANCODE_KP_ENTER) {
-                        submitModelPrompt(uiNowSeconds);
+                        if (menuState.promptMode == MenuPromptMode::WorldName) {
+                            submitWorldPrompt(uiNowSeconds);
+                        } else {
+                            submitModelPrompt(uiNowSeconds);
+                        }
                     } else if (scancode == SDL_SCANCODE_LEFT) {
                         moveMenuPromptCursor(menuState, -1);
                     } else if (scancode == SDL_SCANCODE_RIGHT) {
@@ -16646,6 +19549,10 @@ int main(int argc, char** argv)
                     clampMenuSelection();
                     continue;
                 }
+                if (scancode == SDL_SCANCODE_T && session.has_value() && !session->flightMode) {
+                    toggleTerraformRequested = true;
+                    continue;
+                }
                 (void)triggerBoundActionsFromKey(scancode, modifiers, uiNowSeconds);
                 continue;
             }
@@ -16682,7 +19589,8 @@ int main(int argc, char** argv)
 
         const bool* keys = SDL_GetKeyboardState(nullptr);
         const SDL_Keymod modifiers = SDL_GetModState();
-        const bool altHeld = keys[SDL_SCANCODE_LALT] != 0 || keys[SDL_SCANCODE_RALT] != 0;
+        const bool altLookHeld = keys[SDL_SCANCODE_LALT] != 0;
+        const bool releaseCursorHeld = keys[SDL_SCANCODE_RALT] != 0;
         const SDL_MouseButtonFlags mouseButtons = SDL_GetMouseState(nullptr, nullptr);
         const float gamepadLeftX = gamepadAxisValue(gamepad, SDL_GAMEPAD_AXIS_LEFTX);
         const float gamepadLeftY = gamepadAxisValue(gamepad, SDL_GAMEPAD_AXIS_LEFTY);
@@ -16690,7 +19598,7 @@ int main(int argc, char** argv)
         const float gamepadRightY = gamepadAxisValue(gamepad, SDL_GAMEPAD_AXIS_RIGHTY);
         const float gamepadLeftTrigger = gamepadAxisValue(gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
         const float gamepadRightTrigger = gamepadAxisValue(gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
-        const bool wantsMouseCapture = windowHasFocus && screen == AppScreen::InFlight && !menuVisible() && !altHeld;
+        const bool wantsMouseCapture = windowHasFocus && screen == AppScreen::InFlight && !menuVisible() && !releaseCursorHeld;
         if (wantsMouseCapture != mouseCaptured) {
             setMouseCapture(window, wantsMouseCapture);
             mouseCaptured = wantsMouseCapture;
@@ -16705,18 +19613,36 @@ int main(int argc, char** argv)
              gamepadButtonDown(gamepad, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER));
 
         if (screen == AppScreen::InFlight && session.has_value()) {
+            if (!session->flightMode && toggleTerraformRequested) {
+                localWeaponState().terraformMode = !localWeaponState().terraformMode;
+                setPauseStatus(
+                    menuState,
+                    localWeaponState().terraformMode ? "Terraform mode enabled." : "Terraform mode disabled.",
+                    uiNowSeconds,
+                    2.6f);
+            }
+
             bool flightAfterburnerActive = false;
             if (!menuVisible()) {
                 if (mouseCaptured) {
                     if (session->flightMode) {
-                        applyFlightMouseInput(
-                            boot.uiState,
-                            boot.controls,
-                            session->plane,
-                            frameMouseDx,
-                            frameMouseDy,
-                            modifiers,
-                            session->worldTime + dt);
+                        if (altLookHeld) {
+                            applyFlightMouseLook(
+                                boot.uiState,
+                                session->flightLookYaw,
+                                session->flightLookPitch,
+                                frameMouseDx,
+                                frameMouseDy);
+                        } else {
+                            applyFlightMouseInput(
+                                boot.uiState,
+                                boot.controls,
+                                session->plane,
+                                frameMouseDx,
+                                frameMouseDy,
+                                modifiers,
+                                session->worldTime + dt);
+                        }
                     } else {
                         applyWalkingMouseInput(
                             boot.uiState,
@@ -16730,13 +19656,15 @@ int main(int argc, char** argv)
                     }
                 }
                 if (session->flightMode) {
-                    applyFlightGamepadLook(
-                        boot.uiState,
-                        session->flightLookYaw,
-                        session->flightLookPitch,
-                        gamepadRightX,
-                        gamepadRightY,
-                        dt);
+                    if (!altLookHeld || std::fabs(gamepadRightX) > 1.0e-4f || std::fabs(gamepadRightY) > 1.0e-4f) {
+                        applyFlightGamepadLook(
+                            boot.uiState,
+                            session->flightLookYaw,
+                            session->flightLookPitch,
+                            gamepadRightX,
+                            gamepadRightY,
+                            dt);
+                    }
 
                     const bool rudderLeftHeld = gamepadButtonDown(gamepad, SDL_GAMEPAD_BUTTON_DPAD_LEFT);
                     const bool rudderRightHeld = gamepadButtonDown(gamepad, SDL_GAMEPAD_BUTTON_DPAD_RIGHT);
@@ -16815,6 +19743,33 @@ int main(int argc, char** argv)
                     walkingInput.rightAxis = gamepadLeftX;
                 }
             }
+            const bool terrainGunAddHeld =
+                !menuVisible() &&
+                !session->flightMode &&
+                localWeaponState().terraformMode &&
+                (((mouseButtons & SDL_BUTTON_LMASK) != 0) ||
+                 gamepadButtonDown(gamepad, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER));
+            const bool terrainGunRemoveHeld =
+                !menuVisible() &&
+                !session->flightMode &&
+                localWeaponState().terraformMode &&
+                (((mouseButtons & SDL_BUTTON_RMASK) != 0) ||
+                 gamepadButtonDown(gamepad, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER));
+            const bool firePrimaryHeld =
+                !menuVisible() &&
+                !terrainGunAddHeld &&
+                !terrainGunRemoveHeld &&
+                ((((mouseButtons & SDL_BUTTON_LMASK) != 0) && (!session->flightMode || !boot.uiState.zoomHeld)) ||
+                 gamepadButtonDown(gamepad, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER));
+            const bool dropBombHeld =
+                !menuVisible() &&
+                session->flightMode &&
+                (keys[SDL_SCANCODE_B] != 0);
+            const FlightConfig runtimeFlightConfig = buildRuntimeFlightConfig(boot.planeProfile.flightConfig);
+            const FlightConfig effectiveFlightConfig =
+                session->onlineRole == OnlineSessionRole::Client
+                    ? runtimeFlightConfig
+                    : buildEffectiveFlightConfig(runtimeFlightConfig, localDurabilityState());
 
             FlightEnvironment environment {};
             environment.wind = getWindVector3(session->windState);
@@ -16854,7 +19809,7 @@ int main(int argc, char** argv)
                         session->worldTime + dt,
                         input,
                         environment,
-                        boot.planeProfile.flightConfig);
+                        effectiveFlightConfig);
                     session->foliageBrushAmount = computeBrushContactAmount(
                         terrainVisuals,
                         session->plane.pos,
@@ -16926,12 +19881,16 @@ int main(int argc, char** argv)
                     session->walkYaw,
                     session->walkPitch,
                     localAvatar);
-                session->hostedServer.serviceIncoming(boot.terrainParams, currentAuthoritativeWorldStore());
+                session->hostedServer.serviceIncoming(
+                    boot.terrainParams,
+                    session->terrainContext,
+                    currentAuthoritativeWorldStore());
                 session->hostedServer.update(
                     uiNowSeconds,
                     dt,
                     session->terrainContext,
-                    boot.planeProfile.flightConfig,
+                    runtimeFlightConfig,
+                    getWindVector3(session->windState),
                     currentAuthoritativeWorldStore());
                 for (const std::string& frame : session->voice.pendingOutboundCompressedFrames) {
                     session->hostedServer.queueLocalVoiceFrame(localAvatar.radioChannel, frame);
@@ -16947,20 +19906,26 @@ int main(int argc, char** argv)
                     session->clientReplication.nextHelloAt = uiNowSeconds + 1.0;
                 }
 
-                if (uiNowSeconds >= session->clientReplication.nextInputAt) {
-                    enqueueClientInput(
-                        session->clientReplication,
-                        buildNetPlayerInput(
-                            std::max(session->runtime.tick, session->plane.debug.tick) + 1,
-                            session->flightMode,
-                            session->walkYaw,
-                            session->walkPitch,
-                            session->plane,
-                            input,
-                            walkingInput,
-                            localAvatar));
-                    session->clientReplication.nextInputAt = uiNowSeconds + (1.0 / 60.0);
-                }
+                const int tick = nextLocalNetworkTick(*session);
+                recordClientPredictedState(*session, tick);
+                enqueueClientInput(
+                    session->clientReplication,
+                    buildNetPlayerInput(
+                        tick,
+                        dt,
+                        session->flightMode,
+                        session->walkYaw,
+                        session->walkPitch,
+                        boot.uiState.walkingMoveSpeed,
+                        session->plane,
+                        input,
+                        walkingInput,
+                        localAvatar,
+                        firePrimaryHeld,
+                        dropBombHeld,
+                        terrainGunAddHeld,
+                        terrainGunRemoveHeld,
+                        localWeaponState().terraformMode));
 
                 enqueueClientAoiSubscription(
                     session->clientReplication,
@@ -16986,7 +19951,6 @@ int main(int argc, char** argv)
                 }
                 session->voice.pendingOutboundCompressedFrames.clear();
 
-                const TerrainParams previousMirroredTerrain = session->terrainContext.params;
                 serviceClientReplication(
                     session->clientReplication,
                     uiNowSeconds,
@@ -16994,7 +19958,9 @@ int main(int argc, char** argv)
                     session->mirrorWorldStore.has_value() ? &*session->mirrorWorldStore : nullptr,
                     &session->localReplicationPeer);
 
-                if (terrainNetworkingParamsChanged(previousMirroredTerrain, session->clientReplication.mirroredTerrain)) {
+                const bool mirroredTerrainParamsChanged =
+                    terrainNetworkingParamsChanged(session->terrainContext.params, session->clientReplication.mirroredTerrain);
+                if (mirroredTerrainParamsChanged) {
                     refreshTerrainContext(
                         session->clientReplication.mirroredTerrain,
                         session->terrainContext,
@@ -17003,16 +19969,14 @@ int main(int argc, char** argv)
                         currentWorldStoreMutex(),
                         currentTerrainStream());
                 }
+                session->clientReplication.mirrorTerrainDirty = false;
 
-                if (session->localReplicationPeer.connected) {
-                    session->plane.pos = lerp(session->plane.pos, session->localReplicationPeer.displayPos, 0.35f);
-                    session->plane.rot = nlerpQuat(session->plane.rot, session->localReplicationPeer.displayRot, 0.35f);
-                    session->plane.flightVel = session->localReplicationPeer.vel;
-                    session->plane.vel = session->localReplicationPeer.vel;
-                    session->plane.flightAngVel = session->localReplicationPeer.angVel;
-                }
+                applyClientAuthoritativeCorrection(*session, runtimeFlightConfig);
+                menuState.sessionFlightMode = session->flightMode;
                 moveVoiceFrames(session->voice.inboundCompressedFrames, session->clientReplication.voice.inboundCompressedFrames);
             }
+            simulateAuthoritativeGameplay(dt, uiNowSeconds, firePrimaryHeld, dropBombHeld, terrainGunAddHeld, terrainGunRemoveHeld);
+            applyReplicatedGameplayState(*session);
             moveVoiceFrames(session->voice.inboundCompressedFrames, session->voice.hostLocalReceiveFrames);
             playSessionVoiceFrames(
                 session->voiceRuntime,
@@ -17074,17 +20038,34 @@ int main(int argc, char** argv)
             };
             const RendererMemoryStats rendererStats = nativeRenderer.memoryStats();
             const TerrainStreamStats terrainStreamStats = snapshotTerrainStreamStats(currentTerrainStream());
+            updateOnlineNotifications(boot, &*session, uiNowSeconds);
             int remotePeerCount = 0;
             std::vector<HudPeerIndicator> hudPeerIndicators;
+            std::vector<HudTargetIndicator> hudTargetIndicators;
+            std::vector<PeerStatComparison> peerComparisons = buildPeerStatComparisons(*session);
+            const float localGround = sampleGroundHeight(session->plane.pos.x, session->plane.pos.z, session->terrainContext);
+            const float localSpeedKph = (session->flightMode ? session->plane.debug.speed : length(session->plane.vel)) * 3.6f;
+            const float localAltitudeAgl = session->plane.pos.y - localGround;
             if (session->onlineRole == OnlineSessionRole::Host) {
                 for (const auto& [playerId, player] : session->hostedServer.players()) {
                     if (playerId != 1 && player.connected && player.hasReceivedHello) {
                         ++remotePeerCount;
+                        const float peerGround = sampleGroundHeight(player.actor.pos.x, player.actor.pos.z, session->terrainContext);
+                        const PlaneDurabilityState durability = lookupPlaneDurabilityState(*session, playerId);
                         hudPeerIndicators.push_back({
                             player.actor.pos,
                             player.avatar.callsign,
                             player.avatar.radioChannel,
-                            player.avatar.radioTx
+                            player.avatar.radioTx,
+                            (player.flightMode ? player.actor.debug.speed : length(player.actor.vel)) * 3.6f,
+                            localSpeedKph,
+                            player.actor.pos.y - peerGround,
+                            localAltitudeAgl,
+                            durability.hullStrength,
+                            durability.fuselageStrength,
+                            durability.wear,
+                            durability.targetsDestroyed,
+                            lookupTerraformMode(*session, playerId)
                         });
                     }
                 }
@@ -17093,21 +20074,77 @@ int main(int argc, char** argv)
                     (void)peerId;
                     if (peer.connected) {
                         ++remotePeerCount;
+                        const float peerGround = sampleGroundHeight(peer.displayPos.x, peer.displayPos.z, session->terrainContext);
+                        const PlaneDurabilityState durability = lookupPlaneDurabilityState(*session, peer.id);
                         hudPeerIndicators.push_back({
                             peer.displayPos,
                             peer.avatar.callsign,
                             peer.avatar.radioChannel,
-                            peer.avatar.radioTx
+                            peer.avatar.radioTx,
+                            length(peer.vel) * 3.6f,
+                            localSpeedKph,
+                            peer.displayPos.y - peerGround,
+                            localAltitudeAgl,
+                            durability.hullStrength,
+                            durability.fuselageStrength,
+                            durability.wear,
+                            durability.targetsDestroyed,
+                            lookupTerraformMode(*session, peer.id)
                         });
                     }
                 }
             }
+            for (const EnemyTargetState& target : session->enemyTargets) {
+                if (target.health <= 0.0f) {
+                    continue;
+                }
+                hudTargetIndicators.push_back({
+                    target.id,
+                    target.pos,
+                    target.halfHeight,
+                    length(target.pos - session->plane.pos),
+                    target.health,
+                    target.maxHealth,
+                    false
+                });
+            }
+            std::sort(
+                hudTargetIndicators.begin(),
+                hudTargetIndicators.end(),
+                [](const HudTargetIndicator& lhs, const HudTargetIndicator& rhs) {
+                    return lhs.distanceMeters < rhs.distanceMeters;
+                });
+            if (!hudTargetIndicators.empty()) {
+                hudTargetIndicators.front().highlighted = true;
+            }
             std::vector<std::string> runtimeDebugLines =
                 buildRuntimeDebugLines(runtimeGovernor, rendererStats, terrainStreamStats);
+            const PlaneDurabilityState localDurability = localDurabilityState();
             runtimeDebugLines.push_back("Online Role: " + std::string(
                 session->onlineRole == OnlineSessionRole::Host ? "host" :
                 (session->onlineRole == OnlineSessionRole::Client ? "client" : "offline")));
             runtimeDebugLines.push_back("Peers: " + std::to_string(remotePeerCount));
+            runtimeDebugLines.push_back(
+                "Hull " + std::to_string(static_cast<int>(std::round(localDurability.hullStrength))) +
+                " | Fuselage " + std::to_string(static_cast<int>(std::round(localDurability.fuselageStrength))) +
+                " | Wear " + std::to_string(static_cast<int>(std::round(localDurability.wear))));
+            runtimeDebugLines.push_back(
+                std::string("Targets Active: ") +
+                std::to_string(static_cast<int>(std::count_if(
+                    session->enemyTargets.begin(),
+                    session->enemyTargets.end(),
+                    [](const EnemyTargetState& target) {
+                        return target.health > 0.0f;
+                    }))) +
+                " | Destroyed " + std::to_string(localDurability.targetsDestroyed) +
+                (localWeaponState().terraformMode && !session->flightMode ? " | Terraform" : ""));
+            if (!hudTargetIndicators.empty()) {
+                runtimeDebugLines.push_back(
+                    "Nearest Target " +
+                    std::to_string(static_cast<int>(std::round(hudTargetIndicators.front().distanceMeters))) +
+                    "m | HP " +
+                    std::to_string(static_cast<int>(std::round(hudTargetIndicators.front().health))));
+            }
 
             std::vector<RenderObject> opaqueObjects;
             opaqueObjects.reserve(((terrainVisuals.nearTiles.size() + terrainVisuals.farTiles.size()) * 2u) + 4u);
@@ -17304,6 +20341,95 @@ int main(int argc, char** argv)
                 }
             }
 
+            static Model projectileModel = [] {
+                Model model = makeOctahedronModel();
+                model.assetKey = "builtin:projectile";
+                return model;
+            }();
+            static Model bombModel = [] {
+                Model model = makeCubeModel();
+                model.assetKey = "builtin:bomb";
+                return model;
+            }();
+            static Model targetModel = [] {
+                Model model = makeCubeModel();
+                model.assetKey = "builtin:target";
+                return model;
+            }();
+
+            for (const GameplayObjectState& object : session->gameplayObjects) {
+                if (!object.active) {
+                    continue;
+                }
+                const float cullRadius = std::max(0.6f, object.radius * 3.2f);
+                if (!sphereWithinView(renderCamera, object.pos, cullRadius, effectiveGraphics.drawDistance + cullRadius)) {
+                    continue;
+                }
+
+                const bool translucent =
+                    object.kind == GameplayObjectKind::TerrainAdd ||
+                    object.kind == GameplayObjectKind::TerrainRemove;
+                const Model* model =
+                    object.kind == GameplayObjectKind::Bomb
+                        ? &bombModel
+                        : &projectileModel;
+                const Vec3 color =
+                    object.kind == GameplayObjectKind::Bomb
+                        ? Vec3 { 0.96f, 0.78f, 0.24f }
+                        : (object.kind == GameplayObjectKind::TerrainAdd
+                            ? Vec3 { 0.18f, 0.92f, 0.56f }
+                            : (object.kind == GameplayObjectKind::TerrainRemove
+                                ? Vec3 { 1.0f, 0.42f, 0.24f }
+                                : Vec3 { 1.0f, 0.92f, 0.72f }));
+
+                RenderObject projectileObject {
+                    model,
+                    object.pos,
+                    quatIdentity(),
+                    { object.radius * 2.6f, object.radius * 2.6f, object.radius * 2.6f },
+                    color,
+                    translucent ? 0.88f : 1.0f,
+                    80.0f,
+                    3200.0f,
+                    !translucent
+                };
+                applyFogSettings(projectileObject, effectiveGraphics, effectiveLighting);
+                if (translucent) {
+                    translucentObjects.push_back(projectileObject);
+                } else {
+                    opaqueObjects.push_back(projectileObject);
+                }
+            }
+
+            for (const EnemyTargetState& target : session->enemyTargets) {
+                if (target.health <= 0.0f) {
+                    continue;
+                }
+                const float cullRadius = std::max(target.radius * 3.0f, target.halfHeight);
+                if (!sphereWithinView(renderCamera, target.pos, cullRadius, effectiveGraphics.drawDistance + cullRadius)) {
+                    continue;
+                }
+
+                const float healthAlpha = clamp(target.health / std::max(1.0f, target.maxHealth), 0.0f, 1.0f);
+                RenderObject targetObject {
+                    &targetModel,
+                    target.pos,
+                    quatFromAxisAngle({ 0.0f, 1.0f, 0.0f }, target.yawRadians + (session->worldTime * 0.15f)),
+                    { target.radius * 1.4f, target.halfHeight, target.radius * 1.4f },
+                    {
+                        mix(1.0f, 0.22f, healthAlpha),
+                        mix(0.18f, 0.82f, healthAlpha),
+                        mix(0.16f, 0.28f, healthAlpha)
+                    },
+                    1.0f,
+                    100.0f,
+                    3400.0f,
+                    true
+                };
+                applyFogSettings(targetObject, effectiveGraphics, effectiveLighting);
+                opaqueObjects.push_back(targetObject);
+            }
+
             if (menuVisible() && (menuState.tab == PauseTab::Characters || menuState.tab == PauseTab::Paint)) {
                 const PlaneVisualState& previewVisual =
                     menuState.tab == PauseTab::Paint
@@ -17427,6 +20553,9 @@ int main(int argc, char** argv)
                 session->onlineRole,
                 remotePeerCount,
                 &hudPeerIndicators,
+                &peerComparisons,
+                &hudTargetIndicators,
+                &boot.notifications,
                 &runtimeDebugLines);
             if (menuVisible()) {
                 drawMenuOverlay(
@@ -17444,6 +20573,8 @@ int main(int argc, char** argv)
                     boot.planeProfile.flightConfig,
                     boot.planeProfile.propAudioConfig,
                     boot.terrainParams,
+                    boot.worldInstances,
+                    boot.selectedWorldId,
                     boot.assetCatalog,
                     boot.planeVisual,
                     boot.walkingVisual,
@@ -17463,6 +20594,7 @@ int main(int argc, char** argv)
                 running = false;
             }
         } else {
+            updateOnlineNotifications(boot, nullptr, uiNowSeconds);
             if (boot.preferencesDirty && uiNowSeconds >= boot.preferencesNextSaveAt) {
                 std::string saveError;
                 if (saveBootPreferences(boot, &saveError)) {
@@ -17493,6 +20625,8 @@ int main(int argc, char** argv)
                 boot.planeProfile.flightConfig,
                 boot.planeProfile.propAudioConfig,
                 boot.terrainParams,
+                boot.worldInstances,
+                boot.selectedWorldId,
                 boot.assetCatalog,
                 boot.planeVisual,
                 boot.walkingVisual,
@@ -17609,4 +20743,12 @@ int main(int argc, char** argv)
     }
     SDL_Quit();
     return 0;
+}
+catch (const std::exception& exception) {
+    logToStdout(std::string("[fatal] top-level exception: ") + exception.what());
+    return 1;
+}
+catch (...) {
+    logToStdout("[fatal] top-level non-standard exception");
+    return 1;
 }

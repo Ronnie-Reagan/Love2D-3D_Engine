@@ -105,6 +105,20 @@ struct SteamLobbyState {
     std::shared_ptr<INetTransport> transport;
 };
 
+struct SteamDiscoveredLobby {
+    std::uint64_t lobbyId = 0;
+    std::uint64_t hostSteamId = 0;
+    std::uint32_t appId = 0;
+    int maxPlayers = 0;
+    bool joinable = true;
+    std::string protocolVersion = "1";
+    std::string buildId = "native";
+    std::string worldId = "native_default";
+    std::string sessionNonce;
+    std::string hostPersonaName;
+    std::string sourceFriendPersonaName;
+};
+
 [[nodiscard]] std::shared_ptr<INetTransport> createSteamHostTransport(int virtualPort, std::string* statusText = nullptr);
 [[nodiscard]] std::shared_ptr<INetTransport> createSteamClientTransport(std::uint64_t hostSteamId, int virtualPort, std::string* statusText = nullptr);
 [[nodiscard]] std::shared_ptr<INetTransport> createSteamOrFallbackTransport(
@@ -129,8 +143,12 @@ public:
     [[nodiscard]] bool available() const;
     [[nodiscard]] bool initialized() const;
     void queuePendingJoinRequest(std::uint64_t lobbyId, std::string* statusText = nullptr);
+    void selectNextDiscoveredLobby(int delta);
     [[nodiscard]] bool hasPendingJoinRequest() const;
     [[nodiscard]] std::uint64_t pendingJoinLobbyId() const;
+    [[nodiscard]] std::size_t selectedDiscoveredLobbyIndex() const;
+    [[nodiscard]] std::uint64_t selectedDiscoveredLobbyId() const;
+    [[nodiscard]] const std::vector<SteamDiscoveredLobby>& discoveredLobbies() const;
     [[nodiscard]] std::uint64_t consumePendingJoinRequest();
     [[nodiscard]] const SteamRuntimeState& runtimeState() const;
     [[nodiscard]] const std::string& status() const;

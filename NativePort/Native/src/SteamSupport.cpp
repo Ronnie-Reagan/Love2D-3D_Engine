@@ -2,13 +2,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <iostream>
 #include <memory>
-#include <random>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -32,6 +35,18 @@ void setStatus(std::string* statusText, const std::string& value)
     if (statusText != nullptr) {
         *statusText = value;
     }
+}
+
+std::mutex& steamStdoutMutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+
+void steamStdoutLog(std::string_view message)
+{
+    std::lock_guard<std::mutex> lock(steamStdoutMutex());
+    std::cout << "[steam] " << message << std::endl;
 }
 
 #if TRUEFLIGHT_ENABLE_STEAMWORKS
@@ -61,6 +76,103 @@ std::string steamPersonaName(CSteamID steamId)
     }
     const char* name = SteamFriends()->GetFriendPersonaName(steamId);
     return name != nullptr ? std::string(name) : std::string {};
+}
+
+const char* steamNetworkingAvailabilityLabel(ESteamNetworkingAvailability availability)
+{
+    switch (availability) {
+    case k_ESteamNetworkingAvailability_CannotTry:
+        return "cannot-try";
+    case k_ESteamNetworkingAvailability_Failed:
+        return "failed";
+    case k_ESteamNetworkingAvailability_Previously:
+        return "previously";
+    case k_ESteamNetworkingAvailability_Retrying:
+        return "retrying";
+    case k_ESteamNetworkingAvailability_NeverTried:
+        return "never-tried";
+    case k_ESteamNetworkingAvailability_Waiting:
+        return "waiting";
+    case k_ESteamNetworkingAvailability_Attempting:
+        return "attempting";
+    case k_ESteamNetworkingAvailability_Current:
+        return "current";
+    case k_ESteamNetworkingAvailability_Unknown:
+        return "unknown";
+    default:
+        return "other";
+    }
+}
+
+void onSteamAuthenticationStatusChanged(SteamNetAuthenticationStatus_t* status)
+{
+    if (status == nullptr) {
+        return;
+    }
+    steamStdoutLog(
+        std::string("Steam auth status ") +
+        steamNetworkingAvailabilityLabel(status->m_eAvail) +
+        ": " +
+        status->m_debugMsg);
+}
+
+void onSteamRelayNetworkStatusChanged(SteamRelayNetworkStatus_t* status)
+{
+    if (status == nullptr) {
+        return;
+    }
+    steamStdoutLog(
+        std::string("Steam relay status ") +
+        steamNetworkingAvailabilityLabel(status->m_eAvail) +
+        " net=" +
+        steamNetworkingAvailabilityLabel(status->m_eAvailNetworkConfig) +
+        " any=" +
+        steamNetworkingAvailabilityLabel(status->m_eAvailAnyRelay) +
+        ": " +
+        status->m_debugMsg);
+}
+
+const char* steamConnectionStateLabel(ESteamNetworkingConnectionState state)
+{
+    switch (state) {
+    case k_ESteamNetworkingConnectionState_None:
+        return "idle";
+    case k_ESteamNetworkingConnectionState_Connecting:
+        return "connecting";
+    case k_ESteamNetworkingConnectionState_FindingRoute:
+        return "finding route";
+    case k_ESteamNetworkingConnectionState_Connected:
+        return "connected";
+    case k_ESteamNetworkingConnectionState_ClosedByPeer:
+        return "closed by peer";
+    case k_ESteamNetworkingConnectionState_ProblemDetectedLocally:
+        return "problem detected locally";
+    case k_ESteamNetworkingConnectionState_FinWait:
+        return "fin wait";
+    case k_ESteamNetworkingConnectionState_Linger:
+        return "linger";
+    case k_ESteamNetworkingConnectionState_Dead:
+        return "dead";
+    default:
+        return "unknown";
+    }
+}
+
+std::string describeSteamConnectionFailure(const SteamNetConnectionInfo_t& info)
+{
+    std::ostringstream stream;
+    stream << "Steam connection failed: " << steamConnectionStateLabel(info.m_eState);
+    if (info.m_eEndReason != 0) {
+        stream << " (" << info.m_eEndReason << ")";
+    }
+    std::string debug = info.m_szEndDebug;
+    while (!debug.empty() && static_cast<unsigned char>(debug.back()) <= 0x20u) {
+        debug.pop_back();
+    }
+    if (!debug.empty()) {
+        stream << " - " << debug;
+    }
+    return stream.str();
 }
 
 std::string makeSessionNonce()
@@ -108,6 +220,7 @@ struct SteamTransportRegistry {
     std::mutex mutex;
     std::unordered_map<HSteamListenSocket, std::weak_ptr<SteamSocketsTransport>> listenSockets;
     std::unordered_map<HSteamNetConnection, std::weak_ptr<SteamSocketsTransport>> connections;
+    std::unordered_map<std::int64_t, std::weak_ptr<SteamSocketsTransport>> userDataOwners;
     bool callbackInstalled = false;
 };
 
@@ -151,6 +264,18 @@ public:
     {
         std::lock_guard<std::mutex> lock(mutex_);
         return ready_;
+    }
+
+    [[nodiscard]] std::string statusText() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return statusText_;
+    }
+
+    [[nodiscard]] bool hasTerminalFailure() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return terminalFailure_;
     }
 
     bool send(NetPeerId peerId, int lane, std::string_view payload, bool reliable) override
@@ -239,11 +364,25 @@ public:
     {
         switch (update.m_info.m_eState) {
         case k_ESteamNetworkingConnectionState_Connecting:
+            if (steamApisReady()) {
+                (void)SteamNetworkingSockets()->SetConnectionUserData(update.m_hConn, static_cast<int64>(transportUserData_));
+            }
+            registerConnection(update.m_hConn);
+            updateStatus(
+                mode_ == Mode::Client
+                    ? std::string("Steam P2P connecting to host")
+                    : std::string("Steam peer connection incoming"),
+                false);
             if (mode_ == Mode::Host && update.m_info.m_hListenSocket == listenSocket_) {
                 if (SteamNetworkingSockets()->AcceptConnection(update.m_hConn) != k_EResultOK) {
+                    updateStatus("Steam connection failed: accept rejected", true);
                     (void)SteamNetworkingSockets()->CloseConnection(update.m_hConn, 0, "Accept failed", false);
                 }
             }
+            break;
+
+        case k_ESteamNetworkingConnectionState_FindingRoute:
+            updateStatus("Steam P2P finding relay route", false);
             break;
 
         case k_ESteamNetworkingConnectionState_Connected: {
@@ -251,8 +390,13 @@ public:
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 ready_ = true;
+                terminalFailure_ = false;
                 peerConnections_[peerId] = update.m_hConn;
                 connectionPeers_[update.m_hConn] = peerId;
+                statusText_ =
+                    mode_ == Mode::Client
+                        ? "Steam P2P connected to host"
+                        : ("Steam peer connected " + std::to_string(peerId));
             }
             configureConnectionLanes(update.m_hConn);
             if (pollGroup_ != k_HSteamNetPollGroup_Invalid) {
@@ -267,7 +411,14 @@ public:
         case k_ESteamNetworkingConnectionState_ClosedByPeer:
         case k_ESteamNetworkingConnectionState_ProblemDetectedLocally: {
             const std::uint64_t peerId = steamIdentityToPeerId(update.m_info.m_identityRemote, update.m_hConn);
-            removeConnection(update.m_hConn, peerId, false);
+            const bool clientOutboundFailure =
+                mode_ == Mode::Client && outboundConnection_ != k_HSteamNetConnection_Invalid && update.m_hConn == outboundConnection_;
+            if (clientOutboundFailure) {
+                updateStatus(describeSteamConnectionFailure(update.m_info), true);
+            } else if (mode_ == Mode::Host && peerId != 0) {
+                updateStatus("Steam peer disconnected " + std::to_string(peerId), false);
+            }
+            removeConnection(update.m_hConn, peerId, clientOutboundFailure);
             if (steamApisReady()) {
                 (void)SteamNetworkingSockets()->CloseConnection(update.m_hConn, 0, "Connection closed", false);
             }
@@ -283,7 +434,24 @@ private:
     explicit SteamSocketsTransport(Mode mode, int virtualPort)
         : mode_(mode)
         , virtualPort_(std::max(0, virtualPort))
+        , transportUserData_(nextTransportUserDataToken().fetch_add(1, std::memory_order_relaxed))
     {
+    }
+
+    static std::atomic<std::int64_t>& nextTransportUserDataToken()
+    {
+        static std::atomic<std::int64_t> nextToken { 1 };
+        return nextToken;
+    }
+
+    static std::array<SteamNetworkingConfigValue_t, 2> buildCreateOptions(std::int64_t transportUserData)
+    {
+        std::array<SteamNetworkingConfigValue_t, 2> options {};
+        options[0].SetPtr(
+            k_ESteamNetworkingConfig_Callback_ConnectionStatusChanged,
+            (void*)(&SteamSocketsTransport::onConnectionStatusChanged));
+        options[1].SetInt64(k_ESteamNetworkingConfig_ConnectionUserData, transportUserData);
+        return options;
     }
 
     bool initializeHost(std::string* statusText)
@@ -292,14 +460,20 @@ private:
             if (statusText != nullptr) {
                 *statusText = "Steam networking unavailable.";
             }
+            steamStdoutLog("Steam networking unavailable.");
             return false;
         }
 
         installGlobalCallback();
         SteamNetworkingUtils()->InitRelayNetworkAccess();
+        registerTransportUserData();
 
         pollGroup_ = SteamNetworkingSockets()->CreatePollGroup();
-        listenSocket_ = SteamNetworkingSockets()->CreateListenSocketP2P(virtualPort_, 0, nullptr);
+        const auto options = buildCreateOptions(transportUserData_);
+        listenSocket_ = SteamNetworkingSockets()->CreateListenSocketP2P(
+            virtualPort_,
+            static_cast<int>(options.size()),
+            options.data());
         if (listenSocket_ == k_HSteamListenSocket_Invalid) {
             if (pollGroup_ != k_HSteamNetPollGroup_Invalid) {
                 SteamNetworkingSockets()->DestroyPollGroup(pollGroup_);
@@ -308,6 +482,7 @@ private:
             if (statusText != nullptr) {
                 *statusText = "Failed to create Steam P2P listen socket.";
             }
+            steamStdoutLog("Failed to create Steam P2P listen socket.");
             return false;
         }
 
@@ -315,6 +490,8 @@ private:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             ready_ = true;
+            terminalFailure_ = false;
+            statusText_ = "Steam host listen socket active";
         }
         if (statusText != nullptr) {
             std::ostringstream stream;
@@ -324,6 +501,7 @@ private:
             }
             *statusText = stream.str();
         }
+        steamStdoutLog("Steam host listen socket active on virtual port " + std::to_string(virtualPort_));
         return true;
     }
 
@@ -333,24 +511,32 @@ private:
             if (statusText != nullptr) {
                 *statusText = "Steam networking unavailable.";
             }
+            steamStdoutLog("Steam networking unavailable.");
             return false;
         }
         if (hostSteamId == 0) {
             if (statusText != nullptr) {
                 *statusText = "No host SteamID was provided.";
             }
+            steamStdoutLog("No host SteamID was provided.");
             return false;
         }
 
         installGlobalCallback();
         SteamNetworkingUtils()->InitRelayNetworkAccess();
+        registerTransportUserData();
 
         pollGroup_ = SteamNetworkingSockets()->CreatePollGroup();
 
         SteamNetworkingIdentity remoteIdentity;
         remoteIdentity.Clear();
         remoteIdentity.SetSteamID(CSteamID(hostSteamId));
-        outboundConnection_ = SteamNetworkingSockets()->ConnectP2P(remoteIdentity, virtualPort_, 0, nullptr);
+        const auto options = buildCreateOptions(transportUserData_);
+        outboundConnection_ = SteamNetworkingSockets()->ConnectP2P(
+            remoteIdentity,
+            virtualPort_,
+            static_cast<int>(options.size()),
+            options.data());
         if (outboundConnection_ == k_HSteamNetConnection_Invalid) {
             if (pollGroup_ != k_HSteamNetPollGroup_Invalid) {
                 SteamNetworkingSockets()->DestroyPollGroup(pollGroup_);
@@ -359,15 +545,22 @@ private:
             if (statusText != nullptr) {
                 *statusText = "Failed to start Steam P2P connection.";
             }
+            steamStdoutLog("Failed to start Steam P2P connection.");
             return false;
         }
 
         registerConnection(outboundConnection_);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            terminalFailure_ = false;
+            statusText_ = "Connecting to Steam host";
+        }
         if (statusText != nullptr) {
             std::ostringstream stream;
             stream << "Connecting to Steam host " << hostSteamId << " on virtual port " << virtualPort_;
             *statusText = stream.str();
         }
+        steamStdoutLog("Connecting to Steam host " + std::to_string(hostSteamId) + " on virtual port " + std::to_string(virtualPort_));
         return true;
     }
 
@@ -403,10 +596,12 @@ private:
 
         std::lock_guard<std::mutex> lock(mutex_);
         ready_ = false;
+        terminalFailure_ = false;
         peerConnections_.clear();
         connectionPeers_.clear();
         events_.clear();
         outboundConnection_ = k_HSteamNetConnection_Invalid;
+        statusText_.clear();
     }
 
     void pumpMessages()
@@ -460,6 +655,23 @@ private:
         events_.push_back(std::move(event));
     }
 
+    void updateStatus(const std::string& value, bool terminalFailure)
+    {
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            changed = statusText_ != value || terminalFailure_ != terminalFailure;
+            statusText_ = value;
+            terminalFailure_ = terminalFailure;
+            if (terminalFailure) {
+                ready_ = false;
+            }
+        }
+        if (changed && !value.empty()) {
+            steamStdoutLog(value + (terminalFailure ? " [terminal]" : ""));
+        }
+    }
+
     void removeConnection(HSteamNetConnection connection, NetPeerId fallbackPeerId, bool emitEvent)
     {
         NetPeerId peerId = fallbackPeerId;
@@ -484,6 +696,12 @@ private:
     {
         std::lock_guard<std::mutex> lock(steamTransportRegistry().mutex);
         steamTransportRegistry().listenSockets[listenSocket_] = weak_from_this();
+    }
+
+    void registerTransportUserData()
+    {
+        std::lock_guard<std::mutex> lock(steamTransportRegistry().mutex);
+        steamTransportRegistry().userDataOwners[transportUserData_] = weak_from_this();
     }
 
     void registerConnection(HSteamNetConnection connection)
@@ -511,6 +729,7 @@ private:
         if (outboundConnection_ != k_HSteamNetConnection_Invalid) {
             steamTransportRegistry().connections.erase(outboundConnection_);
         }
+        steamTransportRegistry().userDataOwners.erase(transportUserData_);
     }
 
     static void installGlobalCallback()
@@ -520,7 +739,20 @@ private:
         if (registry.callbackInstalled || !steamApisReady()) {
             return;
         }
-        registry.callbackInstalled = SteamNetworkingUtils()->SetGlobalCallback_SteamNetConnectionStatusChanged(&SteamSocketsTransport::onConnectionStatusChanged);
+        const bool connectionInstalled =
+            SteamNetworkingUtils()->SetGlobalCallback_SteamNetConnectionStatusChanged(&SteamSocketsTransport::onConnectionStatusChanged);
+        const bool authInstalled =
+            SteamNetworkingUtils()->SetGlobalCallback_SteamNetAuthenticationStatusChanged(&onSteamAuthenticationStatusChanged);
+        const bool relayInstalled =
+            SteamNetworkingUtils()->SetGlobalCallback_SteamRelayNetworkStatusChanged(&onSteamRelayNetworkStatusChanged);
+        registry.callbackInstalled = connectionInstalled && authInstalled && relayInstalled;
+        steamStdoutLog(
+            "Steam callbacks connection=" +
+            std::string(connectionInstalled ? "ok" : "failed") +
+            " auth=" +
+            (authInstalled ? "ok" : "failed") +
+            " relay=" +
+            (relayInstalled ? "ok" : "failed"));
     }
 
     static void onConnectionStatusChanged(SteamNetConnectionStatusChangedCallback_t* update)
@@ -537,6 +769,12 @@ private:
             if (connectionIt != registry.connections.end()) {
                 transport = connectionIt->second.lock();
             }
+            if (!transport && update->m_info.m_nUserData > 0) {
+                const auto userDataIt = registry.userDataOwners.find(static_cast<std::int64_t>(update->m_info.m_nUserData));
+                if (userDataIt != registry.userDataOwners.end()) {
+                    transport = userDataIt->second.lock();
+                }
+            }
             if (!transport && update->m_info.m_hListenSocket != k_HSteamListenSocket_Invalid) {
                 const auto listenIt = registry.listenSockets.find(update->m_info.m_hListenSocket);
                 if (listenIt != registry.listenSockets.end()) {
@@ -547,10 +785,21 @@ private:
 
         if (transport) {
             transport->handleConnectionStatus(*update);
-        } else if (steamApisReady() &&
-                   (update->m_info.m_eState == k_ESteamNetworkingConnectionState_ClosedByPeer ||
-                    update->m_info.m_eState == k_ESteamNetworkingConnectionState_ProblemDetectedLocally)) {
-            (void)SteamNetworkingSockets()->CloseConnection(update->m_hConn, 0, "Unowned connection closed", false);
+        } else {
+            steamStdoutLog(
+                "unowned Steam callback state=" +
+                std::string(steamConnectionStateLabel(update->m_info.m_eState)) +
+                " conn=" +
+                std::to_string(update->m_hConn) +
+                " listen=" +
+                std::to_string(update->m_info.m_hListenSocket) +
+                " user=" +
+                std::to_string(static_cast<long long>(update->m_info.m_nUserData)));
+            if (steamApisReady() &&
+                (update->m_info.m_eState == k_ESteamNetworkingConnectionState_ClosedByPeer ||
+                 update->m_info.m_eState == k_ESteamNetworkingConnectionState_ProblemDetectedLocally)) {
+                (void)SteamNetworkingSockets()->CloseConnection(update->m_hConn, 0, "Unowned connection closed", false);
+            }
         }
     }
 
@@ -561,6 +810,9 @@ private:
     Mode mode_ = Mode::Host;
     int virtualPort_ = 0;
     bool ready_ = false;
+    bool terminalFailure_ = false;
+    std::string statusText_;
+    std::int64_t transportUserData_ = 0;
     HSteamListenSocket listenSocket_ = k_HSteamListenSocket_Invalid;
     HSteamNetConnection outboundConnection_ = k_HSteamNetConnection_Invalid;
     HSteamNetPollGroup pollGroup_ = k_HSteamNetPollGroup_Invalid;
@@ -724,6 +976,9 @@ void SteamRuntime::pump()
 #if TRUEFLIGHT_ENABLE_STEAMWORKS
     if (state_.initialized) {
         SteamAPI_RunCallbacks();
+        if (SteamNetworkingSockets() != nullptr) {
+            SteamNetworkingSockets()->RunCallbacks();
+        }
         if (SteamUtils() != nullptr) {
             state_.runningAppId = static_cast<std::uint32_t>(SteamUtils()->GetAppID());
             state_.overlayEnabled = SteamUtils()->IsOverlayEnabled();
@@ -825,6 +1080,199 @@ struct SteamOnlineController::Impl {
     CCallbackManual<Impl, LobbyDataUpdate_t> lobbyDataUpdateCallback;
     CCallResult<Impl, LobbyCreated_t> lobbyCreatedResult;
     CCallResult<Impl, LobbyEnter_t> lobbyEnteredResult;
+    std::vector<SteamDiscoveredLobby> discoveredLobbies;
+    std::uint64_t selectedDiscoveredLobby = 0;
+    std::chrono::steady_clock::time_point nextDiscoveryRefreshAt {};
+
+    void scheduleDiscoveryRefresh(std::chrono::milliseconds delay = std::chrono::milliseconds::zero())
+    {
+        nextDiscoveryRefreshAt = std::chrono::steady_clock::now() + delay;
+    }
+
+    [[nodiscard]] std::size_t resolvedSelectedDiscoveredLobbyIndex() const
+    {
+        if (selectedDiscoveredLobby == 0) {
+            return discoveredLobbies.size();
+        }
+        for (std::size_t index = 0; index < discoveredLobbies.size(); ++index) {
+            if (discoveredLobbies[index].lobbyId == selectedDiscoveredLobby) {
+                return index;
+            }
+        }
+        return discoveredLobbies.size();
+    }
+
+    [[nodiscard]] std::uint64_t resolvedSelectedDiscoveredLobbyId() const
+    {
+        const std::size_t index = resolvedSelectedDiscoveredLobbyIndex();
+        return index < discoveredLobbies.size() ? discoveredLobbies[index].lobbyId : 0ull;
+    }
+
+    void refreshDiscoveredLobbies(bool force = false)
+    {
+        using namespace std::chrono_literals;
+
+        if (!runtime.available() || SteamFriends() == nullptr) {
+            discoveredLobbies.clear();
+            selectedDiscoveredLobby = 0;
+            nextDiscoveryRefreshAt = {};
+            return;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (!force && nextDiscoveryRefreshAt != std::chrono::steady_clock::time_point {} && now < nextDiscoveryRefreshAt) {
+            return;
+        }
+        nextDiscoveryRefreshAt = now + 3s;
+
+        std::unordered_map<std::uint64_t, SteamDiscoveredLobby> discoveredByLobbyId;
+        const int friendCount = SteamFriends()->GetFriendCount(k_EFriendFlagImmediate);
+        for (int friendIndex = 0; friendIndex < friendCount; ++friendIndex) {
+            const CSteamID friendSteamId = SteamFriends()->GetFriendByIndex(friendIndex, k_EFriendFlagImmediate);
+            if (!friendSteamId.IsValid()) {
+                continue;
+            }
+
+            FriendGameInfo_t gameInfo {};
+            if (!SteamFriends()->GetFriendGamePlayed(friendSteamId, &gameInfo) || !gameInfo.m_gameID.IsValid()) {
+                continue;
+            }
+
+            const std::uint32_t friendAppId = static_cast<std::uint32_t>(gameInfo.m_gameID.AppID());
+            const std::uint32_t expectedAppId =
+                buildConfig.appId != 0 ? buildConfig.appId : (runtime.state().appId != 0 ? runtime.state().appId : TRUEFLIGHT_STEAM_APP_ID);
+            if (expectedAppId != 0 && friendAppId != expectedAppId) {
+                continue;
+            }
+            if (!gameInfo.m_steamIDLobby.IsValid()) {
+                continue;
+            }
+
+            const std::uint64_t lobbyId = gameInfo.m_steamIDLobby.ConvertToUint64();
+            if (lobbyId == 0 || lobbyId == lobby.lobbyId) {
+                continue;
+            }
+
+            SteamDiscoveredLobby& discovered = discoveredByLobbyId[lobbyId];
+            if (discovered.lobbyId == 0) {
+                discovered.lobbyId = lobbyId;
+                discovered.appId = friendAppId;
+            }
+
+            if (discovered.sourceFriendPersonaName.empty()) {
+                discovered.sourceFriendPersonaName = steamPersonaName(friendSteamId);
+            }
+
+            if (SteamMatchmaking() != nullptr) {
+                const CSteamID remoteLobby(lobbyId);
+                bool needsLobbyData = false;
+                std::string value;
+                if (readLobbyData(remoteLobby, "protocol_version", &value)) {
+                    discovered.protocolVersion = value;
+                } else {
+                    needsLobbyData = true;
+                }
+                if (readLobbyData(remoteLobby, "build_id", &value)) {
+                    discovered.buildId = value;
+                } else {
+                    needsLobbyData = true;
+                }
+                if (readLobbyData(remoteLobby, "world_id", &value)) {
+                    discovered.worldId = value;
+                } else {
+                    needsLobbyData = true;
+                }
+                if (readLobbyData(remoteLobby, "session_nonce", &value)) {
+                    discovered.sessionNonce = value;
+                } else {
+                    needsLobbyData = true;
+                }
+                if (readLobbyData(remoteLobby, "joinable", &value)) {
+                    discovered.joinable = value != "0" && value != "false";
+                } else {
+                    needsLobbyData = true;
+                }
+                if (readLobbyData(remoteLobby, "max_players", &value)) {
+                    discovered.maxPlayers = std::max(0, std::atoi(value.c_str()));
+                } else {
+                    needsLobbyData = true;
+                }
+                if (readLobbyData(remoteLobby, "host_steam_id", &value)) {
+                    discovered.hostSteamId = std::strtoull(value.c_str(), nullptr, 10);
+                } else if (discovered.hostSteamId == 0) {
+                    needsLobbyData = true;
+                }
+                if (needsLobbyData) {
+                    (void)SteamMatchmaking()->RequestLobbyData(remoteLobby);
+                }
+            }
+
+            if (discovered.hostSteamId == runtime.state().localSteamId) {
+                continue;
+            }
+            if (discovered.hostSteamId != 0 && discovered.hostPersonaName.empty()) {
+                discovered.hostPersonaName = steamPersonaName(CSteamID(discovered.hostSteamId));
+            }
+            if (discovered.hostPersonaName.empty()) {
+                discovered.hostPersonaName = discovered.sourceFriendPersonaName;
+            }
+        }
+
+        std::vector<SteamDiscoveredLobby> refreshed;
+        refreshed.reserve(discoveredByLobbyId.size());
+        for (auto& [lobbyId, discovered] : discoveredByLobbyId) {
+            (void)lobbyId;
+            if (discovered.lobbyId == 0 || discovered.hostSteamId == runtime.state().localSteamId) {
+                continue;
+            }
+            refreshed.push_back(std::move(discovered));
+        }
+        std::sort(
+            refreshed.begin(),
+            refreshed.end(),
+            [](const SteamDiscoveredLobby& lhs, const SteamDiscoveredLobby& rhs) {
+                const std::string lhsName = !lhs.hostPersonaName.empty() ? lhs.hostPersonaName : lhs.sourceFriendPersonaName;
+                const std::string rhsName = !rhs.hostPersonaName.empty() ? rhs.hostPersonaName : rhs.sourceFriendPersonaName;
+                if (lhsName != rhsName) {
+                    return lhsName < rhsName;
+                }
+                return lhs.lobbyId < rhs.lobbyId;
+            });
+
+        const std::uint64_t preferredLobbyId = selectedDiscoveredLobby;
+        discoveredLobbies = std::move(refreshed);
+        if (discoveredLobbies.empty()) {
+            selectedDiscoveredLobby = 0;
+            return;
+        }
+
+        auto selectedIt = std::find_if(
+            discoveredLobbies.begin(),
+            discoveredLobbies.end(),
+            [preferredLobbyId](const SteamDiscoveredLobby& discovered) {
+                return preferredLobbyId != 0 && discovered.lobbyId == preferredLobbyId;
+            });
+        if (selectedIt == discoveredLobbies.end()) {
+            selectedDiscoveredLobby = discoveredLobbies.front().lobbyId;
+        }
+    }
+
+    void cycleDiscoveredLobbySelection(int delta)
+    {
+        refreshDiscoveredLobbies(true);
+        if (discoveredLobbies.empty() || delta == 0) {
+            return;
+        }
+
+        const std::size_t currentIndex = resolvedSelectedDiscoveredLobbyIndex();
+        const std::size_t startIndex = currentIndex < discoveredLobbies.size() ? currentIndex : 0u;
+        const std::size_t count = discoveredLobbies.size();
+        const std::size_t nextIndex =
+            delta > 0
+                ? ((startIndex + 1u) % count)
+                : ((startIndex + count - 1u) % count);
+        selectedDiscoveredLobby = discoveredLobbies[nextIndex].lobbyId;
+    }
 
     void refreshLobbyMemberSnapshot()
     {
@@ -946,9 +1394,11 @@ struct SteamOnlineController::Impl {
 
     bool finalizeJoinedLobby(CSteamID lobbySteamId)
     {
+        steamStdoutLog("finalizing Steam lobby join for lobby " + std::to_string(lobbySteamId.ConvertToUint64()));
         if (SteamMatchmaking() == nullptr) {
             clearLobbySnapshot(true);
             lobby.status = "Steam matchmaking unavailable";
+            steamStdoutLog(lobby.status);
             return true;
         }
 
@@ -966,6 +1416,7 @@ struct SteamOnlineController::Impl {
             }
             (void)SteamMatchmaking()->RequestLobbyData(lobbySteamId);
             lobby.status = std::string("Waiting for Steam lobby metadata (") + key + ")";
+            steamStdoutLog(lobby.status);
             return false;
         };
         if (!requireLobbyData("protocol_version", protocolVersion) ||
@@ -988,17 +1439,20 @@ struct SteamOnlineController::Impl {
         }
         if (lobby.hostSteamId == 0) {
             lobby.status = "Lobby host unavailable";
+            steamStdoutLog(lobby.status);
             return false;
         }
 
         if (!pendingSettings.protocolVersion.empty() && protocolVersion != pendingSettings.protocolVersion) {
             clearLobbySnapshot(true);
             lobby.status = "Protocol mismatch";
+            steamStdoutLog(lobby.status);
             return true;
         }
         if (!pendingSettings.buildId.empty() && buildId != pendingSettings.buildId) {
             clearLobbySnapshot(true);
             lobby.status = "Build mismatch";
+            steamStdoutLog(lobby.status);
             return true;
         }
 
@@ -1011,6 +1465,16 @@ struct SteamOnlineController::Impl {
         lobby.voiceEnabled = voiceEnabled == "1" || voiceEnabled == "true";
         lobby.sessionNonce = sessionNonce;
         lobby.lobbyReady = true;
+        {
+            std::ostringstream stream;
+            stream << "lobby metadata ready"
+                   << " lobby=" << lobby.lobbyId
+                   << " host=" << lobby.hostSteamId
+                   << " world=" << lobby.worldId
+                   << " build=" << lobby.buildId
+                   << " protocol=" << lobby.protocolVersion;
+            steamStdoutLog(stream.str());
+        }
 
         if (lobby.transport == nullptr) {
             std::string transportStatus;
@@ -1018,12 +1482,14 @@ struct SteamOnlineController::Impl {
             if (lobby.transport == nullptr) {
                 clearLobbySnapshot(true);
                 lobby.status = transportStatus.empty() ? "Steam client transport unavailable" : transportStatus;
+                steamStdoutLog(lobby.status);
                 return true;
             }
         }
 
         lobby.transportReady = lobby.transport->ready();
         lobby.status = lobby.transportReady ? "Joined Steam lobby" : "Connecting to Steam host";
+        steamStdoutLog(lobby.status);
         refreshLobbyMemberSnapshot();
         return true;
     }
@@ -1033,9 +1499,14 @@ struct SteamOnlineController::Impl {
         buildConfig = config;
         clearLobbySnapshot(false);
         unregisterCallbacks();
+        discoveredLobbies.clear();
+        selectedDiscoveredLobby = 0;
+        nextDiscoveryRefreshAt = {};
         const bool initialized = runtime.initialize(config, statusText);
         if (initialized) {
             registerCallbacks();
+            scheduleDiscoveryRefresh();
+            refreshDiscoveredLobbies(true);
         }
         return initialized;
     }
@@ -1046,13 +1517,27 @@ struct SteamOnlineController::Impl {
         unregisterCallbacks();
         lobbyCreatedResult.Cancel();
         lobbyEnteredResult.Cancel();
+        discoveredLobbies.clear();
+        selectedDiscoveredLobby = 0;
+        nextDiscoveryRefreshAt = {};
         runtime.shutdown();
     }
 
     void pump()
     {
         runtime.pump();
+        refreshDiscoveredLobbies();
         lobby.transportReady = lobby.transport != nullptr && lobby.transport->ready();
+        if (auto steamTransport = std::dynamic_pointer_cast<SteamSocketsTransport>(lobby.transport); steamTransport != nullptr) {
+            const std::string transportStatus = steamTransport->statusText();
+            if (!transportStatus.empty()) {
+                if (steamTransport->hasTerminalFailure()) {
+                    lobby.status = transportStatus;
+                } else if (lobby.role == SteamLobbyState::Role::Client && !lobby.transportReady) {
+                    lobby.status = transportStatus;
+                }
+            }
+        }
         refreshLobbyMemberSnapshot();
         if (lobby.role == SteamLobbyState::Role::Host && lobby.lobbyId != 0 && lobby.transportReady) {
             publishRichPresence();
@@ -1128,11 +1613,13 @@ struct SteamOnlineController::Impl {
         lobby.lobbyReady = false;
         lobby.transportReady = false;
         lobby.status = "Joining Steam lobby";
+        steamStdoutLog("joining Steam lobby " + std::to_string(lobbyId));
 
         const SteamAPICall_t call = SteamMatchmaking()->JoinLobby(CSteamID(lobbyId));
         if (call == k_uAPICallInvalid) {
             clearLobbySnapshot(true);
             lobby.status = "JoinLobby failed";
+            steamStdoutLog(lobby.status);
             setStatus(statusText, lobby.status);
             return false;
         }
@@ -1175,12 +1662,16 @@ struct SteamOnlineController::Impl {
             lobby.transportReady = false;
             lobby.lobbyReady = false;
             lobby.status = "Steam client transport unavailable";
+            steamStdoutLog(lobby.status);
             setStatus(statusText, lobby.status);
             return false;
         }
         lobby.transportReady = lobby.transport->ready();
         lobby.lobbyReady = false;
         lobby.status = "Connecting to Steam host";
+        steamStdoutLog(
+            "direct Steam host connect host=" + std::to_string(hostSteamId) +
+            " port=" + std::to_string(settings.virtualPort));
         setStatus(statusText, lobby.status);
         return true;
     }
@@ -1190,6 +1681,8 @@ struct SteamOnlineController::Impl {
         lobbyCreatedResult.Cancel();
         lobbyEnteredResult.Cancel();
         clearLobbySnapshot(true);
+        scheduleDiscoveryRefresh();
+        refreshDiscoveredLobbies(true);
     }
 
     bool activateInviteOverlay(std::string* statusText)
@@ -1220,12 +1713,33 @@ struct SteamOnlineController::Impl {
     void queuePendingJoinRequest(std::uint64_t lobbyId, std::string* statusText)
     {
         setPendingJoin(lobbyId);
+        steamStdoutLog("queued pending Steam join for lobby " + std::to_string(lobbyId));
         setStatus(statusText, lobby.status);
+    }
+
+    void selectNextDiscoveredLobby(int delta)
+    {
+        cycleDiscoveredLobbySelection(delta);
     }
 
     [[nodiscard]] std::uint64_t pendingJoinLobbyId() const
     {
         return hasPendingJoinRequest() ? lobby.pendingLobbyId : 0;
+    }
+
+    [[nodiscard]] std::size_t selectedDiscoveredLobbyIndex() const
+    {
+        return resolvedSelectedDiscoveredLobbyIndex();
+    }
+
+    [[nodiscard]] std::uint64_t selectedDiscoveredLobbyId() const
+    {
+        return resolvedSelectedDiscoveredLobbyId();
+    }
+
+    [[nodiscard]] const std::vector<SteamDiscoveredLobby>& discoveredLobbiesView() const
+    {
+        return this->discoveredLobbies;
     }
 
     [[nodiscard]] std::uint64_t consumePendingJoinRequest()
@@ -1251,6 +1765,7 @@ struct SteamOnlineController::Impl {
         if (result == nullptr || ioFailure || result->m_eResult != k_EResultOK) {
             clearLobbySnapshot(true);
             lobby.status = "Lobby creation failed";
+            steamStdoutLog(lobby.status);
             return;
         }
 
@@ -1261,6 +1776,10 @@ struct SteamOnlineController::Impl {
         lobby.transport = createSteamHostTransport(lobby.virtualPort, nullptr);
         lobby.transportReady = lobby.transport != nullptr && lobby.transport->ready();
         lobby.status = lobby.transportReady ? "Steam lobby ready" : "Steam host transport unavailable";
+        steamStdoutLog(
+            "created Steam lobby " + std::to_string(lobby.lobbyId) +
+            " host=" + std::to_string(lobby.hostSteamId));
+        steamStdoutLog(lobby.status);
 
         if (SteamMatchmaking() != nullptr) {
             const CSteamID lobbySteamId(lobby.lobbyId);
@@ -1278,6 +1797,7 @@ struct SteamOnlineController::Impl {
         }
         refreshLobbyMemberSnapshot();
         publishRichPresence();
+        scheduleDiscoveryRefresh();
     }
 
     void onLobbyEntered(LobbyEnter_t* result, bool ioFailure)
@@ -1285,6 +1805,7 @@ struct SteamOnlineController::Impl {
         if (result == nullptr || ioFailure || result->m_EChatRoomEnterResponse != k_EChatRoomEnterResponseSuccess) {
             clearLobbySnapshot(true);
             lobby.status = "Lobby join failed";
+            steamStdoutLog(lobby.status);
             return;
         }
 
@@ -1292,11 +1813,13 @@ struct SteamOnlineController::Impl {
         lobby.lobbyId = result->m_ulSteamIDLobby;
         lobby.localSteamId = SteamUser() != nullptr ? SteamUser()->GetSteamID().ConvertToUint64() : 0;
         lobby.lobbyReady = false;
+        steamStdoutLog("entered Steam lobby " + std::to_string(lobby.lobbyId));
         refreshLobbyMemberSnapshot();
         clearRichPresence();
         if (!finalizeJoinedLobby(lobbySteamId)) {
             (void)SteamMatchmaking()->RequestLobbyData(lobbySteamId);
         }
+        scheduleDiscoveryRefresh();
     }
 
     void onGameLobbyJoinRequested(GameLobbyJoinRequested_t* callback)
@@ -1305,6 +1828,7 @@ struct SteamOnlineController::Impl {
             return;
         }
         setPendingJoin(callback->m_steamIDLobby.ConvertToUint64());
+        steamStdoutLog("Steam overlay requested join for lobby " + std::to_string(callback->m_steamIDLobby.ConvertToUint64()));
     }
 
     void onGameRichPresenceJoinRequested(GameRichPresenceJoinRequested_t* callback)
@@ -1317,6 +1841,7 @@ struct SteamOnlineController::Impl {
             return;
         }
         setPendingJoin(lobbyId);
+        steamStdoutLog("Steam rich presence requested join for lobby " + std::to_string(lobbyId));
     }
 
     void onLobbyDataUpdate(LobbyDataUpdate_t* callback)
@@ -1324,6 +1849,8 @@ struct SteamOnlineController::Impl {
         if (callback == nullptr || callback->m_ulSteamIDLobby == 0 || callback->m_bSuccess == 0) {
             return;
         }
+        steamStdoutLog("Steam lobby data updated for lobby " + std::to_string(callback->m_ulSteamIDLobby));
+        scheduleDiscoveryRefresh(std::chrono::milliseconds(250));
         if (lobby.lobbyId == callback->m_ulSteamIDLobby) {
             refreshLobbyMemberSnapshot();
         }
@@ -1339,6 +1866,8 @@ struct SteamOnlineController::Impl {
 struct SteamOnlineController::Impl {
     SteamRuntime runtime;
     SteamLobbyState lobby;
+    std::vector<SteamDiscoveredLobby> discoveredLobbies;
+    std::uint64_t selectedDiscoveredLobby = 0;
 
     bool initialize(const SteamBuildConfig& config, std::string* statusText)
     {
@@ -1445,9 +1974,28 @@ struct SteamOnlineController::Impl {
         setStatus(statusText, lobby.status);
     }
 
+    void selectNextDiscoveredLobby(int)
+    {
+    }
+
     [[nodiscard]] std::uint64_t pendingJoinLobbyId() const
     {
         return hasPendingJoinRequest() ? lobby.pendingLobbyId : 0;
+    }
+
+    [[nodiscard]] std::size_t selectedDiscoveredLobbyIndex() const
+    {
+        return discoveredLobbies.size();
+    }
+
+    [[nodiscard]] std::uint64_t selectedDiscoveredLobbyId() const
+    {
+        return 0ull;
+    }
+
+    [[nodiscard]] const std::vector<SteamDiscoveredLobby>& discoveredLobbiesView() const
+    {
+        return discoveredLobbies;
     }
 
     [[nodiscard]] std::uint64_t consumePendingJoinRequest()
@@ -1541,6 +2089,13 @@ void SteamOnlineController::queuePendingJoinRequest(std::uint64_t lobbyId, std::
     }
 }
 
+void SteamOnlineController::selectNextDiscoveredLobby(int delta)
+{
+    if (impl_ != nullptr) {
+        impl_->selectNextDiscoveredLobby(delta);
+    }
+}
+
 bool SteamOnlineController::hasPendingJoinRequest() const
 {
     return impl_ != nullptr && impl_->hasPendingJoinRequest();
@@ -1549,6 +2104,22 @@ bool SteamOnlineController::hasPendingJoinRequest() const
 std::uint64_t SteamOnlineController::pendingJoinLobbyId() const
 {
     return impl_ != nullptr ? impl_->pendingJoinLobbyId() : 0ull;
+}
+
+std::size_t SteamOnlineController::selectedDiscoveredLobbyIndex() const
+{
+    return impl_ != nullptr ? impl_->selectedDiscoveredLobbyIndex() : 0u;
+}
+
+std::uint64_t SteamOnlineController::selectedDiscoveredLobbyId() const
+{
+    return impl_ != nullptr ? impl_->selectedDiscoveredLobbyId() : 0ull;
+}
+
+const std::vector<SteamDiscoveredLobby>& SteamOnlineController::discoveredLobbies() const
+{
+    static const std::vector<SteamDiscoveredLobby> kEmptyDiscoveredLobbies {};
+    return impl_ != nullptr ? impl_->discoveredLobbiesView() : kEmptyDiscoveredLobbies;
 }
 
 std::uint64_t SteamOnlineController::consumePendingJoinRequest()

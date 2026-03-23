@@ -257,7 +257,7 @@ struct TerrainParams {
     int lod2Radius = 64;
     float terrainQuality = 3.5f;
     bool autoQualityEnabled = false;
-    float targetFrameMs = 16.6f;
+    float targetFrameMs = 8.3f;
     int lod0ChunkScale = 1;
     int lod1ChunkScale = 4;
     int lod2ChunkScale = 16;
@@ -351,7 +351,9 @@ struct TerrainFieldContext {
     TerrainParams params;
     std::vector<TerrainTunnelSeed> tunnelSeeds;
     std::function<float(float, float)> sampleHeightDeltaAt {};
-    std::function<float(float, float, float)> sampleVolumetricOverrideSdfAt {};
+    std::function<float(float, float, float)> sampleVolumetricAdditiveSdfAt {};
+    std::function<float(float, float, float)> sampleVolumetricSubtractiveSdfAt {};
+    std::function<bool(float, float, float, float)> hasVolumetricOverridesInBounds {};
     std::function<std::uint64_t(float, float, float, float)> sampleChunkRevisionSignature {};
 };
 
@@ -362,6 +364,19 @@ struct TerrainMaterialSample {
     float snowWeight = 0.0f;
     float rockWeight = 0.0f;
     float biomeBlend = 0.0f;
+    float hardnessWeight = 0.0f;
+    float resourceWeight = 0.0f;
+    float erosionWeight = 0.0f;
+    float flowWeight = 0.0f;
+};
+
+struct TerrainHydraulicSample {
+    float moisture = 0.0f;
+    float hardness = 0.0f;
+    float resource = 0.0f;
+    float sediment = 0.0f;
+    float flow = 0.0f;
+    float erosion = 0.0f;
 };
 
 struct TerrainPatchBounds {
@@ -442,7 +457,7 @@ inline TerrainParams normalizeTerrainParams(TerrainParams params)
     params.lod1Radius = std::clamp(params.lod1Radius, params.lod0Radius, 32);
     params.lod2Radius = std::clamp(params.lod2Radius, params.lod1Radius, 96);
     params.terrainQuality = clamp(sanitize(params.terrainQuality, 3.5f), 0.75f, 6.0f);
-    params.targetFrameMs = clamp(sanitize(params.targetFrameMs, 16.6f), 8.0f, 50.0f);
+    params.targetFrameMs = clamp(sanitize(params.targetFrameMs, 8.3f), 4.0f, 50.0f);
 
     params.lod0ChunkScale = std::max(1, params.lod0ChunkScale);
     params.lod1ChunkScale = std::max(params.lod0ChunkScale, params.lod1ChunkScale);
@@ -521,7 +536,7 @@ inline TerrainParams normalizeTerrainParams(TerrainParams params)
     params.tunnelLengthMax = std::max(params.tunnelLengthMin, sanitize(params.tunnelLengthMax, 520.0f));
     params.tunnelSegmentLength = std::max(6.0f, sanitize(params.tunnelSegmentLength, 18.0f));
 
-    params.generatorVersion = std::max(1, params.generatorVersion);
+    params.generatorVersion = std::max(2, params.generatorVersion);
     params.skirtDepth = std::max(2.0f, sanitize(params.skirtDepth, 24.0f));
     params.maxChunkCellsPerAxis = std::clamp(params.maxChunkCellsPerAxis, 24, 128);
     params.craterHistoryLimit = std::max(0, params.craterHistoryLimit);
@@ -567,9 +582,7 @@ inline TerrainParams normalizeTerrainParams(TerrainParams params)
         params.tunnelCount = static_cast<int>(params.explicitTunnelSeeds.size());
     }
 
-    if (!params.caveEnabled && params.tunnelCount <= 0 && params.explicitTunnelSeeds.empty()) {
-        params.surfaceOnlyMeshing = true;
-    }
+    params.surfaceOnlyMeshing = !(params.caveEnabled || params.tunnelCount > 0 || !params.explicitTunnelSeeds.empty());
     return params;
 }
 
@@ -784,6 +797,7 @@ inline std::vector<TerrainTunnelSeed> buildTunnelSeeds(const TerrainParams& inpu
 
         TerrainTunnelSeed tunnel;
         tunnel.radius = radius;
+        tunnel.hillAttached = true;
 
         const int steps = std::max(3, static_cast<int>(std::floor(tunnelLength / params.tunnelSegmentLength)));
         tunnel.points.reserve(static_cast<std::size_t>(steps + 1));
@@ -811,37 +825,7 @@ inline std::vector<TerrainTunnelSeed> buildTunnelSeeds(const TerrainParams& inpu
     return out;
 }
 
-inline TerrainFieldContext createTerrainFieldContext(const TerrainParams& inputParams)
-{
-    TerrainFieldContext context;
-    context.params = normalizeTerrainParams(inputParams);
-    if (!context.params.explicitTunnelSeeds.empty()) {
-        context.tunnelSeeds = context.params.explicitTunnelSeeds;
-    } else if (context.params.tunnelCount > 0) {
-        context.tunnelSeeds = buildTunnelSeeds(context.params);
-    }
-    return context;
-}
-
-inline float sampleWaterHeight(float x, float z, const TerrainFieldContext& context)
-{
-    const TerrainParams& params = context.params;
-    if (params.waterWaveAmplitude <= 0.0f) {
-        return params.waterLevel;
-    }
-
-    const float n1 = (valueNoise2(x * params.waterWaveFrequency, z * params.waterWaveFrequency, params.seed + 700) * 2.0f) - 1.0f;
-    const float n2 = (valueNoise2(x * params.waterWaveFrequency * 1.9f, z * params.waterWaveFrequency * 1.9f, params.seed + 937) * 2.0f) - 1.0f;
-    return params.waterLevel + ((n1 * 0.7f) + (n2 * 0.3f)) * params.waterWaveAmplitude;
-}
-
-inline float sampleWaterHeight(float x, float z, const TerrainParams& params)
-{
-    const TerrainFieldContext context = createTerrainFieldContext(params);
-    return sampleWaterHeight(x, z, context);
-}
-
-inline float sampleBaseSurfaceHeight(float x, float z, const TerrainFieldContext& context)
+inline float sampleProceduralSurfaceHeight(float x, float z, const TerrainFieldContext& context)
 {
     const TerrainParams& params = context.params;
 
@@ -867,8 +851,132 @@ inline float sampleBaseSurfaceHeight(float x, float z, const TerrainFieldContext
         const float stepped = std::floor((surface / params.terraceStep) + 0.5f) * params.terraceStep;
         surface = mix(surface, stepped, params.terraceStrength);
     }
-    surface = applyDynamicCratersToSurfaceHeight(x, z, surface, params);
-    return surface;
+    return applyDynamicCratersToSurfaceHeight(x, z, surface, params);
+}
+
+inline TerrainHydraulicSample sampleTerrainHydraulicMaps(float x, float z, const TerrainFieldContext& context)
+{
+    const TerrainParams& params = context.params;
+    const float moisture = clamp(
+        (fbm2(x * 0.00135f, z * 0.00135f, 4, 2.0f, 0.55f, params.seed + 1847) * 1.18f) +
+            ((valueNoise2(x * 0.0047f, z * 0.0047f, params.seed + 1889) * 2.0f) - 1.0f) * 0.22f,
+        0.0f,
+        1.0f);
+    const float hardness = clamp(
+        (fbm2(x * 0.00195f, z * 0.00195f, 3, 2.12f, 0.58f, params.seed + 2011) * 1.08f) +
+            ((valueNoise2(x * 0.0092f, z * 0.0092f, params.seed + 2077) * 2.0f) - 1.0f) * 0.18f,
+        0.0f,
+        1.0f);
+    const float resource = clamp(
+        (fbm2(x * 0.0011f, z * 0.0011f, 4, 2.18f, 0.53f, params.seed + 2237) * 1.14f) +
+            ((valueNoise2(x * 0.0064f, z * 0.0064f, params.seed + 2293) * 2.0f) - 1.0f) * 0.20f,
+        0.0f,
+        1.0f);
+    const float sediment = clamp(
+        (fbm2(x * 0.0024f, z * 0.0024f, 3, 1.93f, 0.57f, params.seed + 2357) * 1.04f) +
+            ((valueNoise2(x * 0.011f, z * 0.011f, params.seed + 2399) * 2.0f) - 1.0f) * 0.15f,
+        0.0f,
+        1.0f);
+
+    const float sampleStep = clamp(params.chunkSize * 0.05f, 8.0f, 42.0f);
+    const float base = sampleProceduralSurfaceHeight(x, z, context);
+    const float hL = sampleProceduralSurfaceHeight(x - sampleStep, z, context);
+    const float hR = sampleProceduralSurfaceHeight(x + sampleStep, z, context);
+    const float hD = sampleProceduralSurfaceHeight(x, z - sampleStep, context);
+    const float hU = sampleProceduralSurfaceHeight(x, z + sampleStep, context);
+    const float avgNeighbor = (hL + hR + hD + hU) * 0.25f;
+    const float downhill =
+        std::max(0.0f, base - hL) +
+        std::max(0.0f, base - hR) +
+        std::max(0.0f, base - hD) +
+        std::max(0.0f, base - hU);
+    const float convexity = clamp((base - avgNeighbor) / std::max(1.0f, params.heightAmplitude * 0.18f), -1.0f, 1.0f);
+    const float flow = clamp(
+        (downhill / std::max(1.0f, params.heightAmplitude * 0.28f)) +
+            (moisture * 0.42f) +
+            (sediment * 0.18f),
+        0.0f,
+        1.0f);
+
+    const float erosionStrength = flow * (1.0f - hardness) * mix(1.4f, 6.8f, moisture);
+    const float erosion = (-std::max(0.0f, convexity) * erosionStrength) +
+        (std::max(0.0f, -convexity) * sediment * moisture * 1.9f);
+
+    return {
+        moisture,
+        hardness,
+        resource,
+        sediment,
+        flow,
+        erosion
+    };
+}
+
+inline void attachTunnelSeedToSurface(TerrainTunnelSeed& tunnel, const TerrainFieldContext& context)
+{
+    if (!tunnel.hillAttached || tunnel.points.size() < 2u) {
+        return;
+    }
+
+    const float tunnelRadius = std::max(1.0f, tunnel.radius);
+    const float mouthDepth = std::max(1.2f, tunnelRadius * 0.38f);
+    const auto applyAnchor = [&](const std::size_t anchorIndex, const std::size_t adjacentIndex) {
+        if (anchorIndex >= tunnel.points.size() || adjacentIndex >= tunnel.points.size()) {
+            return;
+        }
+
+        Vec3& anchor = tunnel.points[anchorIndex];
+        Vec3& adjacent = tunnel.points[adjacentIndex];
+        const float surface = sampleProceduralSurfaceHeight(anchor.x, anchor.z, context);
+        anchor.y = surface - mouthDepth;
+
+        const Vec3 direction = normalize(adjacent - anchor, { 0.0f, -1.0f, 0.0f });
+        if (lengthSquared(direction) > 1.0e-6f) {
+            adjacent.y = mix(adjacent.y, anchor.y - std::max(2.0f, tunnelRadius * 0.55f), 0.55f);
+        }
+    };
+
+    applyAnchor(0u, 1u);
+    applyAnchor(tunnel.points.size() - 1u, tunnel.points.size() - 2u);
+}
+
+inline TerrainFieldContext createTerrainFieldContext(const TerrainParams& inputParams)
+{
+    TerrainFieldContext context;
+    context.params = normalizeTerrainParams(inputParams);
+    if (!context.params.explicitTunnelSeeds.empty()) {
+        context.tunnelSeeds = context.params.explicitTunnelSeeds;
+    } else if (context.params.tunnelCount > 0) {
+        context.tunnelSeeds = buildTunnelSeeds(context.params);
+    }
+    for (TerrainTunnelSeed& seed : context.tunnelSeeds) {
+        attachTunnelSeedToSurface(seed, context);
+    }
+    return context;
+}
+
+inline float sampleWaterHeight(float x, float z, const TerrainFieldContext& context)
+{
+    const TerrainParams& params = context.params;
+    if (params.waterWaveAmplitude <= 0.0f) {
+        return params.waterLevel;
+    }
+
+    const float n1 = (valueNoise2(x * params.waterWaveFrequency, z * params.waterWaveFrequency, params.seed + 700) * 2.0f) - 1.0f;
+    const float n2 = (valueNoise2(x * params.waterWaveFrequency * 1.9f, z * params.waterWaveFrequency * 1.9f, params.seed + 937) * 2.0f) - 1.0f;
+    return params.waterLevel + ((n1 * 0.7f) + (n2 * 0.3f)) * params.waterWaveAmplitude;
+}
+
+inline float sampleWaterHeight(float x, float z, const TerrainParams& params)
+{
+    const TerrainFieldContext context = createTerrainFieldContext(params);
+    return sampleWaterHeight(x, z, context);
+}
+
+inline float sampleBaseSurfaceHeight(float x, float z, const TerrainFieldContext& context)
+{
+    const TerrainHydraulicSample hydraulic = sampleTerrainHydraulicMaps(x, z, context);
+    return sampleProceduralSurfaceHeight(x, z, context) + hydraulic.erosion;
 }
 
 inline float sampleSurfaceHeight(float x, float z, const TerrainFieldContext& context)
@@ -920,10 +1028,17 @@ inline float sampleSdf(float x, float y, float z, const TerrainFieldContext& con
         }
     }
 
-    if (context.sampleVolumetricOverrideSdfAt) {
-        const float overrideDistance = sanitize(context.sampleVolumetricOverrideSdfAt(x, y, z), std::numeric_limits<float>::infinity());
-        if (std::isfinite(overrideDistance)) {
-            sdf = std::max(sdf, -overrideDistance);
+    if (context.sampleVolumetricAdditiveSdfAt) {
+        const float additiveDistance = sanitize(context.sampleVolumetricAdditiveSdfAt(x, y, z), std::numeric_limits<float>::infinity());
+        if (std::isfinite(additiveDistance)) {
+            sdf = std::min(sdf, additiveDistance);
+        }
+    }
+
+    if (context.sampleVolumetricSubtractiveSdfAt) {
+        const float subtractiveDistance = sanitize(context.sampleVolumetricSubtractiveSdfAt(x, y, z), std::numeric_limits<float>::infinity());
+        if (std::isfinite(subtractiveDistance)) {
+            sdf = std::max(sdf, -subtractiveDistance);
         }
     }
 
@@ -961,15 +1076,21 @@ inline TerrainMaterialSample sampleTerrainMaterial(float x, float y, float z, co
     const float hD = sampleSurfaceHeight(x, z - 1.5f, context);
     const float hU = sampleSurfaceHeight(x, z + 1.5f, context);
     const float slope = clamp(std::sqrt(((hR - hL) * (hR - hL)) + ((hU - hD) * (hU - hD))) * 0.18f, 0.0f, 1.0f);
+    const TerrainHydraulicSample hydraulic = sampleTerrainHydraulicMaps(x, z, context);
 
     const float biomeNoise = (fbm2(x * params.biomeFrequency, z * params.biomeFrequency, 4, 2.0f, 0.54f, params.seed + 1201) * 2.0f) - 1.0f;
     const float elevation01 = clamp((surface - params.baseHeight + params.heightAmplitude) / std::max(1.0f, params.heightAmplitude * 2.0f), 0.0f, 1.0f);
-    const float wetness = clamp((params.waterLevel + params.shorelineBand - surface) / std::max(0.1f, params.shorelineBand), 0.0f, 1.0f);
+    const float wetness = clamp(
+        std::max(
+            (params.waterLevel + params.shorelineBand - surface) / std::max(0.1f, params.shorelineBand),
+            (hydraulic.moisture * 0.72f) + (hydraulic.flow * 0.18f)),
+        0.0f,
+        1.0f);
     const float snowAltitude = clamp((surface - params.snowLine) / 90.0f, 0.0f, 1.0f);
     const float snowNoise = clamp(((valueNoise2(x * 0.0052f, z * 0.0052f, params.seed + 2141) * 2.0f) - 1.0f) * 0.18f, -0.18f, 0.18f);
-    const float rockWeight = clamp((slope - 0.12f) * 1.5f, 0.0f, 1.0f);
-    const float snow = clamp(snowAltitude + snowNoise + (rockWeight * 0.08f), 0.0f, 1.0f);
-    const float biomeBlend = clamp(((biomeNoise + 1.0f) * 0.5f) + (elevation01 * 0.16f), 0.0f, 1.0f);
+    const float rockWeight = clamp((slope - 0.12f) * 1.5f + (hydraulic.hardness * 0.24f) + (hydraulic.flow * 0.14f), 0.0f, 1.0f);
+    const float snow = clamp(snowAltitude + snowNoise + (rockWeight * 0.08f) - (wetness * 0.04f), 0.0f, 1.0f);
+    const float biomeBlend = clamp(((biomeNoise + 1.0f) * 0.5f) + (elevation01 * 0.16f) + (hydraulic.resource * 0.10f) - (hydraulic.hardness * 0.12f), 0.0f, 1.0f);
 
     (void)y;
     return {
@@ -978,7 +1099,11 @@ inline TerrainMaterialSample sampleTerrainMaterial(float x, float y, float z, co
         wetness,
         snow,
         rockWeight,
-        biomeBlend
+        biomeBlend,
+        hydraulic.hardness,
+        hydraulic.resource,
+        clamp(-hydraulic.erosion * 0.18f, 0.0f, 1.0f),
+        hydraulic.flow
     };
 }
 
@@ -1011,17 +1136,20 @@ inline Vec3 sampleTerrainColor(float x, float y, float z, const TerrainFieldCont
     const Vec3 forest { 0.16f, 0.33f, 0.20f };
     const Vec3 sand { 0.70f, 0.64f, 0.47f };
     const Vec3 rock { 0.47f, 0.45f, 0.43f };
+    const Vec3 mineral { 0.58f, 0.44f, 0.34f };
     const Vec3 snowColor { 0.88f, 0.89f, 0.92f };
 
     Vec3 base = lerp(grass, forest, material.biomeBlend);
     base = lerp(base, sand, material.wetness * 0.72f);
     base = lerp(base, rock, material.rockWeight);
+    base = lerp(base, mineral, material.resourceWeight * material.hardnessWeight * 0.45f);
     const Vec3 dampened {
         clamp(base.x * (1.0f - (material.wetness * 0.18f)), 0.0f, 1.0f),
         clamp(base.y * (1.0f - (material.wetness * 0.12f)), 0.0f, 1.0f),
         clamp(base.z * (1.0f - (material.wetness * 0.08f)), 0.0f, 1.0f)
     };
     base = lerp(base, dampened, material.wetness * 0.55f);
+    base = lerp(base, { 0.22f, 0.26f, 0.29f }, material.flowWeight * material.erosionWeight * 0.35f);
     base = lerp(base, snowColor, material.snowWeight);
 
     const float micro = (valueNoise2(x * 0.013f, z * 0.013f, params.seed + 331) * 2.0f) - 1.0f;
