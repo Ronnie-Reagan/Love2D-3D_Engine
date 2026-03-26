@@ -5314,9 +5314,12 @@ RuntimePressureState computeRuntimePressureState(
         return previousState;
     }
 
-    const std::uint64_t pressureRamFloor = std::max(snapshot.totalPhysicalBytes / 10u, 4ull * kGiB);
-    const std::uint64_t criticalRamFloor = std::max((snapshot.totalPhysicalBytes * 7u) / 100u, 2ull * kGiB);
-    const std::uint64_t recoveryRamFloor = std::max((snapshot.totalPhysicalBytes * 15u) / 100u, 6ull * kGiB);
+    const std::uint64_t pressureRamFloor =
+        std::max<std::uint64_t>(snapshot.totalPhysicalBytes / std::uint64_t{10}, std::uint64_t{4} * kGiB);
+    const std::uint64_t criticalRamFloor =
+        std::max<std::uint64_t>((snapshot.totalPhysicalBytes * std::uint64_t{7}) / std::uint64_t{100}, std::uint64_t{2} * kGiB);
+    const std::uint64_t recoveryRamFloor =
+        std::max<std::uint64_t>((snapshot.totalPhysicalBytes * std::uint64_t{15}) / std::uint64_t{100}, std::uint64_t{6} * kGiB);
     const float gpuRatio = gpuUsageRatio(snapshot);
     const bool pressure =
         snapshot.availablePhysicalBytes < pressureRamFloor ||
