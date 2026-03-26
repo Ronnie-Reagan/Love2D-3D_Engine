@@ -21,9 +21,9 @@
 
 namespace NativeGame {
 
-constexpr float kRemoteInterpolationDelaySeconds = 0.010f;
-constexpr float kRemoteExtrapolationCapSeconds = 0.120f;
-constexpr std::size_t kRemoteSnapshotBufferLimit = 128u;
+constexpr float kRemoteInterpolationDelaySeconds = 0.42f;
+constexpr float kRemoteExtrapolationCapSeconds = 0.60f;
+constexpr std::size_t kRemoteSnapshotBufferLimit = 48u;
 constexpr int kVoiceChannelCount = 8;
 
 struct OnlineSettings {

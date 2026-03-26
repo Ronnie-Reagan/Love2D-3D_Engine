@@ -18,17 +18,14 @@ This repo now includes a standalone C++ runtime for `TrueFlight`.
 - Native HUD with debug flight data, minimap, geo readout, crosshair, control indicator, and pause overlay.
 - Native pause tabs for main actions, camera/settings, flight tuning, terrain generation/runtime tuning, asset browsing, HUD visibility, controls, and help.
 - Automatic native preference save/load for exposed UI settings, flight-model tuning values, terrain tuning values, and the selected aircraft model.
-
-The native executable currently uses `portSource/Assets/Models/DualEngine.glb` when available, falls back to `portSource/Assets/Models/DualEngine.stl`, and then falls back to a cube if those loads fail. The pause `Assets` tab can reload `portSource/Assets/Models`, swap to discovered STL/GLB/GLTF assets, and accept drag-and-drop model files at runtime. Native settings are stored in SDL's pref path as `native_settings.ini`.
-
-## Not yet ported
-
 - Networking transport, replication, and a native dedicated server runtime.
 - Voice.
 - Full glTF material/texture parity with the Lua importer.
 - Terrain streaming/SDF worker parity with the Lua chunk system.
 - Native parity for the full Lua settings/character/paint menus.
 - Lua-side test harness parity.
+
+The native executable currently uses `portSource/Assets/Models/DualEngine.glb` when available, falls back to `portSource/Assets/Models/DualEngine.stl`, and then falls back to a cube if those loads fail. The pause `Assets` tab can reload `portSource/Assets/Models`, swap to discovered STL/GLB/GLTF assets, and accept drag-and-drop model files at runtime. Native settings are stored in SDL's pref path as `native_settings.ini`.
 
 ## Build
 
@@ -78,6 +75,8 @@ If `cmake` is not on `PATH`, use the Visual Studio bundled executable:
 - `F3`: toggle debug overlay
 - `R`: reset aircraft
 - `Esc`: pause / resume
+- `T`: Toggles Terraforming mode (on foot)
+- `LMB/RMB`: fires Deposition/Removal terrain bullets (While terraforming) 
 
 ## Pause UI
 
