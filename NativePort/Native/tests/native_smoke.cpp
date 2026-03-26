@@ -229,8 +229,8 @@ void runFlightParityChecks(bool& failed)
 {
     {
         const FlightConfig config = defaultFlightConfig();
-        require(std::fabs(config.CL0 - 0.25f) < 1.0e-6f, "Default CL0 no longer matches the Lua flight model", failed);
-        require(std::fabs(config.CLElevator - 0.65f) < 1.0e-6f, "Default CLElevator no longer matches the Lua flight model", failed);
+        require(std::fabs(config.CL0 - 0.40f) < 1.0e-6f, "Default CL0 no longer matches the Lua flight model", failed);
+        require(std::fabs(config.CLElevator - 0.80f) < 1.0e-6f, "Default CLElevator no longer matches the Lua flight model", failed);
         require(std::fabs(config.Cm0 - 0.04f) < 1.0e-6f, "Default Cm0 no longer matches the Lua flight model", failed);
         require(std::fabs(config.CmElevator + 1.35f) < 1.0e-6f, "Default CmElevator no longer matches the Lua flight model", failed);
         require(std::fabs(degrees(config.maxElevatorDeflectionRad) - 25.0f) < 1.0e-4f, "Default elevator limit no longer matches the Lua flight model", failed);

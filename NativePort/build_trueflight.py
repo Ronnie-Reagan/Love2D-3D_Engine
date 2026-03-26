@@ -263,6 +263,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ctest",
+        default='true',
         action="store_true",
         help="Build the smoke-test target and run ctest --output-on-failure after the main build completes.",
     )
