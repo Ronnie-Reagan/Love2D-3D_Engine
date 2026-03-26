@@ -21,9 +21,9 @@
 
 namespace NativeGame {
 
-constexpr float kRemoteInterpolationDelaySeconds = 0.055f;
+constexpr float kRemoteInterpolationDelaySeconds = 0.010f;
 constexpr float kRemoteExtrapolationCapSeconds = 0.120f;
-constexpr std::size_t kRemoteSnapshotBufferLimit = 48u;
+constexpr std::size_t kRemoteSnapshotBufferLimit = 128u;
 constexpr int kVoiceChannelCount = 8;
 
 struct OnlineSettings {
@@ -73,7 +73,7 @@ struct AvatarManifest {
 struct NetPlayerInput {
     int tick = 0;
     std::string role = "plane";
-    float frameDt = 1.0f / 60.0f;
+    float frameDt = 1.0f / 120.0f;
     float walkYaw = 0.0f;
     float walkPitch = 0.0f;
     float walkMoveSpeed = 10.0f;
@@ -440,7 +440,7 @@ inline AvatarManifest defaultAvatarManifest()
 {
     AvatarManifest manifest;
     manifest.plane.modelHash = "builtin-cube";
-    manifest.walking.modelHash = "builtin-cube";
+    manifest.walking.modelHash = "builtin-walking-biped";
     manifest.callsign = "Pilot";
     return manifest;
 }

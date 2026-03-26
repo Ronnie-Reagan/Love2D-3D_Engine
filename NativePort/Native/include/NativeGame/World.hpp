@@ -347,6 +347,12 @@ struct TerrainParams {
     std::vector<TerrainTunnelSeed> explicitTunnelSeeds;
 };
 
+struct TerrainVerticalBoundsSample {
+    bool valid = false;
+    float minY = 0.0f;
+    float maxY = 0.0f;
+};
+
 struct TerrainFieldContext {
     TerrainParams params;
     std::vector<TerrainTunnelSeed> tunnelSeeds;
@@ -354,6 +360,7 @@ struct TerrainFieldContext {
     std::function<float(float, float, float)> sampleVolumetricAdditiveSdfAt {};
     std::function<float(float, float, float)> sampleVolumetricSubtractiveSdfAt {};
     std::function<bool(float, float, float, float)> hasVolumetricOverridesInBounds {};
+    std::function<TerrainVerticalBoundsSample(float, float, float, float)> sampleWorldVolumetricBoundsInBounds {};
     std::function<std::uint64_t(float, float, float, float)> sampleChunkRevisionSignature {};
 };
 
@@ -1251,6 +1258,149 @@ inline float terrainPatchAxisStep(const TerrainParams& params, float requestedSt
     return std::max(requestedStep, std::max(1.0f, span) / static_cast<float>(axisBudget));
 }
 
+inline void expandTerrainVerticalBounds(TerrainVerticalBoundsSample& bounds, float minY, float maxY)
+{
+    if (!std::isfinite(minY) || !std::isfinite(maxY)) {
+        return;
+    }
+    if (maxY < minY) {
+        std::swap(minY, maxY);
+    }
+    if (!bounds.valid) {
+        bounds.valid = true;
+        bounds.minY = minY;
+        bounds.maxY = maxY;
+        return;
+    }
+    bounds.minY = std::min(bounds.minY, minY);
+    bounds.maxY = std::max(bounds.maxY, maxY);
+}
+
+inline bool terrainPatchOverlapsTunnelPath(const TerrainPatchBounds& bounds, const TerrainTunnelSeed& tunnel, float padding = 0.0f)
+{
+    const float expandedX0 = bounds.x0 - padding;
+    const float expandedX1 = bounds.x1 + padding;
+    const float expandedZ0 = bounds.z0 - padding;
+    const float expandedZ1 = bounds.z1 + padding;
+    for (std::size_t index = 1; index < tunnel.points.size(); ++index) {
+        const Vec3& a = tunnel.points[index - 1];
+        const Vec3& b = tunnel.points[index];
+        const float radius = tunnel.radius + padding;
+        const float minX = std::min(a.x, b.x) - radius;
+        const float maxX = std::max(a.x, b.x) + radius;
+        const float minZ = std::min(a.z, b.z) - radius;
+        const float maxZ = std::max(a.z, b.z) + radius;
+        if (maxX >= expandedX0 && minX <= expandedX1 && maxZ >= expandedZ0 && minZ <= expandedZ1) {
+            return true;
+        }
+    }
+    return false;
+}
+
+inline TerrainVerticalBoundsSample sampleTerrainPatchSurfaceBounds(
+    const TerrainPatchBounds& bounds,
+    const TerrainFieldContext& context,
+    float cellSize)
+{
+    TerrainVerticalBoundsSample out;
+    const TerrainParams& params = context.params;
+    const float spanX = std::max(1.0f, bounds.x1 - bounds.x0);
+    const float spanZ = std::max(1.0f, bounds.z1 - bounds.z0);
+    const float requestedStep = std::max(1.0f, sanitize(cellSize, params.lod1CellSize));
+    const float stepX = terrainPatchAxisStep(params, requestedStep, spanX);
+    const float stepZ = terrainPatchAxisStep(params, requestedStep, spanZ);
+    const int nx = std::max(2, static_cast<int>(std::floor(spanX / stepX)));
+    const int nz = std::max(2, static_cast<int>(std::floor(spanZ / stepZ)));
+    const float xStep = spanX / static_cast<float>(nx);
+    const float zStep = spanZ / static_cast<float>(nz);
+
+    for (int iz = 0; iz <= nz; ++iz) {
+        const float z = bounds.z0 + (static_cast<float>(iz) * zStep);
+        for (int ix = 0; ix <= nx; ++ix) {
+            const float x = bounds.x0 + (static_cast<float>(ix) * xStep);
+            if (pointInsideHole(x, z, bounds)) {
+                continue;
+            }
+            const float y = sampleSurfaceHeight(x, z, context);
+            expandTerrainVerticalBounds(out, y, y);
+        }
+    }
+    return out;
+}
+
+inline TerrainVerticalBoundsSample estimateTerrainPatchVerticalBounds(
+    const TerrainPatchBounds& bounds,
+    const TerrainFieldContext& context,
+    float cellSize)
+{
+    const TerrainParams& params = context.params;
+    TerrainVerticalBoundsSample out = sampleTerrainPatchSurfaceBounds(bounds, context, cellSize);
+    const float shellMargin = std::max({ 12.0f, std::max(2.0f, cellSize * 2.5f), params.skirtDepth * 0.5f });
+
+    const float surfaceMin = out.valid ? out.minY : params.baseHeight;
+    const float surfaceMax = out.valid ? out.maxY : params.baseHeight;
+    expandTerrainVerticalBounds(out, surfaceMin - shellMargin, surfaceMax + shellMargin);
+
+    if (params.caveEnabled) {
+        expandTerrainVerticalBounds(out, params.caveMinY - shellMargin, params.caveMaxY + shellMargin);
+    }
+
+    for (const TerrainTunnelSeed& tunnel : context.tunnelSeeds) {
+        if (!terrainPatchOverlapsTunnelPath(bounds, tunnel, shellMargin)) {
+            continue;
+        }
+        for (const Vec3& point : tunnel.points) {
+            expandTerrainVerticalBounds(
+                out,
+                point.y - tunnel.radius - shellMargin,
+                point.y + tunnel.radius + shellMargin);
+        }
+    }
+
+    if (context.sampleWorldVolumetricBoundsInBounds) {
+        const TerrainVerticalBoundsSample worldBounds = context.sampleWorldVolumetricBoundsInBounds(
+            bounds.x0 - shellMargin,
+            bounds.z0 - shellMargin,
+            bounds.x1 + shellMargin,
+            bounds.z1 + shellMargin);
+        if (worldBounds.valid) {
+            expandTerrainVerticalBounds(
+                out,
+                worldBounds.minY - shellMargin,
+                worldBounds.maxY + shellMargin);
+        }
+    }
+
+    if (!out.valid) {
+        expandTerrainVerticalBounds(out, params.baseHeight - shellMargin, params.baseHeight + shellMargin);
+    }
+
+    const float quantizationStep = std::max(0.5f, sanitize(cellSize, params.lod0CellSize));
+    out.minY = std::floor(out.minY / quantizationStep) * quantizationStep;
+    out.maxY = std::ceil(out.maxY / quantizationStep) * quantizationStep;
+    if (out.maxY <= out.minY + quantizationStep) {
+        out.maxY = out.minY + quantizationStep;
+    }
+    return out;
+}
+
+inline TerrainVolumeBounds buildAdaptiveTerrainVolumeBounds(
+    const TerrainPatchBounds& bounds,
+    const TerrainFieldContext& context,
+    float cellSize,
+    float overlap = 0.0f)
+{
+    const TerrainVerticalBoundsSample verticalBounds = estimateTerrainPatchVerticalBounds(bounds, context, cellSize);
+    return {
+        bounds.x0 - overlap,
+        bounds.x1 + overlap,
+        verticalBounds.minY,
+        verticalBounds.maxY,
+        bounds.z0 - overlap,
+        bounds.z1 + overlap
+    };
+}
+
 inline void appendTerrainWater(Model& model, const TerrainFieldContext& context, const TerrainPatchBounds& bounds, float step)
 {
     const TerrainParams& params = context.params;
@@ -1639,14 +1789,7 @@ inline TerrainVisualBuildResult buildTerrainVisualModels(const Vec3& center, con
         appendTerrainWater(result.nearModel, context, nearBounds, params.lod0CellSize);
     } else {
         const float overlap = params.lod0CellSize;
-        TerrainVolumeBounds nearVolume {
-            nearBounds.x0 - overlap,
-            nearBounds.x1 + overlap,
-            params.minY,
-            params.maxY,
-            nearBounds.z0 - overlap,
-            nearBounds.z1 + overlap
-        };
+        const TerrainVolumeBounds nearVolume = buildAdaptiveTerrainVolumeBounds(nearBounds, context, params.lod0CellSize, overlap);
         result.nearModel = buildVolumetricTerrainPatch(context, nearVolume, params.lod0CellSize);
         appendTerrainWater(result.nearModel, context, nearBounds, params.lod0CellSize);
         if (params.enableSkirts) {

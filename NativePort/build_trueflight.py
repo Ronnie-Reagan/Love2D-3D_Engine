@@ -43,13 +43,13 @@ def find_ctest(cmake: str) -> str:
 
 
 def normalize_steamworks_sdk_root(candidate: Path) -> Path | None:
-    
     candidate = candidate.resolve()
     if (candidate / "public" / "steam" / "steam_api.h").exists():
         return candidate
     if (candidate / "sdk" / "public" / "steam" / "steam_api.h").exists():
         return candidate / "sdk"
     return None
+
 
 def detect_steamworks_sdk_root(source_dir: Path, explicit_root: str | None) -> Path | None:
     if explicit_root:
@@ -75,6 +75,56 @@ def detect_steamworks_sdk_root(source_dir: Path, explicit_root: str | None) -> P
 
     return None
 
+
+def normalize_cache_value(value: str) -> str:
+    return os.path.normcase(value.replace("\\", "/")).rstrip("/")
+
+
+def read_cmake_cache(cache_path: Path) -> dict[str, str]:
+    cache_values: dict[str, str] = {}
+    for line in cache_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if not line or line.startswith("//") or line.startswith("#"):
+            continue
+        key_and_type, separator, value = line.partition("=")
+        if not separator:
+            continue
+        key, _, _cache_type = key_and_type.partition(":")
+        if key:
+            cache_values[key] = value
+    return cache_values
+
+
+def cmake_cache_matches_request(
+    cache_path: Path,
+    generator: str | None,
+    arch: str | None,
+    cmake_defines: list[str],
+) -> bool:
+    cache_values = read_cmake_cache(cache_path)
+
+    if generator is not None:
+        cached_generator = cache_values.get("CMAKE_GENERATOR")
+        if cached_generator is None or normalize_cache_value(cached_generator) != normalize_cache_value(generator):
+            return False
+
+    if arch is not None:
+        cached_arch = cache_values.get("CMAKE_GENERATOR_PLATFORM")
+        if cached_arch is None or normalize_cache_value(cached_arch) != normalize_cache_value(arch):
+            return False
+
+    for define in cmake_defines:
+        if not define.startswith("-D"):
+            continue
+        name, separator, value = define[2:].partition("=")
+        if not separator:
+            return False
+        cached_value = cache_values.get(name)
+        if cached_value is None or normalize_cache_value(cached_value) != normalize_cache_value(value):
+            return False
+
+    return True
+
+
 def configure_if_needed(
     cmake: str,
     source_dir: Path,
@@ -86,7 +136,9 @@ def configure_if_needed(
 ) -> None:
     cache_path = build_dir / "CMakeCache.txt"
     if cache_path.exists() and not reconfigure:
-        return
+        if cmake_cache_matches_request(cache_path, generator, arch, cmake_defines):
+            return
+        print("Cached CMake settings differ from the requested arguments; reconfiguring.")
 
     build_dir.mkdir(parents=True, exist_ok=True)
     command = [cmake, "-S", str(source_dir), "-B", str(build_dir)]
@@ -212,7 +264,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ctest",
         action="store_true",
-        help="Run ctest --output-on-failure after the build completes.",
+        help="Build the smoke-test target and run ctest --output-on-failure after the main build completes.",
     )
     return parser.parse_args()
 
@@ -282,6 +334,15 @@ def main() -> int:
             clean_first=args.clean_first,
         )
         if args.ctest:
+            smoke_target = "TrueFlightNativeSmoke"
+            if args.target != smoke_target:
+                build_target(
+                    cmake=cmake,
+                    build_dir=build_dir,
+                    config=args.config,
+                    target=smoke_target,
+                    clean_first=False,
+                )
             ctest = find_ctest(cmake)
             run_ctest(
                 ctest=ctest,

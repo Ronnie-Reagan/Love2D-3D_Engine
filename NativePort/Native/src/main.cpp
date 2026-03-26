@@ -89,7 +89,7 @@ constexpr float kGamepadProjectileCooldownSec = 0.2f;
 constexpr float kPrimaryFireCooldownSec = 0.085f;
 constexpr float kBombDropCooldownSec = 0.9f;
 constexpr float kTerrainGunCooldownSec = 0.12f;
-constexpr float kGameplaySnapshotIntervalSec = 1.0f / 20.0f;
+constexpr float kGameplaySnapshotIntervalSec = 1.0f / 60.0f;
 constexpr float kProjectileLifetimeSec = 5.0f;
 constexpr float kBombLifetimeSec = 14.0f;
 constexpr int kEnemyTargetCount = 18;
@@ -232,6 +232,11 @@ enum class SettingsSubTab {
 enum class CharacterSubTab {
     Plane = 0,
     Player = 1
+};
+
+enum class CharacterEditorMode {
+    Model = 0,
+    Rig = 1
 };
 
 enum class HudSubTab {
@@ -443,6 +448,8 @@ struct PauseState {
     HudSubTab hudSubTab = HudSubTab::Info;
     CharacterSubTab charactersSubTab = CharacterSubTab::Plane;
     CharacterSubTab paintSubTab = CharacterSubTab::Plane;
+    CharacterEditorMode characterEditorMode = CharacterEditorMode::Model;
+    int characterRigSlot = 0;
     int controlsSelection = 0;
     int controlsSlot = 0;
     bool controlsCapturing = false;
@@ -526,11 +533,15 @@ struct GameplayObjectState {
     float radius = 0.35f;
     float ttl = 1.0f;
     float damage = 10.0f;
-    float drag = 0.02f;
     float gravityScale = 1.0f;
     float blastRadius = 0.0f;
     float craterRadius = 0.0f;
     float craterDepth = 0.0f;
+    float massKg = 0.02f;
+    float dragCoefficient = 0.3f;
+    float referenceAreaM2 = 0.00012f;
+    float spinAngleRad = 0.0f;
+    float spinRateRadPerSec = 0.0f;
     bool active = true;
 };
 
@@ -575,6 +586,24 @@ struct AssetEntry {
     bool supported = false;
 };
 
+enum class VisualRigAxis {
+    PosX = 0,
+    NegX = 1,
+    PosY = 2,
+    NegY = 3,
+    PosZ = 4,
+    NegZ = 5
+};
+
+struct VisualRigCutout {
+    bool enabled = false;
+    VisualRigAxis axis = VisualRigAxis::PosZ;
+    Vec3 center {};
+    Vec3 halfExtents { 0.24f, 0.24f, 0.24f };
+    Vec3 pivot {};
+    float motionScale = 1.0f;
+};
+
 struct PlaneVisualState {
     Model sourceModel = makeCubeModel();
     Model model = makeCubeModel();
@@ -599,6 +628,11 @@ struct PlaneVisualState {
     bool paintSupported = false;
     std::vector<RgbaImage> paintUndoStack;
     std::vector<RgbaImage> paintRedoStack;
+    std::array<VisualRigCutout, 4> rigCutouts {};
+    Model rigBaseModel {};
+    std::array<Model, 4> rigSlotModels {};
+    std::array<bool, 4> rigSlotActive {};
+    bool rigPartitionValid = false;
 };
 
 struct PaintUiState {
@@ -631,6 +665,8 @@ struct TerrainFarTile {
     std::uint64_t paramsSignature = 0u;
     std::uint64_t sourceSignature = 0u;
     bool active = false;
+    Vec3 cullCenter {};
+    float cullRadius = 0.0f;
     Model terrainModel {};
     Model waterModel {};
     Model propModel {};
@@ -669,6 +705,7 @@ struct VisualPreferenceData {
     Vec3 modelOffset {};
     std::string paintHash;
     std::map<std::string, std::string> paintHashesByModelKey;
+    std::array<VisualRigCutout, 4> rigCutouts {};
 };
 
 struct AircraftProfile {
@@ -865,6 +902,11 @@ struct GameSession {
     std::unordered_map<int, PlaneDurabilityState> planeDurabilityByPlayerId;
     std::unordered_map<int, WeaponCooldownState> weaponStateByPlayerId;
     std::unordered_map<int, PlaneDurabilityState> replicatedDurabilityByPlayerId;
+    float audioGunshotImpulse = 0.0f;
+    float audioTerrainShotImpulse = 0.0f;
+    float audioBombLatchImpulse = 0.0f;
+    float audioExplosionImpulse = 0.0f;
+    float audioExplosionDistanceMeters = 1000.0f;
     int nextGameplayObjectId = 1;
     float nextGameplaySnapshotAt = 0.0f;
     std::map<int, std::string> knownRemotePeers;
@@ -1001,7 +1043,8 @@ constexpr int kHudSettingCount = 12;
 constexpr int kHudVisibleRows = 12;
 constexpr int kControlsVisibleRows = 10;
 constexpr int kSettingsVisibleRows = 13;
-constexpr int kCharacterAssetListStart = 13;
+constexpr int kCharacterSettingCount = 14;
+constexpr int kCharacterAssetListStart = kCharacterSettingCount;
 constexpr int kPaintSettingCount = 11;
 constexpr std::array<const char*, 7> kPauseTabs { "Home", "Settings", "Characters", "Paint", "HUD", "Controls", "Help" };
 
@@ -1074,6 +1117,7 @@ bool controlActionSupported(InputActionId actionId);
 bool controlActionConfigurable(InputActionId actionId);
 
 int pauseItemCount(const PauseState& pauseState, std::size_t assetCount);
+int characterItemCount(const PauseState& pauseState, std::size_t assetCount);
 int terrainVisibleStartIndex(int selectedIndex);
 void activatePauseSelection(
     PauseState& pauseState,
@@ -1096,10 +1140,10 @@ std::string formatSettingsRowValue(SettingsSubTab subTab, int localIndex, const 
 const char* settingsRowHelpText(SettingsSubTab subTab, int localIndex);
 void adjustSettingsRowValue(UiState& uiState, PropAudioConfig& propAudioConfig, SettingsSubTab subTab, int localIndex, int direction);
 void resetSettingsRowValue(UiState& uiState, const UiState& defaults, PropAudioConfig& propAudioConfig, const PropAudioConfig& defaultPropAudioConfigValues, SettingsSubTab subTab, int localIndex);
-const char* characterRowLabel(int rowIndex);
-std::string formatCharacterRowValue(int rowIndex, const PlaneVisualState& visual);
-const char* characterRowHelpText(int rowIndex);
-void adjustCharacterRowValue(PlaneVisualState& visual, int rowIndex, int direction);
+const char* characterRowLabel(const PauseState& pauseState, int rowIndex, const PlaneVisualState& visual);
+std::string formatCharacterRowValue(const PauseState& pauseState, int rowIndex, const PlaneVisualState& visual);
+const char* characterRowHelpText(const PauseState& pauseState, int rowIndex, const PlaneVisualState& visual);
+void adjustCharacterRowValue(PauseState& pauseState, PlaneVisualState& visual, int rowIndex, int direction);
 const char* paintRowLabel(int rowIndex);
 std::string formatPaintRowValue(int rowIndex, const PaintUiState& paintUi, const PlaneVisualState& visual);
 const char* paintRowHelpText(int rowIndex, const PlaneVisualState& visual);
@@ -1129,6 +1173,8 @@ std::string formatFixed(float value, int precision);
 TerrainMaterialSample sampleTerrainMaterialFromChunkData(const TerrainChunkData& data, float x, float z);
 float sampleTerrainSlopeFromChunkData(const TerrainChunkData& data, float x, float z);
 void pushHudNotification(BootResources& boot, std::string text, float nowSeconds, float duration);
+void touchModelCacheRevision(Model& model);
+void rebuildVisualRigModels(PlaneVisualState& visual);
 void applyWalkingMouseInput(
     UiState& uiState,
     const ControlProfile& controls,
@@ -1696,6 +1742,13 @@ float sampleGroundHeight(float x, float z, const TerrainFieldContext& terrainCon
     return sampleSurfaceHeight(x, z, terrainContext);
 }
 
+float computeHeightAboveGround(const FlightState& plane, const TerrainFieldContext& terrainContext)
+{
+    const float ground = sampleGroundHeight(plane.pos.x, plane.pos.z, terrainContext);
+    const float lowestPoint = plane.pos.y - std::max(plane.collisionRadius, 1.0f);
+    return std::max(0.0f, lowestPoint - ground);
+}
+
 float computeWaterProximity(const FlightState& plane, const TerrainFieldContext& terrainContext)
 {
     const float ground = sampleGroundHeight(plane.pos.x, plane.pos.z, terrainContext);
@@ -1712,11 +1765,154 @@ float computeWaterProximity(const FlightState& plane, const TerrainFieldContext&
     return skimFactor * depthFactor;
 }
 
+struct CombatAudioTelemetry {
+    float gunshotImpulse = 0.0f;
+    float terrainShotImpulse = 0.0f;
+    float bombLatchImpulse = 0.0f;
+    float explosionImpulse = 0.0f;
+    float explosionDistanceMeters = 1000.0f;
+    float projectileWhistleAmount = 0.0f;
+    float projectilePitchScale = 1.0f;
+    float projectileDoppler = 1.0f;
+    float bombWhistleAmount = 0.0f;
+    float bombPitchScale = 1.0f;
+    float bombDoppler = 1.0f;
+};
+
+float combatAudioDistanceAttenuation(float distanceMeters, float fullGainDistance, float maxDistance)
+{
+    if (distanceMeters <= fullGainDistance) {
+        return 1.0f;
+    }
+    if (distanceMeters >= maxDistance) {
+        return 0.0f;
+    }
+    const float alpha = 1.0f - ((distanceMeters - fullGainDistance) / std::max(1.0f, maxDistance - fullGainDistance));
+    return alpha * alpha;
+}
+
+void accumulateCombatAudioEvent(
+    GameSession& session,
+    const Vec3& sourcePosition,
+    float gunshotImpulse,
+    float terrainShotImpulse,
+    float bombLatchImpulse,
+    float explosionImpulse)
+{
+    const float distanceMeters = length(sourcePosition - session.plane.pos);
+    if (gunshotImpulse > 0.0f) {
+        session.audioGunshotImpulse = std::max(
+            session.audioGunshotImpulse,
+            gunshotImpulse * combatAudioDistanceAttenuation(distanceMeters, 6.0f, 260.0f));
+    }
+    if (terrainShotImpulse > 0.0f) {
+        session.audioTerrainShotImpulse = std::max(
+            session.audioTerrainShotImpulse,
+            terrainShotImpulse * combatAudioDistanceAttenuation(distanceMeters, 6.0f, 240.0f));
+    }
+    if (bombLatchImpulse > 0.0f) {
+        session.audioBombLatchImpulse = std::max(
+            session.audioBombLatchImpulse,
+            bombLatchImpulse * combatAudioDistanceAttenuation(distanceMeters, 8.0f, 220.0f));
+    }
+    if (explosionImpulse > 0.0f) {
+        const float attenuatedImpulse =
+            explosionImpulse * combatAudioDistanceAttenuation(distanceMeters, 18.0f, 560.0f);
+        session.audioExplosionImpulse = std::max(session.audioExplosionImpulse, attenuatedImpulse);
+        if (attenuatedImpulse > 0.0f) {
+            session.audioExplosionDistanceMeters = std::min(session.audioExplosionDistanceMeters, distanceMeters);
+        }
+    }
+}
+
+CombatAudioTelemetry sampleCombatAudioTelemetry(const GameSession& session)
+{
+    CombatAudioTelemetry telemetry;
+    telemetry.gunshotImpulse = clamp(session.audioGunshotImpulse, 0.0f, 1.0f);
+    telemetry.terrainShotImpulse = clamp(session.audioTerrainShotImpulse, 0.0f, 1.0f);
+    telemetry.bombLatchImpulse = clamp(session.audioBombLatchImpulse, 0.0f, 1.0f);
+    telemetry.explosionImpulse = clamp(session.audioExplosionImpulse, 0.0f, 1.0f);
+    telemetry.explosionDistanceMeters =
+        telemetry.explosionImpulse > 0.0f
+            ? std::max(0.0f, session.audioExplosionDistanceMeters)
+            : 1000.0f;
+
+    const Vec3 listenerVelocity = session.flightMode ? session.plane.flightVel : session.plane.vel;
+    const float speedOfSound = clamp(session.runtime.lastAtmosphere.speedOfSound, 280.0f, 360.0f);
+    for (const GameplayObjectState& object : session.gameplayObjects) {
+        if (!object.active) {
+            continue;
+        }
+
+        const bool bombLike = object.kind == GameplayObjectKind::Bomb;
+        const bool projectileLike =
+            object.kind == GameplayObjectKind::Projectile ||
+            object.kind == GameplayObjectKind::TerrainAdd ||
+            object.kind == GameplayObjectKind::TerrainRemove;
+        if (!bombLike && !projectileLike) {
+            continue;
+        }
+
+        const float maxDistance = bombLike ? 300.0f : 220.0f;
+        const Vec3 rel = object.pos - session.plane.pos;
+        const float distance = length(rel);
+        if (distance >= maxDistance) {
+            continue;
+        }
+
+        const Vec3 relDir = normalize(rel, { 0.0f, 0.0f, 1.0f });
+        const Vec3 relVel = object.vel - listenerVelocity;
+        const float relativeSpeed = length(relVel);
+        if (relativeSpeed <= 1.0f) {
+            continue;
+        }
+
+        const float radialSpeed = dot(relVel, relDir);
+        const float lateralSpeed = length(relVel - (relDir * radialSpeed));
+        const float proximity = clamp(1.0f - (distance / maxDistance), 0.0f, 1.0f);
+        const float intensity = proximity * clamp(relativeSpeed / (bombLike ? 95.0f : 210.0f), 0.0f, 1.35f);
+        const float pitchScale =
+            bombLike
+                ? mix(0.72f, 1.45f, clamp((lateralSpeed + std::max(0.0f, -radialSpeed) * 0.45f) / 180.0f, 0.0f, 1.0f))
+                : mix(0.90f, 2.80f, clamp((lateralSpeed + std::max(0.0f, -radialSpeed) * 0.35f) / 360.0f, 0.0f, 1.0f));
+        const float observerTowardSource = dot(listenerVelocity, relDir);
+        const float sourceTowardObserver = -dot(object.vel, relDir);
+        const float doppler = clamp(
+            (speedOfSound + observerTowardSource) / std::max((speedOfSound * 0.30f), speedOfSound - sourceTowardObserver),
+            bombLike ? 0.60f : 0.55f,
+            bombLike ? 1.55f : 1.85f);
+
+        if (bombLike) {
+            if (intensity > telemetry.bombWhistleAmount) {
+                telemetry.bombWhistleAmount = intensity;
+                telemetry.bombPitchScale = pitchScale;
+                telemetry.bombDoppler = doppler;
+            }
+        } else if (intensity > telemetry.projectileWhistleAmount) {
+            telemetry.projectileWhistleAmount = intensity;
+            telemetry.projectilePitchScale = pitchScale;
+            telemetry.projectileDoppler = doppler;
+        }
+    }
+
+    return telemetry;
+}
+
+void clearCombatAudioTelemetry(GameSession& session)
+{
+    session.audioGunshotImpulse = 0.0f;
+    session.audioTerrainShotImpulse = 0.0f;
+    session.audioBombLatchImpulse = 0.0f;
+    session.audioExplosionImpulse = 0.0f;
+    session.audioExplosionDistanceMeters = 1000.0f;
+}
+
 ProceduralAudioFrame buildProceduralAudioFrame(
     const FlightState& plane,
     const FlightRuntimeState& runtime,
     const FlightEnvironment& environment,
     const TerrainFieldContext& terrainContext,
+    const FlightConfig& flightConfig,
     const UiState& uiState,
     const PropAudioConfig& propAudioConfig,
     float foliageBrush,
@@ -1731,6 +1927,7 @@ ProceduralAudioFrame buildProceduralAudioFrame(
     frame.paused = paused;
     frame.audioEnabled = uiState.audioEnabled;
     frame.onGround = plane.onGround;
+    frame.exteriorView = uiState.chaseCamera;
     frame.afterburner = afterburnerActive;
     frame.dt = dt;
     frame.masterVolume = uiState.masterVolume;
@@ -1739,13 +1936,38 @@ ProceduralAudioFrame buildProceduralAudioFrame(
 
     const Vec3 airVelWorld = plane.flightVel - environment.wind;
     const Vec3 airVelBody = worldToBody(plane.rot, airVelWorld);
+    frame.engineThrottle = runtime.engineThrottle;
+    frame.crankRpm = runtime.crankRpm;
+    frame.propRpm = runtime.propRpm;
+    frame.maxCrankRpm = std::max(600.0f, flightConfig.maxCrankRpm);
+    frame.maxPropRpm = frame.maxCrankRpm / std::max(0.25f, flightConfig.propellerGearRatio);
+    frame.manifoldPressureKpa = runtime.manifoldPressureKpa;
+    frame.fuelFlowKgPerSec = runtime.fuelFlowKgPerSec;
+    frame.enginePowerKw = runtime.enginePowerKw;
+    frame.maxBrakePowerKw = std::max(10.0f, flightConfig.maxBrakePowerKw);
+    frame.exhaustGasTempK = runtime.exhaustGasTempK;
+    frame.cylinderHeadTempK = runtime.cylinderHeadTempK;
+    frame.oilTempK = runtime.oilTempK;
+    frame.engineCylinderCount = static_cast<float>(std::max(1, flightConfig.engineCylinderCount));
     frame.trueAirspeed = length(airVelBody);
+    frame.referenceSpeed = std::max(25.0f, flightConfig.maxEffectivePropSpeed);
     frame.dynamicPressure = runtime.lastDynamicPressure;
+    frame.referenceDynamicPressure = std::max(300.0f, flightConfig.controlLoadingReferenceDynamicPressure);
     frame.thrustNewton = runtime.lastThrustNewton;
+    frame.maxThrustNewton =
+        std::max(50.0f, flightConfig.maxThrustSeaLevel * std::max(1.0f, flightConfig.afterburnerMultiplier));
     frame.alphaRad = runtime.lastAlpha;
+    frame.stallAlphaRad = std::max(radians(4.0f), flightConfig.alphaStallRad);
     frame.betaRad = runtime.lastBeta;
     frame.verticalSpeed = airVelWorld.y;
     frame.angularRateRad = length(plane.flightAngVel);
+    frame.maxAngularRateRad = std::max(radians(40.0f), flightConfig.maxAngularRateRad);
+    frame.speedOfSound = std::max(280.0f, runtime.lastAtmosphere.speedOfSound);
+    frame.groundSpeed = std::sqrt((plane.vel.x * plane.vel.x) + (plane.vel.z * plane.vel.z));
+    frame.heightAboveGroundMeters = computeHeightAboveGround(plane, terrainContext);
+    frame.pitchRateRad = std::fabs(plane.flightAngVel.x);
+    frame.yawRateRad = std::fabs(plane.flightAngVel.y);
+    frame.rollRateRad = std::fabs(plane.flightAngVel.z);
     frame.waterProximity = computeWaterProximity(plane, terrainContext);
     frame.foliageBrush = clamp(foliageBrush, 0.0f, 1.0f);
     frame.foliageImpact = clamp(foliageImpact, 0.0f, 1.0f);
@@ -2383,6 +2605,387 @@ void appendTerrainPropOctahedron(
     }
 }
 
+void appendTerrainPropBox(
+    Model& model,
+    const Vec3& origin,
+    const Quat& rotation,
+    const Vec3& scale,
+    const Vec3& halfExtents,
+    const Vec3& color)
+{
+    const Vec3 p000 { -halfExtents.x, -halfExtents.y, -halfExtents.z };
+    const Vec3 p001 { -halfExtents.x, -halfExtents.y,  halfExtents.z };
+    const Vec3 p010 { -halfExtents.x,  halfExtents.y, -halfExtents.z };
+    const Vec3 p011 { -halfExtents.x,  halfExtents.y,  halfExtents.z };
+    const Vec3 p100 {  halfExtents.x, -halfExtents.y, -halfExtents.z };
+    const Vec3 p101 {  halfExtents.x, -halfExtents.y,  halfExtents.z };
+    const Vec3 p110 {  halfExtents.x,  halfExtents.y, -halfExtents.z };
+    const Vec3 p111 {  halfExtents.x,  halfExtents.y,  halfExtents.z };
+
+    // +Z front
+    addTerrainPropQuad(model, origin, rotation, scale, p001, p101, p111, p011, scaledColor(color, 1.03f));
+
+    // -Z back
+    addTerrainPropQuad(model, origin, rotation, scale, p100, p000, p010, p110, scaledColor(color, 0.92f));
+
+    // -X left
+    addTerrainPropQuad(model, origin, rotation, scale, p000, p001, p011, p010, scaledColor(color, 0.98f));
+
+    // +X right
+    addTerrainPropQuad(model, origin, rotation, scale, p101, p100, p110, p111, scaledColor(color, 0.90f));
+
+    // +Y top
+    addTerrainPropQuad(model, origin, rotation, scale, p010, p011, p111, p110, scaledColor(color, 1.08f));
+
+    // -Y bottom
+    addTerrainPropQuad(model, origin, rotation, scale, p000, p100, p101, p001, scaledColor(color, 0.78f));
+}
+
+Model buildProceduralProjectileModel()
+{
+    Model model;
+    model.assetKey = "builtin:projectile_shell";
+
+    const Quat alongForward = quatFromAxisAngle({ 1.0f, 0.0f, 0.0f }, radians(90.0f));
+    const Vec3 brassColor { 0.88f, 0.74f, 0.42f };
+    const Vec3 copperColor { 0.84f, 0.48f, 0.24f };
+    const Vec3 finColor { 0.60f, 0.58f, 0.54f };
+
+    appendTerrainPropPrism(
+        model,
+        { 0.0f, 0.0f, -0.34f },
+        alongForward,
+        { 1.0f, 1.0f, 1.0f },
+        0.18f,
+        0.68f,
+        8,
+        brassColor,
+        scaledColor(brassColor, 1.06f));
+    appendTerrainPropCone(
+        model,
+        { 0.0f, 0.0f, 0.34f },
+        alongForward,
+        { 1.0f, 1.0f, 1.0f },
+        0.18f,
+        0.28f,
+        8,
+        copperColor);
+    appendTerrainPropCone(
+        model,
+        { 0.0f, 0.0f, -0.44f },
+        quatNormalize(quatMultiply(alongForward, quatFromAxisAngle({ 1.0f, 0.0f, 0.0f }, kPi))),
+        { 1.0f, 1.0f, 1.0f },
+        0.12f,
+        0.12f,
+        6,
+        scaledColor(brassColor, 0.86f));
+
+    for (int finIndex = 0; finIndex < 4; ++finIndex) {
+        const float yaw = static_cast<float>(finIndex) * (0.5f * kPi);
+        const Quat finRotation = quatNormalize(quatMultiply(
+            quatFromAxisAngle({ 0.0f, 0.0f, 1.0f }, yaw),
+            alongForward));
+        appendTerrainPropBox(
+            model,
+            { 0.0f, 0.0f, -0.25f },
+            finRotation,
+            { 1.0f, 1.0f, 1.0f },
+            { 0.015f, 0.14f, 0.08f },
+            finColor);
+    }
+
+    touchModelCacheRevision(model);
+    return model;
+}
+
+Model buildProceduralBombModel()
+{
+    Model model;
+    model.assetKey = "builtin:bomb_fin";
+
+    const Quat alongForward = quatFromAxisAngle({ 1.0f, 0.0f, 0.0f }, radians(90.0f));
+    const Vec3 bodyColor { 0.34f, 0.42f, 0.20f };
+    const Vec3 noseColor { 0.46f, 0.48f, 0.28f };
+    const Vec3 finColor { 0.26f, 0.30f, 0.20f };
+
+    appendTerrainPropPrism(
+        model,
+        { 0.0f, 0.0f, -0.50f },
+        alongForward,
+        { 1.0f, 1.0f, 1.0f },
+        0.30f,
+        1.00f,
+        10,
+        bodyColor,
+        scaledColor(bodyColor, 1.05f));
+    appendTerrainPropCone(
+        model,
+        { 0.0f, 0.0f, 0.50f },
+        alongForward,
+        { 1.0f, 1.0f, 1.0f },
+        0.30f,
+        0.34f,
+        10,
+        noseColor);
+    appendTerrainPropPrism(
+        model,
+        { 0.0f, 0.0f, -0.72f },
+        alongForward,
+        { 1.0f, 1.0f, 1.0f },
+        0.12f,
+        0.18f,
+        8,
+        scaledColor(bodyColor, 0.92f),
+        scaledColor(bodyColor, 1.04f));
+
+    for (int finIndex = 0; finIndex < 4; ++finIndex) {
+        const float yaw = static_cast<float>(finIndex) * (0.5f * kPi);
+        const Quat finRotation = quatNormalize(quatMultiply(
+            quatFromAxisAngle({ 0.0f, 0.0f, 1.0f }, yaw),
+            alongForward));
+        appendTerrainPropBox(
+            model,
+            { 0.0f, 0.0f, -0.76f },
+            finRotation,
+            { 1.0f, 1.0f, 1.0f },
+            { 0.028f, 0.34f, 0.18f },
+            finColor);
+    }
+
+    touchModelCacheRevision(model);
+    return model;
+}
+
+struct WalkingRigPoseSample {
+    float yawRadians = 0.0f;
+    float lookPitchRadians = 0.0f;
+    float gaitPhaseRadians = 0.0f;
+    float moveAmount = 0.0f;
+    float bob = 0.0f;
+    float strideAngle = 0.0f;
+    float armSwingAngle = 0.0f;
+    float forwardLean = 0.0f;
+    float bankLean = 0.0f;
+    bool airborne = false;
+};
+
+WalkingRigPoseSample sampleWalkingRigPose(const FlightState& actor, float worldTimeSeconds)
+{
+    WalkingRigPoseSample pose;
+    const Vec3 lookForward = forwardFromRotation(actor.rot);
+    const float flatMagnitude = std::sqrt((lookForward.x * lookForward.x) + (lookForward.z * lookForward.z));
+    pose.lookPitchRadians = clamp(
+        std::atan2(lookForward.y, std::max(flatMagnitude, 1.0e-6f)),
+        -kWalkingPitchLimitRadians,
+        kWalkingPitchLimitRadians);
+    pose.yawRadians = wrapAngle(std::atan2(lookForward.x, lookForward.z));
+    pose.airborne = !actor.onGround;
+
+    const Quat yawRotation = quatFromAxisAngle({ 0.0f, 1.0f, 0.0f }, pose.yawRadians);
+    const Vec3 localVelocity = worldToBody(yawRotation, actor.vel);
+    const float horizontalSpeed = std::sqrt((actor.vel.x * actor.vel.x) + (actor.vel.z * actor.vel.z));
+    pose.moveAmount =
+        pose.airborne
+            ? clamp(horizontalSpeed / 14.0f, 0.0f, 1.0f)
+            : clamp(horizontalSpeed / 8.5f, 0.0f, 1.15f);
+
+    const float gaitFrequency =
+        pose.airborne
+            ? 0.6f
+            : mix(1.2f, 7.4f, clamp(horizontalSpeed / 12.0f, 0.0f, 1.0f));
+    pose.gaitPhaseRadians = worldTimeSeconds * gaitFrequency * (2.0f * kPi);
+    const float strideWave = std::sin(pose.gaitPhaseRadians);
+    const float bobWave = std::cos(pose.gaitPhaseRadians * 2.0f);
+    pose.bob =
+        (pose.airborne
+            ? clamp(-actor.vel.y / 24.0f, -0.02f, 0.08f)
+            : bobWave * 0.055f * pose.moveAmount);
+    pose.strideAngle =
+        pose.airborne
+            ? radians(10.0f)
+            : strideWave * radians(34.0f) * pose.moveAmount;
+    pose.armSwingAngle =
+        pose.airborne
+            ? radians(16.0f)
+            : -strideWave * radians(28.0f) * pose.moveAmount;
+    pose.forwardLean =
+        clamp((localVelocity.z / 18.0f) * 0.22f, -0.14f, 0.24f) +
+        clamp(-actor.vel.y / 26.0f, -0.08f, 0.10f);
+    pose.bankLean = clamp((-localVelocity.x / 16.0f) * 0.18f, -0.16f, 0.16f);
+    return pose;
+}
+
+Model buildProceduralWalkingRigModel(const WalkingRigPoseSample& pose)
+{
+    Model model;
+    model.assetKey = "builtin:walking_biped_dynamic";
+
+    const Vec3 skinTone { 0.92f, 0.78f, 0.66f };
+    const Vec3 jacketColor { 0.22f, 0.32f, 0.42f };
+    const Vec3 shirtColor { 0.28f, 0.40f, 0.56f };
+    const Vec3 harnessColor { 0.78f, 0.62f, 0.24f };
+    const Vec3 trouserColor { 0.20f, 0.22f, 0.28f };
+    const Vec3 bootColor { 0.12f, 0.10f, 0.09f };
+
+    const float bob = pose.bob;
+    const Quat rootLean = quatNormalize(quatMultiply(
+        quatFromAxisAngle({ 0.0f, 0.0f, 1.0f }, pose.bankLean),
+        quatFromAxisAngle({ 1.0f, 0.0f, 0.0f }, pose.forwardLean)));
+    const Vec3 pelvisCenter { 0.0f, -0.95f + bob, 0.0f };
+
+    appendTerrainPropBox(model, pelvisCenter, rootLean, { 1.0f, 1.0f, 1.0f }, { 0.22f, 0.11f, 0.16f }, trouserColor);
+
+    const Quat torsoRotation = quatNormalize(quatMultiply(
+        rootLean,
+        quatFromAxisAngle({ 1.0f, 0.0f, 0.0f }, pose.lookPitchRadians * 0.18f)));
+    appendTerrainPropBox(
+        model,
+        { 0.0f, -0.48f + bob, 0.0f },
+        torsoRotation,
+        { 1.0f, 1.0f, 1.0f },
+        { 0.30f, 0.34f, 0.18f },
+        jacketColor);
+    appendTerrainPropBox(
+        model,
+        { 0.0f, -0.06f + bob, 0.02f },
+        torsoRotation,
+        { 1.0f, 1.0f, 1.0f },
+        { 0.36f, 0.16f, 0.20f },
+        shirtColor);
+    appendTerrainPropBox(
+        model,
+        { 0.0f, -0.22f + bob, 0.18f },
+        torsoRotation,
+        { 1.0f, 1.0f, 1.0f },
+        { 0.06f, 0.30f, 0.05f },
+        harnessColor);
+
+    const Quat headRotation = quatNormalize(quatMultiply(
+        torsoRotation,
+        quatFromAxisAngle({ 1.0f, 0.0f, 0.0f }, pose.lookPitchRadians * 0.34f - (pose.forwardLean * 0.24f))));
+    appendTerrainPropBox(
+        model,
+        { 0.0f, 0.28f + bob, 0.02f },
+        headRotation,
+        { 1.0f, 1.0f, 1.0f },
+        { 0.08f, 0.10f, 0.08f },
+        scaledColor(jacketColor, 0.84f));
+    appendTerrainPropOctahedron(
+        model,
+        { 0.0f, 0.48f + bob, 0.04f },
+        headRotation,
+        { 0.18f, 0.24f, 0.18f },
+        skinTone);
+
+    const auto appendLeg = [&](float sideSign, float phaseOffset) {
+        const float swingWave = std::sin(pose.gaitPhaseRadians + phaseOffset);
+        const float kneeWave = std::max(0.0f, -swingWave);
+        const float hipYaw = radians(4.0f) * sideSign * pose.moveAmount;
+        const float upperPitch =
+            pose.airborne
+                ? radians(18.0f) - (sideSign * radians(6.0f))
+                : (swingWave * radians(34.0f) * pose.moveAmount);
+        const float lowerPitch =
+            pose.airborne
+                ? radians(24.0f)
+                : (kneeWave * radians(30.0f) * pose.moveAmount);
+        const Vec3 hipJoint = pelvisCenter + rotateVector(rootLean, { 0.17f * sideSign, 0.02f, 0.0f });
+        const Quat hipRotation = quatNormalize(quatMultiply(
+            quatMultiply(rootLean, quatFromAxisAngle({ 0.0f, 1.0f, 0.0f }, hipYaw)),
+            quatFromAxisAngle({ 1.0f, 0.0f, 0.0f }, upperPitch)));
+        const float upperLength = 0.50f;
+        appendTerrainPropBox(
+            model,
+            hipJoint + rotateVector(hipRotation, { 0.0f, -upperLength * 0.5f, 0.0f }),
+            hipRotation,
+            { 1.0f, 1.0f, 1.0f },
+            { 0.10f, upperLength * 0.5f, 0.10f },
+            trouserColor);
+
+        const Vec3 kneeJoint = hipJoint + rotateVector(hipRotation, { 0.0f, -upperLength, 0.0f });
+        const Quat kneeRotation = quatNormalize(quatMultiply(
+            hipRotation,
+            quatFromAxisAngle({ 1.0f, 0.0f, 0.0f }, -lowerPitch)));
+        const float lowerLength = 0.50f;
+        appendTerrainPropBox(
+            model,
+            kneeJoint + rotateVector(kneeRotation, { 0.0f, -lowerLength * 0.5f, 0.0f }),
+            kneeRotation,
+            { 1.0f, 1.0f, 1.0f },
+            { 0.08f, lowerLength * 0.5f, 0.08f },
+            scaledColor(trouserColor, 0.92f));
+
+        const Vec3 ankleJoint = kneeJoint + rotateVector(kneeRotation, { 0.0f, -lowerLength, 0.0f });
+        const Quat footRotation = quatNormalize(quatMultiply(
+            rootLean,
+            quatFromAxisAngle({ 1.0f, 0.0f, 0.0f }, clamp(-upperPitch * 0.34f + (pose.moveAmount * 0.08f), -0.32f, 0.24f))));
+        appendTerrainPropBox(
+            model,
+            ankleJoint + rotateVector(footRotation, { 0.0f, -0.04f, 0.12f }),
+            footRotation,
+            { 1.0f, 1.0f, 1.0f },
+            { 0.11f, 0.05f, 0.20f },
+            bootColor);
+    };
+
+    const auto appendArm = [&](float sideSign, float phaseOffset) {
+        const float armWave = std::sin(pose.gaitPhaseRadians + phaseOffset);
+        const float elbowWave = std::max(0.0f, armWave);
+        const float shoulderYaw = radians(8.0f) * sideSign * pose.moveAmount;
+        const float upperPitch =
+            pose.airborne
+                ? radians(-28.0f)
+                : (armWave * radians(28.0f) * pose.moveAmount);
+        const float lowerPitch =
+            pose.airborne
+                ? radians(18.0f)
+                : (elbowWave * radians(18.0f) * pose.moveAmount);
+        const Vec3 shoulderJoint = Vec3 { 0.36f * sideSign, -0.02f + bob, 0.0f };
+        const Quat shoulderRotation = quatNormalize(quatMultiply(
+            quatMultiply(torsoRotation, quatFromAxisAngle({ 0.0f, 1.0f, 0.0f }, shoulderYaw)),
+            quatFromAxisAngle({ 1.0f, 0.0f, 0.0f }, upperPitch)));
+        const float upperLength = 0.38f;
+        appendTerrainPropBox(
+            model,
+            shoulderJoint + rotateVector(shoulderRotation, { 0.0f, -upperLength * 0.5f, 0.0f }),
+            shoulderRotation,
+            { 1.0f, 1.0f, 1.0f },
+            { 0.08f, upperLength * 0.5f, 0.08f },
+            jacketColor);
+
+        const Vec3 elbowJoint = shoulderJoint + rotateVector(shoulderRotation, { 0.0f, -upperLength, 0.0f });
+        const Quat elbowRotation = quatNormalize(quatMultiply(
+            shoulderRotation,
+            quatFromAxisAngle({ 1.0f, 0.0f, 0.0f }, -lowerPitch)));
+        const float lowerLength = 0.34f;
+        appendTerrainPropBox(
+            model,
+            elbowJoint + rotateVector(elbowRotation, { 0.0f, -lowerLength * 0.5f, 0.0f }),
+            elbowRotation,
+            { 1.0f, 1.0f, 1.0f },
+            { 0.07f, lowerLength * 0.5f, 0.07f },
+            scaledColor(jacketColor, 0.95f));
+        appendTerrainPropOctahedron(
+            model,
+            elbowJoint + rotateVector(elbowRotation, { 0.0f, -lowerLength, 0.02f }),
+            elbowRotation,
+            { 0.08f, 0.11f, 0.08f },
+            skinTone);
+    };
+
+    appendLeg(-1.0f, 0.0f);
+    appendLeg(1.0f, kPi);
+    appendArm(-1.0f, kPi);
+    appendArm(1.0f, 0.0f);
+    return model;
+}
+
+bool visualUsesBuiltinWalkingRig(const PlaneVisualState& visual)
+{
+    return visual.sourcePath.empty() &&
+        (visual.sourceModel.assetKey == "builtin:walking_biped" || visual.label == "builtin player biped");
+}
+
 TerrainPropPlacement buildTerrainPropPlacement(
     TerrainPropVariant variant,
     TerrainPropClass propClass,
@@ -3009,7 +3612,11 @@ bool terrainPatchNeedsWorldVolumetrics(const TerrainPatchBounds& bounds, const T
         return false;
     }
 
-    const float padding = std::max(terrainContext.params.lod0CellSize * 1.5f, terrainContext.params.lod1CellSize);
+    const float padding = std::max({
+        terrainContext.params.lod0CellSize * 3.0f,
+        terrainContext.params.lod1CellSize * 2.0f,
+        terrainContext.params.chunkSize * 0.5f
+    });
     return terrainContext.hasVolumetricOverridesInBounds(
         bounds.x0 - padding,
         bounds.z0 - padding,
@@ -3101,14 +3708,7 @@ CompiledTerrainChunk loadOrBuildTerrainChunk(
 
     if (buildPlan.buildVolumetricGround) {
         const float overlap = cellSize;
-        const TerrainVolumeBounds tileVolume {
-            bounds.x0 - overlap,
-            bounds.x1 + overlap,
-            terrainContext.params.minY,
-            terrainContext.params.maxY,
-            bounds.z0 - overlap,
-            bounds.z1 + overlap
-        };
+        const TerrainVolumeBounds tileVolume = buildAdaptiveTerrainVolumeBounds(bounds, terrainContext, cellSize, overlap);
         chunk.terrainModel = buildVolumetricTerrainPatch(terrainContext, tileVolume, cellSize);
     } else {
         TerrainFieldContext tileContext = terrainContext;
@@ -3946,6 +4546,88 @@ bool shouldApplyTerrainChunkResult(
     return terrainTileDetailRank(request.detail) <= terrainTileDetailRank(existingTile->detail);
 }
 
+void expandTerrainCullBounds(Vec3& minBounds, Vec3& maxBounds, bool& hasBounds, const Vec3& point)
+{
+    if (!hasBounds) {
+        minBounds = point;
+        maxBounds = point;
+        hasBounds = true;
+        return;
+    }
+
+    minBounds.x = std::min(minBounds.x, point.x);
+    minBounds.y = std::min(minBounds.y, point.y);
+    minBounds.z = std::min(minBounds.z, point.z);
+    maxBounds.x = std::max(maxBounds.x, point.x);
+    maxBounds.y = std::max(maxBounds.y, point.y);
+    maxBounds.z = std::max(maxBounds.z, point.z);
+}
+
+void expandTerrainCullBoundsFromModel(Vec3& minBounds, Vec3& maxBounds, bool& hasBounds, const Model& model)
+{
+    for (const Vec3& vertex : model.vertices) {
+        expandTerrainCullBounds(minBounds, maxBounds, hasBounds, vertex);
+    }
+}
+
+void expandTerrainCullBoundsFromScalarField(
+    Vec3& minBounds,
+    Vec3& maxBounds,
+    bool& hasBounds,
+    const TerrainChunkData& data,
+    const std::vector<float>& values)
+{
+    if (values.empty() || data.gridWidth <= 0 || data.gridHeight <= 0) {
+        return;
+    }
+
+    const float spanX = std::max(1.0f, data.bounds.x1 - data.bounds.x0);
+    const float spanZ = std::max(1.0f, data.bounds.z1 - data.bounds.z0);
+    const float xStep = spanX / static_cast<float>(std::max(1, data.gridWidth - 1));
+    const float zStep = spanZ / static_cast<float>(std::max(1, data.gridHeight - 1));
+    for (int iz = 0; iz < data.gridHeight; ++iz) {
+        const float z = data.bounds.z0 + (static_cast<float>(iz) * zStep);
+        for (int ix = 0; ix < data.gridWidth; ++ix) {
+            const std::size_t index = static_cast<std::size_t>((iz * data.gridWidth) + ix);
+            if (index >= values.size()) {
+                break;
+            }
+            const float x = data.bounds.x0 + (static_cast<float>(ix) * xStep);
+            expandTerrainCullBounds(minBounds, maxBounds, hasBounds, { x, values[index], z });
+        }
+    }
+}
+
+void updateTerrainTileCullSphere(TerrainFarTile& tile, const TerrainChunkData& sourceData)
+{
+    Vec3 minBounds {};
+    Vec3 maxBounds {};
+    bool hasBounds = false;
+
+    expandTerrainCullBoundsFromModel(minBounds, maxBounds, hasBounds, tile.terrainModel);
+    expandTerrainCullBoundsFromModel(minBounds, maxBounds, hasBounds, tile.waterModel);
+    expandTerrainCullBoundsFromModel(minBounds, maxBounds, hasBounds, tile.propModel);
+
+    if (!hasBounds) {
+        expandTerrainCullBoundsFromScalarField(minBounds, maxBounds, hasBounds, sourceData, sourceData.surfaceHeights);
+        expandTerrainCullBoundsFromScalarField(minBounds, maxBounds, hasBounds, sourceData, sourceData.waterHeights);
+    }
+
+    if (!hasBounds) {
+        const float fallbackSize = std::max(1.0f, sourceData.bounds.x1 - sourceData.bounds.x0);
+        tile.cullCenter = {
+            (sourceData.bounds.x0 + sourceData.bounds.x1) * 0.5f,
+            0.0f,
+            (sourceData.bounds.z0 + sourceData.bounds.z1) * 0.5f
+        };
+        tile.cullRadius = fallbackSize * 0.82f;
+        return;
+    }
+
+    tile.cullCenter = (minBounds + maxBounds) * 0.5f;
+    tile.cullRadius = std::max(1.0f, length(maxBounds - tile.cullCenter));
+}
+
 void applyTerrainChunkResult(TerrainVisualCache& terrainCache, TerrainChunkBuildResult&& result)
 {
     std::vector<TerrainFarTile>& tileList =
@@ -3967,6 +4649,7 @@ void applyTerrainChunkResult(TerrainVisualCache& terrainCache, TerrainChunkBuild
         tile.waterModel = std::move(result.compiledChunk.waterModel);
         tile.propModel = std::move(result.compiledChunk.propModel);
         tile.propColliders = std::move(result.compiledChunk.propColliders);
+        updateTerrainTileCullSphere(tile, result.compiledChunk.sourceData);
         tileList.push_back(std::move(tile));
         return;
     }
@@ -3978,6 +4661,7 @@ void applyTerrainChunkResult(TerrainVisualCache& terrainCache, TerrainChunkBuild
     existingTile->waterModel = std::move(result.compiledChunk.waterModel);
     existingTile->propModel = std::move(result.compiledChunk.propModel);
     existingTile->propColliders = std::move(result.compiledChunk.propColliders);
+    updateTerrainTileCullSphere(*existingTile, result.compiledChunk.sourceData);
 }
 
 const TerrainVisualCache& ensureTerrainVisualCache(
@@ -4927,25 +5611,30 @@ std::vector<std::string> buildRuntimeDebugLines(
 
 bool sphereWithinView(const Camera& camera, const Vec3& center, float radius, float maxDistance)
 {
+    const float safeRadius = std::max(0.0f, radius);
     const Vec3 toCenter = center - camera.pos;
     const float distanceSquared = lengthSquared(toCenter);
     const float distance = std::sqrt(std::max(0.0f, distanceSquared));
-    if ((distance - radius) > std::min(camera.farClipMeters, maxDistance)) {
+    if ((distance - safeRadius) > std::min(camera.farClipMeters, maxDistance)) {
         return false;
     }
 
-    if (distance <= radius) {
+    if (distance <= safeRadius) {
         return true;
     }
 
     const Vec3 forward = forwardFromRotation(camera.rot);
     const float cosine = dot(toCenter / distance, forward);
-    const float expandedHalfFov = std::min(radians(89.0f), camera.fovRadians * 0.72f);
+    const float angularRadius = std::asin(clamp(safeRadius / distance, 0.0f, 0.999f));
+    const float expandedHalfFov = std::min(radians(89.0f), (camera.fovRadians * 0.72f) + angularRadius);
     return cosine >= std::cos(expandedHalfFov);
 }
 
 Vec3 terrainTileCenter(const TerrainVisualCache& terrainCache, const TerrainFarTile& tile)
 {
+    if (tile.cullRadius > 0.0f) {
+        return tile.cullCenter;
+    }
     const float tileSize = terrainTileSizeForBand(terrainCache, tile.band);
     return {
         (static_cast<float>(tile.tileX) + 0.5f) * tileSize,
@@ -4956,6 +5645,9 @@ Vec3 terrainTileCenter(const TerrainVisualCache& terrainCache, const TerrainFarT
 
 float terrainTileRadius(const TerrainVisualCache& terrainCache, const TerrainFarTile& tile)
 {
+    if (tile.cullRadius > 0.0f) {
+        return tile.cullRadius;
+    }
     return terrainTileSizeForBand(terrainCache, tile.band) * 0.82f;
 }
 
@@ -5118,9 +5810,38 @@ int hudSubTabItemCount(HudSubTab subTab)
     }
 }
 
-int characterItemCount(std::size_t assetCount)
+int characterItemCount(const PauseState& pauseState, std::size_t assetCount)
 {
+    if (pauseState.characterEditorMode == CharacterEditorMode::Rig) {
+        return kCharacterSettingCount;
+    }
     return kCharacterAssetListStart + static_cast<int>(assetCount);
+}
+
+bool characterRowCanAdjust(const PauseState& pauseState, int rowIndex)
+{
+    if (pauseState.characterEditorMode == CharacterEditorMode::Rig) {
+        return rowIndex >= 0 && rowIndex < kCharacterSettingCount;
+    }
+    return rowIndex == 0 || (rowIndex >= 2 && rowIndex <= 11);
+}
+
+bool characterRowCanReset(const PauseState& pauseState, int rowIndex)
+{
+    if (pauseState.characterEditorMode == CharacterEditorMode::Rig) {
+        return rowIndex >= 2 && rowIndex < kCharacterSettingCount;
+    }
+    return rowIndex >= 2 && rowIndex <= 11;
+}
+
+bool characterRowOpensModelPrompt(const PauseState& pauseState, int rowIndex)
+{
+    return pauseState.characterEditorMode == CharacterEditorMode::Model && rowIndex == 12;
+}
+
+bool characterRowLoadsBuiltinModel(const PauseState& pauseState, int rowIndex)
+{
+    return pauseState.characterEditorMode == CharacterEditorMode::Model && rowIndex == 13;
 }
 
 float pauseContentWidth(const PauseLayout& layout, PauseTab tab)
@@ -5254,7 +5975,7 @@ RectF pauseRowRect(const PauseLayout& layout, const PauseState& pauseState, std:
         return {};
     }
 
-    if (pauseState.tab == PauseTab::Characters && rowIndex >= characterItemCount(assetCount)) {
+    if (pauseState.tab == PauseTab::Characters && rowIndex >= characterItemCount(pauseState, assetCount)) {
         return {};
     }
     if (pauseState.tab == PauseTab::Paint && rowIndex >= kPaintSettingCount) {
@@ -5767,6 +6488,79 @@ PlaneDurabilityState sanitizePlaneDurabilityState(const PlaneDurabilityState& st
     return out;
 }
 
+void applyGameplayObjectBallistics(GameplayObjectState& object)
+{
+    switch (object.kind) {
+    case GameplayObjectKind::Bomb:
+        object.massKg = 118.0f;
+        object.dragCoefficient = 0.22f;
+        object.referenceAreaM2 = 0.18f;
+        object.spinRateRadPerSec = 18.0f;
+        break;
+    case GameplayObjectKind::TerrainAdd:
+    case GameplayObjectKind::TerrainRemove:
+        object.massKg = 0.65f;
+        object.dragCoefficient = 0.84f;
+        object.referenceAreaM2 = 0.018f;
+        object.spinRateRadPerSec = 10.0f;
+        break;
+    case GameplayObjectKind::Projectile:
+    default:
+        if (object.damage >= 15.0f || object.radius >= 0.075f || length(object.vel) >= 260.0f) {
+            object.massKg = 0.10f;
+            object.dragCoefficient = 0.24f;
+            object.referenceAreaM2 = 0.00032f;
+            object.spinRateRadPerSec = 1650.0f;
+        } else {
+            object.massKg = 0.014f;
+            object.dragCoefficient = 0.29f;
+            object.referenceAreaM2 = 0.00008f;
+            object.spinRateRadPerSec = 980.0f;
+        }
+        break;
+    }
+}
+
+GameplayObjectState makeGameplayObjectState(
+    GameplayObjectKind kind,
+    int id,
+    int ownerId,
+    const Vec3& pos,
+    const Vec3& vel,
+    float radius,
+    float ttl,
+    float damage,
+    float gravityScale,
+    float blastRadius,
+    float craterRadius,
+    float craterDepth)
+{
+    GameplayObjectState object;
+    object.kind = kind;
+    object.id = id;
+    object.ownerId = ownerId;
+    object.pos = pos;
+    object.vel = vel;
+    object.radius = radius;
+    object.ttl = ttl;
+    object.damage = damage;
+    object.gravityScale = gravityScale;
+    object.blastRadius = blastRadius;
+    object.craterRadius = craterRadius;
+    object.craterDepth = craterDepth;
+    applyGameplayObjectBallistics(object);
+    return object;
+}
+
+Quat alignForwardToDirection(const Vec3& direction)
+{
+    const Vec3 forward = normalize(direction, { 0.0f, 0.0f, 1.0f });
+    const float flatMagnitude = std::sqrt((forward.x * forward.x) + (forward.z * forward.z));
+    return composeWalkingRotation(
+        std::atan2(forward.x, forward.z),
+        std::atan2(forward.y, std::max(flatMagnitude, 1.0e-6f)));
+}
+
 PlaneDurabilityState& ensurePlaneDurabilityState(std::unordered_map<int, PlaneDurabilityState>& states, int playerId)
 {
     return states[playerId] = sanitizePlaneDurabilityState(states[playerId]);
@@ -6000,6 +6794,7 @@ void applyReplicatedGameplayState(GameSession& session)
     }
 
     session.clientReplication.gameplayStateDirty = false;
+    const std::vector<GameplayObjectState> previousObjects = session.gameplayObjects;
     session.replicatedDurabilityByPlayerId.clear();
     session.gameplayObjects.clear();
     session.enemyTargets.clear();
@@ -6035,22 +6830,53 @@ void applyReplicatedGameplayState(GameSession& session)
             continue;
         }
 
-        session.gameplayObjects.push_back({
+        const auto previousIt = std::find_if(
+            previousObjects.begin(),
+            previousObjects.end(),
+            [&](const GameplayObjectState& previous) {
+                return previous.id == object.id;
+            });
+        GameplayObjectState replicatedObject = makeGameplayObjectState(
             gameplayObjectKindFromToken(object.kind),
             object.id,
             object.ownerId,
             object.pos,
             object.vel,
-            std::max(0.1f, object.radius),
+            std::max(0.025f, object.radius),
             std::max(0.0f, object.ttl),
             std::max(0.0f, object.health),
-            object.kind == "bomb" ? 0.05f : 0.02f,
-            object.kind == "bomb" ? 1.0f : 0.2f,
+            object.kind == "bomb" ? 1.0f : (object.kind == "projectile" ? 0.92f : 0.16f),
             object.kind == "bomb" ? 16.0f : 0.0f,
             object.kind == "bomb" ? 10.0f : 0.0f,
-            object.kind == "bomb" ? 4.2f : 0.0f,
-            object.active
-        });
+            object.kind == "bomb" ? 4.2f : 0.0f);
+        replicatedObject.active = object.active;
+        session.gameplayObjects.push_back(replicatedObject);
+        if (previousIt == previousObjects.end() && object.active) {
+            const GameplayObjectKind kind = gameplayObjectKindFromToken(object.kind);
+            const bool terrainShot = kind == GameplayObjectKind::TerrainAdd || kind == GameplayObjectKind::TerrainRemove;
+            accumulateCombatAudioEvent(
+                session,
+                object.pos,
+                kind == GameplayObjectKind::Projectile ? 0.55f : 0.0f,
+                terrainShot ? 0.55f : 0.0f,
+                kind == GameplayObjectKind::Bomb ? 0.72f : 0.0f,
+                0.0f);
+        }
+    }
+
+    for (const GameplayObjectState& previous : previousObjects) {
+        if (!previous.active || previous.kind != GameplayObjectKind::Bomb) {
+            continue;
+        }
+        const bool stillExists = std::any_of(
+            session.gameplayObjects.begin(),
+            session.gameplayObjects.end(),
+            [&](const GameplayObjectState& current) {
+                return current.id == previous.id;
+            });
+        if (!stillExists) {
+            accumulateCombatAudioEvent(session, previous.pos, 0.0f, 0.0f, 0.0f, 0.9f);
+        }
     }
 }
 
@@ -6879,6 +7705,8 @@ void clampPropAudioConfigValues(PropAudioConfig& config)
 {
     config.baseRpm = clamp(config.baseRpm, 6.0f, 220.0f);
     config.loadRpmContribution = clamp(config.loadRpmContribution, 20.0f, 420.0f);
+    config.propellerBladeCount = clamp(config.propellerBladeCount, 2.0f, 6.0f);
+    config.propellerDiameterMeters = clamp(config.propellerDiameterMeters, 0.5f, 5.0f);
     config.engineFrequencyScale = clamp(config.engineFrequencyScale, 0.35f, 2.5f);
     config.engineTonalMix = clamp(config.engineTonalMix, 0.0f, 2.0f);
     config.propHarmonicMix = clamp(config.propHarmonicMix, 0.0f, 2.0f);
@@ -6892,6 +7720,14 @@ void clampTuningConfig(FlightConfig& config)
 {
     config.massKg = clamp(config.massKg, 450.0f, 4000.0f);
     config.maxThrustSeaLevel = clamp(config.maxThrustSeaLevel, 800.0f, 12000.0f);
+    config.idleCrankRpm = clamp(config.idleCrankRpm, 450.0f, 1400.0f);
+    config.maxCrankRpm = clamp(config.maxCrankRpm, config.idleCrankRpm + 400.0f, 4200.0f);
+    config.propellerGearRatio = clamp(config.propellerGearRatio, 0.25f, 4.0f);
+    config.propellerDiameterMeters = clamp(config.propellerDiameterMeters, 0.5f, 5.0f);
+    config.engineDisplacementLiters = clamp(config.engineDisplacementLiters, 0.8f, 60.0f);
+    config.engineCylinderCount = std::clamp(config.engineCylinderCount, 1, 18);
+    config.maxBrakePowerKw = clamp(config.maxBrakePowerKw, 20.0f, 2500.0f);
+    config.fuelMassKg = clamp(config.fuelMassKg, 0.0f, 4000.0f);
     config.CLalpha = clamp(config.CLalpha, 2.0f, 8.5f);
     config.CD0 = clamp(config.CD0, 0.01f, 0.12f);
     config.inducedDragK = clamp(config.inducedDragK, 0.01f, 0.18f);
@@ -7080,6 +7916,330 @@ void compositeOverlayIntoImage(RgbaImage& baseImage, const RgbaImage& overlay)
     baseImage.version += 1;
 }
 
+bool visualRigSlotIsPropeller(int slotIndex)
+{
+    return slotIndex >= 0 && slotIndex < 2;
+}
+
+const char* visualRigSlotLabel(int slotIndex)
+{
+    switch (slotIndex) {
+    case 0:
+        return "Prop A";
+    case 1:
+        return "Prop B";
+    case 2:
+        return "Flap L";
+    case 3:
+        return "Flap R";
+    default:
+        return "Prop A";
+    }
+}
+
+const char* visualRigAxisLabel(VisualRigAxis axis)
+{
+    switch (axis) {
+    case VisualRigAxis::PosX:
+        return "+X";
+    case VisualRigAxis::NegX:
+        return "-X";
+    case VisualRigAxis::PosY:
+        return "+Y";
+    case VisualRigAxis::NegY:
+        return "-Y";
+    case VisualRigAxis::PosZ:
+        return "+Z";
+    case VisualRigAxis::NegZ:
+        return "-Z";
+    default:
+        return "+Z";
+    }
+}
+
+Vec3 visualRigAxisVector(VisualRigAxis axis)
+{
+    switch (axis) {
+    case VisualRigAxis::PosX:
+        return { 1.0f, 0.0f, 0.0f };
+    case VisualRigAxis::NegX:
+        return { -1.0f, 0.0f, 0.0f };
+    case VisualRigAxis::PosY:
+        return { 0.0f, 1.0f, 0.0f };
+    case VisualRigAxis::NegY:
+        return { 0.0f, -1.0f, 0.0f };
+    case VisualRigAxis::PosZ:
+        return { 0.0f, 0.0f, 1.0f };
+    case VisualRigAxis::NegZ:
+        return { 0.0f, 0.0f, -1.0f };
+    default:
+        return { 0.0f, 0.0f, 1.0f };
+    }
+}
+
+VisualRigCutout defaultVisualRigCutout(int slotIndex)
+{
+    VisualRigCutout cutout;
+    cutout.axis = visualRigSlotIsPropeller(slotIndex) ? VisualRigAxis::PosZ : VisualRigAxis::PosX;
+    cutout.halfExtents =
+        visualRigSlotIsPropeller(slotIndex)
+            ? Vec3 { 0.28f, 0.28f, 0.34f }
+            : Vec3 { 0.45f, 0.12f, 0.30f };
+    cutout.motionScale = visualRigSlotIsPropeller(slotIndex) ? 1.0f : (slotIndex == 2 ? -24.0f : 24.0f);
+    return cutout;
+}
+
+void clampVisualRigCutout(VisualRigCutout& cutout, int slotIndex)
+{
+    cutout.axis = static_cast<VisualRigAxis>(std::clamp(static_cast<int>(cutout.axis), 0, 5));
+    cutout.center.x = clamp(cutout.center.x, -6.0f, 6.0f);
+    cutout.center.y = clamp(cutout.center.y, -6.0f, 6.0f);
+    cutout.center.z = clamp(cutout.center.z, -6.0f, 6.0f);
+    cutout.halfExtents.x = clamp(cutout.halfExtents.x, 0.02f, 4.0f);
+    cutout.halfExtents.y = clamp(cutout.halfExtents.y, 0.02f, 4.0f);
+    cutout.halfExtents.z = clamp(cutout.halfExtents.z, 0.02f, 4.0f);
+    cutout.pivot.x = clamp(cutout.pivot.x, -6.0f, 6.0f);
+    cutout.pivot.y = clamp(cutout.pivot.y, -6.0f, 6.0f);
+    cutout.pivot.z = clamp(cutout.pivot.z, -6.0f, 6.0f);
+    cutout.motionScale = visualRigSlotIsPropeller(slotIndex)
+        ? clamp(cutout.motionScale, -4.0f, 4.0f)
+        : clamp(cutout.motionScale, -60.0f, 60.0f);
+}
+
+bool pointWithinVisualRigCutout(const Vec3& point, const VisualRigCutout& cutout)
+{
+    return std::fabs(point.x - cutout.center.x) <= cutout.halfExtents.x &&
+        std::fabs(point.y - cutout.center.y) <= cutout.halfExtents.y &&
+        std::fabs(point.z - cutout.center.z) <= cutout.halfExtents.z;
+}
+
+Model makeRigPartitionModelLike(const Model& source, std::string assetKey)
+{
+    Model model;
+    model.materials = source.materials;
+    model.images = source.images;
+    model.hasTexCoords = source.hasTexCoords;
+    model.hasTextureImages = source.hasTextureImages;
+    model.hasPaintableMaterial = source.hasPaintableMaterial;
+    model.assetKey = std::move(assetKey);
+    return model;
+}
+
+void appendRigPartitionFace(Model& destination, const Model& source, const Face& face, std::size_t faceIndex, const Vec3& pivotOffset)
+{
+    if (face.indices.size() < 3u) {
+        return;
+    }
+
+    Face copiedFace;
+    copiedFace.materialIndex = face.materialIndex;
+    for (int sourceIndex : face.indices) {
+        if (sourceIndex < 0 || static_cast<std::size_t>(sourceIndex) >= source.vertices.size()) {
+            return;
+        }
+
+        const std::size_t index = static_cast<std::size_t>(sourceIndex);
+        copiedFace.indices.push_back(static_cast<int>(destination.vertices.size()));
+        destination.vertices.push_back(source.vertices[index] - pivotOffset);
+        destination.vertexNormals.push_back(
+            index < source.vertexNormals.size()
+                ? source.vertexNormals[index]
+                : Vec3 { 0.0f, 1.0f, 0.0f });
+        if (source.hasTexCoords || !source.texCoords.empty()) {
+            destination.texCoords.push_back(index < source.texCoords.size() ? source.texCoords[index] : Vec2 {});
+        }
+        if (!source.texCoords1.empty()) {
+            destination.texCoords1.push_back(index < source.texCoords1.size() ? source.texCoords1[index] : Vec2 {});
+        }
+    }
+
+    destination.faces.push_back(std::move(copiedFace));
+    if (faceIndex < source.faceColors.size()) {
+        destination.faceColors.push_back(source.faceColors[faceIndex]);
+    } else if (face.materialIndex >= 0 && static_cast<std::size_t>(face.materialIndex) < source.materials.size()) {
+        const Vec4 factor = source.materials[static_cast<std::size_t>(face.materialIndex)].baseColorFactor;
+        destination.faceColors.push_back({ factor.x, factor.y, factor.z });
+    } else {
+        destination.faceColors.push_back({ 1.0f, 1.0f, 1.0f });
+    }
+}
+
+void rebuildVisualRigModels(PlaneVisualState& visual)
+{
+    visual.rigPartitionValid = false;
+    visual.rigSlotActive.fill(false);
+    for (int slotIndex = 0; slotIndex < static_cast<int>(visual.rigCutouts.size()); ++slotIndex) {
+        clampVisualRigCutout(visual.rigCutouts[static_cast<std::size_t>(slotIndex)], slotIndex);
+    }
+
+    bool anyEnabled = false;
+    for (const VisualRigCutout& cutout : visual.rigCutouts) {
+        anyEnabled |= cutout.enabled;
+    }
+    if (!anyEnabled || visual.model.vertices.empty() || visual.model.faces.empty()) {
+        return;
+    }
+
+    const std::string baseKey = visual.model.assetKey.empty() ? std::string("builtin:rig") : visual.model.assetKey;
+    visual.rigBaseModel = makeRigPartitionModelLike(visual.model, baseKey + ":rig_base");
+    for (int slotIndex = 0; slotIndex < static_cast<int>(visual.rigSlotModels.size()); ++slotIndex) {
+        visual.rigSlotModels[static_cast<std::size_t>(slotIndex)] =
+            makeRigPartitionModelLike(visual.model, baseKey + ":rig_slot_" + std::to_string(slotIndex));
+    }
+
+    bool anyCapturedFaces = false;
+    for (std::size_t faceIndex = 0; faceIndex < visual.model.faces.size(); ++faceIndex) {
+        const Face& face = visual.model.faces[faceIndex];
+        if (face.indices.empty()) {
+            continue;
+        }
+
+        Vec3 centroid {};
+        int validIndexCount = 0;
+        for (int vertexIndex : face.indices) {
+            if (vertexIndex < 0 || static_cast<std::size_t>(vertexIndex) >= visual.model.vertices.size()) {
+                continue;
+            }
+            centroid += visual.model.vertices[static_cast<std::size_t>(vertexIndex)];
+            validIndexCount += 1;
+        }
+        if (validIndexCount <= 0) {
+            continue;
+        }
+        centroid *= 1.0f / static_cast<float>(validIndexCount);
+
+        int selectedSlot = -1;
+        for (int slotIndex = 0; slotIndex < static_cast<int>(visual.rigCutouts.size()); ++slotIndex) {
+            const VisualRigCutout& cutout = visual.rigCutouts[static_cast<std::size_t>(slotIndex)];
+            if (!cutout.enabled || !pointWithinVisualRigCutout(centroid, cutout)) {
+                continue;
+            }
+            selectedSlot = slotIndex;
+            break;
+        }
+
+        if (selectedSlot >= 0) {
+            const VisualRigCutout& cutout = visual.rigCutouts[static_cast<std::size_t>(selectedSlot)];
+            appendRigPartitionFace(
+                visual.rigSlotModels[static_cast<std::size_t>(selectedSlot)],
+                visual.model,
+                face,
+                faceIndex,
+                cutout.pivot);
+            visual.rigSlotActive[static_cast<std::size_t>(selectedSlot)] = true;
+            anyCapturedFaces = true;
+        } else {
+            appendRigPartitionFace(visual.rigBaseModel, visual.model, face, faceIndex, {});
+        }
+    }
+
+    if (!anyCapturedFaces) {
+        visual.rigBaseModel = {};
+        for (Model& slotModel : visual.rigSlotModels) {
+            slotModel = {};
+        }
+        visual.rigSlotActive.fill(false);
+        return;
+    }
+
+    touchModelCacheRevision(visual.rigBaseModel);
+    for (std::size_t slotIndex = 0; slotIndex < visual.rigSlotModels.size(); ++slotIndex) {
+        if (!visual.rigSlotActive[slotIndex]) {
+            visual.rigSlotModels[slotIndex] = {};
+            continue;
+        }
+        touchModelCacheRevision(visual.rigSlotModels[slotIndex]);
+    }
+    visual.rigPartitionValid = true;
+}
+
+bool visualUsesRigCutouts(const PlaneVisualState& visual)
+{
+    if (!visual.rigPartitionValid) {
+        return false;
+    }
+    for (bool slotActive : visual.rigSlotActive) {
+        if (slotActive) {
+            return true;
+        }
+    }
+    return false;
+}
+
+float visualRigSlotAngleRadians(const PlaneVisualState& visual, int slotIndex, float worldTimeSeconds, float propRpm, float aileronNorm)
+{
+    if (slotIndex < 0 || slotIndex >= static_cast<int>(visual.rigCutouts.size())) {
+        return 0.0f;
+    }
+
+    const VisualRigCutout& cutout = visual.rigCutouts[static_cast<std::size_t>(slotIndex)];
+    if (!cutout.enabled || !visual.rigSlotActive[static_cast<std::size_t>(slotIndex)]) {
+        return 0.0f;
+    }
+    if (visualRigSlotIsPropeller(slotIndex)) {
+        return worldTimeSeconds * ((std::max(0.0f, propRpm) / 60.0f) * (2.0f * kPi)) * cutout.motionScale;
+    }
+    return radians(cutout.motionScale) * aileronNorm;
+}
+
+void appendVisualRenderObjects(
+    std::vector<RenderObject>& opaqueObjects,
+    const PlaneVisualState& visual,
+    const Vec3& basePosition,
+    const Quat& baseRotation,
+    float uniformScale,
+    const Vec3& color,
+    float alpha,
+    float fogNear,
+    float fogFar,
+    bool gpuResident,
+    float worldTimeSeconds,
+    float propRpm,
+    float aileronNorm)
+{
+    const bool rigged = visualUsesRigCutouts(visual);
+    const Model* baseModel = rigged ? &visual.rigBaseModel : &visual.model;
+    opaqueObjects.push_back({
+        baseModel,
+        basePosition,
+        baseRotation,
+        { uniformScale, uniformScale, uniformScale },
+        color,
+        alpha,
+        fogNear,
+        fogFar,
+        gpuResident
+    });
+
+    if (!rigged) {
+        return;
+    }
+
+    for (int slotIndex = 0; slotIndex < static_cast<int>(visual.rigCutouts.size()); ++slotIndex) {
+        if (!visual.rigSlotActive[static_cast<std::size_t>(slotIndex)] ||
+            !visual.rigCutouts[static_cast<std::size_t>(slotIndex)].enabled) {
+            continue;
+        }
+
+        const VisualRigCutout& cutout = visual.rigCutouts[static_cast<std::size_t>(slotIndex)];
+        const Quat slotRotation = quatFromAxisAngle(
+            visualRigAxisVector(cutout.axis),
+            visualRigSlotAngleRadians(visual, slotIndex, worldTimeSeconds, propRpm, aileronNorm));
+        const Vec3 pivotOffset = rotateVector(baseRotation, cutout.pivot * uniformScale);
+        opaqueObjects.push_back({
+            &visual.rigSlotModels[static_cast<std::size_t>(slotIndex)],
+            basePosition + pivotOffset,
+            quatNormalize(quatMultiply(baseRotation, slotRotation)),
+            { uniformScale, uniformScale, uniformScale },
+            color,
+            alpha,
+            fogNear,
+            fogFar,
+            gpuResident
+        });
+    }
+}
+
 void refreshVisualCompositeModel(PlaneVisualState& visual)
 {
     visual.paintSupported = visualSupportsPaint(visual);
@@ -7096,9 +8256,7 @@ void refreshVisualCompositeModel(PlaneVisualState& visual)
         }
     }
     touchModelCacheRevision(visual.model);
-    if (!visual.paintSupported || !visual.hasCommittedPaint) {
-        return;
-    }
+    rebuildVisualRigModels(visual);
 }
 
 void resetVisualPaint(PlaneVisualState& visual)
@@ -7284,7 +8442,7 @@ bool clearPaintOverlay(PlaneVisualState& visual)
 
 std::filesystem::path getPreferenceFilePath()
 {
-    char* prefPath = SDL_GetPrefPath("TrueFlight", "TrueFlight");
+    char* prefPath = SDL_GetPrefPath("Don Reagan", "TrueFlight");
     if (prefPath == nullptr) {
         return {};
     }
@@ -7296,7 +8454,7 @@ std::filesystem::path getPreferenceFilePath()
 
 std::filesystem::path getHudPreferenceFilePath()
 {
-    char* prefPath = SDL_GetPrefPath("TrueFlight", "TrueFlight");
+    char* prefPath = SDL_GetPrefPath("Don Reagan", "TrueFlight");
     if (prefPath == nullptr) {
         return {};
     }
@@ -7611,6 +8769,7 @@ void bindTerrainContextWorldStore(
         terrainContext.sampleVolumetricAdditiveSdfAt = {};
         terrainContext.sampleVolumetricSubtractiveSdfAt = {};
         terrainContext.hasVolumetricOverridesInBounds = {};
+        terrainContext.sampleWorldVolumetricBoundsInBounds = {};
         terrainContext.sampleChunkRevisionSignature = {};
         return;
     }
@@ -7642,6 +8801,13 @@ void bindTerrainContextWorldStore(
             lock = std::shared_lock<std::shared_mutex>(*worldStoreMutex);
         }
         return worldStore->hasVolumetricOverridesInBounds(x0, z0, x1, z1, 1);
+    };
+    terrainContext.sampleWorldVolumetricBoundsInBounds = [worldStore, worldStoreMutex](float x0, float z0, float x1, float z1) {
+        std::shared_lock<std::shared_mutex> lock;
+        if (worldStoreMutex) {
+            lock = std::shared_lock<std::shared_mutex>(*worldStoreMutex);
+        }
+        return worldStore->volumetricVerticalBoundsForBounds(x0, z0, x1, z1, 1);
     };
     terrainContext.sampleChunkRevisionSignature = [worldStore, worldStoreMutex](float x0, float z0, float x1, float z1) {
         std::shared_lock<std::shared_mutex> lock;
@@ -7741,6 +8907,9 @@ void clampVisualPreferenceData(VisualPreferenceData& data)
     data.modelOffset.x = clamp(data.modelOffset.x, -24.0f, 24.0f);
     data.modelOffset.y = clamp(data.modelOffset.y, -24.0f, 24.0f);
     data.modelOffset.z = clamp(data.modelOffset.z, -24.0f, 24.0f);
+    for (int slotIndex = 0; slotIndex < static_cast<int>(data.rigCutouts.size()); ++slotIndex) {
+        clampVisualRigCutout(data.rigCutouts[static_cast<std::size_t>(slotIndex)], slotIndex);
+    }
 }
 
 void applyVisualPreferenceData(PlaneVisualState& visual, const VisualPreferenceData& data)
@@ -7754,6 +8923,7 @@ void applyVisualPreferenceData(PlaneVisualState& visual, const VisualPreferenceD
     visual.rollDegrees = data.rollDegrees;
     visual.modelOffset = data.modelOffset;
     visual.paintHashesByModelKey = data.paintHashesByModelKey;
+    visual.rigCutouts = data.rigCutouts;
     if (!visual.paintTargetKey.empty() &&
         !data.paintHash.empty() &&
         visual.paintHashesByModelKey.find(visual.paintTargetKey) == visual.paintHashesByModelKey.end()) {
@@ -7786,6 +8956,21 @@ void saveVisualPreferenceData(std::ofstream& file, std::string_view roleKey, con
     file << "character." << roleKey << ".offset_x=" << visual.modelOffset.x << "\n";
     file << "character." << roleKey << ".offset_y=" << visual.modelOffset.y << "\n";
     file << "character." << roleKey << ".offset_z=" << visual.modelOffset.z << "\n";
+    for (std::size_t slotIndex = 0; slotIndex < visual.rigCutouts.size(); ++slotIndex) {
+        const VisualRigCutout& cutout = visual.rigCutouts[slotIndex];
+        file << "character." << roleKey << ".rig." << slotIndex << ".enabled=" << (cutout.enabled ? 1 : 0) << "\n";
+        file << "character." << roleKey << ".rig." << slotIndex << ".axis=" << static_cast<int>(cutout.axis) << "\n";
+        file << "character." << roleKey << ".rig." << slotIndex << ".center_x=" << cutout.center.x << "\n";
+        file << "character." << roleKey << ".rig." << slotIndex << ".center_y=" << cutout.center.y << "\n";
+        file << "character." << roleKey << ".rig." << slotIndex << ".center_z=" << cutout.center.z << "\n";
+        file << "character." << roleKey << ".rig." << slotIndex << ".size_x=" << cutout.halfExtents.x << "\n";
+        file << "character." << roleKey << ".rig." << slotIndex << ".size_y=" << cutout.halfExtents.y << "\n";
+        file << "character." << roleKey << ".rig." << slotIndex << ".size_z=" << cutout.halfExtents.z << "\n";
+        file << "character." << roleKey << ".rig." << slotIndex << ".pivot_x=" << cutout.pivot.x << "\n";
+        file << "character." << roleKey << ".rig." << slotIndex << ".pivot_y=" << cutout.pivot.y << "\n";
+        file << "character." << roleKey << ".rig." << slotIndex << ".pivot_z=" << cutout.pivot.z << "\n";
+        file << "character." << roleKey << ".rig." << slotIndex << ".motion=" << cutout.motionScale << "\n";
+    }
     file << "paint." << roleKey << ".hash=" << visual.paintHash << "\n";
     for (const auto& [modelKey, paintHash] : paintHashesByModelKey) {
         if (modelKey.empty() || paintHash.empty()) {
@@ -7797,6 +8982,70 @@ void saveVisualPreferenceData(std::ofstream& file, std::string_view roleKey, con
 
 bool applyVisualPreferenceValue(VisualPreferenceData& data, const std::string& suffix, const std::string& value)
 {
+    if (suffix.rfind("rig.", 0) == 0) {
+        const std::size_t dot = suffix.find('.', 4);
+        if (dot == std::string::npos) {
+            return false;
+        }
+
+        const int slotIndex = parseIntValue(suffix.substr(4, dot - 4), -1);
+        if (slotIndex < 0 || slotIndex >= static_cast<int>(data.rigCutouts.size())) {
+            return false;
+        }
+
+        VisualRigCutout& cutout = data.rigCutouts[static_cast<std::size_t>(slotIndex)];
+        const std::string field = suffix.substr(dot + 1);
+        if (field == "enabled") {
+            cutout.enabled = parseBoolValue(value, cutout.enabled);
+            return true;
+        }
+        if (field == "axis") {
+            cutout.axis = static_cast<VisualRigAxis>(std::clamp(parseIntValue(value, static_cast<int>(cutout.axis)), 0, 5));
+            return true;
+        }
+        if (field == "center_x") {
+            cutout.center.x = parseFloatValue(value, cutout.center.x);
+            return true;
+        }
+        if (field == "center_y") {
+            cutout.center.y = parseFloatValue(value, cutout.center.y);
+            return true;
+        }
+        if (field == "center_z") {
+            cutout.center.z = parseFloatValue(value, cutout.center.z);
+            return true;
+        }
+        if (field == "size_x") {
+            cutout.halfExtents.x = parseFloatValue(value, cutout.halfExtents.x);
+            return true;
+        }
+        if (field == "size_y") {
+            cutout.halfExtents.y = parseFloatValue(value, cutout.halfExtents.y);
+            return true;
+        }
+        if (field == "size_z") {
+            cutout.halfExtents.z = parseFloatValue(value, cutout.halfExtents.z);
+            return true;
+        }
+        if (field == "pivot_x") {
+            cutout.pivot.x = parseFloatValue(value, cutout.pivot.x);
+            return true;
+        }
+        if (field == "pivot_y") {
+            cutout.pivot.y = parseFloatValue(value, cutout.pivot.y);
+            return true;
+        }
+        if (field == "pivot_z") {
+            cutout.pivot.z = parseFloatValue(value, cutout.pivot.z);
+            return true;
+        }
+        if (field == "motion") {
+            cutout.motionScale = parseFloatValue(value, cutout.motionScale);
+            return true;
+        }
+        return false;
+    }
+
     if (suffix == "source_path") {
         data.sourcePath = value.empty() ? std::filesystem::path {} : std::filesystem::path(value);
         data.hasStoredPath = true;
@@ -9041,6 +10290,28 @@ void setBuiltinPlaneModel(PlaneVisualState& planeVisual)
     resetVisualPaint(planeVisual);
 }
 
+void setBuiltinWalkingModel(PlaneVisualState& walkingVisual)
+{
+    walkingVisual.sourceModel = buildProceduralWalkingRigModel({});
+    walkingVisual.sourceModel.assetKey = "builtin:walking_biped";
+    touchModelCacheRevision(walkingVisual.sourceModel);
+    updateVisualPaintTargetKey(walkingVisual);
+    walkingVisual.model = walkingVisual.sourceModel;
+    walkingVisual.label = "builtin player biped";
+    walkingVisual.sourcePath.clear();
+    walkingVisual.usesStl = false;
+    walkingVisual.importRotationOffset = quatIdentity();
+    walkingVisual.forwardAxisYawDegrees = 0.0f;
+    walkingVisual.scale = walkingVisual.defaultScale;
+    walkingVisual.previewZoom = 1.0f;
+    walkingVisual.previewAutoSpin = true;
+    walkingVisual.yawDegrees = 0.0f;
+    walkingVisual.pitchDegrees = 0.0f;
+    walkingVisual.rollDegrees = 0.0f;
+    walkingVisual.modelOffset = {};
+    resetVisualPaint(walkingVisual);
+}
+
 std::string tryRestoreStoredPaintForCurrentModel(PlaneVisualState& visual)
 {
     const std::string storedPaintHash = resolveStoredPaintHashForCurrentModel(visual);
@@ -9401,7 +10672,7 @@ int pauseItemCount(const PauseState& pauseState, std::size_t assetCount)
     case PauseTab::Settings:
         return settingsSubTabItemCount(pauseState.settingsSubTab);
     case PauseTab::Characters:
-        return characterItemCount(assetCount);
+        return characterItemCount(pauseState, assetCount);
     case PauseTab::Paint:
         return kPaintSettingCount;
     case PauseTab::Hud:
@@ -9428,37 +10699,89 @@ bool pauseTabSupportsMouseAdjustment(PauseTab tab)
     return tab == PauseTab::Settings || tab == PauseTab::Characters || tab == PauseTab::Paint || tab == PauseTab::Hud;
 }
 
-void resetCharacterRowValue(PlaneVisualState& visual, int rowIndex)
+void resetCharacterRowValue(PauseState& pauseState, PlaneVisualState& visual, int rowIndex)
 {
+    if (pauseState.characterEditorMode == CharacterEditorMode::Rig) {
+        pauseState.characterRigSlot = std::clamp(
+            pauseState.characterRigSlot,
+            0,
+            static_cast<int>(visual.rigCutouts.size()) - 1);
+        VisualRigCutout& cutout = visual.rigCutouts[static_cast<std::size_t>(pauseState.characterRigSlot)];
+        const VisualRigCutout defaults = defaultVisualRigCutout(pauseState.characterRigSlot);
+        switch (rowIndex) {
+        case 2:
+            cutout.enabled = false;
+            break;
+        case 3:
+            cutout.axis = defaults.axis;
+            break;
+        case 4:
+            cutout.center.x = defaults.center.x;
+            break;
+        case 5:
+            cutout.center.y = defaults.center.y;
+            break;
+        case 6:
+            cutout.center.z = defaults.center.z;
+            break;
+        case 7:
+            cutout.halfExtents.x = defaults.halfExtents.x;
+            break;
+        case 8:
+            cutout.halfExtents.y = defaults.halfExtents.y;
+            break;
+        case 9:
+            cutout.halfExtents.z = defaults.halfExtents.z;
+            break;
+        case 10:
+            cutout.pivot.x = defaults.pivot.x;
+            break;
+        case 11:
+            cutout.pivot.y = defaults.pivot.y;
+            break;
+        case 12:
+            cutout.pivot.z = defaults.pivot.z;
+            break;
+        case 13:
+            cutout.motionScale = defaults.motionScale;
+            break;
+        default:
+            break;
+        }
+        clampVisualRigCutout(cutout, pauseState.characterRigSlot);
+        rebuildVisualRigModels(visual);
+        return;
+    }
+
     switch (rowIndex) {
-    case 1:
+    case 2:
         visual.previewAutoSpin = true;
         break;
-    case 2:
+    case 3:
         visual.previewZoom = 1.0f;
         break;
-    case 3:
+    case 4:
         visual.scale = visual.defaultScale;
         break;
-    case 4:
+    case 5:
         visual.forwardAxisYawDegrees = -90.0f;
         break;
-    case 5:
+    case 6:
         visual.yawDegrees = 0.0f;
         break;
-    case 6:
+    case 7:
         visual.pitchDegrees = 0.0f;
         break;
-    case 7:
+    case 8:
         visual.rollDegrees = 0.0f;
         break;
-    case 8:
+    case 9:
         visual.modelOffset.x = 0.0f;
         break;
-    case 9:
+    case 10:
         visual.modelOffset.y = 0.0f;
         break;
-    case 10:
+    case 11:
         visual.modelOffset.z = 0.0f;
         break;
     default:
@@ -9629,8 +10952,16 @@ void handlePauseMouseButtonDown(
             resetHudValue(uiState, defaultUiStateValues, pauseState.selectedIndex);
             setPauseStatus(pauseState, "Reset selected HUD setting to default.", nowSeconds, 2.2f);
         } else if (pauseState.tab == PauseTab::Characters) {
-            resetCharacterRowValue(selectedCharacterVisual, pauseState.selectedIndex);
-            setPauseStatus(pauseState, "Reset selected character transform value.", nowSeconds, 2.2f);
+            if (characterRowCanReset(pauseState, pauseState.selectedIndex)) {
+                resetCharacterRowValue(pauseState, selectedCharacterVisual, pauseState.selectedIndex);
+                setPauseStatus(
+                    pauseState,
+                    pauseState.characterEditorMode == CharacterEditorMode::Rig
+                        ? "Reset selected rig cutout value."
+                        : "Reset selected character transform value.",
+                    nowSeconds,
+                    2.2f);
+            }
         } else if (pauseState.tab == PauseTab::Paint) {
             resetPaintRowValue(paintUi, pauseState.selectedIndex);
             setPauseStatus(pauseState, "Reset selected paint control.", nowSeconds, 2.2f);
@@ -9661,15 +10992,22 @@ void handlePauseMouseButtonDown(
         adjustHudValue(uiState, pauseState.selectedIndex, direction);
         schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, nowSeconds);
     } else if (pauseState.tab == PauseTab::Characters) {
-        if (pauseState.selectedIndex >= 1 && pauseState.selectedIndex <= 10) {
-            adjustCharacterRowValue(selectedCharacterVisual, pauseState.selectedIndex, direction);
+        if (characterRowCanAdjust(pauseState, pauseState.selectedIndex)) {
+            adjustCharacterRowValue(pauseState, selectedCharacterVisual, pauseState.selectedIndex, direction);
             schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, nowSeconds);
-        } else if (pauseState.selectedIndex == 11) {
-            setBuiltinPlaneModel(selectedCharacterVisual);
-            setPauseStatus(pauseState, "Loaded builtin cube.", nowSeconds, 2.2f);
+        } else if (characterRowOpensModelPrompt(pauseState, pauseState.selectedIndex)) {
+            beginModelPathPrompt(pauseState, pauseState.charactersSubTab, selectedCharacterVisual.sourcePath.generic_string());
+        } else if (characterRowLoadsBuiltinModel(pauseState, pauseState.selectedIndex)) {
+            if (pauseState.charactersSubTab == CharacterSubTab::Player) {
+                setBuiltinWalkingModel(selectedCharacterVisual);
+                setPauseStatus(pauseState, "Loaded builtin player biped.", nowSeconds, 2.2f);
+            } else {
+                setBuiltinPlaneModel(selectedCharacterVisual);
+                setPauseStatus(pauseState, "Loaded builtin cube.", nowSeconds, 2.2f);
+            }
             schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, nowSeconds);
         } else if (pauseState.selectedIndex >= kCharacterAssetListStart &&
-            pauseState.selectedIndex < characterItemCount(assetCatalog.size())) {
+            pauseState.selectedIndex < characterItemCount(pauseState, assetCatalog.size())) {
             const AssetEntry& asset = assetCatalog[static_cast<std::size_t>(pauseState.selectedIndex - kCharacterAssetListStart)];
             std::string loadStatus;
             loadPlaneModelFromPath(asset.path, selectedCharacterVisual, &loadStatus);
@@ -10912,151 +12250,346 @@ void resetSettingsRowValue(UiState& uiState, const UiState& defaults, PropAudioC
     }
 }
 
-const char* characterRowLabel(int rowIndex)
+const char* characterRowLabel(const PauseState& pauseState, int rowIndex, const PlaneVisualState& visual)
 {
+    (void)visual;
+    if (pauseState.characterEditorMode == CharacterEditorMode::Rig) {
+        switch (rowIndex) {
+        case 0:
+            return "Editor Mode";
+        case 1:
+            return "Cutout";
+        case 2:
+            return "Enabled";
+        case 3:
+            return "Axis";
+        case 4:
+            return "Center X";
+        case 5:
+            return "Center Y";
+        case 6:
+            return "Center Z";
+        case 7:
+            return "Size X";
+        case 8:
+            return "Size Y";
+        case 9:
+            return "Size Z";
+        case 10:
+            return "Pivot X";
+        case 11:
+            return "Pivot Y";
+        case 12:
+            return "Pivot Z";
+        case 13:
+            return pauseState.characterRigSlot < 2 ? "Spin Mult" : "Max Angle";
+        default:
+            return "";
+        }
+    }
+
     switch (rowIndex) {
     case 0:
-        return "Current Model";
+        return "Editor Mode";
     case 1:
-        return "Auto Spin";
+        return "Current Model";
     case 2:
-        return "Preview Zoom";
+        return "Auto Spin";
     case 3:
-        return "Scale";
+        return "Preview Zoom";
     case 4:
-        return "Forward Axis";
+        return "Scale";
     case 5:
-        return "Yaw";
+        return "Forward Axis";
     case 6:
-        return "Pitch";
+        return "Yaw";
     case 7:
-        return "Roll";
+        return "Pitch";
     case 8:
-        return "Offset X";
+        return "Roll";
     case 9:
-        return "Offset Y";
+        return "Offset X";
     case 10:
-        return "Offset Z";
+        return "Offset Y";
     case 11:
-        return "Load From Path";
+        return "Offset Z";
     case 12:
+        return "Load From Path";
+    case 13:
         return "Builtin Cube";
     default:
         return "Load Asset";
     }
 }
 
-std::string formatCharacterRowValue(int rowIndex, const PlaneVisualState& visual)
+std::string formatCharacterRowValue(const PauseState& pauseState, int rowIndex, const PlaneVisualState& visual)
 {
     char buffer[64] {};
+    if (pauseState.characterEditorMode == CharacterEditorMode::Rig) {
+        const int slotIndex = std::clamp(pauseState.characterRigSlot, 0, static_cast<int>(visual.rigCutouts.size()) - 1);
+        const VisualRigCutout& cutout = visual.rigCutouts[static_cast<std::size_t>(slotIndex)];
+        switch (rowIndex) {
+        case 0:
+            return "Rig";
+        case 1:
+            return visualRigSlotLabel(slotIndex);
+        case 2:
+            return cutout.enabled ? "On" : "Off";
+        case 3:
+            return visualRigAxisLabel(cutout.axis);
+        case 4:
+            std::snprintf(buffer, sizeof(buffer), "%.2f", cutout.center.x);
+            return buffer;
+        case 5:
+            std::snprintf(buffer, sizeof(buffer), "%.2f", cutout.center.y);
+            return buffer;
+        case 6:
+            std::snprintf(buffer, sizeof(buffer), "%.2f", cutout.center.z);
+            return buffer;
+        case 7:
+            std::snprintf(buffer, sizeof(buffer), "%.2f", cutout.halfExtents.x);
+            return buffer;
+        case 8:
+            std::snprintf(buffer, sizeof(buffer), "%.2f", cutout.halfExtents.y);
+            return buffer;
+        case 9:
+            std::snprintf(buffer, sizeof(buffer), "%.2f", cutout.halfExtents.z);
+            return buffer;
+        case 10:
+            std::snprintf(buffer, sizeof(buffer), "%.2f", cutout.pivot.x);
+            return buffer;
+        case 11:
+            std::snprintf(buffer, sizeof(buffer), "%.2f", cutout.pivot.y);
+            return buffer;
+        case 12:
+            std::snprintf(buffer, sizeof(buffer), "%.2f", cutout.pivot.z);
+            return buffer;
+        case 13:
+            if (visualRigSlotIsPropeller(slotIndex)) {
+                std::snprintf(buffer, sizeof(buffer), "%.2fx", cutout.motionScale);
+            } else {
+                std::snprintf(buffer, sizeof(buffer), "%.0f deg", cutout.motionScale);
+            }
+            return buffer;
+        default:
+            return {};
+        }
+    }
+
     switch (rowIndex) {
     case 0:
-        return visual.label;
+        return "Model";
     case 1:
-        return visual.previewAutoSpin ? "On" : "Off";
+        return visual.label;
     case 2:
+        return visual.previewAutoSpin ? "On" : "Off";
+    case 3:
         std::snprintf(buffer, sizeof(buffer), "%.0f%%", visual.previewZoom * 100.0f);
         return buffer;
-    case 3:
+    case 4:
         std::snprintf(buffer, sizeof(buffer), "%.2f", visual.scale);
         return buffer;
-    case 4:
+    case 5:
         std::snprintf(buffer, sizeof(buffer), "%.0f deg", visual.forwardAxisYawDegrees);
         return buffer;
-    case 5:
+    case 6:
         std::snprintf(buffer, sizeof(buffer), "%.0f deg", visual.yawDegrees);
         return buffer;
-    case 6:
+    case 7:
         std::snprintf(buffer, sizeof(buffer), "%.0f deg", visual.pitchDegrees);
         return buffer;
-    case 7:
+    case 8:
         std::snprintf(buffer, sizeof(buffer), "%.0f deg", visual.rollDegrees);
         return buffer;
-    case 8:
+    case 9:
         std::snprintf(buffer, sizeof(buffer), "%.2f", visual.modelOffset.x);
         return buffer;
-    case 9:
+    case 10:
         std::snprintf(buffer, sizeof(buffer), "%.2f", visual.modelOffset.y);
         return buffer;
-    case 10:
+    case 11:
         std::snprintf(buffer, sizeof(buffer), "%.2f", visual.modelOffset.z);
         return buffer;
-    case 11:
-        return visual.sourcePath.empty() ? "Type Path" : "Edit Path";
     case 12:
+        return visual.sourcePath.empty() ? "Type Path" : "Edit Path";
+    case 13:
         return "Load";
     default:
         return "Load";
     }
 }
 
-const char* characterRowHelpText(int rowIndex)
+const char* characterRowHelpText(const PauseState& pauseState, int rowIndex, const PlaneVisualState& visual)
 {
+    (void)visual;
+    if (pauseState.characterEditorMode == CharacterEditorMode::Rig) {
+        switch (rowIndex) {
+        case 0:
+            return "Switch between transform/model loading and cutout-based prop or flap rigging.";
+        case 1:
+            return "Choose which extracted sub-mesh cutout you are editing in the live 3D preview.";
+        case 2:
+            return "Enable or disable this cutout without losing its stored box, pivot, and motion settings.";
+        case 3:
+            return "Local model-space axis used for prop spin or control-surface rotation.";
+        case 4:
+        case 5:
+        case 6:
+            return "Center of the cutout volume used to capture mesh faces for this animated sub-model.";
+        case 7:
+        case 8:
+        case 9:
+            return "Half-size of the cutout volume. Increase it until the moving part is fully isolated.";
+        case 10:
+        case 11:
+        case 12:
+            return "Rotation pivot in local model space. The extracted cutout rotates around this point.";
+        case 13:
+            return pauseState.characterRigSlot < 2
+                ? "Multiplier applied to live prop RPM. Use a negative value to reverse spin direction."
+                : "Maximum wing-surface rotation driven by the current control deflection preview.";
+        default:
+            return "";
+        }
+    }
+
     switch (rowIndex) {
     case 0:
-        return "Active model for the selected role. Drag and drop STL/GLB/GLTF files to replace it.";
+        return "Switch between transform/model loading and the rig cutout editor.";
     case 1:
-        return "Spin the paused preview automatically to inspect silhouette and material alignment.";
+        return "Active model for the selected role. Drag and drop STL/GLB/GLTF files to replace it.";
     case 2:
-        return "Scale only the paused preview turntable without changing the in-flight transform.";
+        return "Spin the paused preview automatically to inspect silhouette and material alignment.";
     case 3:
-        return "World render scale for this character role.";
+        return "Scale only the paused preview turntable without changing the in-flight transform.";
     case 4:
-        return "Explicit per-model forward-axis calibration replacing the old hardcoded yaw compensation.";
+        return "World render scale for this character role.";
     case 5:
-        return "Additional yaw correction layered onto the calibrated imported model.";
+        return "Explicit per-model forward-axis calibration replacing the old hardcoded yaw compensation.";
     case 6:
-        return "Additional pitch correction layered onto the calibrated imported model.";
+        return "Additional yaw correction layered onto the calibrated imported model.";
     case 7:
-        return "Additional roll correction layered onto the calibrated imported model.";
+        return "Additional pitch correction layered onto the calibrated imported model.";
     case 8:
-    case 9:
+        return "Additional roll correction layered onto the calibrated imported model.";
     case 10:
-        return "Local model-space offset applied after the role transform.";
+    case 9:
     case 11:
-        return "Open a text prompt and load STL, GLB, or GLTF directly from disk for the selected role.";
+        return "Local model-space offset applied after the role transform.";
     case 12:
+        return "Open a text prompt and load STL, GLB, or GLTF directly from disk for the selected role.";
+    case 13:
         return "Reset the selected role back to the built-in cube.";
     default:
         return "Load a model from portSource/Assets/Models into the selected role.";
     }
 }
 
-void adjustCharacterRowValue(PlaneVisualState& visual, int rowIndex, int direction)
+void adjustCharacterRowValue(PauseState& pauseState, PlaneVisualState& visual, int rowIndex, int direction)
 {
     if (direction == 0) {
         return;
     }
 
+    if (rowIndex == 0) {
+        pauseState.characterEditorMode =
+            pauseState.characterEditorMode == CharacterEditorMode::Model
+                ? CharacterEditorMode::Rig
+                : CharacterEditorMode::Model;
+        pauseState.selectedIndex = 0;
+        return;
+    }
+
+    if (pauseState.characterEditorMode == CharacterEditorMode::Rig) {
+        pauseState.characterRigSlot = std::clamp(
+            pauseState.characterRigSlot,
+            0,
+            static_cast<int>(visual.rigCutouts.size()) - 1);
+        if (rowIndex == 1) {
+            pauseState.characterRigSlot =
+                (pauseState.characterRigSlot + direction + static_cast<int>(visual.rigCutouts.size())) %
+                static_cast<int>(visual.rigCutouts.size());
+            return;
+        }
+
+        VisualRigCutout& cutout = visual.rigCutouts[static_cast<std::size_t>(pauseState.characterRigSlot)];
+        switch (rowIndex) {
+        case 2:
+            cutout.enabled = !cutout.enabled;
+            break;
+        case 3:
+            cutout.axis = static_cast<VisualRigAxis>(
+                (static_cast<int>(cutout.axis) + direction + 6) % 6);
+            break;
+        case 4:
+            cutout.center.x += 0.05f * static_cast<float>(direction);
+            break;
+        case 5:
+            cutout.center.y += 0.05f * static_cast<float>(direction);
+            break;
+        case 6:
+            cutout.center.z += 0.05f * static_cast<float>(direction);
+            break;
+        case 7:
+            cutout.halfExtents.x += 0.05f * static_cast<float>(direction);
+            break;
+        case 8:
+            cutout.halfExtents.y += 0.05f * static_cast<float>(direction);
+            break;
+        case 9:
+            cutout.halfExtents.z += 0.05f * static_cast<float>(direction);
+            break;
+        case 10:
+            cutout.pivot.x += 0.05f * static_cast<float>(direction);
+            break;
+        case 11:
+            cutout.pivot.y += 0.05f * static_cast<float>(direction);
+            break;
+        case 12:
+            cutout.pivot.z += 0.05f * static_cast<float>(direction);
+            break;
+        case 13:
+            cutout.motionScale +=
+                (visualRigSlotIsPropeller(pauseState.characterRigSlot) ? 0.1f : 2.0f) *
+                static_cast<float>(direction);
+            break;
+        default:
+            break;
+        }
+        clampVisualRigCutout(cutout, pauseState.characterRigSlot);
+        rebuildVisualRigModels(visual);
+        return;
+    }
+
     switch (rowIndex) {
-    case 1:
+    case 2:
         visual.previewAutoSpin = !visual.previewAutoSpin;
         break;
-    case 2:
+    case 3:
         visual.previewZoom = clamp(visual.previewZoom + (0.1f * static_cast<float>(direction)), 0.35f, 3.0f);
         break;
-    case 3:
+    case 4:
         visual.scale = clamp(visual.scale + (0.1f * static_cast<float>(direction)), 0.15f, 24.0f);
         break;
-    case 4:
+    case 5:
         visual.forwardAxisYawDegrees = clamp(visual.forwardAxisYawDegrees + (5.0f * static_cast<float>(direction)), -180.0f, 180.0f);
         break;
-    case 5:
+    case 6:
         visual.yawDegrees = clamp(visual.yawDegrees + (5.0f * static_cast<float>(direction)), -180.0f, 180.0f);
         break;
-    case 6:
+    case 7:
         visual.pitchDegrees = clamp(visual.pitchDegrees + (5.0f * static_cast<float>(direction)), -180.0f, 180.0f);
         break;
-    case 7:
+    case 8:
         visual.rollDegrees = clamp(visual.rollDegrees + (5.0f * static_cast<float>(direction)), -180.0f, 180.0f);
         break;
-    case 8:
+    case 9:
         visual.modelOffset.x = clamp(visual.modelOffset.x + (0.1f * static_cast<float>(direction)), -24.0f, 24.0f);
         break;
-    case 9:
+    case 10:
         visual.modelOffset.y = clamp(visual.modelOffset.y + (0.1f * static_cast<float>(direction)), -24.0f, 24.0f);
         break;
-    case 10:
+    case 11:
         visual.modelOffset.z = clamp(visual.modelOffset.z + (0.1f * static_cast<float>(direction)), -24.0f, 24.0f);
         break;
     default:
@@ -11709,11 +13242,16 @@ void drawPauseMenu(
             canvas.text(contentX, layout.panelY + layout.panelH - 62.0f, settingsRowHelpText(pauseState.settingsSubTab, pauseState.selectedIndex), makeHudColor(205, 225, 242, 255));
         }
     } else if (pauseState.tab == PauseTab::Characters) {
-        canvas.text(contentX, contentY + 10.0f, "Per-role model selection, transforms, preview zoom, and turntable control.", makeHudColor(180, 214, 240, 255));
-        canvas.text(contentX, contentY + 24.0f, "Drop STL/GLB/GLTF files on the window while this tab is open to load them into the active role.", makeHudColor(180, 214, 240, 255));
+        if (pauseState.characterEditorMode == CharacterEditorMode::Rig) {
+            canvas.text(contentX, contentY + 10.0f, "Extract animated prop and wing-surface cutouts from the active model with stored boxes, pivots, and axes.", makeHudColor(180, 214, 240, 255));
+            canvas.text(contentX, contentY + 24.0f, "Tune the cutout in local model space, then use the live preview to verify prop spin and control-surface motion.", makeHudColor(180, 214, 240, 255));
+        } else {
+            canvas.text(contentX, contentY + 10.0f, "Per-role model selection, transforms, preview zoom, and turntable control.", makeHudColor(180, 214, 240, 255));
+            canvas.text(contentX, contentY + 24.0f, "Drop STL/GLB/GLTF files on the window while this tab is open to load them into the active role.", makeHudColor(180, 214, 240, 255));
+        }
 
         const int totalRows = pauseItemCount(pauseState, assetCatalog.size());
-        if (assetCatalog.empty()) {
+        if (pauseState.characterEditorMode == CharacterEditorMode::Model && assetCatalog.empty()) {
             canvas.text(contentX, contentY + 38.0f + (static_cast<float>(kCharacterAssetListStart + 1) * 28.0f), "No models found in portSource/Assets/Models yet.", makeHudColor(255, 220, 168, 255));
         }
         for (int index = 0; index < totalRows; ++index) {
@@ -11725,9 +13263,9 @@ void drawPauseMenu(
             }
 
             if (index < kCharacterAssetListStart) {
-                canvas.text(rowRect.x + 10.0f, rowRect.y + 7.0f, characterRowLabel(index), makeHudColor(240, 247, 255, 255));
-                canvas.text(rowRect.x + 240.0f, rowRect.y + 7.0f, formatCharacterRowValue(index, characterVisual), makeHudColor(162, 230, 186, 255));
-            } else {
+                canvas.text(rowRect.x + 10.0f, rowRect.y + 7.0f, characterRowLabel(pauseState, index, characterVisual), makeHudColor(240, 247, 255, 255));
+                canvas.text(rowRect.x + 240.0f, rowRect.y + 7.0f, formatCharacterRowValue(pauseState, index, characterVisual), makeHudColor(162, 230, 186, 255));
+            } else if (pauseState.characterEditorMode == CharacterEditorMode::Model) {
                 const AssetEntry& asset = assetCatalog[static_cast<std::size_t>(index - kCharacterAssetListStart)];
                 const bool currentAsset = !characterVisual.sourcePath.empty() && characterVisual.sourcePath == asset.path;
                 const HudColor rowColor = asset.supported ? makeHudColor(240, 247, 255, 255) : makeHudColor(255, 196, 124, 255);
@@ -11741,10 +13279,24 @@ void drawPauseMenu(
             canvas.text(layout.previewX + 10.0f, layout.previewY + 8.0f, "Preview", makeHudColor(240, 247, 255, 255));
             canvas.text(layout.previewX + 10.0f, layout.previewY + 24.0f, characterVisual.label, makeHudColor(180, 214, 240, 255));
             canvas.text(layout.previewX + 10.0f, layout.previewY + 42.0f, characterVisual.previewAutoSpin ? "Turntable: auto-spin" : "Turntable: manual", makeHudColor(180, 214, 240, 255));
-            canvas.text(layout.previewX + 10.0f, layout.previewY + 58.0f, characterVisual.paintSupported ? "Paint: supported" : "Paint: textured UV model required", characterVisual.paintSupported ? makeHudColor(162, 230, 186, 255) : makeHudColor(255, 196, 124, 255));
+            if (pauseState.characterEditorMode == CharacterEditorMode::Rig) {
+                const bool rigValid = characterVisual.rigPartitionValid && characterVisual.rigSlotActive[static_cast<std::size_t>(std::clamp(pauseState.characterRigSlot, 0, 3))];
+                canvas.text(
+                    layout.previewX + 10.0f,
+                    layout.previewY + 58.0f,
+                    std::string("Slot: ") + visualRigSlotLabel(pauseState.characterRigSlot),
+                    makeHudColor(180, 214, 240, 255));
+                canvas.text(
+                    layout.previewX + 10.0f,
+                    layout.previewY + 74.0f,
+                    rigValid ? "Rig: cutout captured" : "Rig: move box until faces are captured",
+                    rigValid ? makeHudColor(162, 230, 186, 255) : makeHudColor(255, 196, 124, 255));
+            } else {
+                canvas.text(layout.previewX + 10.0f, layout.previewY + 58.0f, characterVisual.paintSupported ? "Paint: supported" : "Paint: textured UV model required", characterVisual.paintSupported ? makeHudColor(162, 230, 186, 255) : makeHudColor(255, 196, 124, 255));
+            }
         }
 
-        canvas.text(contentX, layout.panelY + layout.panelH - 62.0f, characterRowHelpText(pauseState.selectedIndex), makeHudColor(205, 225, 242, 255));
+        canvas.text(contentX, layout.panelY + layout.panelH - 62.0f, characterRowHelpText(pauseState, pauseState.selectedIndex, characterVisual), makeHudColor(205, 225, 242, 255));
     } else if (pauseState.tab == PauseTab::Paint) {
         canvas.text(contentX, contentY + 10.0f, "Edit RGBA paint overlays on top of the active role's base-color texture.", makeHudColor(180, 214, 240, 255));
         canvas.text(contentX, contentY + 24.0f, "Brush on the right canvas, then Commit to persist a PNG under the SDL pref path.", makeHudColor(180, 214, 240, 255));
@@ -13671,7 +15223,7 @@ int menuItemCount(const PauseState& pauseState, const ControlProfile& controls, 
     case PauseTab::Settings:
         return settingsSubTabItemCount(pauseState.settingsSubTab);
     case PauseTab::Characters:
-        return characterItemCount(assetCount);
+        return characterItemCount(pauseState, assetCount);
     case PauseTab::Paint:
         return kPaintSettingCount;
     case PauseTab::Hud:
@@ -13771,7 +15323,7 @@ RectF menuRowRect(
         return {};
     }
 
-    if (pauseState.tab == PauseTab::Characters && rowIndex >= characterItemCount(assetCount)) {
+    if (pauseState.tab == PauseTab::Characters && rowIndex >= characterItemCount(pauseState, assetCount)) {
         return {};
     }
     if (pauseState.tab == PauseTab::Paint && rowIndex >= kPaintSettingCount) {
@@ -14539,10 +16091,15 @@ void drawMenuOverlay(
             }
         }
     } else if (pauseState.tab == PauseTab::Characters) {
-        canvas.text(contentX, contentY + 10.0f, "Per-role model selection, transforms, preview zoom, and turntable control.", makeHudColor(180, 214, 240, 255));
-        canvas.text(contentX, contentY + 24.0f, "Use Load From Path, choose a scanned asset below, or drag STL/GLB/GLTF files onto the window.", makeHudColor(180, 214, 240, 255));
-        const int totalRows = characterItemCount(assetCatalog.size());
-        if (assetCatalog.empty()) {
+        if (pauseState.characterEditorMode == CharacterEditorMode::Rig) {
+            canvas.text(contentX, contentY + 10.0f, "Extract animated prop and wing-surface cutouts from the active model with stored boxes, pivots, and axes.", makeHudColor(180, 214, 240, 255));
+            canvas.text(contentX, contentY + 24.0f, "Tune the cutout in local model space, then use the live preview to verify prop spin and control-surface motion.", makeHudColor(180, 214, 240, 255));
+        } else {
+            canvas.text(contentX, contentY + 10.0f, "Per-role model selection, transforms, preview zoom, and turntable control.", makeHudColor(180, 214, 240, 255));
+            canvas.text(contentX, contentY + 24.0f, "Use Load From Path, choose a scanned asset below, or drag STL/GLB/GLTF files onto the window.", makeHudColor(180, 214, 240, 255));
+        }
+        const int totalRows = characterItemCount(pauseState, assetCatalog.size());
+        if (pauseState.characterEditorMode == CharacterEditorMode::Model && assetCatalog.empty()) {
             canvas.text(contentX, contentY + 38.0f + (static_cast<float>(kCharacterAssetListStart + 1) * 28.0f), "No models found in portSource/Assets/Models yet.", makeHudColor(255, 220, 168, 255));
         }
         for (int index = 0; index < totalRows; ++index) {
@@ -14553,9 +16110,9 @@ void drawMenuOverlay(
                 canvas.strokeRect(rowRect.x, rowRect.y, rowRect.w, rowRect.h, makeHudColor(220, 238, 255, 255));
             }
             if (index < kCharacterAssetListStart) {
-                canvas.text(rowRect.x + 10.0f, rowRect.y + 7.0f, characterRowLabel(index), makeHudColor(240, 247, 255, 255));
-                canvas.text(rowRect.x + 240.0f, rowRect.y + 7.0f, formatCharacterRowValue(index, characterVisual), makeHudColor(162, 230, 186, 255));
-            } else {
+                canvas.text(rowRect.x + 10.0f, rowRect.y + 7.0f, characterRowLabel(pauseState, index, characterVisual), makeHudColor(240, 247, 255, 255));
+                canvas.text(rowRect.x + 240.0f, rowRect.y + 7.0f, formatCharacterRowValue(pauseState, index, characterVisual), makeHudColor(162, 230, 186, 255));
+            } else if (pauseState.characterEditorMode == CharacterEditorMode::Model) {
                 const AssetEntry& asset = assetCatalog[static_cast<std::size_t>(index - kCharacterAssetListStart)];
                 const bool currentAsset = !characterVisual.sourcePath.empty() && characterVisual.sourcePath == asset.path;
                 const HudColor rowColor = asset.supported ? makeHudColor(240, 247, 255, 255) : makeHudColor(255, 196, 124, 255);
@@ -14568,9 +16125,23 @@ void drawMenuOverlay(
             canvas.text(layout.previewX + 10.0f, layout.previewY + 8.0f, "Preview", makeHudColor(240, 247, 255, 255));
             canvas.text(layout.previewX + 10.0f, layout.previewY + 24.0f, characterVisual.label, makeHudColor(180, 214, 240, 255));
             canvas.text(layout.previewX + 10.0f, layout.previewY + 42.0f, characterVisual.previewAutoSpin ? "Turntable: auto-spin" : "Turntable: manual", makeHudColor(180, 214, 240, 255));
-            canvas.text(layout.previewX + 10.0f, layout.previewY + 58.0f, characterVisual.paintSupported ? "Paint: supported" : "Paint: textured UV model required", characterVisual.paintSupported ? makeHudColor(162, 230, 186, 255) : makeHudColor(255, 196, 124, 255));
+            if (pauseState.characterEditorMode == CharacterEditorMode::Rig) {
+                const bool rigValid = characterVisual.rigPartitionValid && characterVisual.rigSlotActive[static_cast<std::size_t>(std::clamp(pauseState.characterRigSlot, 0, 3))];
+                canvas.text(
+                    layout.previewX + 10.0f,
+                    layout.previewY + 58.0f,
+                    std::string("Slot: ") + visualRigSlotLabel(pauseState.characterRigSlot),
+                    makeHudColor(180, 214, 240, 255));
+                canvas.text(
+                    layout.previewX + 10.0f,
+                    layout.previewY + 74.0f,
+                    rigValid ? "Rig: cutout captured" : "Rig: move box until faces are captured",
+                    rigValid ? makeHudColor(162, 230, 186, 255) : makeHudColor(255, 196, 124, 255));
+            } else {
+                canvas.text(layout.previewX + 10.0f, layout.previewY + 58.0f, characterVisual.paintSupported ? "Paint: supported" : "Paint: textured UV model required", characterVisual.paintSupported ? makeHudColor(162, 230, 186, 255) : makeHudColor(255, 196, 124, 255));
+            }
         }
-        canvas.text(contentX, layout.panelY + layout.panelH - 62.0f, characterRowHelpText(pauseState.selectedIndex), makeHudColor(205, 225, 242, 255));
+        canvas.text(contentX, layout.panelY + layout.panelH - 62.0f, characterRowHelpText(pauseState, pauseState.selectedIndex, characterVisual), makeHudColor(205, 225, 242, 255));
     } else if (pauseState.tab == PauseTab::Paint) {
         canvas.text(contentX, contentY + 10.0f, "Edit RGBA paint overlays on top of the active role's base-color texture.", makeHudColor(180, 214, 240, 255));
         canvas.text(contentX, contentY + 24.0f, "Brush on the right canvas, then Commit to persist a PNG under the SDL pref path.", makeHudColor(180, 214, 240, 255));
@@ -15990,7 +17561,7 @@ bool startGameSession(
 
     if (audioSubsystemReady) {
         std::string audioError;
-        if (!session.audioState.initialize(22050, 1024, 8, &audioError) && !audioError.empty()) {
+        if (!session.audioState.initialize(48000, 1024, 8, &audioError) && !audioError.empty()) {
             SDL_Log("Native audio disabled: %s", audioError.c_str());
         }
     }
@@ -16186,8 +17757,7 @@ try
     setBuiltinPlaneModel(planeVisual);
     PlaneVisualState walkingVisual;
     walkingVisual.defaultScale = 1.0f;
-    setBuiltinPlaneModel(walkingVisual);
-    walkingVisual.label = "builtin player cube";
+    setBuiltinWalkingModel(walkingVisual);
     PaintUiState paintUi {};
 
     const auto restoreVisual = [&](PlaneVisualState& visual, const VisualPreferenceData& prefs, const std::filesystem::path& fallbackPath, const char* logLabel) {
@@ -16212,7 +17782,7 @@ try
     ProceduralAudioState audioState {};
     if (audioSubsystemReady) {
         std::string audioError;
-        if (!audioState.initialize(22050, 1024, 8, &audioError) && !audioError.empty()) {
+        if (!audioState.initialize(48000, 1024, 8, &audioError) && !audioError.empty()) {
             SDL_Log("Native audio disabled: %s", audioError.c_str());
         }
     }
@@ -16389,8 +17959,8 @@ try
                             adjustHudValue(uiState, pauseState.selectedIndex, direction);
                             schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
                         } else if (pauseState.tab == PauseTab::Characters) {
-                            if (pauseState.selectedIndex >= 1 && pauseState.selectedIndex <= 10) {
-                                adjustCharacterRowValue(selectedCharacterVisual, pauseState.selectedIndex, direction);
+                            if (characterRowCanAdjust(pauseState, pauseState.selectedIndex)) {
+                                adjustCharacterRowValue(pauseState, selectedCharacterVisual, pauseState.selectedIndex, direction);
                                 schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
                             }
                         } else if (pauseState.tab == PauseTab::Paint) {
@@ -16419,9 +17989,17 @@ try
                             setPauseStatus(pauseState, "Reset selected HUD setting to default.", uiNowSeconds, 2.2f);
                             schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
                         } else if (pauseState.tab == PauseTab::Characters) {
-                            resetCharacterRowValue(selectedCharacterVisual, pauseState.selectedIndex);
-                            setPauseStatus(pauseState, "Reset selected character transform value.", uiNowSeconds, 2.2f);
-                            schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
+                            if (characterRowCanReset(pauseState, pauseState.selectedIndex)) {
+                                resetCharacterRowValue(pauseState, selectedCharacterVisual, pauseState.selectedIndex);
+                                setPauseStatus(
+                                    pauseState,
+                                    pauseState.characterEditorMode == CharacterEditorMode::Rig
+                                        ? "Reset selected rig cutout value."
+                                        : "Reset selected character transform value.",
+                                    uiNowSeconds,
+                                    2.2f);
+                                schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
+                            }
                         } else if (pauseState.tab == PauseTab::Paint) {
                             resetPaintRowValue(paintUi, pauseState.selectedIndex);
                             setPauseStatus(pauseState, "Reset selected paint control.", uiNowSeconds, 2.2f);
@@ -16517,17 +18095,35 @@ try
                         setPauseStatus(pauseState, "Restored native HUD defaults.", uiNowSeconds);
                         schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
                     } else if (scancode == SDL_SCANCODE_BACKSPACE && pauseState.tab == PauseTab::Characters) {
-                        setBuiltinPlaneModel(selectedCharacterVisual);
-                        setPauseStatus(pauseState, "Restored selected role to builtin defaults.", uiNowSeconds);
+                        if (pauseState.characterEditorMode == CharacterEditorMode::Rig) {
+                            for (int slotIndex = 0; slotIndex < static_cast<int>(selectedCharacterVisual.rigCutouts.size()); ++slotIndex) {
+                                selectedCharacterVisual.rigCutouts[static_cast<std::size_t>(slotIndex)] = defaultVisualRigCutout(slotIndex);
+                            }
+                            rebuildVisualRigModels(selectedCharacterVisual);
+                            setPauseStatus(pauseState, "Cleared saved rig cutouts for this role.", uiNowSeconds);
+                        } else {
+                            if (pauseState.charactersSubTab == CharacterSubTab::Player) {
+                                setBuiltinWalkingModel(selectedCharacterVisual);
+                            } else {
+                                setBuiltinPlaneModel(selectedCharacterVisual);
+                            }
+                            setPauseStatus(pauseState, "Restored selected role to builtin defaults.", uiNowSeconds);
+                            assetCatalog = scanModelAssets();
+                        }
                         schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
                     } else if (scancode == SDL_SCANCODE_BACKSPACE && pauseState.tab == PauseTab::Paint) {
                         if (clearPaintOverlay(selectedPaintVisual)) {
                             setPauseStatus(pauseState, "Cleared active paint overlay.", uiNowSeconds);
                         }
                     } else if (scancode == SDL_SCANCODE_F5 && pauseState.tab == PauseTab::Characters) {
-                        assetCatalog = scanModelAssets();
-                        pauseState.selectedIndex = std::clamp(pauseState.selectedIndex, 0, std::max(0, pauseItemCount(pauseState, assetCatalog.size()) - 1));
-                        setPauseStatus(pauseState, "Refreshed portSource/Assets/Models catalog.", uiNowSeconds, 2.2f);
+                        if (pauseState.characterEditorMode == CharacterEditorMode::Rig) {
+                            rebuildVisualRigModels(selectedCharacterVisual);
+                            setPauseStatus(pauseState, "Rebuilt animated cutout partitions for this model.", uiNowSeconds, 2.2f);
+                        } else {
+                            assetCatalog = scanModelAssets();
+                            pauseState.selectedIndex = std::clamp(pauseState.selectedIndex, 0, std::max(0, pauseItemCount(pauseState, assetCatalog.size()) - 1));
+                            setPauseStatus(pauseState, "Refreshed portSource/Assets/Models catalog.", uiNowSeconds, 2.2f);
+                        }
                     } else if (scancode == SDL_SCANCODE_RETURN || scancode == SDL_SCANCODE_SPACE) {
                         if (pauseState.tab == PauseTab::Main) {
                             const int activatedIndex = pauseState.selectedIndex;
@@ -16538,14 +18134,24 @@ try
                         } else if (pauseState.tab == PauseTab::Settings) {
                             resetSelectedPauseRow();
                         } else if (pauseState.tab == PauseTab::Characters) {
-                            if (pauseState.selectedIndex >= 1 && pauseState.selectedIndex <= 10) {
+                            if (pauseState.selectedIndex == 0) {
+                                adjustCharacterRowValue(pauseState, selectedCharacterVisual, pauseState.selectedIndex, 1);
+                                schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
+                            } else if (characterRowCanReset(pauseState, pauseState.selectedIndex)) {
                                 resetSelectedPauseRow();
-                            } else if (pauseState.selectedIndex == 11) {
-                                setBuiltinPlaneModel(selectedCharacterVisual);
-                                setPauseStatus(pauseState, "Loaded builtin cube.", uiNowSeconds, 2.2f);
+                            } else if (characterRowOpensModelPrompt(pauseState, pauseState.selectedIndex)) {
+                                beginModelPathPrompt(pauseState, pauseState.charactersSubTab, selectedCharacterVisual.sourcePath.generic_string());
+                            } else if (characterRowLoadsBuiltinModel(pauseState, pauseState.selectedIndex)) {
+                                if (pauseState.charactersSubTab == CharacterSubTab::Player) {
+                                    setBuiltinWalkingModel(selectedCharacterVisual);
+                                    setPauseStatus(pauseState, "Loaded builtin player biped.", uiNowSeconds, 2.2f);
+                                } else {
+                                    setBuiltinPlaneModel(selectedCharacterVisual);
+                                    setPauseStatus(pauseState, "Loaded builtin cube.", uiNowSeconds, 2.2f);
+                                }
                                 schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
                             } else if (pauseState.selectedIndex >= kCharacterAssetListStart &&
-                                pauseState.selectedIndex < characterItemCount(assetCatalog.size())) {
+                                pauseState.selectedIndex < characterItemCount(pauseState, assetCatalog.size())) {
                                 const AssetEntry& asset = assetCatalog[static_cast<std::size_t>(pauseState.selectedIndex - kCharacterAssetListStart)];
                                 std::string loadStatus;
                                 loadPlaneModelFromPath(asset.path, selectedCharacterVisual, &loadStatus);
@@ -16671,6 +18277,7 @@ try
             runtime,
             environment,
             terrainContext,
+            config,
             uiState,
             propAudioConfig,
             0.0f,
@@ -16808,17 +18415,20 @@ try
         const Quat planeRenderRotation = quatNormalize(quatMultiply(plane.rot, composeVisualRotationOffset(planeVisual)));
         const Vec3 planeRenderPosition = plane.pos + rotateVector(planeRenderRotation, planeVisual.modelOffset);
         if (uiState.chaseCamera) {
-            opaqueObjects.push_back({
-                &planeVisual.model,
+            appendVisualRenderObjects(
+                opaqueObjects,
+                planeVisual,
                 planeRenderPosition,
                 planeRenderRotation,
-                { planeVisual.scale, planeVisual.scale, planeVisual.scale },
+                planeVisual.scale,
                 { 1.0f, 1.0f, 1.0f },
                 1.0f,
                 400.0f,
                 2600.0f,
-                true
-            });
+                true,
+                uiNowSeconds,
+                runtime.propRpm,
+                clamp(runtime.aileronDeflection / std::max(radians(1.0f), config.maxAileronDeflectionRad), -1.0f, 1.0f));
         }
 
         if (pauseState.active && (pauseState.tab == PauseTab::Characters || pauseState.tab == PauseTab::Paint)) {
@@ -16835,22 +18445,20 @@ try
             const Quat previewRotation = quatNormalize(quatMultiply(previewSpin, composeVisualRotationOffset(previewVisual)));
             const Vec3 previewAnchor = renderCamera.pos + (cameraForward * 34.0f) + (cameraRight * 18.0f) - (cameraUp * 6.0f);
             const Vec3 previewPosition = previewAnchor + rotateVector(previewRotation, previewVisual.modelOffset);
-
-            opaqueObjects.push_back({
-                &previewVisual.model,
+            appendVisualRenderObjects(
+                opaqueObjects,
+                previewVisual,
                 previewPosition,
                 previewRotation,
-                {
-                    previewVisual.scale * previewVisual.previewZoom,
-                    previewVisual.scale * previewVisual.previewZoom,
-                    previewVisual.scale * previewVisual.previewZoom
-                },
+                previewVisual.scale * previewVisual.previewZoom,
                 { 1.0f, 1.0f, 1.0f },
                 1.0f,
                 40.0f,
                 160.0f,
-                true
-            });
+                true,
+                uiNowSeconds,
+                pauseState.tab == PauseTab::Characters && pauseState.characterEditorMode == CharacterEditorMode::Rig ? 1850.0f : 0.0f,
+                pauseState.tab == PauseTab::Characters && pauseState.characterEditorMode == CharacterEditorMode::Rig ? std::sin(uiNowSeconds * 1.4f) : 0.0f);
         }
 
         for (const CloudGroup& group : cloudField.groups) {
@@ -16982,8 +18590,7 @@ try
     boot.planeVisual.defaultScale = 3.0f;
     setBuiltinPlaneModel(boot.planeVisual);
     boot.walkingVisual.defaultScale = 1.0f;
-    setBuiltinPlaneModel(boot.walkingVisual);
-    boot.walkingVisual.label = "builtin player cube";
+    setBuiltinWalkingModel(boot.walkingVisual);
 
     SDL_Window* window = SDL_CreateWindow(
         "TrueFlight",
@@ -17158,8 +18765,12 @@ try
 
     restoreVisualFromPreferences(boot.planeVisual, boot.planeProfile.visualPrefs, planeFallbackPath, "plane");
     restoreVisualFromPreferences(boot.walkingVisual, boot.walkingPrefs, {}, "walking");
-    if (boot.walkingVisual.sourcePath.empty() && boot.walkingVisual.label == "builtin cube") {
-        boot.walkingVisual.label = "builtin player cube";
+    if (boot.walkingVisual.sourcePath.empty() &&
+        (boot.walkingVisual.label == "builtin cube" || boot.walkingVisual.label == "builtin player cube")) {
+        boot.walkingVisual.label = "builtin player biped";
+        if (!boot.walkingPrefs.hasStoredPath && std::fabs(boot.walkingVisual.forwardAxisYawDegrees + 90.0f) < 1.0e-3f) {
+            boot.walkingVisual.forwardAxisYawDegrees = 0.0f;
+        }
     }
 
     if (!bootStage("Menu Ready", 0.92f, "Preparing shared menu resources.")) {
@@ -17385,8 +18996,10 @@ try
     };
 
     auto fixBuiltinRoleLabel = [&](CharacterSubTab role, PlaneVisualState& visual) {
-        if (role == CharacterSubTab::Player && visual.sourcePath.empty() && visual.label == "builtin cube") {
-            visual.label = "builtin player cube";
+        if (role == CharacterSubTab::Player &&
+            visual.sourcePath.empty() &&
+            (visual.label == "builtin cube" || visual.label == "builtin player cube")) {
+            visual.label = "builtin player biped";
         }
     };
 
@@ -17717,8 +19330,8 @@ try
         return true;
     };
 
-    auto spawnGameplayObject = [&](GameplayObjectKind kind, int ownerId, const Vec3& pos, const Vec3& vel, float radius, float ttl, float damage, float drag, float gravityScale, float blastRadius, float craterRadius, float craterDepth) {
-        session->gameplayObjects.push_back({
+    auto spawnGameplayObject = [&](GameplayObjectKind kind, int ownerId, const Vec3& pos, const Vec3& vel, float radius, float ttl, float damage, float gravityScale, float blastRadius, float craterRadius, float craterDepth) {
+        session->gameplayObjects.push_back(makeGameplayObjectState(
             kind,
             session->nextGameplayObjectId++,
             ownerId,
@@ -17727,13 +19340,10 @@ try
             radius,
             ttl,
             damage,
-            drag,
             gravityScale,
             blastRadius,
             craterRadius,
-            craterDepth,
-            true
-        });
+            craterDepth));
     };
 
     auto spawnPrimaryShot = [&](float nowSeconds, int ownerId, const FlightState& actor, bool actorFlightMode, float walkYaw, float walkPitch, bool terrainAdd, bool terrainRemove) {
@@ -17760,11 +19370,10 @@ try
             terrainAdd ? GameplayObjectKind::TerrainAdd :
             (terrainRemove ? GameplayObjectKind::TerrainRemove : GameplayObjectKind::Projectile);
         const float muzzleSpeed = terrainShot ? 72.0f : (actorFlightMode ? 340.0f : 185.0f);
-        const float radius = terrainShot ? 0.42f : 0.22f;
+        const float radius = terrainShot ? 0.18f : (actorFlightMode ? 0.085f : 0.05f);
         const float ttl = terrainShot ? 2.2f : kProjectileLifetimeSec;
         const float damage = terrainShot ? 0.0f : (actorFlightMode ? 18.0f : 12.0f);
-        const float drag = terrainShot ? 0.03f : 0.012f;
-        const float gravityScale = terrainShot ? 0.18f : 0.12f;
+        const float gravityScale = terrainShot ? 0.16f : (actorFlightMode ? 0.92f : 1.0f);
         spawnGameplayObject(
             kind,
             ownerId,
@@ -17773,12 +19382,18 @@ try
             radius,
             ttl,
             damage,
-            drag,
             gravityScale,
             0.0f,
             0.0f,
             0.0f);
         cooldown = nowSeconds + (terrainShot ? kTerrainGunCooldownSec : kPrimaryFireCooldownSec);
+        accumulateCombatAudioEvent(
+            *session,
+            muzzlePos,
+            terrainShot ? 0.0f : (actorFlightMode ? 1.0f : 0.82f),
+            terrainShot ? 0.92f : 0.0f,
+            0.0f,
+            0.0f);
     };
 
     auto spawnBomb = [&](float nowSeconds, int ownerId, const FlightState& actor) {
@@ -17798,15 +19413,15 @@ try
             ownerId,
             actor.pos - (up * 0.9f) - (forward * 0.6f),
             actor.flightVel - (up * 2.0f),
-            0.62f,
+            0.34f,
             kBombLifetimeSec,
-            46.0f,
-            0.05f,
+            72.0f,
             1.0f,
-            18.0f,
-            12.0f,
-            4.6f);
+            28.0f,
+            16.0f,
+            6.8f);
         weaponState.nextBombDropAt = nowSeconds + kBombDropCooldownSec;
+        accumulateCombatAudioEvent(*session, actor.pos, 0.0f, 0.0f, 1.0f, 0.0f);
     };
 
     auto simulateAuthoritativeGameplay = [&](float dt, float nowSeconds, bool localFirePrimary, bool localDropBomb, bool localTerrainAdd, bool localTerrainRemove) {
@@ -17879,7 +19494,12 @@ try
                     return;
                 }
                 const float alpha = 1.0f - clamp(distance / std::max(1.0f, blastRadius + radius), 0.0f, 1.0f);
-                applyPlaneDamage(ensurePlaneDurabilityState(session->planeDurabilityByPlayerId, playerId), 26.0f * alpha, 33.0f * alpha, 14.0f * alpha);
+                const float blastScale = clamp(maxDamage / 46.0f, 0.65f, 2.4f);
+                applyPlaneDamage(
+                    ensurePlaneDurabilityState(session->planeDurabilityByPlayerId, playerId),
+                    26.0f * blastScale * alpha,
+                    33.0f * blastScale * alpha,
+                    14.0f * blastScale * alpha);
             };
 
             applyPlayerBlastDamage(localGameplayPlayerId(), session->plane, session->flightMode);
@@ -17908,8 +19528,20 @@ try
             const float stepDt = dt / static_cast<float>(substeps);
             for (int substep = 0; substep < substeps && object.active; ++substep) {
                 const Vec3 start = object.pos;
-                object.vel.y += -9.80665f * object.gravityScale * stepDt;
-                object.vel *= clamp(1.0f - (object.drag * stepDt), 0.0f, 1.0f);
+                const AtmosphereSample atmosphere = sampleAtmosphere(object.pos.y);
+                const Vec3 wind = getWindVector3(session->windState);
+                const Vec3 airVelocity = object.vel - wind;
+                const float airSpeed = length(airVelocity);
+                Vec3 acceleration { 0.0f, -9.80665f * object.gravityScale, 0.0f };
+                if (airSpeed > 0.1f) {
+                    const float qbar = 0.5f * std::max(0.02f, atmosphere.densityKgM3) * airSpeed * airSpeed;
+                    const float dragAcceleration =
+                        (qbar * std::max(0.01f, object.dragCoefficient) * std::max(1.0e-5f, object.referenceAreaM2)) /
+                        std::max(0.01f, object.massKg);
+                    acceleration += normalize(-airVelocity, {}) * dragAcceleration;
+                }
+                object.vel += acceleration * stepDt;
+                object.spinAngleRad = std::fmod(object.spinAngleRad + (object.spinRateRadPerSec * stepDt), 2.0f * kPi);
                 object.pos += object.vel * stepDt;
 
                 for (EnemyTargetState& target : session->enemyTargets) {
@@ -17929,6 +19561,7 @@ try
                     }
                     if (object.kind == GameplayObjectKind::Bomb) {
                         applyBlastDamage(object.ownerId, target.pos, object.blastRadius, object.damage);
+                        accumulateCombatAudioEvent(*session, target.pos, 0.0f, 0.0f, 0.0f, 1.0f);
                     }
                     object.active = false;
                 }
@@ -17953,6 +19586,7 @@ try
                     }
                     if (object.kind == GameplayObjectKind::Bomb) {
                         applyBlastDamage(object.ownerId, actor.pos, object.blastRadius, object.damage);
+                        accumulateCombatAudioEvent(*session, actor.pos, 0.0f, 0.0f, 0.0f, 1.0f);
                     }
                     object.active = false;
                 };
@@ -17990,6 +19624,7 @@ try
                         };
                         (void)applyAuthoritativeCrater(crater);
                         applyBlastDamage(object.ownerId, samplePos, object.blastRadius, object.damage);
+                        accumulateCombatAudioEvent(*session, samplePos, 0.0f, 0.0f, 0.0f, 1.0f);
                     } else if (object.kind == GameplayObjectKind::TerrainAdd || object.kind == GameplayObjectKind::TerrainRemove) {
                         const Vec3 impactNormal = sampleTerrainNormal(samplePos.x, samplePos.y, samplePos.z, session->terrainContext);
                         const float magnitude = object.kind == GameplayObjectKind::TerrainAdd ? 3.4f : -3.8f;
@@ -17999,6 +19634,7 @@ try
                             magnitude,
                             impactNormal,
                             object.kind == GameplayObjectKind::TerrainAdd ? "terrain_add" : "terrain_remove");
+                        accumulateCombatAudioEvent(*session, samplePos, 0.0f, 0.18f, 0.0f, 0.0f);
                     }
                     object.active = false;
                 }
@@ -18203,8 +19839,7 @@ try
         boot.paintUi = {};
         boot.selectedWorldId = "native_default";
         setBuiltinPlaneModel(boot.planeVisual);
-        setBuiltinPlaneModel(boot.walkingVisual);
-        boot.walkingVisual.label = "builtin player cube";
+        setBuiltinWalkingModel(boot.walkingVisual);
         syncHudUi();
         refreshWorldInstanceCatalog(boot);
         refreshSteamRuntimeState();
@@ -18397,11 +20032,17 @@ try
             queueSave(nowSeconds);
             break;
         case PauseTab::Characters:
-            if (menuState.selectedIndex >= 1 && menuState.selectedIndex <= 10) {
+            if (characterRowCanReset(menuState, menuState.selectedIndex)) {
                 PlaneVisualState& visual = activeCharacterVisual();
-                resetCharacterRowValue(visual, menuState.selectedIndex);
+                resetCharacterRowValue(menuState, visual, menuState.selectedIndex);
                 fixBuiltinRoleLabel(menuState.charactersSubTab, visual);
-                setPauseStatus(menuState, "Reset selected character transform value.", nowSeconds, 2.2f);
+                setPauseStatus(
+                    menuState,
+                    menuState.characterEditorMode == CharacterEditorMode::Rig
+                        ? "Reset selected rig cutout value."
+                        : "Reset selected character transform value.",
+                    nowSeconds,
+                    2.2f);
                 queueSave(nowSeconds);
             }
             break;
@@ -18486,9 +20127,9 @@ try
             }
             break;
         case PauseTab::Characters:
-            if (menuState.selectedIndex >= 1 && menuState.selectedIndex <= 10) {
+            if (characterRowCanAdjust(menuState, menuState.selectedIndex)) {
                 PlaneVisualState& visual = activeCharacterVisual();
-                adjustCharacterRowValue(visual, menuState.selectedIndex, direction);
+                adjustCharacterRowValue(menuState, visual, menuState.selectedIndex, direction);
                 fixBuiltinRoleLabel(menuState.charactersSubTab, visual);
                 queueSave(nowSeconds);
             }
@@ -18565,9 +20206,21 @@ try
             break;
         case PauseTab::Characters: {
             PlaneVisualState& visual = activeCharacterVisual();
-            setBuiltinPlaneModel(visual);
-            fixBuiltinRoleLabel(menuState.charactersSubTab, visual);
-            setPauseStatus(menuState, "Restored selected role to builtin defaults.", nowSeconds, 2.6f);
+            if (menuState.characterEditorMode == CharacterEditorMode::Rig) {
+                for (int slotIndex = 0; slotIndex < static_cast<int>(visual.rigCutouts.size()); ++slotIndex) {
+                    visual.rigCutouts[static_cast<std::size_t>(slotIndex)] = defaultVisualRigCutout(slotIndex);
+                }
+                rebuildVisualRigModels(visual);
+                setPauseStatus(menuState, "Cleared saved rig cutouts for this role.", nowSeconds, 2.6f);
+            } else {
+                if (menuState.charactersSubTab == CharacterSubTab::Player) {
+                    setBuiltinWalkingModel(visual);
+                } else {
+                    setBuiltinPlaneModel(visual);
+                }
+                fixBuiltinRoleLabel(menuState.charactersSubTab, visual);
+                setPauseStatus(menuState, "Restored selected role to builtin defaults.", nowSeconds, 2.6f);
+            }
             queueSave(nowSeconds);
             break;
         }
@@ -18636,18 +20289,30 @@ try
             }
             break;
         case PauseTab::Characters:
-            if (menuState.selectedIndex >= 1 && menuState.selectedIndex <= 10) {
-                resetSelectedRow(nowSeconds);
-            } else if (menuState.selectedIndex == 11) {
-                beginModelPrompt(menuState.charactersSubTab, nowSeconds);
-            } else if (menuState.selectedIndex == 12) {
+            if (menuState.selectedIndex == 0) {
                 PlaneVisualState& visual = activeCharacterVisual();
-                setBuiltinPlaneModel(visual);
+                adjustCharacterRowValue(menuState, visual, menuState.selectedIndex, 1);
+                queueSave(nowSeconds);
+            } else if (characterRowCanReset(menuState, menuState.selectedIndex)) {
+                resetSelectedRow(nowSeconds);
+            } else if (characterRowOpensModelPrompt(menuState, menuState.selectedIndex)) {
+                beginModelPrompt(menuState.charactersSubTab, nowSeconds);
+            } else if (characterRowLoadsBuiltinModel(menuState, menuState.selectedIndex)) {
+                PlaneVisualState& visual = activeCharacterVisual();
+                if (menuState.charactersSubTab == CharacterSubTab::Player) {
+                    setBuiltinWalkingModel(visual);
+                } else {
+                    setBuiltinPlaneModel(visual);
+                }
                 fixBuiltinRoleLabel(menuState.charactersSubTab, visual);
-                setPauseStatus(menuState, "Loaded builtin cube.", nowSeconds, 2.2f);
+                setPauseStatus(
+                    menuState,
+                    menuState.charactersSubTab == CharacterSubTab::Player ? "Loaded builtin player biped." : "Loaded builtin cube.",
+                    nowSeconds,
+                    2.2f);
                 queueSave(nowSeconds);
             } else if (menuState.selectedIndex >= kCharacterAssetListStart &&
-                       menuState.selectedIndex < characterItemCount(boot.assetCatalog.size())) {
+                       menuState.selectedIndex < characterItemCount(menuState, boot.assetCatalog.size())) {
                 PlaneVisualState& visual = activeCharacterVisual();
                 const AssetEntry& asset = boot.assetCatalog[static_cast<std::size_t>(menuState.selectedIndex - kCharacterAssetListStart)];
                 std::string loadStatus;
@@ -18812,7 +20477,7 @@ try
         case PauseTab::Hud:
             return !hudRowDisabled(menuState.hudSubTab, menuState.selectedIndex);
         case PauseTab::Characters:
-            return menuState.selectedIndex >= 1 && menuState.selectedIndex <= 10;
+            return characterRowCanAdjust(menuState, menuState.selectedIndex);
         case PauseTab::Paint:
             return menuState.selectedIndex >= 0 && menuState.selectedIndex <= 4;
         default:
@@ -19346,7 +21011,7 @@ try
                         menuState.rowDragLastX = mouseX;
                     }
                 } else if (menuState.tab == PauseTab::Characters) {
-                    if (menuState.selectedIndex >= 1 && menuState.selectedIndex <= 10) {
+                    if (characterRowCanAdjust(menuState, menuState.selectedIndex)) {
                         adjustSelectedRow(direction, uiNowSeconds);
                         menuState.rowDragActive = true;
                         menuState.rowDragLastX = mouseX;
@@ -19476,9 +21141,14 @@ try
                 }
 
                 if (scancode == SDL_SCANCODE_F5 && menuState.tab == PauseTab::Characters) {
-                    boot.assetCatalog = scanModelAssets();
-                    clampMenuSelection();
-                    setPauseStatus(menuState, "Refreshed portSource/Assets/Models catalog.", uiNowSeconds, 2.2f);
+                    if (menuState.characterEditorMode == CharacterEditorMode::Rig) {
+                        rebuildVisualRigModels(activeCharacterVisual());
+                        setPauseStatus(menuState, "Rebuilt animated cutout partitions for this model.", uiNowSeconds, 2.2f);
+                    } else {
+                        boot.assetCatalog = scanModelAssets();
+                        clampMenuSelection();
+                        setPauseStatus(menuState, "Refreshed portSource/Assets/Models catalog.", uiNowSeconds, 2.2f);
+                    }
                     continue;
                 }
 
@@ -19986,20 +21656,56 @@ try
             session->steamOnline = snapshotSteamOnlineState(boot.steamController);
             boot.steamOnline = session->steamOnline;
 
-            const ProceduralAudioFrame audioFrame = buildProceduralAudioFrame(
+            ProceduralAudioFrame audioFrame = buildProceduralAudioFrame(
                 session->plane,
                 session->runtime,
                 environment,
                 session->terrainContext,
+                boot.planeProfile.flightConfig,
                 boot.uiState,
                 boot.planeProfile.propAudioConfig,
                 session->foliageBrushAmount,
                 session->foliageImpactPulse,
-                windowHasFocus && session->flightMode && !session->runtime.crashed,
-                menuVisible() || !session->flightMode,
+                windowHasFocus && !session->runtime.crashed,
+                menuVisible(),
                 dt,
                 flightAfterburnerActive);
+            if (!session->flightMode) {
+                audioFrame.onGround = session->plane.onGround;
+                audioFrame.exteriorView = true;
+                audioFrame.afterburner = false;
+                audioFrame.engineThrottle = 0.0f;
+                audioFrame.crankRpm = 480.0f;
+                audioFrame.propRpm = 480.0f;
+                audioFrame.manifoldPressureKpa = 25.0f;
+                audioFrame.fuelFlowKgPerSec = 0.0f;
+                audioFrame.enginePowerKw = 0.0f;
+                audioFrame.trueAirspeed = length(session->plane.vel);
+                audioFrame.dynamicPressure = 0.0f;
+                audioFrame.thrustNewton = 0.0f;
+                audioFrame.alphaRad = 0.0f;
+                audioFrame.betaRad = 0.0f;
+                audioFrame.verticalSpeed = session->plane.vel.y;
+                audioFrame.angularRateRad = 0.0f;
+                audioFrame.pitchRateRad = 0.0f;
+                audioFrame.yawRateRad = 0.0f;
+                audioFrame.rollRateRad = 0.0f;
+                audioFrame.engineVolume *= 0.12f;
+            }
+            const CombatAudioTelemetry combatTelemetry = sampleCombatAudioTelemetry(*session);
+            audioFrame.gunshotImpulse = combatTelemetry.gunshotImpulse;
+            audioFrame.terrainShotImpulse = combatTelemetry.terrainShotImpulse;
+            audioFrame.bombLatchImpulse = combatTelemetry.bombLatchImpulse;
+            audioFrame.explosionImpulse = combatTelemetry.explosionImpulse;
+            audioFrame.explosionDistanceMeters = combatTelemetry.explosionDistanceMeters;
+            audioFrame.projectileWhistleAmount = combatTelemetry.projectileWhistleAmount;
+            audioFrame.projectilePitchScale = combatTelemetry.projectilePitchScale;
+            audioFrame.projectileDoppler = combatTelemetry.projectileDoppler;
+            audioFrame.bombWhistleAmount = combatTelemetry.bombWhistleAmount;
+            audioFrame.bombPitchScale = combatTelemetry.bombPitchScale;
+            audioFrame.bombDoppler = combatTelemetry.bombDoppler;
             session->audioState.update(audioFrame);
+            clearCombatAudioTelemetry(*session);
 
             if (boot.preferencesDirty && uiNowSeconds >= boot.preferencesNextSaveAt) {
                 std::string saveError;
@@ -20152,6 +21858,16 @@ try
             translucentObjects.reserve(
                 (terrainVisuals.nearTiles.size() + terrainVisuals.farTiles.size()) +
                 (session->cloudField.groups.size() * 12u));
+            std::vector<Model> transientPoseModels;
+            transientPoseModels.reserve(static_cast<std::size_t>(remotePeerCount) + 4u);
+            const auto yawOnlyRotationForActor = [](const FlightState& actor) {
+                const Vec3 lookForward = forwardFromRotation(actor.rot);
+                return quatFromAxisAngle({ 0.0f, 1.0f, 0.0f }, wrapAngle(std::atan2(lookForward.x, lookForward.z)));
+            };
+            const auto appendWalkingPoseModel = [&](const FlightState& actor, float timeOffsetSeconds) -> const Model* {
+                transientPoseModels.push_back(buildProceduralWalkingRigModel(sampleWalkingRigPose(actor, session->worldTime + timeOffsetSeconds)));
+                return &transientPoseModels.back();
+            };
 
             for (const TerrainFarTile& tile : terrainVisuals.farTiles) {
                 if (!tile.active) {
@@ -20274,28 +21990,70 @@ try
             }
 
             const PlaneVisualState& activeVisual = session->flightMode ? boot.planeVisual : boot.walkingVisual;
-            const Quat actorRenderRotation = quatNormalize(quatMultiply(session->plane.rot, composeVisualRotationOffset(activeVisual)));
+            const Model* actorRenderModel = &activeVisual.model;
+            Quat actorRenderRotation = quatNormalize(quatMultiply(session->plane.rot, composeVisualRotationOffset(activeVisual)));
+            if (!session->flightMode && visualUsesBuiltinWalkingRig(activeVisual)) {
+                actorRenderModel = appendWalkingPoseModel(session->plane, 0.0f);
+                actorRenderRotation = quatNormalize(quatMultiply(yawOnlyRotationForActor(session->plane), composeVisualRotationOffset(activeVisual)));
+            }
             const Vec3 actorRenderPosition = session->plane.pos + rotateVector(actorRenderRotation, activeVisual.modelOffset);
             if (boot.uiState.chaseCamera) {
-                RenderObject actorObject {
-                    &activeVisual.model,
-                    actorRenderPosition,
-                    actorRenderRotation,
-                    { activeVisual.scale, activeVisual.scale, activeVisual.scale },
-                    { 1.0f, 1.0f, 1.0f },
-                    1.0f,
-                    400.0f,
-                    2600.0f,
-                    true
-                };
-                applyFogSettings(actorObject, effectiveGraphics, effectiveLighting);
-                opaqueObjects.push_back(actorObject);
+                const std::size_t objectStart = opaqueObjects.size();
+                if (actorRenderModel != &activeVisual.model) {
+                    RenderObject actorObject {
+                        actorRenderModel,
+                        actorRenderPosition,
+                        actorRenderRotation,
+                        { activeVisual.scale, activeVisual.scale, activeVisual.scale },
+                        { 1.0f, 1.0f, 1.0f },
+                        1.0f,
+                        400.0f,
+                        2600.0f,
+                        true
+                    };
+                    applyFogSettings(actorObject, effectiveGraphics, effectiveLighting);
+                    opaqueObjects.push_back(actorObject);
+                } else {
+                    const float aileronNorm =
+                        session->flightMode
+                            ? clamp(
+                                session->runtime.aileronDeflection /
+                                    std::max(radians(1.0f), boot.planeProfile.flightConfig.maxAileronDeflectionRad),
+                                -1.0f,
+                                1.0f)
+                            : 0.0f;
+                    appendVisualRenderObjects(
+                        opaqueObjects,
+                        activeVisual,
+                        actorRenderPosition,
+                        actorRenderRotation,
+                        activeVisual.scale,
+                        { 1.0f, 1.0f, 1.0f },
+                        1.0f,
+                        400.0f,
+                        2600.0f,
+                        true,
+                        session->worldTime,
+                        session->runtime.propRpm,
+                        aileronNorm);
+                    for (std::size_t objectIndex = objectStart; objectIndex < opaqueObjects.size(); ++objectIndex) {
+                        applyFogSettings(opaqueObjects[objectIndex], effectiveGraphics, effectiveLighting);
+                    }
+                }
             }
 
             const auto appendRemoteRenderObject = [&](const FlightState& peerPlane, const AvatarManifest& avatar, bool peerFlightMode) {
                 const PlaneVisualState& peerVisual = peerFlightMode ? boot.planeVisual : boot.walkingVisual;
                 const AvatarRoleConfig& roleConfig = peerFlightMode ? avatar.plane : avatar.walking;
-                const Quat peerRenderRotation = quatNormalize(quatMultiply(peerPlane.rot, composeNetworkVisualRotation(peerVisual, roleConfig)));
+                const Model* peerRenderModel = &peerVisual.model;
+                Quat peerRenderRotation = quatNormalize(quatMultiply(peerPlane.rot, composeNetworkVisualRotation(peerVisual, roleConfig)));
+                if (!peerFlightMode && visualUsesBuiltinWalkingRig(peerVisual)) {
+                    const float phaseOffset = std::fmod(
+                        std::fabs((peerPlane.pos.x * 0.013f) + (peerPlane.pos.z * 0.017f)),
+                        1.0f);
+                    peerRenderModel = appendWalkingPoseModel(peerPlane, phaseOffset);
+                    peerRenderRotation = quatNormalize(quatMultiply(yawOnlyRotationForActor(peerPlane), composeNetworkVisualRotation(peerVisual, roleConfig)));
+                }
                 const Vec3 peerRenderPosition = peerPlane.pos + rotateVector(peerRenderRotation, roleConfig.offset);
                 const float peerScale = resolveNetworkVisualScale(peerVisual, roleConfig);
                 const float cullRadius = std::max(2.0f, peerScale * 3.5f);
@@ -20303,19 +22061,44 @@ try
                     return;
                 }
 
-                RenderObject peerObject {
-                    &peerVisual.model,
-                    peerRenderPosition,
-                    peerRenderRotation,
-                    { peerScale, peerScale, peerScale },
-                    { 1.0f, 1.0f, 1.0f },
-                    1.0f,
-                    120.0f,
-                    3200.0f,
-                    true
-                };
-                applyFogSettings(peerObject, effectiveGraphics, effectiveLighting);
-                opaqueObjects.push_back(peerObject);
+                const std::size_t objectStart = opaqueObjects.size();
+                if (peerRenderModel != &peerVisual.model) {
+                    RenderObject peerObject {
+                        peerRenderModel,
+                        peerRenderPosition,
+                        peerRenderRotation,
+                        { peerScale, peerScale, peerScale },
+                        { 1.0f, 1.0f, 1.0f },
+                        1.0f,
+                        120.0f,
+                        3200.0f,
+                        true
+                    };
+                    applyFogSettings(peerObject, effectiveGraphics, effectiveLighting);
+                    opaqueObjects.push_back(peerObject);
+                } else {
+                    const float estimatedPropRpm =
+                        peerFlightMode
+                            ? mix(860.0f, 2420.0f, clamp(length(peerPlane.flightVel) / 95.0f, 0.0f, 1.15f))
+                            : 0.0f;
+                    appendVisualRenderObjects(
+                        opaqueObjects,
+                        peerVisual,
+                        peerRenderPosition,
+                        peerRenderRotation,
+                        peerScale,
+                        { 1.0f, 1.0f, 1.0f },
+                        1.0f,
+                        120.0f,
+                        3200.0f,
+                        true,
+                        session->worldTime,
+                        estimatedPropRpm,
+                        0.0f);
+                    for (std::size_t objectIndex = objectStart; objectIndex < opaqueObjects.size(); ++objectIndex) {
+                        applyFogSettings(opaqueObjects[objectIndex], effectiveGraphics, effectiveLighting);
+                    }
+                }
             };
 
             if (session->onlineRole == OnlineSessionRole::Host) {
@@ -20342,14 +22125,10 @@ try
             }
 
             static Model projectileModel = [] {
-                Model model = makeOctahedronModel();
-                model.assetKey = "builtin:projectile";
-                return model;
+                return buildProceduralProjectileModel();
             }();
             static Model bombModel = [] {
-                Model model = makeCubeModel();
-                model.assetKey = "builtin:bomb";
-                return model;
+                return buildProceduralBombModel();
             }();
             static Model targetModel = [] {
                 Model model = makeCubeModel();
@@ -20373,6 +22152,9 @@ try
                     object.kind == GameplayObjectKind::Bomb
                         ? &bombModel
                         : &projectileModel;
+                const Quat flightAlignment = quatNormalize(quatMultiply(
+                    alignForwardToDirection(object.vel),
+                    quatFromAxisAngle({ 0.0f, 0.0f, 1.0f }, object.spinAngleRad)));
                 const Vec3 color =
                     object.kind == GameplayObjectKind::Bomb
                         ? Vec3 { 0.96f, 0.78f, 0.24f }
@@ -20385,8 +22167,12 @@ try
                 RenderObject projectileObject {
                     model,
                     object.pos,
-                    quatIdentity(),
-                    { object.radius * 2.6f, object.radius * 2.6f, object.radius * 2.6f },
+                    flightAlignment,
+                    object.kind == GameplayObjectKind::Bomb
+                        ? Vec3 { object.radius * 2.2f, object.radius * 2.2f, object.radius * 4.8f }
+                        : (object.kind == GameplayObjectKind::TerrainAdd || object.kind == GameplayObjectKind::TerrainRemove
+                            ? Vec3 { object.radius * 2.4f, object.radius * 2.4f, object.radius * 4.2f }
+                            : Vec3 { object.radius * 1.8f, object.radius * 1.8f, object.radius * 6.6f }),
                     color,
                     translucent ? 0.88f : 1.0f,
                     80.0f,
@@ -20444,24 +22230,24 @@ try
                 const Quat previewRotation = quatNormalize(quatMultiply(previewSpin, composeVisualRotationOffset(previewVisual)));
                 const Vec3 previewAnchor = renderCamera.pos + (cameraForward * 34.0f) + (cameraRight * 18.0f) - (cameraUp * 6.0f);
                 const Vec3 previewPosition = previewAnchor + rotateVector(previewRotation, previewVisual.modelOffset);
-
-                RenderObject previewObject {
-                    &previewVisual.model,
+                const std::size_t objectStart = opaqueObjects.size();
+                appendVisualRenderObjects(
+                    opaqueObjects,
+                    previewVisual,
                     previewPosition,
                     previewRotation,
-                    {
-                        previewVisual.scale * previewVisual.previewZoom,
-                        previewVisual.scale * previewVisual.previewZoom,
-                        previewVisual.scale * previewVisual.previewZoom
-                    },
+                    previewVisual.scale * previewVisual.previewZoom,
                     { 1.0f, 1.0f, 1.0f },
                     1.0f,
                     40.0f,
                     160.0f,
-                    true
-                };
-                applyFogSettings(previewObject, effectiveGraphics, effectiveLighting);
-                opaqueObjects.push_back(previewObject);
+                    true,
+                    uiNowSeconds,
+                    menuState.tab == PauseTab::Characters && menuState.characterEditorMode == CharacterEditorMode::Rig ? 1850.0f : 0.0f,
+                    menuState.tab == PauseTab::Characters && menuState.characterEditorMode == CharacterEditorMode::Rig ? std::sin(uiNowSeconds * 1.4f) : 0.0f);
+                for (std::size_t objectIndex = objectStart; objectIndex < opaqueObjects.size(); ++objectIndex) {
+                    applyFogSettings(opaqueObjects[objectIndex], effectiveGraphics, effectiveLighting);
+                }
             }
 
             const Model cloudModel = makeOctahedronModel();
@@ -20647,23 +22433,24 @@ try
                 : quatIdentity();
             const Quat previewRotation = quatNormalize(quatMultiply(previewSpin, composeVisualRotationOffset(previewVisual)));
             const Vec3 previewPosition = Vec3 { 0.0f, -2.5f, 18.0f } + rotateVector(previewRotation, previewVisual.modelOffset);
-            RenderObject previewObject {
-                &previewVisual.model,
+            const std::size_t previewObjectStart = opaqueObjects.size();
+            appendVisualRenderObjects(
+                opaqueObjects,
+                previewVisual,
                 previewPosition,
                 previewRotation,
-                {
-                    previewVisual.scale * previewVisual.previewZoom,
-                    previewVisual.scale * previewVisual.previewZoom,
-                    previewVisual.scale * previewVisual.previewZoom
-                },
+                previewVisual.scale * previewVisual.previewZoom,
                 { 1.0f, 1.0f, 1.0f },
                 1.0f,
                 80.0f,
                 2600.0f,
-                true
-            };
-            applyFogSettings(previewObject, effectiveGraphics, effectiveLighting);
-            opaqueObjects.push_back(previewObject);
+                true,
+                uiNowSeconds,
+                menuState.tab == PauseTab::Characters && menuState.characterEditorMode == CharacterEditorMode::Rig ? 1850.0f : 0.0f,
+                menuState.tab == PauseTab::Characters && menuState.characterEditorMode == CharacterEditorMode::Rig ? std::sin(uiNowSeconds * 1.4f) : 0.0f);
+            for (std::size_t objectIndex = previewObjectStart; objectIndex < opaqueObjects.size(); ++objectIndex) {
+                applyFogSettings(opaqueObjects[objectIndex], effectiveGraphics, effectiveLighting);
+            }
 
             Camera previewCamera {};
             previewCamera.pos = { 0.0f, 0.0f, -22.0f };

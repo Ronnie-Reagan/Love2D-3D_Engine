@@ -429,6 +429,7 @@ void runAudioFrameChecks(bool& failed)
 {
     UiState uiState {};
     TerrainFieldContext terrainContext = createTerrainFieldContext(defaultTerrainParams());
+    FlightConfig flightConfig = defaultFlightConfig();
     PropAudioConfig propAudioConfig = defaultPropAudioConfig();
     propAudioConfig.baseRpm = 42.0f;
     propAudioConfig.engineFrequencyScale = 1.15f;
@@ -443,6 +444,15 @@ void runAudioFrameChecks(bool& failed)
     plane.flightAngVel = { radians(12.0f), radians(4.0f), radians(20.0f) };
 
     FlightRuntimeState runtime {};
+    runtime.engineThrottle = 0.58f;
+    runtime.crankRpm = 2140.0f;
+    runtime.propRpm = 2140.0f;
+    runtime.manifoldPressureKpa = 86.0f;
+    runtime.fuelFlowKgPerSec = 0.012f;
+    runtime.enginePowerKw = 128.0f;
+    runtime.exhaustGasTempK = 905.0f;
+    runtime.cylinderHeadTempK = 431.0f;
+    runtime.oilTempK = 364.0f;
     runtime.lastDynamicPressure = 4100.0f;
     runtime.lastThrustNewton = 2300.0f;
     runtime.lastAlpha = radians(6.0f);
@@ -456,6 +466,7 @@ void runAudioFrameChecks(bool& failed)
         runtime,
         environment,
         terrainContext,
+        flightConfig,
         uiState,
         propAudioConfig,
         0.35f,
@@ -467,16 +478,138 @@ void runAudioFrameChecks(bool& failed)
     const Vec3 airVelWorld = plane.flightVel - environment.wind;
     const Vec3 airVelBody = worldToBody(plane.rot, airVelWorld);
     const float expectedWaterProximity = computeWaterProximity(plane, terrainContext);
+    const float expectedHeightAboveGround = computeHeightAboveGround(plane, terrainContext);
     require(std::fabs(frame.trueAirspeed - length(airVelBody)) < 1.0e-4f, "Audio frame should use air-relative speed", failed);
     require(std::fabs(frame.verticalSpeed - airVelWorld.y) < 1.0e-4f, "Audio frame should use air-relative vertical speed", failed);
     require(std::fabs(frame.angularRateRad - length(plane.flightAngVel)) < 1.0e-4f, "Audio frame should expose body-rate magnitude", failed);
     require(std::fabs(frame.dynamicPressure - runtime.lastDynamicPressure) < 1.0e-4f, "Audio frame should expose runtime q-bar", failed);
     require(std::fabs(frame.thrustNewton - runtime.lastThrustNewton) < 1.0e-4f, "Audio frame should expose runtime thrust", failed);
+    require(std::fabs(frame.engineThrottle - runtime.engineThrottle) < 1.0e-4f, "Audio frame should expose runtime throttle state", failed);
+    require(std::fabs(frame.crankRpm - runtime.crankRpm) < 1.0e-4f, "Audio frame should expose crank RPM", failed);
+    require(std::fabs(frame.propRpm - runtime.propRpm) < 1.0e-4f, "Audio frame should expose prop RPM", failed);
+    require(std::fabs(frame.manifoldPressureKpa - runtime.manifoldPressureKpa) < 1.0e-4f, "Audio frame should expose manifold pressure", failed);
+    require(std::fabs(frame.enginePowerKw - runtime.enginePowerKw) < 1.0e-4f, "Audio frame should expose engine shaft power", failed);
+    require(std::fabs(frame.fuelFlowKgPerSec - runtime.fuelFlowKgPerSec) < 1.0e-4f, "Audio frame should expose fuel flow", failed);
+    require(std::fabs(frame.referenceSpeed - flightConfig.maxEffectivePropSpeed) < 1.0e-4f, "Audio frame should use aircraft reference speed", failed);
+    require(std::fabs(frame.maxCrankRpm - flightConfig.maxCrankRpm) < 1.0e-4f, "Audio frame should expose maximum crank RPM", failed);
+    require(std::fabs(frame.maxBrakePowerKw - flightConfig.maxBrakePowerKw) < 1.0e-4f, "Audio frame should expose max brake power", failed);
+    require(std::fabs(frame.referenceDynamicPressure - flightConfig.controlLoadingReferenceDynamicPressure) < 1.0e-4f, "Audio frame should use aircraft q-bar reference", failed);
+    require(std::fabs(frame.maxThrustNewton - (flightConfig.maxThrustSeaLevel * flightConfig.afterburnerMultiplier)) < 1.0e-4f, "Audio frame should expose max propulsion authority", failed);
+    require(std::fabs(frame.stallAlphaRad - flightConfig.alphaStallRad) < 1.0e-4f, "Audio frame should expose stall alpha", failed);
+    require(std::fabs(frame.maxAngularRateRad - flightConfig.maxAngularRateRad) < 1.0e-4f, "Audio frame should expose aircraft rate limit", failed);
+    require(std::fabs(frame.groundSpeed - std::sqrt((plane.vel.x * plane.vel.x) + (plane.vel.z * plane.vel.z))) < 1.0e-4f, "Audio frame should expose ground-relative horizontal speed", failed);
+    require(std::fabs(frame.heightAboveGroundMeters - expectedHeightAboveGround) < 1.0e-4f, "Audio frame should expose terrain clearance", failed);
+    require(std::fabs(frame.pitchRateRad - std::fabs(plane.flightAngVel.x)) < 1.0e-4f, "Audio frame should expose pitch-rate magnitude", failed);
+    require(std::fabs(frame.yawRateRad - std::fabs(plane.flightAngVel.y)) < 1.0e-4f, "Audio frame should expose yaw-rate magnitude", failed);
+    require(std::fabs(frame.rollRateRad - std::fabs(plane.flightAngVel.z)) < 1.0e-4f, "Audio frame should expose roll-rate magnitude", failed);
     require(std::fabs(frame.waterProximity - expectedWaterProximity) < 1.0e-4f, "Audio frame should preserve water proximity sampling", failed);
     require(std::fabs(frame.foliageBrush - 0.35f) < 1.0e-4f, "Audio frame should preserve foliage brush amount", failed);
     require(std::fabs(frame.foliageImpact - 0.7f) < 1.0e-4f, "Audio frame should preserve foliage impact amount", failed);
+    require(frame.exteriorView == uiState.chaseCamera, "Audio frame should preserve camera mode for interior/exterior mixing", failed);
     require(std::fabs(frame.propAudioConfig.baseRpm - propAudioConfig.baseRpm) < 1.0e-4f, "Audio frame should preserve aircraft-local base RPM config", failed);
     require(std::fabs(frame.propAudioConfig.engineFrequencyScale - propAudioConfig.engineFrequencyScale) < 1.0e-4f, "Audio frame should preserve aircraft-local engine frequency scaling", failed);
+
+    GameSession session {};
+    session.flightMode = false;
+    session.plane.pos = { 0.0f, 2.0f, 0.0f };
+    session.plane.vel = { 0.0f, 0.0f, 0.0f };
+    session.audioGunshotImpulse = 0.65f;
+    session.audioTerrainShotImpulse = 0.25f;
+    session.audioBombLatchImpulse = 0.45f;
+    session.audioExplosionImpulse = 0.72f;
+    session.audioExplosionDistanceMeters = 38.0f;
+    session.gameplayObjects.push_back(makeGameplayObjectState(
+        GameplayObjectKind::Projectile,
+        1,
+        1,
+        { 8.0f, 2.0f, 28.0f },
+        { 0.0f, 0.0f, -210.0f },
+        0.08f,
+        1.0f,
+        10.0f,
+        1.0f,
+        0.0f,
+        0.0f,
+        0.0f));
+    session.gameplayObjects.push_back(makeGameplayObjectState(
+        GameplayObjectKind::Bomb,
+        2,
+        1,
+        { -6.0f, 18.0f, 34.0f },
+        { 0.0f, -8.0f, -64.0f },
+        0.34f,
+        1.0f,
+        24.0f,
+        1.0f,
+        16.0f,
+        10.0f,
+        4.2f));
+    const CombatAudioTelemetry combatTelemetry = sampleCombatAudioTelemetry(session);
+    require(combatTelemetry.gunshotImpulse > 0.0f, "Combat audio telemetry should preserve gunshot impulses", failed);
+    require(combatTelemetry.explosionImpulse > 0.0f, "Combat audio telemetry should preserve explosion impulses", failed);
+    require(combatTelemetry.projectileWhistleAmount > 0.0f, "Combat audio telemetry should expose nearby projectile flyby whistles", failed);
+    require(combatTelemetry.bombWhistleAmount > 0.0f, "Combat audio telemetry should expose nearby bomb whistles", failed);
+    require(combatTelemetry.explosionDistanceMeters < 100.0f, "Combat audio telemetry should preserve explosion distance", failed);
+}
+
+void runCullingAndWalkingRigChecks(bool& failed)
+{
+    Camera camera {};
+    camera.rot = quatIdentity();
+    camera.fovRadians = radians(70.0f);
+    camera.farClipMeters = 320.0f;
+
+    const float edgeAngle = radians(62.0f);
+    const Vec3 edgeCenter {
+        std::sin(edgeAngle) * 100.0f,
+        0.0f,
+        std::cos(edgeAngle) * 100.0f
+    };
+    require(
+        sphereWithinView(camera, edgeCenter, 40.0f, 320.0f),
+        "Large terrain-edge spheres should remain visible when their bounds still overlap the frustum",
+        failed);
+
+    PlaneVisualState walkingVisual;
+    walkingVisual.defaultScale = 1.0f;
+    setBuiltinWalkingModel(walkingVisual);
+    require(walkingVisual.sourceModel.assetKey == "builtin:walking_biped", "Built-in walking visual should use the biped rig asset key", failed);
+    require(walkingVisual.label == "builtin player biped", "Built-in walking visual should advertise the biped label", failed);
+    require(
+        walkingVisual.sourceModel.vertices.size() > makeCubeModel().vertices.size(),
+        "Built-in walking visual should no longer be the cube primitive",
+        failed);
+
+    FlightState actor {};
+    actor.pos = { 0.0f, 1.8f, 0.0f };
+    actor.vel = { 2.0f, 0.0f, 5.5f };
+    actor.onGround = true;
+    actor.rot = composeWalkingRotation(radians(18.0f), radians(10.0f));
+    const Model posedWalkingModel = buildProceduralWalkingRigModel(sampleWalkingRigPose(actor, 0.75f));
+    require(posedWalkingModel.faces.size() > 40u, "Procedural walking rig should generate a multi-part articulated mesh", failed);
+    if (!posedWalkingModel.vertices.empty()) {
+        float minY = posedWalkingModel.vertices.front().y;
+        float maxY = posedWalkingModel.vertices.front().y;
+        for (const Vec3& vertex : posedWalkingModel.vertices) {
+            minY = std::min(minY, vertex.y);
+            maxY = std::max(maxY, vertex.y);
+        }
+        require((maxY - minY) > 1.8f, "Procedural walking rig height regressed below the intended biped silhouette", failed);
+    }
+
+    PlaneVisualState planeVisual;
+    planeVisual.defaultScale = 1.0f;
+    setBuiltinPlaneModel(planeVisual);
+    planeVisual.rigCutouts[0] = defaultVisualRigCutout(0);
+    planeVisual.rigCutouts[0].enabled = true;
+    planeVisual.rigCutouts[0].center = { 0.0f, 0.0f, 1.0f };
+    planeVisual.rigCutouts[0].halfExtents = { 1.2f, 1.2f, 0.24f };
+    planeVisual.rigCutouts[0].pivot = { 0.0f, 0.0f, 1.0f };
+    rebuildVisualRigModels(planeVisual);
+    require(visualUsesRigCutouts(planeVisual), "Character rig cutouts should build a split animated model cache", failed);
+    require(planeVisual.rigSlotActive[0], "Character rig cutouts should capture faces inside the selected prop volume", failed);
+    require(planeVisual.rigBaseModel.faces.size() + planeVisual.rigSlotModels[0].faces.size() == planeVisual.model.faces.size(), "Character rig partitioning should preserve the source face count", failed);
+    require(std::fabs(visualRigSlotAngleRadians(planeVisual, 0, 1.0f, 1800.0f, 0.0f)) > 10.0f, "Character rig prop previews should derive visible rotation from prop RPM", failed);
 }
 
 void runTerrainLodChecks(bool& failed)
@@ -509,6 +642,77 @@ void runTerrainLodChecks(bool& failed)
     require(
         !nearPatch.vertices.empty() && nearPatch.vertexNormals.size() == nearPatch.vertices.size(),
         "Surface terrain patch no longer generates per-vertex normals for near-field lighting",
+        failed);
+}
+
+void runTerrainEditBoundsChecks(bool& failed)
+{
+    const auto root = repoRoot();
+    const std::filesystem::path tempRoot = root / "build/native-smoke-terrain-edit-temp";
+    std::error_code ec;
+    std::filesystem::remove_all(tempRoot, ec);
+
+    WorldStoreOptions options;
+    options.name = "smoke_edit_bounds";
+    options.storageRoot = tempRoot;
+    options.groundParams = defaultTerrainParams();
+
+    std::string worldError;
+    auto openedWorld = WorldStore::open(options, &worldError);
+    require(openedWorld.has_value(), "World store failed to open for terrain edit smoke: " + worldError, failed);
+    if (!openedWorld.has_value()) {
+        return;
+    }
+
+    WorldStore world = std::move(*openedWorld);
+    WorldChunkState chunk;
+    chunk.cx = 0;
+    chunk.cz = 0;
+    chunk.resolution = normalizeWorldChunkResolution(world.getMeta().chunkResolution);
+    chunk.heightDeltas.assign(static_cast<std::size_t>((chunk.resolution + 1) * (chunk.resolution + 1)), 0.0f);
+    chunk.revision = 1;
+    chunk.materialRevision = 1;
+    chunk.volumetricOverrides.push_back({ "sphere_sub", 84.0f, -260.0f, 64.0f, 28.0f });
+    require(world.applyChunkState(chunk), "Terrain edit smoke failed to inject a deep volumetric override", failed);
+
+    TerrainFieldContext terrainContext = createTerrainFieldContext(options.groundParams);
+    bindTerrainContextWorldStore(terrainContext, &world, {});
+
+    const TerrainPatchBounds ownerBounds {
+        0.0f,
+        terrainContext.params.chunkSize,
+        0.0f,
+        terrainContext.params.chunkSize,
+        false,
+        0.0f,
+        0.0f,
+        0.0f,
+        0.0f
+    };
+    const TerrainPatchBounds neighborBounds {
+        terrainContext.params.chunkSize,
+        terrainContext.params.chunkSize * 2.0f,
+        0.0f,
+        terrainContext.params.chunkSize,
+        false,
+        0.0f,
+        0.0f,
+        0.0f,
+        0.0f
+    };
+
+    const TerrainVolumeBounds adaptiveBounds = buildAdaptiveTerrainVolumeBounds(
+        ownerBounds,
+        terrainContext,
+        terrainContext.params.lod0CellSize,
+        terrainContext.params.lod0CellSize);
+    require(
+        adaptiveBounds.y0 < (terrainContext.params.minY - 100.0f),
+        "Adaptive terrain volume bounds should extend below the generic minY when deep live voxel edits exist",
+        failed);
+    require(
+        terrainPatchNeedsWorldVolumetrics(neighborBounds, terrainContext),
+        "Neighboring terrain tiles should qualify for volumetric meshing around live voxel edits to avoid mixed-mode seams",
         failed);
 }
 
@@ -1747,7 +1951,9 @@ int main()
 
     runFlightParityChecks(failed);
     runAudioFrameChecks(failed);
+    runCullingAndWalkingRigChecks(failed);
     runTerrainLodChecks(failed);
+    runTerrainEditBoundsChecks(failed);
     runTerrainStreamingChecks(failed);
     runPressureGovernorChecks(failed);
     runTerrainDecorationChecks(failed);

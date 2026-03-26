@@ -106,6 +106,7 @@ public:
     float sampleVolumetricSubtractiveSdf(float x, float y, float z);
     float sampleVolumetricOverrideSdf(float x, float y, float z);
     bool hasVolumetricOverridesInBounds(float x0, float z0, float x1, float z1, int neighborRing = 1);
+    TerrainVerticalBoundsSample volumetricVerticalBoundsForBounds(float x0, float z0, float x1, float z1, int neighborRing = 1);
     std::uint64_t revisionSignatureForBounds(float x0, float z0, float x1, float z1, int neighborRing = 1);
     std::vector<WorldChunkState> collectEditedChunks(int centerCx, int centerCz, int radiusChunks);
     std::pair<bool, std::vector<WorldChunkState>> applyCrater(const TerrainCrater& craterSpec);
@@ -598,6 +599,46 @@ inline bool WorldStore::hasVolumetricOverridesInBounds(float x0, float z0, float
         }
     }
     return false;
+}
+
+inline TerrainVerticalBoundsSample WorldStore::volumetricVerticalBoundsForBounds(float x0, float z0, float x1, float z1, int neighborRing)
+{
+    TerrainVerticalBoundsSample out;
+    const float chunkSize = std::max(1.0f, chunkSize_);
+    const int ring = std::max(0, neighborRing);
+    const float minX = std::min(x0, x1);
+    const float maxX = std::max(x0, x1);
+    const float minZ = std::min(z0, z1);
+    const float maxZ = std::max(z0, z1);
+    const int minCx = static_cast<int>(std::floor(minX / chunkSize)) - ring;
+    const int maxCx = static_cast<int>(std::floor(maxX / chunkSize)) + ring;
+    const int minCz = static_cast<int>(std::floor(minZ / chunkSize)) - ring;
+    const int maxCz = static_cast<int>(std::floor(maxZ / chunkSize)) + ring;
+
+    for (int cz = minCz; cz <= maxCz; ++cz) {
+        for (int cx = minCx; cx <= maxCx; ++cx) {
+            WorldChunkState* chunk = getChunk(cx, cz, false);
+            if (chunk == nullptr || chunk->volumetricOverrides.empty()) {
+                continue;
+            }
+            for (const WorldVolumetricOverride& override : chunk->volumetricOverrides) {
+                const float radius = std::max(0.1f, override.radius);
+                if ((override.x + radius) < minX || (override.x - radius) > maxX ||
+                    (override.z + radius) < minZ || (override.z - radius) > maxZ) {
+                    continue;
+                }
+                if (!out.valid) {
+                    out.valid = true;
+                    out.minY = override.y - radius;
+                    out.maxY = override.y + radius;
+                    continue;
+                }
+                out.minY = std::min(out.minY, override.y - radius);
+                out.maxY = std::max(out.maxY, override.y + radius);
+            }
+        }
+    }
+    return out;
 }
 
 inline std::uint64_t WorldStore::revisionSignatureForBounds(float x0, float z0, float x1, float z1, int neighborRing)

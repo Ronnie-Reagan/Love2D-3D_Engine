@@ -24,7 +24,7 @@ struct FlightConfig {
     int maxSubsteps = 8;
     float maxFrameDt = 0.1f;
     float metersPerUnit = 1.0f;
-    float massKg = 1150.0f;
+    float massKg = 750.0f;
     float Ixx = 1200.0f;
     float Iyy = 1700.0f;
     float Izz = 2500.0f;
@@ -32,17 +32,17 @@ struct FlightConfig {
     float wingArea = 16.2f;
     float wingSpan = 10.9f;
     float meanChord = 1.5f;
-    float CL0 = 0.25f;
-    float CLalpha = 5.5f;
-    float CLElevator = 0.65f;
-    float alphaStallRad = radians(15.0f);
-    float stallLiftDropoff = 0.55f;
-    float CD0 = 0.03f;
-    float inducedDragK = 0.045f;
+    float CL0 = 0.40f;
+    float CLalpha = 6.2f;
+    float CLElevator = 0.80f;
+    float alphaStallRad = radians(18.0f);
+    float stallLiftDropoff = 0.22f;
+    float CD0 = 0.025f;
+    float inducedDragK = 0.027f;
     float CYbeta = -0.95f;
     float CYrudder = 0.28f;
     float Cm0 = 0.04f;
-    float CmAlpha = -1.2f;
+    float CmAlpha = -1.02f;
     float CmQ = -12.0f;
     float CmElevator = -1.35f;
     float ClBeta = -0.12f;
@@ -55,9 +55,17 @@ struct FlightConfig {
     float CnP = -0.06f;
     float CnRudder = -0.17f;
     float CnAileron = 0.02f;
-    float maxThrustSeaLevel = 3200.0f;
+    float maxThrustSeaLevel = 6400.0f;
     float afterburnerMultiplier = 1.45f;
-    float maxEffectivePropSpeed = 95.0f;
+    float maxEffectivePropSpeed = 600.0f;
+    float idleCrankRpm = 780.0f;
+    float maxCrankRpm = 3600.0f;
+    float propellerGearRatio = 1.0f;
+    float propellerDiameterMeters = 2.6f;
+    float engineDisplacementLiters = 9.0f;
+    int engineCylinderCount = 16;
+    float maxBrakePowerKw = 650.0f;
+    float fuelMassKg = 250.0f;
     float throttleTimeConstant = 0.8f;
     float maxElevatorDeflectionRad = radians(25.0f);
     float maxAileronDeflectionRad = radians(20.0f);
@@ -87,7 +95,7 @@ struct FlightConfig {
     float rollControlScale = 0.72f;
     float yawControlScale = 0.65f;
     bool crashEnabled = true;
-    float maxLinearSpeed = 180.0f;
+    float maxLinearSpeed = 600.0f;
     float maxAngularRateRad = radians(240.0f);
     float maxForceNewton = 70000.0f;
     float maxMomentNewtonMeter = 120000.0f;
@@ -136,6 +144,15 @@ struct FlightDebugState {
     float thrust = 0.0f;
     float throttle = 0.0f;
     float speed = 0.0f;
+    float crankRpm = 0.0f;
+    float propRpm = 0.0f;
+    float manifoldPressureKpa = 0.0f;
+    float enginePowerKw = 0.0f;
+    float fuelFlowKgPerHour = 0.0f;
+    float exhaustGasTempC = 0.0f;
+    float cylinderHeadTempC = 0.0f;
+    float oilTempC = 0.0f;
+    float fuelRemainingKg = 0.0f;
 };
 
 struct FlightState {
@@ -197,6 +214,18 @@ struct FlightRuntimeState {
     float accumulator = 0.0f;
     int tick = 0;
     float engineThrottle = 0.0f;
+    float fuelRemainingKg = 0.0f;
+    float crankRpm = 0.0f;
+    float shaftRpm = 0.0f;
+    float propRpm = 0.0f;
+    float manifoldPressureKpa = 101.325f;
+    float fuelFlowKgPerSec = 0.0f;
+    float airMassFlowKgPerSec = 0.0f;
+    float enginePowerKw = 0.0f;
+    float exhaustGasTempK = 720.0f;
+    float cylinderHeadTempK = 360.0f;
+    float oilTempK = 330.0f;
+    float propellerEfficiency = 0.45f;
     float elevatorTrim = 0.0f;
     float trimTarget = 0.0f;
     int trimNextUpdateTick = 0;
@@ -397,8 +426,8 @@ inline AeroState computeAero(
 
     const float alphaModelClamp = std::max(config.alphaStallRad + radians(2.0f), radians(50.0f));
     const float betaModelClamp = radians(65.0f);
-    const float clMin = -1.4f;
-    const float clMax = 1.8f;
+    const float clMin = -1.6f;
+    const float clMax = 2.1f;
     const float cdMax = 2.2f;
     const float cyMax = 1.4f;
     const float cMomentMax = 2.8f;
@@ -729,6 +758,18 @@ inline void stepFlight(
         runtime.rudderDeflection = 0.0f;
         runtime.lastAtmosphere = atmosphere;
         runtime.engineThrottle = state.throttle;
+        runtime.fuelRemainingKg = std::max(0.0f, config.fuelMassKg);
+        runtime.crankRpm = std::max(450.0f, config.idleCrankRpm);
+        runtime.shaftRpm = runtime.crankRpm;
+        runtime.propRpm = runtime.shaftRpm / std::max(0.25f, config.propellerGearRatio);
+        runtime.manifoldPressureKpa = std::max(20.0f, atmosphere.pressurePa * 0.001f);
+        runtime.fuelFlowKgPerSec = 0.0f;
+        runtime.airMassFlowKgPerSec = 0.0f;
+        runtime.enginePowerKw = 0.0f;
+        runtime.exhaustGasTempK = 720.0f;
+        runtime.cylinderHeadTempK = 360.0f;
+        runtime.oilTempK = 330.0f;
+        runtime.propellerEfficiency = 0.45f;
         runtime.bootstrapDone = true;
     }
 
@@ -750,13 +791,83 @@ inline void stepFlight(
 
         const float throttleAlpha = clamp(fixedDt / std::max(0.05f, config.throttleTimeConstant), 0.0f, 1.0f);
         runtime.engineThrottle += (state.throttle - runtime.engineThrottle) * throttleAlpha;
-        const float speedFactor = clamp(1.0f - (trueAirspeed / std::max(40.0f, config.maxEffectivePropSpeed)), 0.18f, 1.0f);
-        runtime.lastThrustNewton =
-            std::max(0.0f, config.maxThrustSeaLevel) *
-            std::max(0.05f, atmosphere.sigma) *
-            clamp(runtime.engineThrottle, 0.0f, 1.0f) *
-            speedFactor *
-            (input.flightAfterburner ? std::max(1.0f, config.afterburnerMultiplier) : 1.0f);
+        const float boostMultiplier = input.flightAfterburner ? std::max(1.0f, config.afterburnerMultiplier) : 1.0f;
+        const float propellerDiameter = std::max(0.5f, config.propellerDiameterMeters);
+        const float ambientPressureKpa = std::max(12.0f, atmosphere.pressurePa * 0.001f);
+        const float throttleCommand = clamp(runtime.engineThrottle, 0.0f, 1.0f);
+        const float combustionAvailability = runtime.fuelRemainingKg > 0.0f ? 1.0f : 0.0f;
+        const float idleManifoldRatio = clamp(32.0f / 101.325f, 0.12f, 0.55f);
+        const float manifoldTargetKpa = ambientPressureKpa * clamp(
+            idleManifoldRatio + (throttleCommand * 0.76f * boostMultiplier * combustionAvailability),
+            idleManifoldRatio,
+            boostMultiplier * 1.05f);
+        runtime.manifoldPressureKpa +=
+            (manifoldTargetKpa - runtime.manifoldPressureKpa) *
+            clamp(fixedDt * 6.0f, 0.0f, 1.0f);
+
+        const float windmillRpm = clamp(
+            (trueAirspeed / propellerDiameter) * 32.0f,
+            std::max(350.0f, config.idleCrankRpm * 0.45f),
+            std::max(800.0f, config.maxCrankRpm * 0.78f));
+        const float propTipSpeed = kPi * propellerDiameter * std::max(5.0f, runtime.propRpm / 60.0f);
+        const float advanceRatio = trueAirspeed / std::max(18.0f, propTipSpeed);
+        const float rpmLoadFactor = clamp(1.06f - (advanceRatio * 0.12f), 0.88f, 1.08f);
+        const float commandedRpm =
+            mix(std::max(450.0f, config.idleCrankRpm), std::max(config.idleCrankRpm + 200.0f, config.maxCrankRpm), throttleCommand * combustionAvailability);
+        const float rpmTarget = std::max(windmillRpm, commandedRpm * rpmLoadFactor);
+        runtime.crankRpm += (rpmTarget - runtime.crankRpm) * clamp(fixedDt * 4.0f, 0.0f, 1.0f);
+        runtime.shaftRpm = runtime.crankRpm;
+        runtime.propRpm = runtime.shaftRpm / std::max(0.25f, config.propellerGearRatio);
+
+        const float displacementM3 = std::max(0.5f, config.engineDisplacementLiters) * 0.001f;
+        const float manifoldDensity = std::max(0.05f, atmosphere.densityKgM3 * (runtime.manifoldPressureKpa / ambientPressureKpa));
+        runtime.airMassFlowKgPerSec =
+            displacementM3 *
+            (std::max(0.0f, runtime.crankRpm) / 120.0f) *
+            manifoldDensity *
+            0.86f *
+            combustionAvailability;
+        runtime.fuelFlowKgPerSec = runtime.airMassFlowKgPerSec / 12.8f;
+
+        if (runtime.fuelRemainingKg > 0.0f) {
+            const float fuelUsed = runtime.fuelFlowKgPerSec * fixedDt;
+            if (fuelUsed >= runtime.fuelRemainingKg && fuelUsed > 0.0f) {
+                const float scale = runtime.fuelRemainingKg / fuelUsed;
+                runtime.airMassFlowKgPerSec *= scale;
+                runtime.fuelFlowKgPerSec *= scale;
+                runtime.fuelRemainingKg = 0.0f;
+            } else {
+                runtime.fuelRemainingKg -= fuelUsed;
+            }
+        } else {
+            runtime.airMassFlowKgPerSec = 0.0f;
+            runtime.fuelFlowKgPerSec = 0.0f;
+        }
+
+        const float chemicalPowerKw = runtime.fuelFlowKgPerSec * 43000.0f;
+        const float brakePowerLimit =
+            std::max(15.0f, config.maxBrakePowerKw * std::max(0.20f, atmosphere.sigma) * boostMultiplier);
+        runtime.enginePowerKw = std::min(chemicalPowerKw * 0.35f, brakePowerLimit);
+        const float propAdvanceNorm = clamp(advanceRatio / 0.85f, 0.0f, 2.0f);
+        runtime.propellerEfficiency = clamp(
+            0.26f + (0.58f * std::exp(-((propAdvanceNorm - 0.85f) * (propAdvanceNorm - 0.85f)) / 0.18f)),
+            0.22f,
+            0.86f);
+        const float effectiveAirspeed = std::max(22.0f, trueAirspeed);
+
+        runtime.lastThrustNewton = clamp(
+            (runtime.enginePowerKw * 1000.0f * runtime.propellerEfficiency) / effectiveAirspeed,
+            0.0f,
+            std::max(400.0f, config.maxThrustSeaLevel * boostMultiplier * 1.25f));
+
+        const float powerNorm = runtime.enginePowerKw / brakePowerLimit;
+        const float coolingFlow = clamp((trueAirspeed / std::max(25.0f, config.maxEffectivePropSpeed)) + 0.12f, 0.12f, 1.8f);
+        const float egtTargetK = 720.0f + (powerNorm * 220.0f);
+        const float chtTargetK = 365.0f + (powerNorm * 105.0f) - (coolingFlow * 42.0f);
+        const float oilTargetK = 330.0f + (powerNorm * 62.0f) - (coolingFlow * 20.0f);
+        runtime.exhaustGasTempK += (egtTargetK - runtime.exhaustGasTempK) * clamp(fixedDt * 1.8f, 0.0f, 1.0f);
+        runtime.cylinderHeadTempK += (chtTargetK - runtime.cylinderHeadTempK) * clamp(fixedDt * 0.45f, 0.0f, 1.0f);
+        runtime.oilTempK += (oilTargetK - runtime.oilTempK) * clamp(fixedDt * 0.22f, 0.0f, 1.0f);
 
         if (config.enableAutoTrim) {
             if (runtime.tick >= runtime.trimNextUpdateTick) {
@@ -844,6 +955,15 @@ inline void stepFlight(
     state.debug.thrust = runtime.lastThrustNewton;
     state.debug.throttle = runtime.engineThrottle;
     state.debug.speed = length(state.flightVel);
+    state.debug.crankRpm = runtime.crankRpm;
+    state.debug.propRpm = runtime.propRpm;
+    state.debug.manifoldPressureKpa = runtime.manifoldPressureKpa;
+    state.debug.enginePowerKw = runtime.enginePowerKw;
+    state.debug.fuelFlowKgPerHour = runtime.fuelFlowKgPerSec * 3600.0f;
+    state.debug.exhaustGasTempC = runtime.exhaustGasTempK - 273.15f;
+    state.debug.cylinderHeadTempC = runtime.cylinderHeadTempK - 273.15f;
+    state.debug.oilTempC = runtime.oilTempK - 273.15f;
+    state.debug.fuelRemainingKg = runtime.fuelRemainingKg;
 }
 
 }  // namespace NativeGame
