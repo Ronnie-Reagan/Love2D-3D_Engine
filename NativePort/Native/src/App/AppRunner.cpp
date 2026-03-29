@@ -68,6 +68,14 @@ namespace TrueFlightApp {
 
 using namespace NativeGame;
 
+static float avg(const std::array<float, NativeGame::kMaxFlightEngines>& v, int count)
+{
+    const int c = std::max(1, std::min(count, NativeGame::kMaxFlightEngines));
+    float t = 0.0f;
+    for (int i = 0; i < c; ++i) t += v[i];
+    return t / static_cast<float>(c);
+}
+
 constexpr float kFlightMouseSensitivity = 0.001f;
 constexpr float kFlightZoomFactor = 0.6f;
 const float kMinimumZoomFovRadians = radians(20.0f);
@@ -2027,21 +2035,21 @@ ProceduralAudioFrame buildProceduralAudioFrame(
     frame.ambienceVolume = uiState.ambienceVolume;
     frame.combatVolume = uiState.combatVolume;
     frame.flybyVolume = uiState.flybyVolume;
-
+    const int engineCount = runtime.engineCount;
     const Vec3 airVelWorld = plane.flightVel - environment.wind;
     const Vec3 airVelBody = worldToBody(plane.rot, airVelWorld);
     frame.engineThrottle = runtime.engineThrottle;
-    frame.crankRpm = runtime.crankRpm;
-    frame.propRpm = runtime.propRpm;
+    frame.crankRpm = avg(runtime.crankRpm, engineCount);
+    frame.propRpm = avg(runtime.propRpm, engineCount);
     frame.maxCrankRpm = std::max(600.0f, flightConfig.maxCrankRpm);
     frame.maxPropRpm = frame.maxCrankRpm / std::max(0.25f, flightConfig.propellerGearRatio);
-    frame.manifoldPressureKpa = runtime.manifoldPressureKpa;
-    frame.fuelFlowKgPerSec = runtime.fuelFlowKgPerSec;
-    frame.enginePowerKw = runtime.enginePowerKw;
+    frame.manifoldPressureKpa = avg(runtime.manifoldPressureKpa, engineCount);
+    frame.fuelFlowKgPerSec = avg(runtime.fuelFlowKgPerSec, engineCount);
+    frame.enginePowerKw = avg(runtime.enginePowerKw, engineCount);
     frame.maxBrakePowerKw = std::max(10.0f, flightConfig.maxBrakePowerKw);
-    frame.exhaustGasTempK = runtime.exhaustGasTempK;
-    frame.cylinderHeadTempK = runtime.cylinderHeadTempK;
-    frame.oilTempK = runtime.oilTempK;
+    frame.exhaustGasTempK = avg(runtime.exhaustGasTempK, engineCount);
+    frame.cylinderHeadTempK = avg(runtime.cylinderHeadTempK, engineCount);
+    frame.oilTempK = avg(runtime.oilTempK, engineCount);
     frame.engineCylinderCount = static_cast<float>(std::max(1, flightConfig.engineCylinderCount));
     frame.trueAirspeed = length(airVelBody);
     frame.referenceSpeed = std::max(25.0f, flightConfig.maxEffectivePropSpeed);
@@ -20122,6 +20130,7 @@ namespace TrueFlightApp {
 int run(int argc, char** argv)
 try
 {
+    
     logToStdout("[boot] TrueFlight startup");
 
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
@@ -26369,7 +26378,7 @@ try
                         2600.0f,
                         true,
                         session->worldTime,
-                        session->runtime.propRpm,
+                        avg(session->runtime.propRpm, session->runtime.engineCount),
                         aileronNorm);
                     for (std::size_t objectIndex = objectStart; objectIndex < opaqueObjects.size(); ++objectIndex) {
                         applyFogSettings(opaqueObjects[objectIndex], effectiveGraphics, effectiveLighting);
@@ -26419,7 +26428,7 @@ try
                         2600.0f,
                         true,
                         session->worldTime,
-                        session->runtime.propRpm,
+                        avg(session->runtime.propRpm, session->runtime.engineCount),
                         aileronNorm);
                     for (std::size_t objectIndex = objectStart; objectIndex < translucentObjects.size(); ++objectIndex) {
                         applyFogSettings(translucentObjects[objectIndex], effectiveGraphics, effectiveLighting);
