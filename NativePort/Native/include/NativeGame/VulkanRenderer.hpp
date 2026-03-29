@@ -13,6 +13,8 @@
 #include <string>
 #include <vector>
 
+struct ImDrawData;
+
 namespace NativeGame {
 
 struct RendererLightingState {
@@ -77,11 +79,14 @@ public:
         const std::vector<RenderObject>& opaqueObjects,
         const std::vector<RenderObject>& translucentObjects,
         const HudCanvas& hudCanvas,
+        ImDrawData* imguiDrawData,
         std::string* errorMessage);
 
     void setMemoryBudgets(std::size_t residentMeshBudgetBytes, std::size_t sceneTextureBudgetBytes);
     [[nodiscard]] const RendererMemoryStats& memoryStats() const;
     [[nodiscard]] const char* backendName() const;
+    [[nodiscard]] SDL_GPUDevice* gpuDevice() const;
+    [[nodiscard]] SDL_GPUTextureFormat swapchainTextureFormat() const;
 
 private:
     struct SceneVertex {

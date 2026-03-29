@@ -10,6 +10,20 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(TRUEFLIGHT_ENABLE_STEAMWORKS "Enable optional Steamworks runtime support" OFF)
 set(TRUEFLIGHT_STEAM_APP_ID "480" CACHE STRING "Development Steam AppID written to steam_appid.txt when Steamworks is enabled")
 set(STEAMWORKS_SDK_ROOT "" CACHE PATH "Path to the Steamworks SDK root or sdk/ directory")
+set(TRUEFLIGHT_WINDOWS_ICON_ICO "" CACHE FILEPATH "Optional .ico embedded as the TrueFlight Windows executable icon")
+
+set(TRUEFLIGHT_PORTSOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../portSource")
+if(TRUEFLIGHT_WINDOWS_ICON_ICO STREQUAL "")
+    foreach(TRUEFLIGHT_ICON_CANDIDATE
+        "${TRUEFLIGHT_PORTSOURCE_DIR}/Assets/Icons/TrueFlight.ico"
+        "${TRUEFLIGHT_PORTSOURCE_DIR}/Assets/Icons/AppIcon.ico"
+        "${TRUEFLIGHT_PORTSOURCE_DIR}/Assets/Icons/WindowIcon.ico")
+        if(EXISTS "${TRUEFLIGHT_ICON_CANDIDATE}")
+            set(TRUEFLIGHT_WINDOWS_ICON_ICO "${TRUEFLIGHT_ICON_CANDIDATE}")
+            break()
+        endif()
+    endforeach()
+endif()
 
 include(FetchContent)
 
@@ -67,42 +81,91 @@ compile_native_shader(hud.frag hud.frag.spv)
 
 add_custom_target(NativeShaders ALL DEPENDS ${NATIVE_SHADER_OUTPUTS})
 
-add_executable(TrueFlight
-    Native/src/main.cpp
+add_library(TrueFlightImGui STATIC
+    third_party/imgui/imgui.cpp
+    third_party/imgui/imgui_draw.cpp
+    third_party/imgui/imgui_widgets.cpp
+    third_party/imgui/imgui_tables.cpp
+    third_party/imgui/imgui_demo.cpp
+    third_party/imgui/backends/imgui_impl_sdl3.cpp
+    third_party/imgui/backends/imgui_impl_sdlgpu3.cpp
+    third_party/imgui/misc/cpp/imgui_stdlib.cpp
+)
+
+add_library(TrueFlightRuntime STATIC
+    Native/src/App/AppState.cpp
+    Native/src/App/InputBindings.cpp
+    Native/src/App/MenuController.cpp
+    Native/src/App/AppRunner.cpp
+    Native/src/App/WorldCatalog.cpp
     Native/src/VulkanRenderer.cpp
     Native/src/SteamSupport.cpp
 )
 
+add_executable(TrueFlight
+    Native/src/main.cpp
+)
+
 add_executable(TrueFlightNativeSmoke
     Native/tests/native_smoke.cpp
-    Native/src/VulkanRenderer.cpp
-    Native/src/SteamSupport.cpp
 )
 
 add_test(NAME TrueFlightNativeSmoke COMMAND $<TARGET_FILE:TrueFlightNativeSmoke>)
 
 add_dependencies(TrueFlight NativeShaders)
 
-target_include_directories(TrueFlight
-    PRIVATE
+if(WIN32 AND NOT TRUEFLIGHT_WINDOWS_ICON_ICO STREQUAL "")
+    if(EXISTS "${TRUEFLIGHT_WINDOWS_ICON_ICO}")
+        file(TO_CMAKE_PATH "${TRUEFLIGHT_WINDOWS_ICON_ICO}" TRUEFLIGHT_WINDOWS_ICON_ICO_RC)
+        configure_file(
+            "${CMAKE_CURRENT_SOURCE_DIR}/Native/windows_app_icon.rc.in"
+            "${CMAKE_CURRENT_BINARY_DIR}/trueflight_windows_icon.rc"
+            @ONLY)
+        target_sources(TrueFlight PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/trueflight_windows_icon.rc")
+    else()
+        message(WARNING "TRUEFLIGHT_WINDOWS_ICON_ICO was set but the file does not exist: ${TRUEFLIGHT_WINDOWS_ICON_ICO}")
+    endif()
+endif()
+
+target_include_directories(TrueFlightRuntime
+    PUBLIC
         Native/include
+        Native/src
         ${sdl3_SOURCE_DIR}/src/render
 )
 
-target_include_directories(TrueFlightNativeSmoke
-    PRIVATE
-        Native/include
-        ${sdl3_SOURCE_DIR}/src/render
+target_include_directories(TrueFlightImGui
+    PUBLIC
+        third_party/imgui
+        third_party/imgui/backends
+        third_party/imgui/misc/cpp
 )
 
-target_link_libraries(TrueFlight
-    PRIVATE
+target_link_libraries(TrueFlightImGui
+    PUBLIC
         SDL3::SDL3
+)
+
+target_link_libraries(TrueFlightRuntime
+    PUBLIC
+        SDL3::SDL3
+    PRIVATE
+        TrueFlightImGui
 )
 
 target_link_libraries(TrueFlightNativeSmoke
     PRIVATE
-        SDL3::SDL3
+        TrueFlightRuntime
+)
+
+target_link_libraries(TrueFlight
+    PRIVATE
+        TrueFlightRuntime
+)
+
+target_compile_definitions(TrueFlightRuntime
+    PRIVATE
+        _CRT_SECURE_NO_WARNINGS
 )
 
 target_compile_definitions(TrueFlight
@@ -116,21 +179,25 @@ target_compile_definitions(TrueFlightNativeSmoke
 )
 
 if(MSVC)
+    target_compile_options(TrueFlightRuntime PRIVATE /W4 /permissive-)
     target_compile_options(TrueFlight PRIVATE /W4 /permissive-)
     target_compile_options(TrueFlightNativeSmoke PRIVATE /W4 /permissive-)
+    target_compile_options(TrueFlightImGui PRIVATE /W1)
 else()
+    target_compile_options(TrueFlightRuntime PRIVATE -Wall -Wextra -Wpedantic)
     target_compile_options(TrueFlight PRIVATE -Wall -Wextra -Wpedantic)
     target_compile_options(TrueFlightNativeSmoke PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(TrueFlightImGui PRIVATE -w)
 endif()
 
 if(WIN32)
-    target_link_libraries(TrueFlight PRIVATE gdi32 dxgi psapi bcrypt)
-    target_link_libraries(TrueFlightNativeSmoke PRIVATE gdi32 dxgi psapi bcrypt)
+    target_link_libraries(TrueFlightRuntime PUBLIC gdi32 dxgi psapi bcrypt)
 
     add_custom_command(TARGET TrueFlight POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy -t $<TARGET_FILE_DIR:TrueFlight> $<TARGET_RUNTIME_DLLS:TrueFlight>
         COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:TrueFlight>/Shaders
         COMMAND ${CMAKE_COMMAND} -E copy_directory ${NATIVE_SHADER_OUTPUT_DIR} $<TARGET_FILE_DIR:TrueFlight>/Shaders
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${TRUEFLIGHT_PORTSOURCE_DIR}" $<TARGET_FILE_DIR:TrueFlight>/portSource
         COMMAND_EXPAND_LISTS
     )
 
@@ -162,19 +229,34 @@ if(TRUEFLIGHT_ENABLE_STEAMWORKS)
         message(FATAL_ERROR "Steamworks was enabled, but steam_api64.lib was not found in: ${STEAMWORKS_REDIST_DIR}")
     endif()
 
+    target_include_directories(TrueFlightRuntime
+        PRIVATE
+            "${STEAMWORKS_SDK_ROOT}/public"
+    )
+
+    target_compile_definitions(TrueFlightRuntime
+        PRIVATE
+            TRUEFLIGHT_ENABLE_STEAMWORKS=1
+            TRUEFLIGHT_STEAM_APP_ID=${TRUEFLIGHT_STEAM_APP_ID}
+    )
+
+    target_link_libraries(TrueFlightRuntime
+        PUBLIC
+            "${STEAMWORKS_REDIST_DIR}/steam_api64.lib"
+    )
+
     foreach(TARGET_NAME TrueFlight TrueFlightNativeSmoke)
-        target_include_directories(${TARGET_NAME}
-            PRIVATE
-                "${STEAMWORKS_SDK_ROOT}/public"
-        )
         target_compile_definitions(${TARGET_NAME}
             PRIVATE
                 TRUEFLIGHT_ENABLE_STEAMWORKS=1
                 TRUEFLIGHT_STEAM_APP_ID=${TRUEFLIGHT_STEAM_APP_ID}
         )
-        target_link_libraries(${TARGET_NAME}
+    endforeach()
+
+    foreach(TARGET_NAME TrueFlight TrueFlightNativeSmoke)
+        target_include_directories(${TARGET_NAME}
             PRIVATE
-                "${STEAMWORKS_REDIST_DIR}/steam_api64.lib"
+                Native/src
         )
     endforeach()
 
@@ -192,6 +274,12 @@ if(TRUEFLIGHT_ENABLE_STEAMWORKS)
         COMMAND_EXPAND_LISTS
     )
 else()
+    target_compile_definitions(TrueFlightRuntime
+        PRIVATE
+            TRUEFLIGHT_ENABLE_STEAMWORKS=0
+            TRUEFLIGHT_STEAM_APP_ID=480
+    )
+
     foreach(TARGET_NAME TrueFlight TrueFlightNativeSmoke)
         target_compile_definitions(${TARGET_NAME}
             PRIVATE

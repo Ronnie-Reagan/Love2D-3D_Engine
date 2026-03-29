@@ -6,8 +6,8 @@ All rights reserved.
 1. Definitions
    “Software” means the source code, scripts, binaries, and related files
    distributed by the Author.
-   “Author” means the original copyright holder.
-   “You” means any individual or entity using the Software.
+   “Author” and/or "author" means the original copyright holder.
+   “You” and/or "you" means any individual or entity using the Software.
    “Derivative Work” means any modification, adaptation, refactor, extension,
    partial reuse, or translation of the Software.
    “Combined Work” means embedding, linking, bundling, or integrating the
@@ -110,3 +110,29 @@ All rights reserved.
 13. Attribution
     Any permitted redistribution must include clear and visible attribution to
     the Author and include this license text in full.
+
+14. Third-Party Software, Licenses, and Attributions
+
+    This Software may include or depend on third-party libraries, assets, or
+    components that are licensed under their own terms.
+
+    Notwithstanding Section 5 (“No Combination or Embedding”), the Author grants
+    permission to combine, link, and distribute the Software with such third-party
+    components solely as required to build, run, and use the Software as distributed.
+
+    All required third-party license texts, notices, and attributions are provided in:
+
+        /licenses/THIRD_PARTY_LICENSES.txt
+
+    Each third-party component remains subject to its own license, and You must
+    comply with those licenses independently in addition to this license.
+
+    Where required by applicable third-party licenses (including but not limited
+    to MIT, zlib, Apache 2.0, and Creative Commons Attribution 4.0), attribution
+    must be preserved and displayed in a reasonable and visible manner.
+
+    This exception does NOT grant permission to combine this Software with other
+    software beyond what is necessary to use the Software as distributed.
+
+    Failure to comply with third-party license terms may result in loss of rights
+    granted under those respective licenses.

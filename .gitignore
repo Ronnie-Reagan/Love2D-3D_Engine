@@ -5,4 +5,7 @@ build/
 out/
 vc140.pdb
 steamworks_sdk_164/
-NativePort\Docs
+NativePort/Docs
+NativePort/third_party/imgui
+
+

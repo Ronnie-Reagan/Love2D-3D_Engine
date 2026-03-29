@@ -1,11 +1,24 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import shutil
 import subprocess
 import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+
+
+@dataclass
+class TimedCommandResult:
+    command: list[str]
+    cwd: Path
+    started_utc: str
+    duration_seconds: float
+    returncode: int
 
 
 def find_cmake() -> str:
@@ -24,9 +37,32 @@ def find_cmake() -> str:
     raise FileNotFoundError("cmake was not found on PATH and no known Windows install path exists")
 
 
-def run_command(command: list[str], cwd: Path) -> None:
-    print("+", " ".join(f'"{part}"' if " " in part else part for part in command))
-    subprocess.run(command, cwd=str(cwd), check=True)
+def stringify_command(command: list[str]) -> str:
+    return " ".join(f'"{part}"' if " " in part else part for part in command)
+
+
+def run_command(command: list[str], cwd: Path) -> TimedCommandResult:
+    started = datetime.now(timezone.utc).isoformat()
+    started_perf = time.perf_counter()
+
+    print("+", stringify_command(command))
+    completed = subprocess.run(command, cwd=str(cwd), check=False)
+
+    duration_seconds = time.perf_counter() - started_perf
+    result = TimedCommandResult(
+        command=command,
+        cwd=cwd,
+        started_utc=started,
+        duration_seconds=duration_seconds,
+        returncode=completed.returncode,
+    )
+
+    print(f"  -> exit={result.returncode} elapsed={result.duration_seconds:.3f}s")
+
+    if completed.returncode != 0:
+        raise subprocess.CalledProcessError(completed.returncode, command)
+
+    return result
 
 
 def find_ctest(cmake: str) -> str:
@@ -73,6 +109,24 @@ def detect_steamworks_sdk_root(source_dir: Path, explicit_root: str | None) -> P
         if resolved is not None:
             return resolved
 
+    return None
+
+
+def detect_windows_icon_ico(source_dir: Path, explicit_icon: str | None) -> Path | None:
+    if explicit_icon:
+        candidate = Path(explicit_icon).expanduser().resolve()
+        if not candidate.exists():
+            raise FileNotFoundError(f"Windows icon .ico was provided but could not be found: {explicit_icon}")
+        return candidate
+
+    candidates = (
+        source_dir / "portSource" / "Assets" / "Icons" / "TrueFlight.ico",
+        source_dir / "portSource" / "Assets" / "Icons" / "AppIcon.ico",
+        source_dir / "portSource" / "Assets" / "Icons" / "WindowIcon.ico",
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
     return None
 
 
@@ -125,6 +179,91 @@ def cmake_cache_matches_request(
     return True
 
 
+def append_metrics_row(csv_path: Path, row: dict[str, str | int | float | bool]) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = [
+        "timestamp_utc",
+        "run_label",
+        "phase",
+        "status",
+        "duration_seconds",
+        "returncode",
+        "command",
+        "cwd",
+        "source_dir",
+        "build_dir",
+        "config",
+        "target",
+        "generator",
+        "arch",
+        "clean_first",
+        "reconfigure",
+        "ctest_requested",
+        "steamworks_enabled",
+        "cache_state",
+        "notes",
+    ]
+
+    file_exists = csv_path.exists()
+    with csv_path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def log_phase_metrics(
+    metrics_csv: Path | None,
+    run_label: str,
+    phase: str,
+    result: TimedCommandResult | None,
+    *,
+    status: str,
+    source_dir: Path,
+    build_dir: Path,
+    config: str,
+    target: str,
+    generator: str | None,
+    arch: str | None,
+    clean_first: bool,
+    reconfigure: bool,
+    ctest_requested: bool,
+    steamworks_enabled: bool,
+    cache_state: str,
+    notes: str = "",
+    returncode_override: int | None = None,
+) -> None:
+    if metrics_csv is None:
+        return
+
+    append_metrics_row(
+        metrics_csv,
+        {
+            "timestamp_utc": result.started_utc if result is not None else datetime.now(timezone.utc).isoformat(),
+            "run_label": run_label,
+            "phase": phase,
+            "status": status,
+            "duration_seconds": f"{(result.duration_seconds if result is not None else 0.0):.6f}",
+            "returncode": returncode_override if returncode_override is not None else (result.returncode if result is not None else ""),
+            "command": stringify_command(result.command) if result is not None else "",
+            "cwd": str(result.cwd) if result is not None else "",
+            "source_dir": str(source_dir),
+            "build_dir": str(build_dir),
+            "config": config,
+            "target": target,
+            "generator": generator or "",
+            "arch": arch or "",
+            "clean_first": int(clean_first),
+            "reconfigure": int(reconfigure),
+            "ctest_requested": int(ctest_requested),
+            "steamworks_enabled": int(steamworks_enabled),
+            "cache_state": cache_state,
+            "notes": notes,
+        },
+    )
+
+
 def configure_if_needed(
     cmake: str,
     source_dir: Path,
@@ -133,11 +272,15 @@ def configure_if_needed(
     arch: str | None,
     reconfigure: bool,
     cmake_defines: list[str],
-) -> None:
+) -> tuple[TimedCommandResult | None, str]:
     cache_path = build_dir / "CMakeCache.txt"
-    if cache_path.exists() and not reconfigure:
-        if cmake_cache_matches_request(cache_path, generator, arch, cmake_defines):
-            return
+    cache_state = "no_cache"
+
+    if cache_path.exists():
+        cache_state = "cache_miss"
+        if not reconfigure and cmake_cache_matches_request(cache_path, generator, arch, cmake_defines):
+            print("CMake configure step skipped: matching cache already present.")
+            return None, "cache_hit"
         print("Cached CMake settings differ from the requested arguments; reconfiguring.")
 
     build_dir.mkdir(parents=True, exist_ok=True)
@@ -147,7 +290,9 @@ def configure_if_needed(
         command.extend(["-G", generator])
     if arch:
         command.extend(["-A", arch])
-    run_command(command, cwd=source_dir)
+
+    return run_command(command, cwd=source_dir), cache_state
+
 
 def build_target(
     cmake: str,
@@ -155,19 +300,21 @@ def build_target(
     config: str,
     target: str,
     clean_first: bool,
-) -> None:
+) -> TimedCommandResult:
     command = [cmake, "--build", str(build_dir), "--target", target]
     if config:
         command.extend(["--config", config])
     if clean_first:
         command.append("--clean-first")
-    run_command(command, cwd=build_dir)
+    return run_command(command, cwd=build_dir)
 
-def run_ctest(ctest: str, build_dir: Path, config: str) -> None:
+
+def run_ctest(ctest: str, build_dir: Path, config: str) -> TimedCommandResult:
     command = [ctest, "--test-dir", str(build_dir), "--output-on-failure"]
     if config:
         command.extend(["-C", config])
-    run_command(command, cwd=build_dir)
+    return run_command(command, cwd=build_dir)
+
 
 def find_built_executable(build_dir: Path, config: str, target: str) -> Path | None:
     extensions = [".exe"] if os.name == "nt" else [""]
@@ -191,6 +338,26 @@ def find_built_executable(build_dir: Path, config: str, target: str) -> Path | N
             return matches[0]
 
     return None
+
+
+def sync_runtime_assets(runtime_dir: Path, source_dir: Path) -> None:
+    assets_source = source_dir / "portSource"
+    if not assets_source.exists():
+        return
+
+    assets_destination = runtime_dir / "portSource"
+    shutil.copytree(assets_source, assets_destination, dirs_exist_ok=True)
+
+
+def stage_runtime_package(runtime_dir: Path, package_dir: Path) -> Path:
+    if runtime_dir.resolve() == package_dir.resolve():
+        return runtime_dir
+
+    if package_dir.exists():
+        shutil.rmtree(package_dir)
+    package_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(runtime_dir, package_dir)
+    return package_dir
 
 
 def parse_args() -> argparse.Namespace:
@@ -263,9 +430,38 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ctest",
-        default='true',
         action="store_true",
         help="Build the smoke-test target and run ctest --output-on-failure after the main build completes.",
+    )
+    parser.add_argument(
+        "--metrics-csv",
+        default=str(workspace_root / "build" / "compile_metrics.csv"),
+        help="CSV file used to append timing metrics. Defaults to build/compile_metrics.csv.",
+    )
+    parser.add_argument(
+        "--no-metrics",
+        action="store_true",
+        help="Disable CSV metrics logging entirely.",
+    )
+    parser.add_argument(
+        "--run-label",
+        default="",
+        help="Optional label written to the CSV so runs can be grouped, for example 'ctest-cache-hit' or 'clean-build'.",
+    )
+    parser.add_argument(
+        "--windows-icon-ico",
+        default=None,
+        help="Optional .ico file embedded as the Windows executable icon. Defaults to auto-detecting an .ico under portSource/Assets/Icons.",
+    )
+    parser.add_argument(
+        "--package-dir",
+        default="",
+        help="Optional staged runtime package directory. Defaults to build/package/<config>/<target> under the source directory.",
+    )
+    parser.add_argument(
+        "--no-package",
+        action="store_true",
+        help="Skip staging a packaged runtime directory after the build completes.",
     )
     return parser.parse_args()
 
@@ -274,6 +470,7 @@ def main() -> int:
     args = parse_args()
     source_dir = Path(args.source_dir).resolve()
     build_dir = Path(args.build_dir).resolve()
+    metrics_csv = None if args.no_metrics else Path(args.metrics_csv).resolve()
 
     if not (source_dir / "CMakeLists.txt").exists():
         print(f"Source directory does not contain CMakeLists.txt: {source_dir}", file=sys.stderr)
@@ -315,10 +512,34 @@ def main() -> int:
     if steamworks_sdk_root is not None:
         cmake_defines.append(f"-DSTEAMWORKS_SDK_ROOT={steamworks_sdk_root}")
 
+    try:
+        windows_icon_ico = detect_windows_icon_ico(source_dir, args.windows_icon_ico)
+    except FileNotFoundError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    if windows_icon_ico is not None:
+        cmake_defines.append(f"-DTRUEFLIGHT_WINDOWS_ICON_ICO={windows_icon_ico}")
+
+    run_label = args.run_label.strip()
+    if not run_label:
+        parts = [
+            "ctest" if args.ctest else "build",
+            "clean" if args.clean_first else "incremental",
+            "reconfig" if args.reconfigure else "cached-config",
+        ]
+        run_label = "-".join(parts)
+
     print(f"Steamworks build mode: {'enabled' if steamworks_enabled else 'disabled'}")
+    print(f"Windows exe icon: {windows_icon_ico if windows_icon_ico is not None else 'not set (.ico not found; PNG window icon still loads at runtime)'}")
+    print(f"Metrics CSV: {metrics_csv if metrics_csv is not None else 'disabled'}")
+    print(f"Run label: {run_label}")
+
+    overall_started_utc = datetime.now(timezone.utc).isoformat()
+    overall_started_perf = time.perf_counter()
+    cache_state = "unknown"
 
     try:
-        configure_if_needed(
+        configure_result, cache_state = configure_if_needed(
             cmake=cmake,
             source_dir=source_dir,
             build_dir=build_dir,
@@ -327,34 +548,188 @@ def main() -> int:
             reconfigure=args.reconfigure,
             cmake_defines=cmake_defines,
         )
-        build_target(
+
+        if configure_result is None:
+            log_phase_metrics(
+                metrics_csv,
+                run_label,
+                "configure",
+                None,
+                status="skipped",
+                source_dir=source_dir,
+                build_dir=build_dir,
+                config=args.config,
+                target=args.target,
+                generator=args.generator,
+                arch=args.arch,
+                clean_first=args.clean_first,
+                reconfigure=args.reconfigure,
+                ctest_requested=args.ctest,
+                steamworks_enabled=steamworks_enabled,
+                cache_state=cache_state,
+                notes="matching CMake cache reused",
+            )
+        else:
+            log_phase_metrics(
+                metrics_csv,
+                run_label,
+                "configure",
+                configure_result,
+                status="ok",
+                source_dir=source_dir,
+                build_dir=build_dir,
+                config=args.config,
+                target=args.target,
+                generator=args.generator,
+                arch=args.arch,
+                clean_first=args.clean_first,
+                reconfigure=args.reconfigure,
+                ctest_requested=args.ctest,
+                steamworks_enabled=steamworks_enabled,
+                cache_state=cache_state,
+            )
+
+        build_result = build_target(
             cmake=cmake,
             build_dir=build_dir,
             config=args.config,
             target=args.target,
             clean_first=args.clean_first,
         )
+        log_phase_metrics(
+            metrics_csv,
+            run_label,
+            "build",
+            build_result,
+            status="ok",
+            source_dir=source_dir,
+            build_dir=build_dir,
+            config=args.config,
+            target=args.target,
+            generator=args.generator,
+            arch=args.arch,
+            clean_first=args.clean_first,
+            reconfigure=args.reconfigure,
+            ctest_requested=args.ctest,
+            steamworks_enabled=steamworks_enabled,
+            cache_state=cache_state,
+        )
+
         if args.ctest:
             smoke_target = "TrueFlightNativeSmoke"
             if args.target != smoke_target:
-                build_target(
+                smoke_build_result = build_target(
                     cmake=cmake,
                     build_dir=build_dir,
                     config=args.config,
                     target=smoke_target,
                     clean_first=False,
                 )
+                log_phase_metrics(
+                    metrics_csv,
+                    run_label,
+                    "build_smoke_target",
+                    smoke_build_result,
+                    status="ok",
+                    source_dir=source_dir,
+                    build_dir=build_dir,
+                    config=args.config,
+                    target=smoke_target,
+                    generator=args.generator,
+                    arch=args.arch,
+                    clean_first=False,
+                    reconfigure=args.reconfigure,
+                    ctest_requested=args.ctest,
+                    steamworks_enabled=steamworks_enabled,
+                    cache_state=cache_state,
+                    notes=f"main requested target was {args.target}",
+                )
+
             ctest = find_ctest(cmake)
-            run_ctest(
+            test_result = run_ctest(
                 ctest=ctest,
                 build_dir=build_dir,
                 config=args.config,
             )
+            log_phase_metrics(
+                metrics_csv,
+                run_label,
+                "ctest",
+                test_result,
+                status="ok",
+                source_dir=source_dir,
+                build_dir=build_dir,
+                config=args.config,
+                target=args.target,
+                generator=args.generator,
+                arch=args.arch,
+                clean_first=args.clean_first,
+                reconfigure=args.reconfigure,
+                ctest_requested=args.ctest,
+                steamworks_enabled=steamworks_enabled,
+                cache_state=cache_state,
+            )
+
     except subprocess.CalledProcessError as error:
+        failed_duration = time.perf_counter() - overall_started_perf
+        failed_command = TimedCommandResult(
+            command=[str(part) for part in error.cmd] if isinstance(error.cmd, (list, tuple)) else [str(error.cmd)],
+            cwd=build_dir,
+            started_utc=overall_started_utc,
+            duration_seconds=failed_duration,
+            returncode=error.returncode,
+        )
+        log_phase_metrics(
+            metrics_csv,
+            run_label,
+            "failed",
+            failed_command,
+            status="failed",
+            source_dir=source_dir,
+            build_dir=build_dir,
+            config=args.config,
+            target=args.target,
+            generator=args.generator,
+            arch=args.arch,
+            clean_first=args.clean_first,
+            reconfigure=args.reconfigure,
+            ctest_requested=args.ctest,
+            steamworks_enabled=steamworks_enabled,
+            cache_state=cache_state,
+            notes="command failed",
+            returncode_override=error.returncode,
+        )
         return error.returncode
     except FileNotFoundError as error:
         print(str(error), file=sys.stderr)
         return 1
+
+    total_duration = time.perf_counter() - overall_started_perf
+    total_result = TimedCommandResult(
+        command=["<overall>"],
+        cwd=build_dir,
+        started_utc=overall_started_utc,
+        duration_seconds=total_duration,
+        returncode=0,
+    )
+    log_phase_metrics(
+        metrics_csv,
+        run_label,
+        "overall",
+        total_result,
+        status="ok",
+        source_dir=source_dir,
+        build_dir=build_dir,
+        config=args.config,
+        target=args.target,
+        generator=args.generator,
+        arch=args.arch,
+        clean_first=args.clean_first,
+        reconfigure=args.reconfigure,
+        ctest_requested=args.ctest,
+        steamworks_enabled=steamworks_enabled,
+        cache_state=cache_state,
+    )
 
     executable = find_built_executable(build_dir, args.config, args.target)
     if executable is not None:
@@ -363,6 +738,15 @@ def main() -> int:
         print("Build finished, but the executable path could not be resolved automatically.", file=sys.stderr)
         return 2
 
+    runtime_dir = executable.parent
+    sync_runtime_assets(runtime_dir, source_dir)
+    print(f"Runtime assets synced: {runtime_dir / 'portSource'}")
+
+    if not args.no_package:
+        package_dir = Path(args.package_dir).resolve() if args.package_dir else source_dir / "build" / "package" / args.config / args.target
+        staged_dir = stage_runtime_package(runtime_dir, package_dir.resolve())
+        print(f"Packaged runtime: {staged_dir}")
+    print(f"Total Time Taken: {total_duration:.3f}s")
     return 0
 
 

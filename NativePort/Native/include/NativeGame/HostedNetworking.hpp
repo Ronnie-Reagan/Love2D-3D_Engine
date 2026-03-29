@@ -302,6 +302,12 @@ inline void stepWalkingAuthoritative(
     const TerrainFieldContext& terrainContext,
     float baseMoveSpeed = 10.0f)
 {
+    constexpr float kWalkHalfHeight = 1.8f;
+    constexpr float kWalkJumpSpeed = 5.4f;
+    constexpr float kWalkGravity = -12.5f;
+    constexpr float kWalkTerminalVelocity = -54.0f;
+    constexpr float kWalkGroundSnapDistance = 0.45f;
+
     FlightState& actor = player.actor;
     player.walkYaw = wrapAngle(player.input.walkYaw);
     player.walkPitch = clamp(player.input.walkPitch, radians(-89.0f), radians(89.0f));
@@ -335,21 +341,36 @@ inline void stepWalkingAuthoritative(
         moveDir = normalize(moveDir, {}) * (player.input.walkSprint ? baseMoveSpeed * 1.8f : baseMoveSpeed);
     }
 
-    actor.pos += moveDir * dt;
-    actor.vel.x = moveDir.x;
-    actor.vel.z = moveDir.z;
-    actor.vel.y += -9.80665f * dt;
+    const float currentGround = sampleSurfaceHeight(actor.pos.x, actor.pos.z, terrainContext);
+    const float standHeight = currentGround + kWalkHalfHeight;
+    const bool nearGround = actor.pos.y <= standHeight + kWalkGroundSnapDistance;
+    const Vec3 groundNormal =
+        nearGround
+            ? normalize(sampleTerrainNormal(actor.pos.x, actor.pos.y, actor.pos.z, terrainContext), { 0.0f, 1.0f, 0.0f })
+            : Vec3 { 0.0f, 1.0f, 0.0f };
+
+    Vec3 desiredVelocity = moveDir;
+    if (nearGround && groundNormal.y > 0.18f) {
+        desiredVelocity -= groundNormal * dot(desiredVelocity, groundNormal);
+    } else {
+        desiredVelocity.y = 0.0f;
+    }
+
+    actor.pos += desiredVelocity * dt;
+    actor.vel.x = desiredVelocity.x;
+    actor.vel.z = desiredVelocity.z;
+    actor.vel.y = std::max(kWalkTerminalVelocity, actor.vel.y + (kWalkGravity * dt));
     actor.pos.y += actor.vel.y * dt;
     const float ground = sampleSurfaceHeight(actor.pos.x, actor.pos.z, terrainContext);
-    if (actor.pos.y <= ground + 1.8f) {
-        actor.pos.y = ground + 1.8f;
+    if (actor.pos.y <= ground + kWalkHalfHeight + kWalkGroundSnapDistance) {
+        actor.pos.y = ground + kWalkHalfHeight;
         actor.vel.y = 0.0f;
         actor.onGround = true;
     } else {
         actor.onGround = false;
     }
     if (player.input.walkJump && actor.onGround) {
-        actor.vel.y = 5.0f;
+        actor.vel.y = kWalkJumpSpeed;
         actor.onGround = false;
     }
     actor.flightVel = actor.vel;
@@ -448,6 +469,8 @@ inline void applyReplicatedFlightControlState(FlightState& actor, const NetPlaye
     actor.yoke.pitch = clamp(input.yokePitch, -1.0f, 1.0f);
     actor.yoke.yaw = clamp(input.yokeYaw, -1.0f, 1.0f);
     actor.yoke.roll = clamp(input.yokeRoll, -1.0f, 1.0f);
+    actor.manualElevatorTrim = input.manualElevatorTrim;
+    actor.manualRudderTrim = input.manualRudderTrim;
 }
 
 }  // namespace HostedNetworkingDetail

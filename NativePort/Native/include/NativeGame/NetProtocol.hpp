@@ -81,6 +81,8 @@ struct NetPlayerInput {
     float yokePitch = 0.0f;
     float yokeYaw = 0.0f;
     float yokeRoll = 0.0f;
+    float manualElevatorTrim = 0.0f;
+    float manualRudderTrim = 0.0f;
     bool walkForward = false;
     bool walkBackward = false;
     bool walkStrafeLeft = false;
@@ -715,6 +717,8 @@ inline std::string buildInputPacket(const NetPlayerInput& input)
         { "yokePitch", formatNetFloat(input.yokePitch) },
         { "yokeYaw", formatNetFloat(input.yokeYaw) },
         { "yokeRoll", formatNetFloat(input.yokeRoll) },
+        { "pitchTrim", formatNetFloat(input.manualElevatorTrim) },
+        { "rudderTrim", formatNetFloat(input.manualRudderTrim) },
         { "walkForward", input.walkForward ? "1" : "0" },
         { "walkBackward", input.walkBackward ? "1" : "0" },
         { "walkStrafeLeft", input.walkStrafeLeft ? "1" : "0" },
@@ -1113,6 +1117,8 @@ inline std::optional<NetPlayerInput> parseInputPacket(const std::string& packet)
     input.yokePitch = clampNetFloat(std::strtof(kv["yokePitch"].c_str(), nullptr), -1.0f, 1.0f);
     input.yokeYaw = clampNetFloat(std::strtof(kv["yokeYaw"].c_str(), nullptr), -1.0f, 1.0f);
     input.yokeRoll = clampNetFloat(std::strtof(kv["yokeRoll"].c_str(), nullptr), -1.0f, 1.0f);
+    input.manualElevatorTrim = std::strtof(kv["pitchTrim"].c_str(), nullptr);
+    input.manualRudderTrim = std::strtof(kv["rudderTrim"].c_str(), nullptr);
     input.walkForward = kv["walkForward"] == "1";
     input.walkBackward = kv["walkBackward"] == "1";
     input.walkStrafeLeft = kv["walkStrafeLeft"] == "1";

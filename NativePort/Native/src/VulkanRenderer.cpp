@@ -1,5 +1,8 @@
 #include "NativeGame/VulkanRenderer.hpp"
 
+#include "imgui.h"
+#include "imgui_impl_sdlgpu3.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -1440,6 +1443,7 @@ bool VulkanRenderer::render(
     const std::vector<RenderObject>& opaqueObjects,
     const std::vector<RenderObject>& translucentObjects,
     const HudCanvas& hudCanvas,
+    ImDrawData* imguiDrawData,
     std::string* errorMessage)
 {
     if (device_ == nullptr || window_ == nullptr) {
@@ -1882,6 +1886,10 @@ bool VulkanRenderer::render(
     compositeTarget.load_op = SDL_GPU_LOADOP_CLEAR;
     compositeTarget.store_op = SDL_GPU_STOREOP_STORE;
 
+    if (imguiDrawData != nullptr) {
+        ImGui_ImplSDLGPU3_PrepareDrawData(imguiDrawData, commandBuffer);
+    }
+
     SDL_GPURenderPass* compositePass = SDL_BeginGPURenderPass(commandBuffer, &compositeTarget, 1, nullptr);
 
     SDL_GPUBufferBinding overlayBinding {};
@@ -1902,6 +1910,9 @@ bool VulkanRenderer::render(
     overlaySamplerBinding.sampler = overlaySampler_;
     SDL_BindGPUFragmentSamplers(compositePass, 0, &overlaySamplerBinding, 1);
     SDL_DrawGPUPrimitives(compositePass, 6, 1, 0, 0);
+    if (imguiDrawData != nullptr) {
+        ImGui_ImplSDLGPU3_RenderDrawData(imguiDrawData, commandBuffer, compositePass);
+    }
     SDL_EndGPURenderPass(compositePass);
 
     if (!SDL_SubmitGPUCommandBuffer(commandBuffer)) {
@@ -1929,6 +1940,19 @@ bool VulkanRenderer::render(
 const char* VulkanRenderer::backendName() const
 {
     return device_ != nullptr ? SDL_GetGPUDeviceDriver(device_) : nullptr;
+}
+
+SDL_GPUDevice* VulkanRenderer::gpuDevice() const
+{
+    return device_;
+}
+
+SDL_GPUTextureFormat VulkanRenderer::swapchainTextureFormat() const
+{
+    if (device_ == nullptr || window_ == nullptr) {
+        return SDL_GPU_TEXTUREFORMAT_INVALID;
+    }
+    return SDL_GetGPUSwapchainTextureFormat(device_, window_);
 }
 
 }  // namespace NativeGame

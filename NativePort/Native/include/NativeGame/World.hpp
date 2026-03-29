@@ -1855,11 +1855,11 @@ inline Model buildTerrainPatch(const Vec3& center, const TerrainParams& params, 
 
 struct WindState {
     float angle = 0.0f;
-    float speed = 10.0f;
+    float speed = 3.0f;
     float targetAngle = 0.0f;
-    float targetSpeed = 10.0f;
-    float gustAmplitude = 2.0f;
-    float gustFrequency = 0.35f;
+    float targetSpeed = 3.0f;
+    float gustAmplitude = 0.45f;
+    float gustFrequency = 0.12f;
     float gustPhase = 0.0f;
     float nextTargetAt = 0.0f;
 };
@@ -1902,10 +1902,10 @@ inline int randomRangeInt(std::mt19937& rng, int minValue, int maxValue)
 inline void pickNextWindTarget(WindState& windState, std::mt19937& rng, float nowSeconds = 0.0f)
 {
     windState.targetAngle = wrapAngle(randomRange(rng, -kPi, kPi));
-    windState.targetSpeed = randomRange(rng, 8.0f, 26.0f);
-    windState.gustAmplitude = randomRange(rng, 1.0f, 4.0f);
-    windState.gustFrequency = randomRange(rng, 0.2f, 0.55f);
-    windState.nextTargetAt = nowSeconds + randomRange(rng, 8.0f, 20.0f);
+    windState.targetSpeed = randomRange(rng, 0.8f, 6.0f);
+    windState.gustAmplitude = randomRange(rng, 0.05f, 1.1f);
+    windState.gustFrequency = randomRange(rng, 0.05f, 0.18f);
+    windState.nextTargetAt = nowSeconds + randomRange(rng, 18.0f, 45.0f);
 }
 
 inline void updateWind(WindState& windState, float dt, float nowSeconds, std::mt19937& rng)
@@ -1914,8 +1914,8 @@ inline void updateWind(WindState& windState, float dt, float nowSeconds, std::mt
         pickNextWindTarget(windState, rng, nowSeconds);
     }
 
-    windState.angle = wrapAngle(windState.angle + shortestAngleDelta(windState.angle, windState.targetAngle) * clamp(dt * 0.28f, 0.0f, 1.0f));
-    windState.speed = mix(windState.speed, windState.targetSpeed, clamp(dt * 0.16f, 0.0f, 1.0f));
+    windState.angle = wrapAngle(windState.angle + shortestAngleDelta(windState.angle, windState.targetAngle) * clamp(dt * 0.12f, 0.0f, 1.0f));
+    windState.speed = mix(windState.speed, windState.targetSpeed, clamp(dt * 0.08f, 0.0f, 1.0f));
     windState.gustPhase += dt * windState.gustFrequency;
 }
 

@@ -41,6 +41,8 @@ struct ProceduralAudioFrame {
     float masterVolume = 1.0f;
     float engineVolume = 1.0f;
     float ambienceVolume = 1.0f;
+    float combatVolume = 1.0f;
+    float flybyVolume = 1.0f;
     float engineThrottle = 0.0f;
     float crankRpm = 780.0f;
     float propRpm = 780.0f;
@@ -86,6 +88,9 @@ struct ProceduralAudioFrame {
     float bombWhistleAmount = 0.0f;
     float bombPitchScale = 1.0f;
     float bombDoppler = 1.0f;
+    float peerPlaneAmount = 0.0f;
+    float peerPlanePitchScale = 1.0f;
+    float peerPlaneDoppler = 1.0f;
     PropAudioConfig propAudioConfig = defaultPropAudioConfig();
 };
 
@@ -154,6 +159,9 @@ struct ProceduralAudioState {
     float bombWhistleAmount = 0.0f;
     float bombPitchScale = 1.0f;
     float bombDoppler = 1.0f;
+    float peerPlaneAmount = 0.0f;
+    float peerPlanePitchScale = 1.0f;
+    float peerPlaneDoppler = 1.0f;
     float speedOfSoundMetersPerSec = 340.0f;
     float gunshotPhase = 0.0f;
     float latchPhase = 0.0f;
@@ -161,6 +169,8 @@ struct ProceduralAudioState {
     float explosionPhase2 = 0.0f;
     float projectilePhase = 0.0f;
     float bombPhase = 0.0f;
+    float peerPlanePhase1 = 0.0f;
+    float peerPlanePhase2 = 0.0f;
     float combatNoise1 = 0.0f;
     float combatNoise2 = 0.0f;
     std::vector<float> scratchBuffer {};
@@ -297,10 +307,17 @@ struct ProceduralAudioState {
         bombWhistleAmount = mix(bombWhistleAmount, clamp(frame.bombWhistleAmount, 0.0f, 1.4f), fastBlend);
         bombPitchScale = mix(bombPitchScale, clamp(frame.bombPitchScale, 0.4f, 2.0f), fastBlend);
         bombDoppler = mix(bombDoppler, clamp(frame.bombDoppler, 0.6f, 1.6f), fastBlend);
+        peerPlaneAmount = mix(
+            peerPlaneAmount,
+            clamp(frame.peerPlaneAmount * clamp(frame.flybyVolume, 0.0f, 1.5f), 0.0f, 1.5f),
+            fastBlend);
+        peerPlanePitchScale = mix(peerPlanePitchScale, clamp(frame.peerPlanePitchScale, 0.5f, 1.8f), fastBlend);
+        peerPlaneDoppler = mix(peerPlaneDoppler, clamp(frame.peerPlaneDoppler, 0.6f, 1.8f), fastBlend);
 
         const float masterVolume = clamp(frame.masterVolume, 0.0f, 1.5f);
         const float engineVolume = clamp(frame.engineVolume, 0.0f, 1.5f);
         const float ambienceVolume = clamp(frame.ambienceVolume, 0.0f, 1.5f);
+        const float combatVolume = clamp(frame.combatVolume, 0.0f, 1.5f);
         const PropAudioConfig propAudio = frame.propAudioConfig;
         const float exterior = exteriorViewBlend;
         const float interior = 1.0f - exterior;
@@ -346,10 +363,12 @@ struct ProceduralAudioState {
                 (bombLatchPulse * 0.14f) +
                 (explosionPulse * 0.68f) +
                 (projectileWhistleAmount * 0.08f) +
-                (bombWhistleAmount * 0.12f)) *
+                (bombWhistleAmount * 0.12f) +
+                (peerPlaneAmount * 0.20f)) *
             masterDuck *
             masterVolume *
-            (0.30f + (ambienceVolume * 0.48f) + (engineVolume * 0.14f));
+            (0.30f + (ambienceVolume * 0.48f) + (engineVolume * 0.14f)) *
+            combatVolume;
 
         const int targetQueuedBytes = bufferSamples * queueDepth * static_cast<int>(sizeof(float));
         int queuedBytes = SDL_GetAudioStreamQueued(stream);
@@ -532,9 +551,15 @@ private:
     {
         const float white = nextNoiseSigned();
         combatNoise1 += (white - combatNoise1) * (0.28f + gunshotPulse * 0.18f + explosionPulse * 0.06f);
-        combatNoise2 += (white - combatNoise2) * (0.08f + projectileWhistleAmount * 0.10f + bombWhistleAmount * 0.08f + explosionPulse * 0.05f);
+        combatNoise2 +=
+            (white - combatNoise2) *
+            (0.08f +
+                projectileWhistleAmount * 0.10f +
+                bombWhistleAmount * 0.08f +
+                peerPlaneAmount * 0.06f +
+                explosionPulse * 0.05f);
 
-        const float gunshotFrequency = 280.0f + (terrainShotPulse * 80.0f) + (gunshotPulse * 60.0f);
+        const float gunshotFrequency = 180.0f + (terrainShotPulse * 42.0f) + (gunshotPulse * 36.0f);
         gunshotPhase = std::fmod(gunshotPhase + ((2.0f * kPi * gunshotFrequency) / static_cast<float>(sampleRate)), 2.0f * kPi);
         const float latchFrequency = 420.0f + (bombLatchPulse * 160.0f);
         latchPhase = std::fmod(latchPhase + ((2.0f * kPi * latchFrequency) / static_cast<float>(sampleRate)), 2.0f * kPi);
@@ -552,23 +577,41 @@ private:
             45.0f,
             520.0f);
         bombPhase = std::fmod(bombPhase + ((2.0f * kPi * bombFrequency) / static_cast<float>(sampleRate)), 2.0f * kPi);
+        const float peerPlaneFrequency = clamp(
+            (54.0f + (peerPlanePitchScale * 42.0f)) * peerPlaneDoppler,
+            28.0f,
+            340.0f);
+        peerPlanePhase1 = std::fmod(peerPlanePhase1 + ((2.0f * kPi * peerPlaneFrequency) / static_cast<float>(sampleRate)), 2.0f * kPi);
+        peerPlanePhase2 = std::fmod(peerPlanePhase2 + ((2.0f * kPi * (peerPlaneFrequency * 2.7f)) / static_cast<float>(sampleRate)), 2.0f * kPi);
 
-        const float gunCrack =
-            ((std::sin((gunshotPhase * 3.7f) + 0.2f) * 0.36f) + ((white - combatNoise1) * 0.64f)) *
-            (gunshotPulse * (0.26f + (terrainShotPulse * 0.10f)));
+        const float shockCrack =
+            (((white - combatNoise1) * 0.90f) + (std::sin((gunshotPhase * 6.4f) + 0.2f) * 0.16f)) *
+            (gunshotPulse * (0.30f + (projectileWhistleAmount * 0.04f)));
         const float muzzleBang =
-            ((std::sin((gunshotPhase * 0.18f) + 1.1f) * 0.76f) +
-                (std::sin((gunshotPhase * 0.33f) + 0.2f) * 0.32f) +
-                (combatNoise1 * 0.24f)) *
-            (gunshotPulse * 0.24f);
+            ((std::sin((gunshotPhase * 0.08f) + 1.1f) * 0.92f) +
+                (std::sin((gunshotPhase * 0.19f) + 0.2f) * 0.46f) +
+                (combatNoise1 * 0.42f)) *
+            (gunshotPulse * 0.36f);
         const float gunReport =
-            ((std::sin((gunshotPhase * 0.42f) + 0.4f) * 0.82f) +
-                (std::sin(gunshotPhase + 0.1f) * 0.18f) +
-                (combatNoise1 * 0.22f)) *
-            (gunshotPulse * (0.18f + (terrainShotPulse * 0.10f)));
+            ((std::sin((gunshotPhase * 0.28f) + 0.4f) * 0.84f) +
+                (std::sin((gunshotPhase * 0.62f) + 0.1f) * 0.34f) +
+                (combatNoise1 * 0.30f)) *
+            (gunshotPulse * (0.28f + (terrainShotPulse * 0.12f)));
+        const float barrelResonance =
+            ((std::sin((gunshotPhase * 0.42f) + 0.3f) * 0.74f) +
+                (std::sin((gunshotPhase * 0.96f) + 0.8f) * 0.26f)) *
+            (gunshotPulse * 0.16f);
+        const float blastBody =
+            ((std::sin((gunshotPhase * 0.05f) + 0.7f) * 0.92f) +
+                (std::sin((gunshotPhase * 0.11f) + 0.2f) * 0.46f) +
+                (combatNoise2 * 0.20f)) *
+            (gunshotPulse * 0.18f);
+        const float mechanicalClack =
+            ((std::sin((gunshotPhase * 1.72f) + 0.6f) * 0.48f) + (combatNoise2 * 0.30f)) *
+            (gunshotPulse * 0.05f);
         const float terrainThump =
-            ((std::sin((gunshotPhase * 0.24f) + 1.2f) * 0.58f) + (combatNoise1 * 0.30f)) *
-            (terrainShotPulse * 0.18f);
+            ((std::sin((gunshotPhase * 0.16f) + 1.2f) * 0.72f) + (combatNoise1 * 0.34f)) *
+            (terrainShotPulse * 0.28f);
         const float latchClunk =
             ((std::sin(latchPhase) * 0.44f) + (std::sin((latchPhase * 0.52f) + 0.3f) * 0.56f) + (combatNoise2 * 0.12f)) *
             (bombLatchPulse * 0.16f);
@@ -590,8 +633,30 @@ private:
         const float bombTone =
             ((std::sin(bombPhase) * 0.58f) + (std::sin((bombPhase * 0.52f) + 1.1f) * 0.34f) + (combatNoise2 * 0.16f)) *
             (bombWhistleAmount * 0.10f);
+        const float peerPlaneTone =
+            ((std::sin(peerPlanePhase1) * 0.62f) +
+                (std::sin(peerPlanePhase2 + 0.2f) * 0.28f) +
+                (combatNoise2 * 0.18f)) *
+            (peerPlaneAmount * 0.10f);
+        const float peerPlaneChop =
+            ((std::sin((peerPlanePhase1 * 2.0f) + 0.4f) * 0.44f) +
+                (std::sin((peerPlanePhase2 * 0.52f) + 0.9f) * 0.22f)) *
+            (peerPlaneAmount * 0.08f);
 
-        return gunCrack + muzzleBang + gunReport + terrainThump + latchClunk + explosionSample + projectileTone + bombTone;
+        return
+            shockCrack +
+            muzzleBang +
+            gunReport +
+            barrelResonance +
+            blastBody +
+            mechanicalClack +
+            terrainThump +
+            latchClunk +
+            explosionSample +
+            projectileTone +
+            bombTone +
+            peerPlaneTone +
+            peerPlaneChop;
     }
 };
 

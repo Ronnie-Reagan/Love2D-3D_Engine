@@ -20,80 +20,90 @@ struct AtmosphereSample {
 };
 
 struct FlightConfig {
-    float physicsHz = 120.0f;
+    float physicsHz = 180.0f;
     int maxSubsteps = 8;
     float maxFrameDt = 0.1f;
     float metersPerUnit = 1.0f;
-    float massKg = 750.0f;
-    float Ixx = 1200.0f;
-    float Iyy = 1700.0f;
-    float Izz = 2500.0f;
+    float massKg = 1157.0f;
+    float Ixx = 1280.0f;
+    float Iyy = 1825.0f;
+    float Izz = 2660.0f;
     float Ixz = 0.0f;
-    float wingArea = 16.2f;
-    float wingSpan = 10.9f;
-    float meanChord = 1.5f;
-    float CL0 = 0.40f;
-    float CLalpha = 6.2f;
-    float CLElevator = 0.80f;
-    float alphaStallRad = radians(18.0f);
-    float stallLiftDropoff = 0.22f;
-    float CD0 = 0.025f;
-    float inducedDragK = 0.027f;
-    float CYbeta = -0.95f;
-    float CYrudder = 0.28f;
-    float Cm0 = 0.04f;
-    float CmAlpha = -1.02f;
-    float CmQ = -12.0f;
-    float CmElevator = -1.35f;
-    float ClBeta = -0.12f;
-    float ClP = -0.48f;
-    float ClR = 0.16f;
-    float ClAileron = 0.22f;
+    float wingArea = 16.17f;
+    float wingSpan = 11.0f;
+    float meanChord = 1.47f;
+    float CL0 = 0.24f;
+    float CLalpha = 4.95f;
+    float CLElevator = 0.92f;
+    float alphaStallRad = radians(15.5f);
+    float stallLiftDropoff = 0.32f;
+    float postStallSpinBlendRangeRad = radians(8.0f);
+    float postStallDampingScale = 1.6f;
+    float postStallAileronEffectiveness = 0.22f;
+    float postStallRudderEffectiveness = 0.95f;
+    float postStallYawStabilityScale = 0.18f;
+    float spinRollMoment = 0.42f;
+    float spinYawMoment = 0.54f;
+    float CD0 = 0.031f;
+    float inducedDragK = 0.045f;
+    float CYbeta = -0.78f;
+    float CYrudder = 0.21f;
+    float Cm0 = 0.03f;
+    float CmAlpha = -1.22f;
+    float CmQ = -18.0f;
+    float CmElevator = -1.60f;
+    float ClBeta = -0.08f;
+    float ClP = -0.62f;
+    float ClR = 0.12f;
+    float ClAileron = 0.14f;
     float ClRudder = 0.03f;
-    float CnBeta = 0.16f;
-    float CnR = -0.24f;
-    float CnP = -0.06f;
-    float CnRudder = -0.17f;
-    float CnAileron = 0.02f;
-    float maxThrustSeaLevel = 6400.0f;
-    float afterburnerMultiplier = 1.45f;
-    float maxEffectivePropSpeed = 600.0f;
-    float idleCrankRpm = 780.0f;
-    float maxCrankRpm = 3600.0f;
+    float CnBeta = 0.10f;
+    float CnR = -0.17f;
+    float CnP = -0.02f;
+    float CnRudder = -0.10f;
+    float CnAileron = 0.015f;
+    float maxThrustSeaLevel = 1850.0f;
+    float afterburnerMultiplier = 1.0f;
+    float maxEffectivePropSpeed = 78.0f;
+    float idleCrankRpm = 650.0f;
+    float maxCrankRpm = 2700.0f;
     float propellerGearRatio = 1.0f;
-    float propellerDiameterMeters = 2.6f;
-    float engineDisplacementLiters = 9.0f;
-    int engineCylinderCount = 16;
-    float maxBrakePowerKw = 650.0f;
-    float fuelMassKg = 250.0f;
-    float throttleTimeConstant = 0.8f;
+    float propellerDiameterMeters = 1.93f;
+    float engineDisplacementLiters = 5.9f;
+    int engineCylinderCount = 4;
+    float maxBrakePowerKw = 134.0f;
+    float fuelMassKg = 144.0f;
+    float throttleTimeConstant = 1.15f;
     float maxElevatorDeflectionRad = radians(25.0f);
-    float maxAileronDeflectionRad = radians(20.0f);
-    float maxRudderDeflectionRad = radians(30.0f);
-    float maxManualElevatorTrimRad = radians(8.0f);
+    float maxAileronDeflectionRad = radians(18.0f);
+    float maxRudderDeflectionRad = radians(16.0f);
+    float maxManualElevatorTrimRad = radians(6.0f);
+    float maxManualRudderTrimRad = radians(4.0f);
     float pitchInputExpo = 0.72f;
     float rollInputExpo = 0.58f;
     float yawInputExpo = 0.38f;
-    float elevatorSurfaceRateRadPerSec = radians(55.0f);
-    float aileronSurfaceRateRadPerSec = radians(80.0f);
-    float rudderSurfaceRateRadPerSec = radians(60.0f);
-    float controlLoadingReferenceDynamicPressure = 2300.0f;
-    float controlLoadingRateBlend = 0.45f;
+    float yawInputResponseRate = 12.0f;
+    float yawInputReturnRate = 12.0f;
+    float elevatorSurfaceRateRadPerSec = radians(45.0f);
+    float aileronSurfaceRateRadPerSec = radians(58.0f);
+    float rudderSurfaceRateRadPerSec = radians(48.0f);
+    float controlLoadingReferenceDynamicPressure = 1800.0f;
+    float controlLoadingRateBlend = 0.62f;
     bool enableAutoTrim = false;
     float autoTrimUpdateHz = 6.0f;
     bool autoTrimUseWorker = true;
     float autoTrimWorkerTimeoutSec = 0.35f;
-    float groundFriction = 0.92f;
-    float groundAngularDamping = 0.82f;
-    bool stabilityAugmentation = true;
+    float groundFriction = 0.78f;
+    float groundAngularDamping = 0.42f;
+    bool stabilityAugmentation = false;
     float pitchRateDampingMoment = 2600.0f;
     float yawRateDampingMoment = 1700.0f;
     float rollRateDampingMoment = 2100.0f;
-    float controlAuthoritySpeed = 34.0f;
-    float minControlAuthority = 0.28f;
-    float pitchControlScale = 0.78f;
-    float rollControlScale = 0.72f;
-    float yawControlScale = 0.65f;
+    float controlAuthoritySpeed = 28.0f;
+    float minControlAuthority = 0.08f;
+    float pitchControlScale = 0.68f;
+    float rollControlScale = 0.58f;
+    float yawControlScale = 0.52f;
     bool crashEnabled = true;
     float maxLinearSpeed = 600.0f;
     float maxAngularRateRad = radians(240.0f);
@@ -167,11 +177,13 @@ struct FlightState {
         float roll = 0.0f;
     } yoke;
     float manualElevatorTrim = 0.0f;
+    float manualRudderTrim = 0.0f;
     float throttle = 0.0f;
     float throttleAccel = 0.55f;
     float airBrakeStrength = 1.2f;
     float wheelThrottleStep = 0.06f;
     float wheelElevatorTrimStepRad = radians(0.25f);
+    float rudderTrimStepRad = radians(0.35f);
     float yokeKeyboardRate = 2.8f;
     float yokeAutoCenterRate = 0.5f;
     float yokeMouseHoldDurationSec = 0.75f;
@@ -310,6 +322,15 @@ inline float axis(bool positive, bool negative)
     return value;
 }
 
+inline float moveTowardsScalar(float current, float target, float maxDelta)
+{
+    const float delta = target - current;
+    if (std::fabs(delta) <= maxDelta) {
+        return target;
+    }
+    return current + (delta > 0.0f ? maxDelta : -maxDelta);
+}
+
 inline Vec3 bodyToWorld(const Quat& rot, const Vec3& v)
 {
     return rotateVector(rot, v);
@@ -327,6 +348,10 @@ inline void applyNumericalGuards(FlightState& state, const FlightConfig& config)
         sanitize(state.manualElevatorTrim, 0.0f),
         -std::max(0.0f, config.maxManualElevatorTrimRad),
         std::max(0.0f, config.maxManualElevatorTrimRad));
+    state.manualRudderTrim = clamp(
+        sanitize(state.manualRudderTrim, 0.0f),
+        -std::max(0.0f, config.maxManualRudderTrimRad),
+        std::max(0.0f, config.maxManualRudderTrimRad));
     state.pos.x = clamp(sanitize(state.pos.x, 0.0f), -config.maxPositionAbs, config.maxPositionAbs);
     state.pos.y = clamp(sanitize(state.pos.y, 0.0f), -config.maxPositionAbs, config.maxPositionAbs);
     state.pos.z = clamp(sanitize(state.pos.z, 0.0f), -config.maxPositionAbs, config.maxPositionAbs);
@@ -342,7 +367,7 @@ inline void applyNumericalGuards(FlightState& state, const FlightConfig& config)
     }, std::max(radians(20.0f), config.maxAngularRateRad));
 }
 
-inline void updatePilotInputs(FlightState& state, float dt, float nowSeconds, const InputState& input)
+inline void updatePilotInputs(FlightState& state, float dt, float nowSeconds, const InputState& input, const FlightConfig& config)
 {
     const float throttleAxis = clamp(axis(input.flightThrottleUp, input.flightThrottleDown) + input.flightThrottleAnalog, -1.0f, 1.0f);
     state.throttle = clamp(state.throttle + (throttleAxis * state.throttleAccel * dt), 0.0f, 1.0f);
@@ -364,13 +389,19 @@ inline void updatePilotInputs(FlightState& state, float dt, float nowSeconds, co
         state.yoke.pitch = clamp(state.yoke.pitch + (pitchAxis * state.yokeKeyboardRate * dt), -1.0f, 1.0f);
         state.yoke.roll = clamp(state.yoke.roll + (rollAxis * state.yokeKeyboardRate * dt), -1.0f, 1.0f);
     }
-    state.yoke.yaw = clamp(state.yoke.yaw + (yawAxis * state.yokeKeyboardRate * dt), -1.0f, 1.0f);
+    const float yawTarget =
+        yawAxis != 0.0f
+            ? clamp(yawAxis, -1.0f, 1.0f)
+            : (input.flightHoldYaw ? state.yoke.yaw : 0.0f);
+    const float yawStep =
+        std::max(
+            0.5f,
+            (yawAxis != 0.0f || input.flightHoldYaw) ? config.yawInputResponseRate : config.yawInputReturnRate) *
+        dt;
+    state.yoke.yaw = clamp(moveTowardsScalar(state.yoke.yaw, yawTarget, yawStep), -1.0f, 1.0f);
 
     if (!holdMouseYoke && !input.flightUseAnalogYoke && pitchAxis == 0.0f) {
         state.yoke.pitch += (0.0f - state.yoke.pitch) * autoCenterAlpha;
-    }
-    if (!holdMouseYoke && !input.flightHoldYaw && yawAxis == 0.0f) {
-        state.yoke.yaw += (0.0f - state.yoke.yaw) * autoCenterAlpha;
     }
     if (!holdMouseYoke && !input.flightUseAnalogYoke && rollAxis == 0.0f) {
         state.yoke.roll += (0.0f - state.yoke.roll) * autoCenterAlpha;
@@ -424,11 +455,11 @@ inline AeroState computeAero(
     const float rawBeta = std::asin(clamp(v * invSpeed, -0.999f, 0.999f));
     const float qbar = 0.5f * std::max(0.02f, atmosphere.densityKgM3) * speed * speed;
 
-    const float alphaModelClamp = std::max(config.alphaStallRad + radians(2.0f), radians(50.0f));
+    const float alphaModelClamp = std::max(config.alphaStallRad + radians(6.0f), radians(55.0f));
     const float betaModelClamp = radians(65.0f);
     const float clMin = -1.6f;
     const float clMax = 2.1f;
-    const float cdMax = 2.2f;
+    const float cdMax = 2.5f;
     const float cyMax = 1.4f;
     const float cMomentMax = 2.8f;
     const float rateNormMax = 4.0f;
@@ -436,38 +467,80 @@ inline AeroState computeAero(
     const float alpha = clamp(rawAlpha, -alphaModelClamp, alphaModelClamp);
     const float beta = clamp(rawBeta, -betaModelClamp, betaModelClamp);
 
+    const float stallBlend = clamp(
+        (std::fabs(alpha) - config.alphaStallRad) / std::max(radians(3.0f), config.postStallSpinBlendRangeRad),
+        0.0f,
+        1.0f);
+
+    const float betaNorm = clamp(beta / radians(18.0f), -1.5f, 1.5f);
+
+    const float aileronEffectiveness = mix(1.0f, std::max(0.08f, config.postStallAileronEffectiveness), stallBlend);
+    const float rudderEffectiveness = mix(1.0f, std::max(0.20f, config.postStallRudderEffectiveness), stallBlend);
+
+    const float yawStabilityScale = mix(
+        1.0f,
+        std::max(1.0f, config.postStallYawStabilityScale),
+        stallBlend);
+
     const float pitchRateNorm = clamp((pitchRate * config.meanChord) / (2.0f * speed), -rateNormMax, rateNormMax);
     const float rollRateNorm = clamp((rollRate * config.wingSpan) / (2.0f * speed), -rateNormMax, rateNormMax);
     const float yawRateNorm = clamp((yawRate * config.wingSpan) / (2.0f * speed), -rateNormMax, rateNormMax);
 
-    float cl = config.CL0 + (config.CLalpha * alpha) + (config.CLElevator * elevator);
-    if (std::fabs(alpha) > config.alphaStallRad) {
-        const float exceed = std::fabs(alpha) - config.alphaStallRad;
-        const float drop = std::exp(-exceed * config.stallLiftDropoff * 8.0f);
-        cl *= clamp(drop, 0.15f, 1.0f);
+    float clLinear = config.CL0 + (config.CLalpha * alpha) + (config.CLElevator * elevator);
+
+    const float alphaAbs = std::fabs(alpha);
+    float cl = clLinear;
+    if (alphaAbs > config.alphaStallRad) {
+        const float exceed = alphaAbs - config.alphaStallRad;
+        const float width = std::max(radians(5.0f), config.postStallSpinBlendRangeRad + radians(2.0f));
+        const float t = clamp(exceed / width, 0.0f, 1.0f);
+        const float postStallLiftScale = mix(1.0f, 0.38f, t);
+        cl *= postStallLiftScale;
     }
     cl = clamp(cl, clMin, clMax);
 
-    const float cd = clamp(config.CD0 + (config.inducedDragK * cl * cl), 0.01f, cdMax);
-    const float cy = clamp((config.CYbeta * beta) + (config.CYrudder * rudder), -cyMax, cyMax);
+    float cd = config.CD0 + (config.inducedDragK * cl * cl);
+    cd += stallBlend * (0.85f + 0.35f * betaNorm * betaNorm);
+    cd = clamp(cd, 0.01f, cdMax);
+
+    const float cy = clamp(
+        (config.CYbeta * beta * yawStabilityScale) +
+        (config.CYrudder * rudder * rudderEffectiveness),
+        -cyMax,
+        cyMax);
 
     float cRoll =
         (config.ClBeta * beta) +
         (config.ClP * rollRateNorm) +
         (config.ClR * yawRateNorm) +
-        (config.ClAileron * aileron) +
-        (config.ClRudder * rudder);
+        (config.ClAileron * aileron * aileronEffectiveness) +
+        (config.ClRudder * rudder * rudderEffectiveness);
+
     float cPitch =
         config.Cm0 +
         (config.CmAlpha * alpha) +
         (config.CmQ * pitchRateNorm) +
         (config.CmElevator * elevator);
+
     float cYaw =
-        (config.CnBeta * beta) +
-        (config.CnR * yawRateNorm) +
+        (config.CnBeta * beta * yawStabilityScale) +
+        (config.CnR * yawRateNorm * yawStabilityScale) +
         (config.CnP * rollRateNorm) +
-        (config.CnRudder * rudder) +
-        (config.CnAileron * aileron);
+        (config.CnRudder * rudder * rudderEffectiveness) +
+        (config.CnAileron * aileron * aileronEffectiveness);
+
+    if (stallBlend > 0.0f) {
+        const float spinDriver = clamp(
+            (betaNorm * 0.55f) + (yawRateNorm * 0.75f) + (rudder * 0.80f) + (aileron * 0.12f),
+            -2.0f,
+            2.0f);
+
+        cRoll += (spinDriver * config.spinRollMoment * stallBlend * 0.40f);
+        cYaw += (spinDriver * config.spinYawMoment * stallBlend * 0.35f);
+
+        cRoll -= rollRateNorm * stallBlend * 0.55f;
+        cYaw -= yawRateNorm * stallBlend * 0.90f;
+    }
 
     cRoll = clamp(cRoll, -cMomentMax, cMomentMax);
     cPitch = clamp(cPitch, -cMomentMax, cMomentMax);
@@ -741,7 +814,7 @@ inline void stepFlight(
     runtime.crashed = false;
     runtime.hasPendingCrash = false;
     applyNumericalGuards(state, config);
-    updatePilotInputs(state, dt, nowSeconds, input);
+    updatePilotInputs(state, dt, nowSeconds, input, config);
 
     if (!runtime.bootstrapDone) {
         const AtmosphereSample atmosphere = sampleAtmosphere(state.pos.y * config.metersPerUnit);
@@ -871,7 +944,7 @@ inline void stepFlight(
 
         if (config.enableAutoTrim) {
             if (runtime.tick >= runtime.trimNextUpdateTick) {
-                runtime.trimTarget = estimateElevatorForLevelFlight(config, atmosphere, std::max(20.0f, trueAirspeed));
+                runtime.trimTarget = -estimateElevatorForLevelFlight(config, atmosphere, std::max(20.0f, trueAirspeed));
                 const int trimIntervalTicks = std::max(1, static_cast<int>(std::round(config.physicsHz / std::max(0.5f, config.autoTrimUpdateHz))));
                 runtime.trimNextUpdateTick = runtime.tick + trimIntervalTicks;
             }
@@ -881,23 +954,34 @@ inline void stepFlight(
             runtime.trimTarget = 0.0f;
         }
 
-        const float controlAuthority = clamp(
+        const float baseControlAuthority = clamp(
             trueAirspeed / std::max(5.0f, config.controlAuthoritySpeed),
             clamp(config.minControlAuthority, 0.05f, 1.0f),
             1.0f);
 
+        const float alphaAbs = std::fabs(runtime.lastAlpha);
+        const float stallAuthorityBlend = clamp(
+            (alphaAbs - config.alphaStallRad) / std::max(radians(3.0f), config.postStallSpinBlendRangeRad),
+            0.0f,
+            1.0f);
+
+        const float elevatorAuthority = baseControlAuthority * mix(1.0f, 0.65f, stallAuthorityBlend);
+        const float aileronAuthority = baseControlAuthority * mix(1.0f, 0.20f, stallAuthorityBlend);
+        const float rudderAuthority = baseControlAuthority * mix(1.0f, 0.55f, stallAuthorityBlend);
+
         const float elevatorTarget = clamp(
-            (state.yoke.pitch * controlAuthority * std::max(0.05f, config.pitchControlScale) * config.maxElevatorDeflectionRad) +
+            (state.yoke.pitch * elevatorAuthority * std::max(0.05f, config.pitchControlScale) * config.maxElevatorDeflectionRad) +
                 runtime.elevatorTrim +
                 state.manualElevatorTrim,
             -config.maxElevatorDeflectionRad,
             config.maxElevatorDeflectionRad);
         const float aileronTarget = clamp(
-            state.yoke.roll * controlAuthority * std::max(0.05f, config.rollControlScale) * config.maxAileronDeflectionRad,
+            state.yoke.roll * aileronAuthority * std::max(0.05f, config.rollControlScale) * config.maxAileronDeflectionRad,
             -config.maxAileronDeflectionRad,
             config.maxAileronDeflectionRad);
         const float rudderTarget = clamp(
-            -state.yoke.yaw * controlAuthority * std::max(0.05f, config.yawControlScale) * config.maxRudderDeflectionRad,
+            (-state.yoke.yaw * rudderAuthority * std::max(0.05f, config.yawControlScale) * config.maxRudderDeflectionRad) +
+                state.manualRudderTrim,
             -config.maxRudderDeflectionRad,
             config.maxRudderDeflectionRad);
 
@@ -924,9 +1008,27 @@ inline void stepFlight(
 
         Vec3 momentBody = aero.momentBody;
         if (config.stabilityAugmentation) {
-            momentBody.x -= state.flightAngVel.x * std::max(0.0f, config.pitchRateDampingMoment);
-            momentBody.y -= state.flightAngVel.y * std::max(0.0f, config.yawRateDampingMoment);
-            momentBody.z -= state.flightAngVel.z * std::max(0.0f, config.rollRateDampingMoment);
+            const float postStallBlend = clamp(
+                (std::fabs(aero.alpha) - config.alphaStallRad) / std::max(radians(2.0f), config.postStallSpinBlendRangeRad),
+                0.0f,
+                1.0f);
+
+            const float postStallDampingScale = std::max(1.0f, config.postStallDampingScale);
+            const float dampingScale = mix(1.0f, postStallDampingScale, postStallBlend);
+
+            const float pitchDamping = std::max(0.0f, config.pitchRateDampingMoment) * dampingScale;
+            const float yawDamping = std::max(0.0f, config.yawRateDampingMoment) * dampingScale;
+            const float rollDamping = std::max(0.0f, config.rollRateDampingMoment) * dampingScale;
+
+            momentBody.x -= state.flightAngVel.x * pitchDamping;
+            momentBody.y -= state.flightAngVel.y * yawDamping;
+            momentBody.z -= state.flightAngVel.z * rollDamping;
+
+            const float extraYawDamper = mix(0.0f, std::max(0.0f, config.yawRateDampingMoment) * 0.75f, postStallBlend);
+            const float extraRollDamper = mix(0.0f, std::max(0.0f, config.rollRateDampingMoment) * 0.35f, postStallBlend);
+
+            momentBody.y -= state.flightAngVel.y * extraYawDamper;
+            momentBody.z -= state.flightAngVel.z * extraRollDamper;
         }
         momentBody = clampMagnitude(momentBody, std::max(1000.0f, config.maxMomentNewtonMeter));
 

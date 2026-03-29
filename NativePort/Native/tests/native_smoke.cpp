@@ -1,5 +1,6 @@
 #include <SDL3/SDL.h>
 
+#include "App/AppSmokeApi.hpp"
 #include "NativeGame/BlobSync.hpp"
 #include "NativeGame/HostedNetworking.hpp"
 #include "NativeGame/NetProtocol.hpp"
@@ -7,23 +8,22 @@
 #include "NativeGame/WorldStore.hpp"
 #include "NativeGame/WorldWire.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <array>
+#include <cmath>
 #include <deque>
 #include <memory>
 #include <optional>
 #include <string>
 #include <system_error>
 
-#define main trueflight_native_main
-#include "../src/main.cpp"
-#undef main
-
 namespace {
 
 using namespace NativeGame;
+using namespace TrueFlightApp;
 
 std::filesystem::path repoRoot()
 {
@@ -229,14 +229,14 @@ void runFlightParityChecks(bool& failed)
 {
     {
         const FlightConfig config = defaultFlightConfig();
-        require(std::fabs(config.CL0 - 0.40f) < 1.0e-6f, "Default CL0 no longer matches the Lua flight model", failed);
-        require(std::fabs(config.CLElevator - 0.80f) < 1.0e-6f, "Default CLElevator no longer matches the Lua flight model", failed);
-        require(std::fabs(config.Cm0 - 0.04f) < 1.0e-6f, "Default Cm0 no longer matches the Lua flight model", failed);
-        require(std::fabs(config.CmElevator + 1.35f) < 1.0e-6f, "Default CmElevator no longer matches the Lua flight model", failed);
-        require(std::fabs(degrees(config.maxElevatorDeflectionRad) - 25.0f) < 1.0e-4f, "Default elevator limit no longer matches the Lua flight model", failed);
-        require(std::fabs(config.pitchControlScale - 0.78f) < 1.0e-6f, "Default pitch control scale no longer matches the Lua flight model", failed);
-        require(std::fabs(config.rollControlScale - 0.72f) < 1.0e-6f, "Default roll control scale no longer matches the Lua flight model", failed);
-        require(std::fabs(config.yawControlScale - 0.65f) < 1.0e-6f, "Default yaw control scale no longer matches the Lua flight model", failed);
+        require(std::fabs(config.CL0 - 0.24f) < 1.0e-6f, "Default CL0 no longer matches the light-aircraft baseline", failed);
+        require(std::fabs(config.CLElevator - 0.92f) < 1.0e-6f, "Default CLElevator no longer matches the light-aircraft baseline", failed);
+        require(std::fabs(config.Cm0 - 0.03f) < 1.0e-6f, "Default Cm0 no longer matches the light-aircraft baseline", failed);
+        require(std::fabs(config.CmElevator + 1.60f) < 1.0e-6f, "Default CmElevator no longer matches the light-aircraft baseline", failed);
+        require(std::fabs(degrees(config.maxElevatorDeflectionRad) - 25.0f) < 1.0e-4f, "Default elevator limit no longer matches the light-aircraft baseline", failed);
+        require(std::fabs(config.pitchControlScale - 0.68f) < 1.0e-6f, "Default pitch control scale no longer matches the light-aircraft baseline", failed);
+        require(std::fabs(config.rollControlScale - 0.58f) < 1.0e-6f, "Default roll control scale no longer matches the light-aircraft baseline", failed);
+        require(std::fabs(config.yawControlScale - 0.52f) < 1.0e-6f, "Default yaw control scale no longer matches the light-aircraft baseline", failed);
     }
 
     {
@@ -400,6 +400,51 @@ void runFlightParityChecks(bool& failed)
         config.enableAutoTrim = false;
         config.autoTrimUseWorker = false;
 
+        const float clMaxEstimate = config.CL0 + (config.CLalpha * config.alphaStallRad);
+        const float stallSpeedMetersPerSecond =
+            std::sqrt((2.0f * config.massKg * 9.80665f) / (1.225f * config.wingArea * std::max(0.5f, clMaxEstimate)));
+
+        require(config.engineCylinderCount == 4, "Default native aircraft should use a four-cylinder light-aircraft engine baseline", failed);
+        require(
+            config.maxBrakePowerKw >= 130.0f && config.maxBrakePowerKw <= 140.0f,
+            "Default native aircraft brake power drifted away from the Skyhawk baseline",
+            failed);
+        require(
+            config.maxThrustSeaLevel >= 1500.0f && config.maxThrustSeaLevel <= 2200.0f,
+            "Default native aircraft thrust cap drifted away from the light-aircraft baseline",
+            failed);
+        require(!config.stabilityAugmentation, "Default native aircraft should no longer ship with synthetic stability augmentation enabled", failed);
+        require(
+            stallSpeedMetersPerSecond >= 25.0f && stallSpeedMetersPerSecond <= 29.0f,
+            "Default native aircraft clean stall speed drifted away from the Cessna-like baseline",
+            failed);
+    }
+
+    {
+        std::mt19937 rng(42u);
+        WindState wind {};
+        for (int sampleIndex = 0; sampleIndex < 96; ++sampleIndex) {
+            pickNextWindTarget(wind, rng, static_cast<float>(sampleIndex) * 10.0f);
+            require(
+                wind.targetSpeed >= 0.8f && wind.targetSpeed <= 6.0f,
+                "Default wind targets should stay within the reduced light-aircraft operating range",
+                failed);
+            require(
+                wind.gustAmplitude >= 0.05f && wind.gustAmplitude <= 1.1f,
+                "Default wind gust amplitude drifted outside the reduced operating range",
+                failed);
+            require(
+                wind.gustFrequency >= 0.05f && wind.gustFrequency <= 0.18f,
+                "Default wind gust frequency drifted outside the reduced operating range",
+                failed);
+        }
+    }
+
+    {
+        FlightConfig config = defaultFlightConfig();
+        config.enableAutoTrim = false;
+        config.autoTrimUseWorker = false;
+
         FlightState plane = makeFlightState();
         plane.manualElevatorTrim = radians(2.5f);
         FlightRuntimeState runtime {};
@@ -422,6 +467,114 @@ void runFlightParityChecks(bool& failed)
             std::fabs(runtime.elevatorDeflection - plane.manualElevatorTrim) < radians(0.1f),
             "Manual trim should feed the native elevator target",
             failed);
+    }
+
+    {
+        FlightConfig config = defaultFlightConfig();
+        config.enableAutoTrim = false;
+        config.autoTrimUseWorker = false;
+
+        FlightState plane = makeFlightState();
+        plane.manualRudderTrim = radians(3.0f);
+        FlightRuntimeState runtime {};
+        FlightEnvironment environment {};
+        environment.wind = { 0.0f, 0.0f, 0.0f };
+        environment.groundHeightAt = [](float, float) {
+            return -1.0e6f;
+        };
+        environment.sampleSdf = [](float, float, float) {
+            return 1.0e6f;
+        };
+        environment.sampleNormal = [](float, float, float) {
+            return Vec3 { 0.0f, 1.0f, 0.0f };
+        };
+        environment.collisionRadius = plane.collisionRadius;
+
+        stepFlight(plane, runtime, 1.0f / 120.0f, 0.0f, InputState {}, environment, config);
+
+        require(
+            std::fabs(runtime.rudderDeflection - plane.manualRudderTrim) < radians(0.1f),
+            "Manual rudder trim should feed the native rudder target",
+            failed);
+    }
+
+    {
+        FlightConfig config = defaultFlightConfig();
+        config.enableAutoTrim = false;
+        config.autoTrimUseWorker = false;
+
+        FlightState plane = makeFlightState();
+        FlightRuntimeState runtime {};
+        FlightEnvironment environment {};
+        environment.wind = { 0.0f, 0.0f, 0.0f };
+        environment.groundHeightAt = [](float, float) {
+            return -1.0e6f;
+        };
+        environment.sampleSdf = [](float, float, float) {
+            return 1.0e6f;
+        };
+        environment.sampleNormal = [](float, float, float) {
+            return Vec3 { 0.0f, 1.0f, 0.0f };
+        };
+        environment.collisionRadius = plane.collisionRadius;
+
+        InputState input {};
+        input.flightYawRight = true;
+        for (int step = 0; step < 18; ++step) {
+            stepFlight(plane, runtime, 1.0f / 120.0f, static_cast<float>(step) / 120.0f, input, environment, config);
+        }
+        require(plane.yoke.yaw > 0.85f, "Rudder pedal input should reach near-full authority quickly", failed);
+
+        input = {};
+        for (int step = 18; step < 48; ++step) {
+            stepFlight(plane, runtime, 1.0f / 120.0f, static_cast<float>(step) / 120.0f, input, environment, config);
+        }
+        require(std::fabs(plane.yoke.yaw) < 0.15f, "Rudder pedal input should spring back toward center after release", failed);
+    }
+
+    {
+        FlightConfig config = defaultFlightConfig();
+        config.enableAutoTrim = false;
+        config.autoTrimUseWorker = false;
+
+        FlightState plane = makeFlightState({ 0.0f, 420.0f, 0.0f }, { 0.0f, 0.0f, 32.0f }, 0.48f, 1.2f);
+        plane.rot = quatNormalize(quatFromAxisAngle({ 1.0f, 0.0f, 0.0f }, radians(24.0f)));
+        FlightRuntimeState runtime {};
+        FlightEnvironment environment {};
+        environment.wind = { 0.0f, 0.0f, 0.0f };
+        environment.groundHeightAt = [](float, float) {
+            return -1.0e6f;
+        };
+        environment.sampleSdf = [](float, float, float) {
+            return 1.0e6f;
+        };
+        environment.sampleNormal = [](float, float, float) {
+            return Vec3 { 0.0f, 1.0f, 0.0f };
+        };
+        environment.collisionRadius = plane.collisionRadius;
+
+        float neutralPhaseMaxYawRate = 0.0f;
+        float neutralPhaseMaxRollRate = 0.0f;
+        float neutralPhaseMaxBeta = 0.0f;
+        for (int step = 0; step < 360; ++step) {
+            InputState input {};
+            if (step < 120) {
+                input.flightPitchUp = true;
+                input.flightYawRight = true;
+                input.flightRollRight = true;
+            }
+
+            stepFlight(plane, runtime, 1.0f / 120.0f, static_cast<float>(step) / 120.0f, input, environment, config);
+            if (step >= 120) {
+                neutralPhaseMaxYawRate = std::max(neutralPhaseMaxYawRate, std::fabs(plane.flightAngVel.y));
+                neutralPhaseMaxRollRate = std::max(neutralPhaseMaxRollRate, std::fabs(plane.flightAngVel.z));
+                neutralPhaseMaxBeta = std::max(neutralPhaseMaxBeta, std::fabs(runtime.lastBeta));
+            }
+        }
+
+        require(neutralPhaseMaxYawRate > radians(18.0f), "Post-stall departure should now sustain yaw rate after releasing the controls", failed);
+        require(neutralPhaseMaxRollRate > radians(30.0f), "Post-stall departure should now sustain roll rate after releasing the controls", failed);
+        require(neutralPhaseMaxBeta > radians(10.0f), "Post-stall departure should now develop substantial sideslip", failed);
     }
 }
 
@@ -610,6 +763,42 @@ void runCullingAndWalkingRigChecks(bool& failed)
     require(planeVisual.rigSlotActive[0], "Character rig cutouts should capture faces inside the selected prop volume", failed);
     require(planeVisual.rigBaseModel.faces.size() + planeVisual.rigSlotModels[0].faces.size() == planeVisual.model.faces.size(), "Character rig partitioning should preserve the source face count", failed);
     require(std::fabs(visualRigSlotAngleRadians(planeVisual, 0, 1.0f, 1800.0f, 0.0f)) > 10.0f, "Character rig prop previews should derive visible rotation from prop RPM", failed);
+
+    PlaneVisualState mirroredVisual;
+    mirroredVisual.defaultScale = 1.0f;
+    mirroredVisual.sourceModel = makeCubeModel();
+    mirroredVisual.model = mirroredVisual.sourceModel;
+    mirroredVisual.label = "mirrored cube";
+    mirroredVisual.rigCutouts[2] = defaultVisualRigCutout(2);
+    mirroredVisual.rigCutouts[2].enabled = true;
+    mirroredVisual.rigCutouts[2].center = { 0.32f, 0.08f, 0.22f };
+    mirroredVisual.rigCutouts[2].pivot = { 0.28f, 0.12f, 0.06f };
+    mirroredVisual.rigCutouts[2].motionScale = -18.0f;
+    const VisualRigCutout sourceCutout = mirroredVisual.rigCutouts[2];
+    require(mirrorVisualRigCutoutFromPairedSlot(mirroredVisual, 3), "Rig mirror helper should succeed for paired control surfaces", failed);
+
+    const Quat mirroredRotation = composeVisualRotationOffset(mirroredVisual);
+    const Vec3 mirroredLocalRight = normalize(rotateVector(quatConjugate(mirroredRotation), { 1.0f, 0.0f, 0.0f }), { 1.0f, 0.0f, 0.0f });
+    float rightMin = dot(mirroredVisual.model.vertices.front(), mirroredLocalRight);
+    float rightMax = rightMin;
+    for (const Vec3& vertex : mirroredVisual.model.vertices) {
+        const float projection = dot(vertex, mirroredLocalRight);
+        rightMin = std::min(rightMin, projection);
+        rightMax = std::max(rightMax, projection);
+    }
+    const float rightMid = (rightMin + rightMax) * 0.5f;
+    require(
+        std::fabs((dot(sourceCutout.center, mirroredLocalRight) + dot(mirroredVisual.rigCutouts[3].center, mirroredLocalRight)) - (2.0f * rightMid)) < 1.0e-3f,
+        "Rig mirror helper should reflect cutout centers across the model centerline",
+        failed);
+    require(
+        std::fabs((dot(sourceCutout.pivot, mirroredLocalRight) + dot(mirroredVisual.rigCutouts[3].pivot, mirroredLocalRight)) - (2.0f * rightMid)) < 1.0e-3f,
+        "Rig mirror helper should reflect pivots across the model centerline",
+        failed);
+    require(
+        std::fabs(mirroredVisual.rigCutouts[3].motionScale + sourceCutout.motionScale) < 1.0e-4f,
+        "Rig mirror helper should flip control-surface travel when copying to the paired side",
+        failed);
 }
 
 void runTerrainLodChecks(bool& failed)
@@ -1160,6 +1349,8 @@ void runNetworkingSmokeChecks(bool& failed)
         input.throttle = 0.85f;
         input.yokePitch = -0.25f;
         input.yokeYaw = 0.55f;
+        input.manualElevatorTrim = -0.08f;
+        input.manualRudderTrim = 0.05f;
         input.walkBackward = true;
         input.walkStrafeLeft = true;
         input.walkSprint = true;
@@ -1229,6 +1420,8 @@ void runNetworkingSmokeChecks(bool& failed)
             require(parsedInput->tick == 31, "Input tick did not round-trip", failed);
             require(parsedInput->walkBackward && parsedInput->walkStrafeLeft && parsedInput->walkSprint, "Input button state did not round-trip", failed);
             require(std::fabs(parsedInput->yokeYaw - 0.55f) < 1.0e-4f, "Input analog state did not round-trip", failed);
+            require(std::fabs(parsedInput->manualElevatorTrim + 0.08f) < 1.0e-4f, "Input elevator trim did not round-trip", failed);
+            require(std::fabs(parsedInput->manualRudderTrim - 0.05f) < 1.0e-4f, "Input rudder trim did not round-trip", failed);
         }
 
         const auto parsedSnapshot = parseSnapshotPacket(snapshotPacket);
@@ -1709,16 +1902,29 @@ int main()
             controlActionTriggeredByKey(defaultControls, InputActionId::PaintUndo, SDL_SCANCODE_Z, SDL_KMOD_LCTRL),
             "Default ctrl+Z paint binding should trigger with left ctrl",
             failed);
+        require(
+            controlActionTriggeredByKey(defaultControls, InputActionId::FlightRudderTrimLeft, SDL_SCANCODE_LEFTBRACKET, SDL_KMOD_NONE) &&
+                controlActionTriggeredByKey(defaultControls, InputActionId::FlightRudderTrimRight, SDL_SCANCODE_RIGHTBRACKET, SDL_KMOD_NONE),
+            "Default rudder-trim key bindings should trigger with bracket keys",
+            failed);
 
         const ControlActionBinding* voicePtt = findControlAction(defaultControls, InputActionId::VoicePushToTalk);
+        const ControlActionBinding* rudderTrimLeft = findControlAction(defaultControls, InputActionId::FlightRudderTrimLeft);
+        const ControlActionBinding* rudderTrimRight = findControlAction(defaultControls, InputActionId::FlightRudderTrimRight);
         require(voicePtt != nullptr, "Voice push-to-talk binding should exist in the default control profile", failed);
         require(
             controlActionSupported(InputActionId::VoicePushToTalk) &&
+                controlActionSupported(InputActionId::FlightRudderTrimLeft) &&
+                controlActionSupported(InputActionId::FlightRudderTrimRight) &&
                 controlActionConfigurable(InputActionId::VoicePushToTalk) &&
+                controlActionConfigurable(InputActionId::FlightRudderTrimLeft) &&
+                controlActionConfigurable(InputActionId::FlightRudderTrimRight) &&
+                rudderTrimLeft != nullptr &&
+                rudderTrimRight != nullptr &&
                 voicePtt->supported &&
                 voicePtt->configurable &&
                 voicePtt->slots[0].kind == BindingKind::Key,
-            "Voice push-to-talk should be supported and configurable in native controls",
+            "Voice push-to-talk and rudder trim actions should be supported and configurable in native controls",
             failed);
     }
 
