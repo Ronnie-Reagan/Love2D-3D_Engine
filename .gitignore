@@ -6,6 +6,33 @@ out/
 vc140.pdb
 steamworks_sdk_164/
 NativePort/Docs
-NativePort/third_party/imgui
+NativePort/third_party/imgui/*
+!NativePort/third_party/imgui/backends/
+!NativePort/third_party/imgui/misc/
+!NativePort/third_party/imgui/imconfig.h
+!NativePort/third_party/imgui/imgui.cpp
+!NativePort/third_party/imgui/imgui.h
+!NativePort/third_party/imgui/imgui_demo.cpp
+!NativePort/third_party/imgui/imgui_draw.cpp
+!NativePort/third_party/imgui/imgui_internal.h
+!NativePort/third_party/imgui/imgui_tables.cpp
+!NativePort/third_party/imgui/imgui_widgets.cpp
+!NativePort/third_party/imgui/imstb_rectpack.h
+!NativePort/third_party/imgui/imstb_textedit.h
+!NativePort/third_party/imgui/imstb_truetype.h
+!NativePort/third_party/imgui/LICENSE.txt
+NativePort/third_party/imgui/backends/*
+!NativePort/third_party/imgui/backends/imgui_impl_sdl3.cpp
+!NativePort/third_party/imgui/backends/imgui_impl_sdl3.h
+!NativePort/third_party/imgui/backends/imgui_impl_sdlgpu3.cpp
+!NativePort/third_party/imgui/backends/imgui_impl_sdlgpu3.h
+!NativePort/third_party/imgui/backends/imgui_impl_sdlgpu3_shaders.h
+NativePort/third_party/imgui/misc/*
+!NativePort/third_party/imgui/misc/cpp/
+NativePort/third_party/imgui/misc/cpp/*
+!NativePort/third_party/imgui/misc/cpp/imgui_stdlib.cpp
+!NativePort/third_party/imgui/misc/cpp/imgui_stdlib.h
+
+
 
 
