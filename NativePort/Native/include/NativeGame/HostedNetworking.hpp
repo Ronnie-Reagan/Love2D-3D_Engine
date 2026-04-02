@@ -4,6 +4,8 @@
 #include "NativeGame/Hash.hpp"
 #include "NativeGame/NetTransport.hpp"
 
+#include <cstddef>
+#include <deque>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -11,6 +13,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <string_view>
 
 namespace NativeGame {
 
@@ -41,13 +44,20 @@ struct AvatarBlobCache {
     }
 };
 
+struct QueuedVoiceFrame {
+    int senderId = 0;
+    int channel = 1;
+    std::string compressedData;
+};
+
 struct VoiceSessionState {
     bool captureEnabled = false;
     bool transmitting = false;
     int radioChannel = 1;
     std::vector<std::string> pendingOutboundCompressedFrames;
-    std::vector<std::string> inboundCompressedFrames;
-    std::vector<std::string> hostLocalReceiveFrames;
+    std::vector<QueuedVoiceFrame> inboundCompressedFrames;
+    std::vector<QueuedVoiceFrame> hostLocalReceiveFrames;
+    std::unordered_map<int, VoiceTalkerState> talkersById;
 };
 
 struct AreaOfInterestState {
@@ -59,6 +69,16 @@ struct AreaOfInterestState {
     std::unordered_map<std::string, int> lastChunkRevisionByKey;
 };
 
+struct HostedBlobOutboundPacket {
+    std::string transferKey;
+    std::string payload;
+};
+
+struct HostedTerrainEditRequest {
+    NetPeerId peerId = 0;
+    TerrainEditRequest request {};
+};
+
 struct HostedPlayerState {
     int id = 0;
     NetPeerId peerId = 0;
@@ -66,7 +86,9 @@ struct HostedPlayerState {
     bool connected = false;
     bool hasReceivedHello = false;
     bool hasReceivedInput = false;
+    PlayerMode mode = PlayerMode::Flight;
     bool flightMode = true;
+    VehicleId vehicleId = 0;
     float walkYaw = 0.0f;
     float walkPitch = 0.0f;
     AvatarManifest avatar = defaultAvatarManifest();
@@ -76,12 +98,17 @@ struct HostedPlayerState {
     FlightRuntimeState runtime {};
     AreaOfInterestState aoi {};
     BlobSyncState blobSync = createBlobSyncState();
+    std::deque<HostedBlobOutboundPacket> outboundBlobReliable;
+    std::unordered_map<std::string, int> queuedBlobPacketCountsByTransfer;
+    double nextBlobFlushAt = 0.0;
     std::map<int, NetPlayerInput> pendingInputs;
 };
 
 struct ClientPredictedState {
     int tick = 0;
+    PlayerMode mode = PlayerMode::Flight;
     bool flightMode = true;
+    VehicleId vehicleId = 0;
     FlightState plane {};
     FlightRuntimeState runtime {};
     float walkYaw = 0.0f;
@@ -93,7 +120,9 @@ struct LocalAuthoritativeState {
     bool dirty = false;
     int ack = 0;
     int simTick = 0;
+    PlayerMode mode = PlayerMode::Flight;
     bool flightMode = true;
+    VehicleId vehicleId = 0;
     Vec3 pos {};
     Quat rot = quatIdentity();
     Vec3 vel {};
@@ -122,14 +151,26 @@ struct ClientReplicationState {
     int pendingControlTick = 0;
     double nextHelloAt = 0.0;
     double nextInputAt = 0.0;
+    double nextBlobFlushAt = 0.0;
     WorldInfoSnapshot lastWorldInfo {};
     TerrainParams mirroredTerrain = defaultTerrainParams();
     bool mirrorTerrainDirty = false;
     LocalAuthoritativeState localAuthoritative {};
     BlobSyncState blobSync = createBlobSyncState();
     AvatarBlobCache blobCache {};
+    std::unordered_set<std::string> uploadedBlobKeys;
+    std::unordered_map<std::string, double> nextBlobRequestAtByKey;
+    std::unordered_map<std::string, BlobTransferStatus> blobStatusByKey;
+    std::unordered_map<TerrainEditOpId, TerrainEditRequest> pendingTerrainEditsById;
+    std::deque<TerrainEditAck> terrainEditAcks;
+    std::vector<WorldChunkState> recentTerrainChunks;
+    TerrainEditOpId nextTerrainEditOpId = 1;
+    double nextTerrainHudNotificationAt = 0.0;
     VoiceSessionState voice {};
     std::unordered_map<int, RemotePeerState> peers;
+    std::unordered_map<ConstructId, ConstructBlueprint> constructBlueprints;
+    std::unordered_map<ConstructId, ConstructState> constructStates;
+    std::unordered_map<VehicleId, SharedVehicleState> sharedVehicles;
     NetGameplayStatePacket gameplayState {};
     bool gameplayStateDirty = false;
     std::map<int, NetPlayerInput> pendingInputs;
@@ -199,6 +240,36 @@ public:
         return players_;
     }
 
+    [[nodiscard]] const AvatarBlobRecord* lookupBlob(std::string_view kind, std::string_view hash) const
+    {
+        return blobCache_.get(kind, hash);
+    }
+
+    [[nodiscard]] const std::unordered_map<ConstructId, ConstructBlueprint>& constructBlueprints() const
+    {
+        return constructBlueprints_;
+    }
+
+    [[nodiscard]] const std::unordered_map<ConstructId, ConstructState>& constructStates() const
+    {
+        return constructStates_;
+    }
+
+    [[nodiscard]] const std::unordered_map<VehicleId, SharedVehicleState>& sharedVehicles() const
+    {
+        return sharedVehicles_;
+    }
+
+    void setSharedWorldState(
+        const std::unordered_map<ConstructId, ConstructBlueprint>& constructBlueprints,
+        const std::unordered_map<ConstructId, ConstructState>& constructStates,
+        const std::unordered_map<VehicleId, SharedVehicleState>& sharedVehicles);
+
+    void cacheBlob(const AvatarBlobRecord& record)
+    {
+        blobCache_.put(record);
+    }
+
     void setLog(std::function<void(const std::string&)> logFn)
     {
         log_ = std::move(logFn);
@@ -207,7 +278,8 @@ public:
     void setLocalAuthoritativeState(
         const FlightState& actor,
         const FlightRuntimeState& runtime,
-        bool flightMode,
+        PlayerMode mode,
+        VehicleId vehicleId,
         float walkYaw,
         float walkPitch,
         const AvatarManifest& avatar);
@@ -216,8 +288,10 @@ public:
     void update(double nowSeconds, float dt, const TerrainFieldContext& terrainContext, const FlightConfig& flightConfig, Vec3 wind, WorldStore* worldStore);
     bool addCrater(const TerrainCrater& crater, WorldStore* worldStore, const TerrainParams& terrainParams);
     void queueLocalVoiceFrame(int channel, std::string_view compressedFrame);
-    [[nodiscard]] std::vector<std::string> drainLocalVoiceFrames();
-    [[nodiscard]] std::vector<std::string> drainHostLocalVoiceFrames();
+    [[nodiscard]] std::vector<QueuedVoiceFrame> drainLocalVoiceFrames();
+    [[nodiscard]] std::vector<QueuedVoiceFrame> drainHostLocalVoiceFrames();
+    [[nodiscard]] std::vector<HostedTerrainEditRequest> drainPendingTerrainEdits();
+    void sendTerrainEditAck(NetPeerId peerId, const TerrainEditAck& ack);
 
 private:
     std::shared_ptr<INetTransport> transport_;
@@ -229,7 +303,11 @@ private:
     double cloudAccumulator_ = 0.0;
     int snapshotSequence_ = 0;
     int nextPlayerId_ = 2;
-    std::vector<std::string> hostLocalReceiveFrames_;
+    std::unordered_map<ConstructId, ConstructBlueprint> constructBlueprints_;
+    std::unordered_map<ConstructId, ConstructState> constructStates_;
+    std::unordered_map<VehicleId, SharedVehicleState> sharedVehicles_;
+    std::vector<QueuedVoiceFrame> hostLocalReceiveFrames_;
+    std::deque<HostedTerrainEditRequest> pendingTerrainEdits_;
     std::function<void(const std::string&)> log_;
 
     HostedPlayerState& ensurePlayerForPeer(NetPeerId peerId);
@@ -237,11 +315,13 @@ private:
     void sendWorldBootstrap(HostedPlayerState& player, WorldStore* worldStore, const TerrainParams& terrainParams);
     void sendChunksForPlayer(HostedPlayerState& player, WorldStore* worldStore, std::string_view reason);
     void broadcastAvatarManifest(const HostedPlayerState& player, NetPeerId exceptPeer = 0);
+    void broadcastVehicleStates();
     void broadcastSnapshots(double nowSeconds);
     void broadcastCloudSnapshot(double nowSeconds);
     void handlePacket(const NetEvent& event, const TerrainParams& terrainParams, const TerrainFieldContext& terrainContext, WorldStore* worldStore);
     void simulateRemotePlayers(float dt, const TerrainFieldContext& terrainContext, const FlightConfig& flightConfig, Vec3 wind);
     void fulfillBlobRequest(NetPeerId peerId, std::string_view kind, std::string_view hash);
+    void flushBlobTransfers(double nowSeconds);
 };
 
 void serviceClientReplication(
@@ -256,7 +336,7 @@ void enqueueClientInput(ClientReplicationState& client, const NetPlayerInput& in
 void enqueueClientModeSwitch(ClientReplicationState& client, const ModeSwitchPacket& modeSwitch);
 void enqueueClientResetFlight(ClientReplicationState& client, const ResetFlightPacket& reset);
 void enqueueClientAoiSubscription(ClientReplicationState& client, const AoiSubscription& subscription);
-void flushClientOutbound(ClientReplicationState& client);
+void flushClientOutbound(ClientReplicationState& client, double nowSeconds);
 
 namespace HostedNetworkingDetail {
 
@@ -397,7 +477,9 @@ inline void applyWalkingAuthoritativeState(
     float walkYaw,
     float walkPitch)
 {
+    player.mode = PlayerMode::Walking;
     player.flightMode = false;
+    player.vehicleId = 0;
     player.walkYaw = wrapAngle(walkYaw);
     player.walkPitch = clamp(walkPitch, radians(-89.0f), radians(89.0f));
     player.actor.pos = requestedPos;
@@ -434,15 +516,216 @@ inline void resetAuthoritativeFlightState(
     player.actor.throttle = 0.64f;
     player.actor.collisionRadius = 3.2f;
     player.actor.onGround = false;
+    player.mode = PlayerMode::Flight;
     player.flightMode = true;
+    player.vehicleId = 0;
     syncWalkingLookFromRotation(player.actor.rot, player.walkYaw, player.walkPitch);
     player.avatar.role = "plane";
     player.input.role = "plane";
 }
 
+inline const ConstructBlueprint* findConstructBlueprint(
+    const std::unordered_map<ConstructId, ConstructBlueprint>& constructs,
+    ConstructId constructId)
+{
+    const auto it = constructs.find(constructId);
+    return it == constructs.end() ? nullptr : &it->second;
+}
+
+inline Vec3 vehicleForwardFromYaw(float yawRadians)
+{
+    return normalize(Vec3 { std::sin(yawRadians), 0.0f, std::cos(yawRadians) }, { 0.0f, 0.0f, 1.0f });
+}
+
+inline Quat vehicleRotationFromYaw(float yawRadians)
+{
+    return quatNormalize(quatFromAxisAngle({ 0.0f, 1.0f, 0.0f }, yawRadians));
+}
+
+inline void ensureVehicleSeatCount(SharedVehicleState& vehicle, const ConstructBlueprint& blueprint)
+{
+    const std::size_t desiredSeats = std::max<std::size_t>(1u, blueprint.seatOffsets.empty() ? 1u : blueprint.seatOffsets.size());
+    if (vehicle.seatOccupants.size() < desiredSeats) {
+        vehicle.seatOccupants.resize(desiredSeats, 0);
+    }
+}
+
+inline int findVehicleSeatIndex(const SharedVehicleState& vehicle, int playerId)
+{
+    for (std::size_t index = 0; index < vehicle.seatOccupants.size(); ++index) {
+        if (vehicle.seatOccupants[index] == playerId) {
+            return static_cast<int>(index);
+        }
+    }
+    return -1;
+}
+
+inline void syncPlayerToVehicleSeat(
+    HostedPlayerState& player,
+    const SharedVehicleState& vehicle,
+    const ConstructBlueprint& blueprint)
+{
+    const int seatIndex = std::max(0, findVehicleSeatIndex(vehicle, player.id));
+    const Vec3 seatOffset =
+        seatIndex >= 0 && seatIndex < static_cast<int>(blueprint.seatOffsets.size())
+            ? blueprint.seatOffsets[static_cast<std::size_t>(seatIndex)]
+            : Vec3 {};
+    const Quat vehicleRot = vehicleRotationFromYaw(vehicle.yawRadians);
+    player.mode = PlayerMode::Driving;
+    player.flightMode = false;
+    player.vehicleId = vehicle.vehicleId;
+    player.actor.pos = vehicle.pos + rotateVector(vehicleRot, seatOffset);
+    player.actor.rot = vehicleRot;
+    player.actor.vel = vehicle.vel;
+    player.actor.flightVel = vehicle.vel;
+    player.actor.flightAngVel = {};
+    player.actor.throttle = std::max(0.0f, vehicle.throttleNormalized);
+    player.actor.onGround = true;
+    player.runtime.crashed = false;
+    player.runtime.hasPendingCrash = false;
+    player.avatar.role = "driving";
+    player.input.role = "driving";
+}
+
+inline void exitPlayerFromVehicle(
+    HostedPlayerState& player,
+    const TerrainFieldContext& terrainContext,
+    const SharedVehicleState& vehicle)
+{
+    const TerrainRoadSample road = sampleRoadNetwork(vehicle.pos.x, vehicle.pos.z, terrainContext);
+    const Vec3 right = terrainRoadRight(road);
+    const Vec3 exitPos = vehicle.pos + (right * std::max(2.0f, road.widthMeters * 0.5f + 1.0f));
+    applyWalkingAuthoritativeState(
+        player,
+        terrainContext,
+        { exitPos.x, sampleSurfaceHeight(exitPos.x, exitPos.z, terrainContext) + 1.8f, exitPos.z },
+        wrapAngle(vehicle.yawRadians),
+        player.walkPitch);
+}
+
+inline bool applyVehicleSeatChange(
+    SharedVehicleState& vehicle,
+    int playerId,
+    int requestedSeatIndex,
+    bool entering)
+{
+    if (playerId <= 0) {
+        return false;
+    }
+    const int currentSeat = findVehicleSeatIndex(vehicle, playerId);
+    if (!entering) {
+        if (currentSeat < 0) {
+            return false;
+        }
+        vehicle.seatOccupants[static_cast<std::size_t>(currentSeat)] = 0;
+        if (vehicle.driverPlayerId == playerId) {
+            vehicle.driverPlayerId = 0;
+        }
+        return true;
+    }
+
+    int seatIndex = requestedSeatIndex;
+    if (seatIndex < 0 || seatIndex >= static_cast<int>(vehicle.seatOccupants.size())) {
+        seatIndex = -1;
+        for (std::size_t index = 0; index < vehicle.seatOccupants.size(); ++index) {
+            if (vehicle.seatOccupants[index] == 0 || vehicle.seatOccupants[index] == playerId) {
+                seatIndex = static_cast<int>(index);
+                break;
+            }
+        }
+    }
+    if (seatIndex < 0 || seatIndex >= static_cast<int>(vehicle.seatOccupants.size())) {
+        return false;
+    }
+    if (currentSeat >= 0 && currentSeat != seatIndex) {
+        vehicle.seatOccupants[static_cast<std::size_t>(currentSeat)] = 0;
+    }
+    if (vehicle.seatOccupants[static_cast<std::size_t>(seatIndex)] != 0 &&
+        vehicle.seatOccupants[static_cast<std::size_t>(seatIndex)] != playerId) {
+        return false;
+    }
+    vehicle.seatOccupants[static_cast<std::size_t>(seatIndex)] = playerId;
+    if (seatIndex == 0) {
+        vehicle.driverPlayerId = playerId;
+    }
+    return true;
+}
+
+inline void simulateSharedVehicle(
+    SharedVehicleState& vehicle,
+    const ConstructBlueprint& blueprint,
+    const NetPlayerInput* driverInput,
+    const TerrainFieldContext& terrainContext,
+    float dt)
+{
+    dt = clamp(dt, 0.0f, 0.05f);
+    if (dt <= 0.0f || !vehicle.active) {
+        return;
+    }
+
+    ensureVehicleSeatCount(vehicle, blueprint);
+    const float throttleInput = driverInput != nullptr ? clamp(driverInput->driveThrottle, -1.0f, 1.0f) : 0.0f;
+    const float steerInput = driverInput != nullptr ? clamp(driverInput->driveSteer, -1.0f, 1.0f) : 0.0f;
+    const bool brake = driverInput != nullptr && driverInput->driveBrake;
+    const TerrainRoadSample road = sampleRoadNetwork(vehicle.pos.x, vehicle.pos.z, terrainContext);
+    const float roadAdhesion = clamp(road.roadMask + (road.shoulderMask * 0.2f), 0.0f, 1.0f);
+    const float friction = roadAdhesion > 0.0f
+        ? terrainRoadSurfaceFriction(road) * mix(blueprint.offroadGrip, blueprint.roadGrip, roadAdhesion)
+        : blueprint.offroadGrip;
+    const float steeringAssist = terrainRoadSteeringAssist(road) * blueprint.steeringAssist;
+
+    vehicle.steerNormalized = mix(vehicle.steerNormalized, steerInput, clamp(dt * 7.0f, 0.0f, 1.0f));
+    vehicle.throttleNormalized = mix(vehicle.throttleNormalized, throttleInput, clamp(dt * 5.0f, 0.0f, 1.0f));
+
+    Vec3 forward = vehicleForwardFromYaw(vehicle.yawRadians);
+    float forwardSpeed = dot(vehicle.vel, forward);
+    const float accelRate = vehicle.throttleNormalized >= 0.0f ? blueprint.accelerationMps2 : blueprint.brakingMps2 * 0.65f;
+    forwardSpeed += vehicle.throttleNormalized * accelRate * dt;
+    if (brake) {
+        const float brakeStep = blueprint.brakingMps2 * dt;
+        if (forwardSpeed > 0.0f) {
+            forwardSpeed = std::max(0.0f, forwardSpeed - brakeStep);
+        } else if (forwardSpeed < 0.0f) {
+            forwardSpeed = std::min(0.0f, forwardSpeed + brakeStep);
+        }
+    }
+    forwardSpeed = clamp(forwardSpeed, -(blueprint.maxSpeedMps * 0.35f), blueprint.maxSpeedMps);
+
+    const float steerRate = blueprint.steeringRate * mix(1.0f, 0.28f, clamp(std::fabs(forwardSpeed) / std::max(1.0f, blueprint.maxSpeedMps), 0.0f, 1.0f));
+    vehicle.yawRadians = wrapAngle(vehicle.yawRadians + (vehicle.steerNormalized * steerRate * dt));
+    if (terrainRoadSampleValid(road)) {
+        const float desiredYaw = std::atan2(road.forward.x, road.forward.z);
+        vehicle.yawRadians = wrapAngle(vehicle.yawRadians + wrapAngle(desiredYaw - vehicle.yawRadians) * steeringAssist * dt * 2.4f);
+    }
+
+    forward = vehicleForwardFromYaw(vehicle.yawRadians);
+    const Vec3 targetVel = forward * forwardSpeed;
+    vehicle.vel += (targetVel - vehicle.vel) * clamp(dt * (3.0f + (friction * 2.0f)), 0.0f, 1.0f);
+    vehicle.vel.y = 0.0f;
+    vehicle.pos += vehicle.vel * dt;
+    vehicle.pos.y = sampleSurfaceHeight(vehicle.pos.x, vehicle.pos.z, terrainContext) + blueprint.bodyHalfExtents.y + 0.35f;
+    vehicle.roadAdhesion = roadAdhesion;
+    vehicle.surfaceFriction = friction;
+    vehicle.cage.heave = mix(vehicle.cage.heave, road.potholeMask * blueprint.suspensionTravel, clamp(dt * 8.0f, 0.0f, 1.0f));
+    vehicle.cage.pitch = mix(vehicle.cage.pitch, -vehicle.throttleNormalized * 0.12f, clamp(dt * 6.0f, 0.0f, 1.0f));
+    vehicle.cage.roll = mix(vehicle.cage.roll, -vehicle.steerNormalized * 0.18f, clamp(dt * 6.0f, 0.0f, 1.0f));
+    const float wheelBaseCompression = clamp(std::fabs(forwardSpeed) / std::max(1.0f, blueprint.maxSpeedMps), 0.0f, 1.0f) * blueprint.suspensionTravel;
+    vehicle.cage.wheelCompression = {
+        wheelBaseCompression + (road.patchMask * 0.05f),
+        wheelBaseCompression + (road.potholeMask * 0.08f),
+        wheelBaseCompression + (road.potholeMask * 0.08f),
+        wheelBaseCompression + (road.patchMask * 0.05f)
+    };
+}
+
 inline std::string voiceFrameChannelKey(int channel)
 {
     return "voice:" + std::to_string(normalizeRadioChannel(channel));
+}
+
+inline float voiceRelayDistanceMeters(const AreaOfInterestState& speakerAoi, const AreaOfInterestState& listenerAoi)
+{
+    return std::max(6000.0f, std::max(speakerAoi.snapshotFarMeters, listenerAoi.snapshotFarMeters) * 2.0f);
 }
 
 inline std::string packetType(const std::string& packet)
@@ -463,6 +746,122 @@ inline AvatarManifest avatarFromLocalVisuals(const AvatarManifest& current, cons
     return avatar;
 }
 
+inline std::string normalizeAvatarModelFormat(std::string format)
+{
+    std::transform(format.begin(), format.end(), format.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    if (format == "stl" || format == "glb" || format == "gltf") {
+        return format;
+    }
+    return "builtin";
+}
+
+inline std::string avatarModelBlobKind(const AvatarRoleConfig& config)
+{
+    const std::string format = normalizeAvatarModelFormat(config.modelFormat);
+    if (format == "builtin" || config.modelHash.empty()) {
+        return {};
+    }
+    return "model:" + format;
+}
+
+inline BlobTransferStatus& ensureBlobTransferStatus(
+    ClientReplicationState& client,
+    std::string_view kind,
+    std::string_view hash)
+{
+    BlobTransferStatus& status = client.blobStatusByKey[blobTransferKey(kind, hash)];
+    status.kind = std::string(kind);
+    status.hash = std::string(hash);
+    return status;
+}
+
+inline void updateBlobTransferStatus(
+    ClientReplicationState& client,
+    double nowSeconds,
+    std::string_view kind,
+    std::string_view hash,
+    BlobTransferPhase phase,
+    std::string detail = {},
+    std::string_view ownerId = {},
+    std::string_view role = {},
+    int chunkCount = -1,
+    int completedChunks = -1,
+    int rawBytes = -1)
+{
+    BlobTransferStatus& status = ensureBlobTransferStatus(client, kind, hash);
+    status.phase = phase;
+    status.updatedAtSeconds = nowSeconds;
+    if (!detail.empty()) {
+        status.detail = std::move(detail);
+    }
+    if (!ownerId.empty()) {
+        status.ownerId = std::string(ownerId);
+    }
+    if (!role.empty()) {
+        status.role = std::string(role);
+    }
+    if (chunkCount >= 0) {
+        status.chunkCount = chunkCount;
+    }
+    if (completedChunks >= 0) {
+        status.completedChunks = completedChunks;
+    }
+    if (rawBytes >= 0) {
+        status.rawBytes = rawBytes;
+    }
+}
+
+inline void maybeQueueClientBlobRequest(
+    ClientReplicationState& client,
+    double nowSeconds,
+    std::string_view kind,
+    std::string_view hash)
+{
+    if (kind.empty() || hash.empty() || client.blobCache.has(kind, hash)) {
+        return;
+    }
+    const std::string key = blobTransferKey(kind, hash);
+    const double nextAllowedAt = [&]() {
+        const auto it = client.nextBlobRequestAtByKey.find(key);
+        return it == client.nextBlobRequestAtByKey.end() ? 0.0 : it->second;
+    }();
+    if (nowSeconds < nextAllowedAt) {
+        return;
+    }
+    client.nextBlobRequestAtByKey[key] = nowSeconds + 1.0;
+    client.outboundReliable.push_back(buildBlobRequestPacket(kind, hash));
+    updateBlobTransferStatus(client, nowSeconds, kind, hash, BlobTransferPhase::Requested, "requested from host");
+    networkStdoutLog(
+        "queued BLOB_REQUEST kind=" +
+        std::string(kind) +
+        " hash=" +
+        std::string(hash));
+}
+
+inline void requestMissingAvatarBlobs(ClientReplicationState& client, double nowSeconds, const AvatarManifest& avatar)
+{
+    const bool wantsFlightRole = sanitizeRole(avatar.role) != "walking";
+    const AvatarRoleConfig& activeRole = wantsFlightRole ? avatar.plane : avatar.walking;
+    maybeQueueClientBlobRequest(client, nowSeconds, avatarModelBlobKind(activeRole), activeRole.modelHash);
+}
+
+inline bool isBlobPacketType(std::string_view type)
+{
+    return type == "BLOB_META" || type == "BLOB_CHUNK" || type == "BLOB_REQUEST";
+}
+
+inline void queueHostedBlobPacket(HostedPlayerState& player, std::string transferKey, std::string payload)
+{
+    if (transferKey.empty() || payload.empty()) {
+        return;
+    }
+    player.outboundBlobReliable.push_back({ std::move(transferKey), std::move(payload) });
+    const HostedBlobOutboundPacket& packet = player.outboundBlobReliable.back();
+    ++player.queuedBlobPacketCountsByTransfer[packet.transferKey];
+}
+
 inline void applyReplicatedFlightControlState(FlightState& actor, const NetPlayerInput& input)
 {
     actor.throttle = clamp(input.throttle, 0.0f, 1.0f);
@@ -471,6 +870,79 @@ inline void applyReplicatedFlightControlState(FlightState& actor, const NetPlaye
     actor.yoke.roll = clamp(input.yokeRoll, -1.0f, 1.0f);
     actor.manualElevatorTrim = input.manualElevatorTrim;
     actor.manualRudderTrim = input.manualRudderTrim;
+}
+
+inline void applyClientReportedAuthoritativeState(
+    HostedPlayerState& player,
+    const TerrainFieldContext& terrainContext,
+    const NetPlayerInput& input)
+{
+    const TerrainParams params = normalizeTerrainParams(terrainContext.params);
+    const PlayerMode mode = playerModeFromRole(input.role);
+    const bool flightMode = mode == PlayerMode::Flight;
+    const Vec3 sanitizedPos {
+        clamp(sanitize(input.reportedPos.x, 0.0f), -params.worldRadius * 1.25f, params.worldRadius * 1.25f),
+        clamp(sanitize(input.reportedPos.y, params.baseHeight), params.minY - 512.0f, params.maxY + 512.0f),
+        clamp(sanitize(input.reportedPos.z, 0.0f), -params.worldRadius * 1.25f, params.worldRadius * 1.25f)
+    };
+    const Vec3 reportedVel {
+        sanitize(input.reportedVel.x, 0.0f),
+        sanitize(input.reportedVel.y, 0.0f),
+        sanitize(input.reportedVel.z, 0.0f)
+    };
+    const Vec3 reportedAngVel {
+        sanitize(input.reportedAngVel.x, 0.0f),
+        sanitize(input.reportedAngVel.y, 0.0f),
+        sanitize(input.reportedAngVel.z, 0.0f)
+    };
+
+    player.mode = mode;
+    player.flightMode = flightMode;
+    player.vehicleId = mode == PlayerMode::Driving ? input.vehicleId : 0;
+    player.walkYaw = wrapAngle(input.walkYaw);
+    player.walkPitch = clamp(input.walkPitch, radians(-89.0f), radians(89.0f));
+    player.avatar.role = playerModeToken(mode);
+    player.runtime.tick = std::max(player.runtime.tick, std::max(0, input.reportedSimTick));
+    player.runtime.crashed = false;
+    player.runtime.hasPendingCrash = false;
+
+    if (flightMode) {
+        player.actor.pos = sanitizedPos;
+        player.actor.rot = quatNormalize(input.reportedRot);
+        player.actor.flightVel = clampMagnitude(reportedVel, 480.0f);
+        player.actor.vel = player.actor.flightVel;
+        player.actor.flightAngVel = clampMagnitude(reportedAngVel, 12.0f);
+        player.actor.collisionRadius = std::max(player.actor.collisionRadius, 3.2f);
+        HostedNetworkingDetail::applyReplicatedFlightControlState(player.actor, input);
+        const float ground = sampleSurfaceHeight(player.actor.pos.x, player.actor.pos.z, terrainContext);
+        player.actor.onGround = player.actor.pos.y <= ground + 4.0f;
+    } else if (mode == PlayerMode::Driving) {
+        player.actor.pos = sanitizedPos;
+        player.actor.rot = quatNormalize(input.reportedRot);
+        player.actor.vel = clampMagnitude(reportedVel, 96.0f);
+        player.actor.flightVel = player.actor.vel;
+        player.actor.flightAngVel = {};
+        player.actor.yoke = {};
+        player.actor.throttle = std::max(0.0f, input.driveThrottle);
+        player.actor.onGround = true;
+    } else {
+        player.actor.pos = sanitizedPos;
+        const float ground = sampleSurfaceHeight(player.actor.pos.x, player.actor.pos.z, terrainContext);
+        if (player.actor.pos.y < ground + 1.8f) {
+            player.actor.pos.y = ground + 1.8f;
+        }
+        player.actor.rot = composeWalkingRotation(player.walkYaw, player.walkPitch);
+        player.actor.vel = clampMagnitude(reportedVel, std::max(4.0f, input.walkMoveSpeed * 2.5f));
+        player.actor.flightVel = player.actor.vel;
+        player.actor.flightAngVel = {};
+        player.actor.yoke = {};
+        player.actor.throttle = 0.0f;
+        player.actor.onGround = player.actor.pos.y <= ground + 1.81f;
+    }
+
+    player.actor.debug.tick = player.runtime.tick;
+    player.actor.debug.throttle = player.actor.throttle;
+    player.actor.debug.speed = length(flightMode ? player.actor.flightVel : player.actor.vel);
 }
 
 }  // namespace HostedNetworkingDetail
@@ -502,7 +974,8 @@ inline HostedPlayerState& HostedWorldServer::ensurePlayerForPeer(NetPeerId peerI
 inline void HostedWorldServer::setLocalAuthoritativeState(
     const FlightState& actor,
     const FlightRuntimeState& runtime,
-    bool flightMode,
+    PlayerMode mode,
+    VehicleId vehicleId,
     float walkYaw,
     float walkPitch,
     const AvatarManifest& avatar)
@@ -510,13 +983,26 @@ inline void HostedWorldServer::setLocalAuthoritativeState(
     if (HostedPlayerState* player = localPlayer(); player != nullptr) {
         player->actor = actor;
         player->runtime = runtime;
-        player->flightMode = flightMode;
+        player->mode = mode;
+        player->flightMode = mode == PlayerMode::Flight;
+        player->vehicleId = mode == PlayerMode::Driving ? vehicleId : 0;
         player->walkYaw = walkYaw;
         player->walkPitch = walkPitch;
         player->avatar = HostedNetworkingDetail::avatarFromLocalVisuals(player->avatar, avatar);
+        player->avatar.role = playerModeToken(mode);
         player->hasReceivedHello = true;
         player->hasReceivedInput = true;
     }
+}
+
+inline void HostedWorldServer::setSharedWorldState(
+    const std::unordered_map<ConstructId, ConstructBlueprint>& constructBlueprints,
+    const std::unordered_map<ConstructId, ConstructState>& constructStates,
+    const std::unordered_map<VehicleId, SharedVehicleState>& sharedVehicles)
+{
+    constructBlueprints_ = constructBlueprints;
+    constructStates_ = constructStates;
+    sharedVehicles_ = sharedVehicles;
 }
 
 inline void HostedWorldServer::sendWorldBootstrap(HostedPlayerState& player, WorldStore* worldStore, const TerrainParams& terrainParams)
@@ -539,6 +1025,32 @@ inline void HostedWorldServer::sendWorldBootstrap(HostedPlayerState& player, Wor
             player.peerId,
             static_cast<int>(TransportLane::Control),
             buildAvatarManifestPacket(other.id, other.avatar),
+            true);
+    }
+    for (const auto& [constructId, blueprint] : constructBlueprints_) {
+        (void)constructId;
+        ConstructPublishPacket publish;
+        publish.blueprint = blueprint;
+        if (const auto stateIt = constructStates_.find(blueprint.constructId); stateIt != constructStates_.end()) {
+            publish.state = stateIt->second;
+        } else {
+            publish.state.constructId = blueprint.constructId;
+            publish.state.revisionId = blueprint.revisionId;
+            publish.state.label = blueprint.label;
+            publish.state.published = true;
+        }
+        transport_->send(
+            player.peerId,
+            static_cast<int>(TransportLane::Control),
+            buildConstructPublishPacket(publish),
+            true);
+    }
+    for (const auto& [vehicleId, vehicle] : sharedVehicles_) {
+        (void)vehicleId;
+        transport_->send(
+            player.peerId,
+            static_cast<int>(TransportLane::Control),
+            buildVehicleSpawnPacket({ vehicle, "bootstrap" }),
             true);
     }
     sendChunksForPlayer(player, worldStore, "hello");
@@ -591,15 +1103,23 @@ inline void HostedWorldServer::fulfillBlobRequest(NetPeerId peerId, std::string_
     if (!transport_) {
         return;
     }
+    HostedPlayerState& player = ensurePlayerForPeer(peerId);
+    if (!player.connected || player.peerId == 0) {
+        return;
+    }
     const AvatarBlobRecord* record = blobCache_.get(kind, hash);
     if (record == nullptr) {
         return;
     }
+    const std::string transferKey = blobTransferKey(kind, hash);
+    if (player.queuedBlobPacketCountsByTransfer.find(transferKey) != player.queuedBlobPacketCountsByTransfer.end()) {
+        return;
+    }
     BlobSyncState tempState = createBlobSyncState();
     const BlobOutgoingTransfer transfer = prepareOutgoingBlobTransfer(tempState, kind, hash, record->raw, record->meta);
-    transport_->send(
-        peerId,
-        static_cast<int>(TransportLane::Blob),
+    HostedNetworkingDetail::queueHostedBlobPacket(
+        player,
+        transferKey,
         encodePacket("BLOB_META", {
             { "kind", transfer.meta.kind },
             { "hash", transfer.meta.hash },
@@ -610,19 +1130,38 @@ inline void HostedWorldServer::fulfillBlobRequest(NetPeerId peerId, std::string_
             { "encodedBytes", std::to_string(transfer.meta.encodedBytes) },
             { "chunkSize", std::to_string(transfer.meta.chunkSize) },
             { "chunkCount", std::to_string(transfer.meta.chunkCount) }
-        }),
-        true);
+        }));
     for (int index = 0; index < transfer.chunkCount; ++index) {
-        transport_->send(
-            peerId,
-            static_cast<int>(TransportLane::Blob),
+        HostedNetworkingDetail::queueHostedBlobPacket(
+            player,
+            transferKey,
             encodePacket("BLOB_CHUNK", {
                 { "kind", transfer.kind },
                 { "hash", transfer.hash },
                 { "idx", std::to_string(index + 1) },
                 { "data", transfer.chunks[static_cast<std::size_t>(index)] }
-            }),
-            true);
+            }));
+    }
+}
+
+inline void HostedWorldServer::broadcastVehicleStates()
+{
+    if (!transport_) {
+        return;
+    }
+    for (const auto& [playerId, player] : players_) {
+        (void)playerId;
+        if (!player.connected || player.peerId == 0 || !player.hasReceivedHello) {
+            continue;
+        }
+        for (const auto& [vehicleId, vehicle] : sharedVehicles_) {
+            (void)vehicleId;
+            transport_->send(
+                player.peerId,
+                static_cast<int>(TransportLane::Snapshot),
+                buildVehicleStatePacket(vehicle),
+                false);
+        }
     }
 }
 
@@ -636,17 +1175,25 @@ inline void HostedWorldServer::handlePacket(
     const std::string type = HostedNetworkingDetail::packetType(event.payload);
     if (type == "HELLO") {
         const auto avatar = parseAvatarManifestPacket("AVATAR_MANIFEST|" + event.payload.substr(6), nullptr);
+
+        player.connected = true;
         player.hasReceivedHello = true;
+        player.hasReceivedInput = false;
+        player.pendingInputs.clear();
+        player.input = {};
+        player.inputTimeSeconds = 0.0;
+        player.aoi.lastChunkRevisionByKey.clear();
+        player.blobSync = createBlobSyncState();
+        player.outboundBlobReliable.clear();
+        player.queuedBlobPacketCountsByTransfer.clear();
+        player.nextBlobFlushAt = 0.0;
+
         if (avatar.has_value()) {
             player.avatar = *avatar;
+        } else {
+            player.avatar = defaultAvatarManifest();
         }
-        log(
-            "[net] received HELLO from player " +
-            std::to_string(player.id) +
-            " peer " +
-            std::to_string(event.peerId) +
-            " callsign " +
-            sanitizeCallsign(player.avatar.callsign));
+
         sendWorldBootstrap(player, worldStore, terrainParams);
         broadcastAvatarManifest(player, player.peerId);
         return;
@@ -662,13 +1209,40 @@ inline void HostedWorldServer::handlePacket(
                     ++it;
                 }
             }
-            if (sanitizeRole(modeSwitch->role) == "walking") {
+            const PlayerMode mode = playerModeFromRole(modeSwitch->role);
+            if (mode == PlayerMode::Walking) {
                 HostedNetworkingDetail::applyWalkingAuthoritativeState(
                     player,
                     terrainContext,
                     { modeSwitch->x, modeSwitch->y, modeSwitch->z },
                     modeSwitch->walkYaw,
                     modeSwitch->walkPitch);
+            } else if (mode == PlayerMode::Driving) {
+                const auto vehicleIt = sharedVehicles_.find(modeSwitch->vehicleId);
+                const ConstructBlueprint* blueprint =
+                    vehicleIt == sharedVehicles_.end()
+                        ? nullptr
+                        : HostedNetworkingDetail::findConstructBlueprint(constructBlueprints_, vehicleIt->second.constructId);
+                if (vehicleIt != sharedVehicles_.end() && blueprint != nullptr) {
+                    HostedNetworkingDetail::ensureVehicleSeatCount(vehicleIt->second, *blueprint);
+                    if (HostedNetworkingDetail::applyVehicleSeatChange(vehicleIt->second, player.id, 0, true)) {
+                        HostedNetworkingDetail::syncPlayerToVehicleSeat(player, vehicleIt->second, *blueprint);
+                    } else {
+                        HostedNetworkingDetail::applyWalkingAuthoritativeState(
+                            player,
+                            terrainContext,
+                            { modeSwitch->x, modeSwitch->y, modeSwitch->z },
+                            modeSwitch->walkYaw,
+                            modeSwitch->walkPitch);
+                    }
+                } else {
+                    HostedNetworkingDetail::applyWalkingAuthoritativeState(
+                        player,
+                        terrainContext,
+                        { modeSwitch->x, modeSwitch->y, modeSwitch->z },
+                        modeSwitch->walkYaw,
+                        modeSwitch->walkPitch);
+                }
             } else {
                 HostedNetworkingDetail::resetAuthoritativeFlightState(
                     player,
@@ -718,41 +1292,89 @@ inline void HostedWorldServer::handlePacket(
             if (player.hasReceivedInput && input->tick <= player.input.tick) {
                 return;
             }
-            const bool wantsFlightMode = sanitizeRole(input->role) != "walking";
-            const bool modeChanged = wantsFlightMode != player.flightMode;
+            const PlayerMode previousMode = player.mode;
+            const PlayerMode wantedMode = playerModeFromRole(input->role);
+            const bool modeChanged = wantedMode != previousMode || (wantedMode == PlayerMode::Driving && player.vehicleId != input->vehicleId);
             player.hasReceivedInput = true;
             player.input = *input;
-            player.pendingInputs[input->tick] = *input;
-            while (player.pendingInputs.size() > 256u) {
-                player.pendingInputs.erase(player.pendingInputs.begin());
-            }
+            player.pendingInputs.clear();
             player.avatar = HostedNetworkingDetail::avatarFromLocalVisuals(player.avatar, input->avatar);
+            HostedNetworkingDetail::applyClientReportedAuthoritativeState(player, terrainContext, *input);
             if (modeChanged) {
-                if (wantsFlightMode) {
-                    HostedNetworkingDetail::resetAuthoritativeFlightState(
-                        player,
-                        terrainContext,
-                        player.actor.pos.x,
-                        player.actor.pos.z);
-                } else {
-                    HostedNetworkingDetail::applyWalkingAuthoritativeState(
-                        player,
-                        terrainContext,
-                        player.actor.pos,
-                        input->walkYaw,
-                        input->walkPitch);
-                }
                 broadcastAvatarManifest(player, player.peerId);
                 log(
-                    "[net] applied INPUT fallback mode switch for player " +
+                    "[net] applied INPUT mode switch for player " +
                     std::to_string(player.id) +
                     " role " +
                     sanitizeRole(input->role) +
                     " tick " +
                     std::to_string(input->tick));
-            } else {
-                player.flightMode = wantsFlightMode;
-                player.avatar.role = wantsFlightMode ? "plane" : "walking";
+            }
+        }
+        return;
+    }
+    if (type == "CONSTRUCT_PUBLISH") {
+        if (const auto publish = parseConstructPublishPacket(event.payload); publish.has_value()) {
+            constructBlueprints_[publish->blueprint.constructId] = publish->blueprint;
+            constructStates_[publish->state.constructId] = publish->state;
+            for (const auto& [otherId, other] : players_) {
+                if (!other.connected || other.peerId == 0) {
+                    continue;
+                }
+                transport_->send(
+                    other.peerId,
+                    static_cast<int>(TransportLane::Control),
+                    buildConstructPublishPacket(*publish),
+                    true);
+            }
+        }
+        return;
+    }
+    if (type == "VEHICLE_SPAWN") {
+        if (const auto spawn = parseVehicleSpawnPacket(event.payload); spawn.has_value()) {
+            sharedVehicles_[spawn->state.vehicleId] = spawn->state;
+            for (const auto& [otherId, other] : players_) {
+                if (!other.connected || other.peerId == 0) {
+                    continue;
+                }
+                transport_->send(
+                    other.peerId,
+                    static_cast<int>(TransportLane::Control),
+                    buildVehicleSpawnPacket(*spawn),
+                    true);
+            }
+        }
+        return;
+    }
+    if (type == "VEHICLE_SEAT") {
+        if (const auto seat = parseVehicleSeatPacket(event.payload); seat.has_value()) {
+            auto vehicleIt = sharedVehicles_.find(seat->vehicleId);
+            if (vehicleIt != sharedVehicles_.end()) {
+                const ConstructBlueprint* blueprint = HostedNetworkingDetail::findConstructBlueprint(constructBlueprints_, vehicleIt->second.constructId);
+                if (blueprint != nullptr) {
+                    HostedNetworkingDetail::ensureVehicleSeatCount(vehicleIt->second, *blueprint);
+                }
+                if (HostedNetworkingDetail::applyVehicleSeatChange(vehicleIt->second, seat->playerId, seat->seatIndex, seat->entering)) {
+                    auto playerIt = players_.find(seat->playerId);
+                    if (playerIt != players_.end()) {
+                        if (seat->entering && blueprint != nullptr) {
+                            HostedNetworkingDetail::syncPlayerToVehicleSeat(playerIt->second, vehicleIt->second, *blueprint);
+                        } else {
+                            HostedNetworkingDetail::exitPlayerFromVehicle(playerIt->second, terrainContext, vehicleIt->second);
+                        }
+                    }
+                    for (const auto& [otherId, other] : players_) {
+                        (void)otherId;
+                        if (!other.connected || other.peerId == 0) {
+                            continue;
+                        }
+                        transport_->send(
+                            other.peerId,
+                            static_cast<int>(TransportLane::Control),
+                            buildVehicleSeatPacket(*seat),
+                            true);
+                    }
+                }
             }
         }
         return;
@@ -776,6 +1398,15 @@ inline void HostedWorldServer::handlePacket(
     if (type == "BLOB_META") {
         if (const auto meta = parseBlobMetaPacket(event.payload); meta.has_value()) {
             acceptIncomingBlobMeta(player.blobSync, *meta);
+            log(
+                "[net] received BLOB_META from player " +
+                std::to_string(player.id) +
+                " kind=" +
+                meta->kind +
+                " hash=" +
+                meta->hash +
+                " chunks=" +
+                std::to_string(std::max(0, meta->chunkCount)));
         }
         return;
     }
@@ -789,7 +1420,34 @@ inline void HostedWorldServer::handlePacket(
                 record.raw = completed->second;
                 record.meta = completed->first;
                 blobCache_.put(record);
+                broadcastAvatarManifest(player, player.peerId);
+                log(
+                    "[net] completed blob upload from player " +
+                    std::to_string(player.id) +
+                    " kind=" +
+                    record.kind +
+                    " hash=" +
+                    record.hash +
+                    " bytes=" +
+                    std::to_string(static_cast<int>(record.raw.size())));
             }
+        }
+        return;
+    }
+    if (type == "TERRAIN_EDIT_REQUEST") {
+        if (const auto request = parseTerrainEditRequestPacket(event.payload); request.has_value()) {
+            HostedTerrainEditRequest queued;
+            queued.peerId = event.peerId;
+            queued.request = *request;
+            queued.request.playerId = player.id;
+            pendingTerrainEdits_.push_back(std::move(queued));
+            log(
+                "[net] queued TERRAIN_EDIT_REQUEST player=" +
+                std::to_string(player.id) +
+                " kind=" +
+                request->kind +
+                " op=" +
+                std::to_string(request->opId));
         }
         return;
     }
@@ -802,20 +1460,26 @@ inline void HostedWorldServer::handlePacket(
         return;
     }
     if (type == "VOICE_FRAME") {
-        if (const auto frame = parseVoiceFramePacket(event.payload); !frame.has_value()) {
+        const auto frame = parseVoiceFramePacket(event.payload);
+        if (!frame.has_value()) {
             return;
         }
+        const int routedChannel = normalizeRadioChannel(frame->channel);
+        VoiceFramePacket relayedFrame = *frame;
+        relayedFrame.senderId = player.id;
+        relayedFrame.channel = routedChannel;
+        const std::string relayPacket = buildVoiceFramePacket(relayedFrame);
         for (const auto& [otherId, other] : players_) {
             if (otherId == player.id || !other.connected) {
                 continue;
             }
-            const float limit = std::max(player.aoi.snapshotFarMeters, other.aoi.snapshotFarMeters);
-            if (player.avatar.radioChannel == other.avatar.radioChannel &&
+            const float limit = HostedNetworkingDetail::voiceRelayDistanceMeters(player.aoi, other.aoi);
+            if (routedChannel == other.avatar.radioChannel &&
                 HostedNetworkingDetail::distanceSq2(player.actor.pos, other.actor.pos) <= (limit * limit)) {
                 if (other.peerId == 0) {
-                    hostLocalReceiveFrames_.push_back(event.payload);
+                    hostLocalReceiveFrames_.push_back({ relayedFrame.senderId, relayedFrame.channel, relayedFrame.compressedData });
                 } else if (transport_) {
-                    transport_->send(other.peerId, static_cast<int>(TransportLane::Voice), event.payload, false);
+                    transport_->send(other.peerId, static_cast<int>(TransportLane::Voice), relayPacket, false);
                 }
             }
         }
@@ -866,6 +1530,16 @@ inline void HostedWorldServer::serviceIncoming(
             if (peerIt != peerToPlayerId_.end()) {
                 const int playerId = peerIt->second;
                 peerToPlayerId_.erase(peerIt);
+                for (auto& [vehicleId, vehicle] : sharedVehicles_) {
+                    (void)vehicleId;
+                    const int seatIndex = HostedNetworkingDetail::findVehicleSeatIndex(vehicle, playerId);
+                    if (seatIndex >= 0) {
+                        vehicle.seatOccupants[static_cast<std::size_t>(seatIndex)] = 0;
+                        if (vehicle.driverPlayerId == playerId) {
+                            vehicle.driverPlayerId = 0;
+                        }
+                    }
+                }
                 if (auto playerIt = players_.find(playerId); playerIt != players_.end()) {
                     playerIt->second.connected = false;
                     if (transport_) {
@@ -894,75 +1568,33 @@ inline void HostedWorldServer::simulateRemotePlayers(
     const FlightConfig& flightConfig,
     Vec3 wind)
 {
-    (void)dt;
-    constexpr int kMaxBufferedInputStepsPerUpdate = 32;
+    (void)flightConfig;
+    (void)wind;
 
-    for (auto& [playerId, player] : players_) {
-        if (player.isLocalAuthority || !player.connected || !player.hasReceivedInput) {
+    for (auto& [vehicleId, vehicle] : sharedVehicles_) {
+        (void)vehicleId;
+        const ConstructBlueprint* blueprint = HostedNetworkingDetail::findConstructBlueprint(constructBlueprints_, vehicle.constructId);
+        if (blueprint == nullptr) {
             continue;
         }
-
-        int processedSteps = 0;
-        while (!player.pendingInputs.empty() && processedSteps < kMaxBufferedInputStepsPerUpdate) {
-            auto nextInput = player.pendingInputs.begin();
-            player.input = nextInput->second;
-            player.pendingInputs.erase(nextInput);
-
-            const float inputDt = HostedNetworkingDetail::sanitizeNetInputFrameDt(player.input.frameDt);
-            player.inputTimeSeconds += static_cast<double>(inputDt);
-
-            if (sanitizeRole(player.input.role) == "walking") {
-                player.flightMode = false;
-                HostedNetworkingDetail::stepWalkingAuthoritative(
-                    player,
-                    inputDt,
-                    terrainContext,
-                    std::clamp(player.input.walkMoveSpeed, 2.0f, 30.0f));
-            } else {
-                player.flightMode = true;
-                HostedNetworkingDetail::applyReplicatedFlightControlState(player.actor, player.input);
-                InputState inputState {};
-                inputState.flightAirBrakes = player.input.flightAirBrakes;
-                inputState.flightAfterburner = player.input.flightAfterburner;
-                inputState.flightUseAnalogYoke = true;
-                inputState.flightHoldYaw = true;
-                inputState.flightThrottleAnalog = 0.0f;
-                inputState.flightPitchAnalog = player.input.yokePitch;
-                inputState.flightRollAnalog = player.input.yokeRoll;
-
-                FlightEnvironment environment {};
-                environment.wind = wind;
-                environment.groundHeightAt = [&terrainContext](float x, float z) {
-                    return sampleSurfaceHeight(x, z, terrainContext);
-                };
-                environment.waterHeightAt = [&terrainContext](float x, float z) {
-                    return sampleWaterHeight(x, z, terrainContext);
-                };
-                environment.sampleSdf = [&terrainContext](float x, float y, float z) {
-                    return sampleSdf(x, y, z, terrainContext);
-                };
-                environment.sampleNormal = [&terrainContext](float x, float y, float z) {
-                    return sampleTerrainNormal(x, y, z, terrainContext);
-                };
-                environment.collisionRadius = player.actor.collisionRadius;
-                stepFlight(
-                    player.actor,
-                    player.runtime,
-                    inputDt,
-                    static_cast<float>(player.inputTimeSeconds),
-                    inputState,
-                    environment,
-                    flightConfig);
+        HostedNetworkingDetail::ensureVehicleSeatCount(vehicle, *blueprint);
+        const NetPlayerInput* driverInput = nullptr;
+        if (vehicle.driverPlayerId > 0) {
+            if (const auto playerIt = players_.find(vehicle.driverPlayerId); playerIt != players_.end()) {
+                driverInput = &playerIt->second.input;
             }
-
-            ++processedSteps;
         }
-
-        if (player.pendingInputs.size() > static_cast<std::size_t>(kMaxBufferedInputStepsPerUpdate)) {
-            const auto latest = std::prev(player.pendingInputs.end());
-            const NetPlayerInput newest = latest->second;
-            player.pendingInputs.clear();
-            player.pendingInputs.emplace(newest.tick, newest);
+        HostedNetworkingDetail::simulateSharedVehicle(vehicle, *blueprint, driverInput, terrainContext, dt);
+        for (std::size_t seatIndex = 0; seatIndex < vehicle.seatOccupants.size(); ++seatIndex) {
+            const int occupantId = vehicle.seatOccupants[seatIndex];
+            if (occupantId <= 0) {
+                continue;
+            }
+            const auto playerIt = players_.find(occupantId);
+            if (playerIt == players_.end()) {
+                continue;
+            }
+            HostedNetworkingDetail::syncPlayerToVehicleSeat(playerIt->second, vehicle, *blueprint);
         }
     }
 }
@@ -1019,18 +1651,28 @@ inline void enqueueClientAoiSubscription(ClientReplicationState& client, const A
     client.outboundReliable.push_back(buildAoiSubscribePacket(subscription));
 }
 
-inline void flushClientOutbound(ClientReplicationState& client)
+inline void flushClientOutbound(ClientReplicationState& client, double nowSeconds)
 {
     if (!client.transport || client.serverPeerId == 0 || !client.transport->ready()) {
         return;
     }
 
+    std::vector<std::string> controlPackets;
+    std::vector<std::string> blobPackets;
+    controlPackets.reserve(client.outboundReliable.size());
+    blobPackets.reserve(client.outboundReliable.size());
     for (const std::string& packet : client.outboundReliable) {
         const std::string type = HostedNetworkingDetail::packetType(packet);
-        const int lane =
-            (type == "BLOB_META" || type == "BLOB_CHUNK" || type == "BLOB_REQUEST")
-            ? static_cast<int>(TransportLane::Blob)
-            : static_cast<int>(TransportLane::Control);
+        if (HostedNetworkingDetail::isBlobPacketType(type)) {
+            blobPackets.push_back(packet);
+        } else {
+            controlPackets.push_back(packet);
+        }
+    }
+    client.outboundReliable.clear();
+
+    const auto sendReliablePacket = [&](const std::string& packet, int lane) {
+        const std::string type = HostedNetworkingDetail::packetType(packet);
         const bool sent = client.transport->send(client.serverPeerId, lane, packet, true);
         if (type == "HELLO" || !sent) {
             HostedNetworkingDetail::networkStdoutLog(
@@ -1039,8 +1681,15 @@ inline void flushClientOutbound(ClientReplicationState& client)
                 " to peer " +
                 std::to_string(client.serverPeerId));
         }
+        return sent;
+    };
+
+    std::size_t controlIndex = 0;
+    for (; controlIndex < controlPackets.size(); ++controlIndex) {
+        if (!sendReliablePacket(controlPackets[controlIndex], static_cast<int>(TransportLane::Control))) {
+            break;
+        }
     }
-    client.outboundReliable.clear();
 
     for (const std::string& packet : client.outboundUnreliable) {
         const std::string type = HostedNetworkingDetail::packetType(packet);
@@ -1050,6 +1699,51 @@ inline void flushClientOutbound(ClientReplicationState& client)
         (void)client.transport->send(client.serverPeerId, lane, packet, false);
     }
     client.outboundUnreliable.clear();
+
+    if (controlIndex < controlPackets.size()) {
+        client.outboundReliable.insert(
+            client.outboundReliable.end(),
+            controlPackets.begin() + static_cast<std::ptrdiff_t>(controlIndex),
+            controlPackets.end());
+        client.outboundReliable.insert(client.outboundReliable.end(), blobPackets.begin(), blobPackets.end());
+    } else {
+        constexpr double kBlobFlushIntervalSeconds = 1.0 / 60.0;
+        constexpr double kBlobBackoffSeconds = 0.25;
+        constexpr std::size_t kMaxBlobReliableBytesPerFlush = 4u * 1024u;
+        constexpr std::size_t kMaxBlobReliablePacketsPerFlush = 1u;
+
+        if ((nowSeconds + 1.0e-6) < client.nextBlobFlushAt) {
+            client.outboundReliable.insert(client.outboundReliable.end(), blobPackets.begin(), blobPackets.end());
+        } else {
+            bool blobSendFailed = false;
+            std::size_t blobIndex = 0;
+            std::size_t blobBytesSent = 0u;
+            std::size_t blobPacketsSent = 0u;
+            for (; blobIndex < blobPackets.size(); ++blobIndex) {
+                const std::string& packet = blobPackets[blobIndex];
+                if (blobPacketsSent > 0u &&
+                    (blobPacketsSent >= kMaxBlobReliablePacketsPerFlush ||
+                     blobBytesSent + packet.size() > kMaxBlobReliableBytesPerFlush)) {
+                    break;
+                }
+                if (!sendReliablePacket(packet, static_cast<int>(TransportLane::Blob))) {
+                    blobSendFailed = true;
+                    break;
+                }
+                blobBytesSent += packet.size();
+                ++blobPacketsSent;
+            }
+            client.outboundReliable.insert(
+                client.outboundReliable.end(),
+                blobPackets.begin() + static_cast<std::ptrdiff_t>(blobIndex),
+                blobPackets.end());
+            if (blobSendFailed || !client.outboundReliable.empty()) {
+                client.nextBlobFlushAt = nowSeconds + (blobSendFailed ? kBlobBackoffSeconds : kBlobFlushIntervalSeconds);
+            } else {
+                client.nextBlobFlushAt = 0.0;
+            }
+        }
+    }
 }
 
 inline void serviceClientReplication(
@@ -1074,14 +1768,65 @@ inline void serviceClientReplication(
         if (event.type == NetEvent::Type::Disconnected) {
             client.connected = false;
             client.joinAcknowledged = false;
+            client.helloPending = true;
+            client.worldInfoReceived = false;
+            client.worldSyncReceived = false;
+
             client.serverPeerId = 0;
+            client.localPlayerId = 0;
+
             client.pendingControlTick = 0;
+            client.lastAckTick = 0;
+            client.nextOutboundTick = 1;
+            client.nextHelloAt = 0.0;
+            client.nextInputAt = 0.0;
+            client.nextBlobFlushAt = 0.0;
+
+            client.hasAoiSubscription = false;
+            client.lastAoiSubscription = {};
+
             client.mirrorTerrainDirty = false;
             client.localAuthoritative = {};
+
             client.peers.clear();
             client.pendingInputs.clear();
             client.predictedStates.clear();
-            HostedNetworkingDetail::networkStdoutLog("client transport disconnected from peer " + std::to_string(event.peerId));
+
+            client.gameplayState = {};
+            client.gameplayStateDirty = false;
+
+            client.outboundReliable.clear();
+            client.outboundUnreliable.clear();
+
+            client.blobSync = createBlobSyncState();
+            client.blobCache.entries.clear();
+            client.uploadedBlobKeys.clear();
+            client.nextBlobRequestAtByKey.clear();
+            client.blobStatusByKey.clear();
+            client.pendingTerrainEditsById.clear();
+            client.terrainEditAcks.clear();
+            client.recentTerrainChunks.clear();
+            client.voice = {};
+            client.constructBlueprints.clear();
+            client.constructStates.clear();
+            client.sharedVehicles.clear();
+
+            if (localPeer != nullptr) {
+                localPeer->id = 0;
+                localPeer->vehicleId = 0;
+                localPeer->connected = false;
+                localPeer->avatar = defaultAvatarManifest();
+                localPeer->snapshots.clear();
+                localPeer->basePos = {};
+                localPeer->displayPos = {};
+                localPeer->vel = {};
+                localPeer->angVel = {};
+                localPeer->baseRot = quatIdentity();
+                localPeer->displayRot = quatIdentity();
+            }
+
+            HostedNetworkingDetail::networkStdoutLog(
+                "client transport disconnected from peer " + std::to_string(event.peerId));
             continue;
         }
         if (event.type != NetEvent::Type::Message) {
@@ -1091,10 +1836,39 @@ inline void serviceClientReplication(
         const std::string type = HostedNetworkingDetail::packetType(event.payload);
         if (type == "JOIN_OK") {
             if (const auto id = parseJoinOkPacket(event.payload); id.has_value()) {
+                const bool localPeerNeedsReset = localPeer != nullptr && localPeer->id != *id;
+
                 client.localPlayerId = *id;
                 client.joinAcknowledged = true;
                 client.helloPending = false;
-                HostedNetworkingDetail::networkStdoutLog("received JOIN_OK as player " + std::to_string(*id));
+                client.peers.erase(*id);
+
+                client.lastAckTick = 0;
+                client.pendingControlTick = 0;
+                client.pendingInputs.clear();
+                client.predictedStates.clear();
+                client.localAuthoritative = {};
+
+                if (localPeerNeedsReset) {
+                    localPeer->id = *id;
+                    localPeer->vehicleId = 0;
+                    localPeer->connected = true;
+                    localPeer->avatar = defaultAvatarManifest();
+                    localPeer->snapshots.clear();
+                    localPeer->basePos = {};
+                    localPeer->displayPos = {};
+                    localPeer->vel = {};
+                    localPeer->angVel = {};
+                    localPeer->baseRot = quatIdentity();
+                    localPeer->displayRot = quatIdentity();
+                } else if (localPeer != nullptr) {
+                    localPeer->id = *id;
+                    localPeer->vehicleId = 0;
+                    localPeer->connected = true;
+                }
+
+                HostedNetworkingDetail::networkStdoutLog(
+                    "received JOIN_OK as player " + std::to_string(*id));
             }
             continue;
         }
@@ -1133,6 +1907,57 @@ inline void serviceClientReplication(
                     peer.avatar = *avatar;
                     peer.connected = true;
                 }
+                HostedNetworkingDetail::requestMissingAvatarBlobs(client, nowSeconds, *avatar);
+            }
+            continue;
+        }
+        if (type == "CONSTRUCT_PUBLISH") {
+            if (const auto publish = parseConstructPublishPacket(event.payload); publish.has_value()) {
+                client.constructBlueprints[publish->blueprint.constructId] = publish->blueprint;
+                client.constructStates[publish->state.constructId] = publish->state;
+            }
+            continue;
+        }
+        if (type == "VEHICLE_SPAWN") {
+            if (const auto spawn = parseVehicleSpawnPacket(event.payload); spawn.has_value()) {
+                client.sharedVehicles[spawn->state.vehicleId] = spawn->state;
+            }
+            continue;
+        }
+        if (type == "VEHICLE_STATE") {
+            if (const auto vehicle = parseVehicleStatePacket(event.payload); vehicle.has_value()) {
+                client.sharedVehicles[vehicle->vehicleId] = *vehicle;
+            }
+            continue;
+        }
+        if (type == "VEHICLE_SEAT") {
+            if (const auto seat = parseVehicleSeatPacket(event.payload); seat.has_value()) {
+                auto vehicleIt = client.sharedVehicles.find(seat->vehicleId);
+                if (vehicleIt != client.sharedVehicles.end()) {
+                    if (seat->entering) {
+                        const std::size_t desiredSize = std::max<std::size_t>(
+                            vehicleIt->second.seatOccupants.size(),
+                            static_cast<std::size_t>(std::max(0, seat->seatIndex)) + 1u);
+                        vehicleIt->second.seatOccupants.resize(desiredSize, 0);
+                        if (seat->seatIndex >= 0 && seat->seatIndex < static_cast<int>(vehicleIt->second.seatOccupants.size())) {
+                            vehicleIt->second.seatOccupants[static_cast<std::size_t>(seat->seatIndex)] = seat->playerId;
+                            if (seat->seatIndex == 0) {
+                                vehicleIt->second.driverPlayerId = seat->playerId;
+                            }
+                        }
+                    } else {
+                        const auto it = std::find(
+                            vehicleIt->second.seatOccupants.begin(),
+                            vehicleIt->second.seatOccupants.end(),
+                            seat->playerId);
+                        if (it != vehicleIt->second.seatOccupants.end()) {
+                            *it = 0;
+                        }
+                        if (vehicleIt->second.driverPlayerId == seat->playerId) {
+                            vehicleIt->second.driverPlayerId = 0;
+                        }
+                    }
+                }
             }
             continue;
         }
@@ -1153,29 +1978,18 @@ inline void serviceClientReplication(
                     if (localPeer != nullptr) {
                         localPeer->id = snapshot->id;
                         localPeer->avatar = snapshot->avatar;
+                        localPeer->vehicleId = snapshot->vehicleId;
                         localPeer->connected = true;
                         if (client.pendingControlTick > 0 && snapshot->ack < client.pendingControlTick) {
                             continue;
                         }
                     }
-                    client.localAuthoritative.valid = true;
-                    client.localAuthoritative.dirty = true;
-                    client.localAuthoritative.ack = snapshot->ack;
-                    client.localAuthoritative.simTick = snapshot->simTick;
-                    client.localAuthoritative.flightMode = sanitizeRole(snapshot->avatar.role) != "walking";
-                    client.localAuthoritative.pos = snapshot->pos;
-                    client.localAuthoritative.rot = snapshot->rot;
-                    client.localAuthoritative.vel = snapshot->vel;
-                    client.localAuthoritative.angVel = snapshot->angVel;
-                    client.localAuthoritative.throttle = snapshot->throttle;
-                    client.localAuthoritative.yokePitch = snapshot->elevator;
-                    client.localAuthoritative.yokeYaw = snapshot->rudder;
-                    client.localAuthoritative.yokeRoll = snapshot->aileron;
-                    client.localAuthoritative.avatar = snapshot->avatar;
+                    client.localAuthoritative = {};
                 } else {
                     RemotePeerState& peer = client.peers[snapshot->id];
                     peer.id = snapshot->id;
                     peer.avatar = snapshot->avatar;
+                    peer.vehicleId = snapshot->vehicleId;
                     peer.connected = true;
                     appendRemoteSnapshot(peer, {
                         nowSeconds,
@@ -1185,6 +1999,7 @@ inline void serviceClientReplication(
                         snapshot->angVel
                     });
                     (void)sampleRemotePeer(peer, nowSeconds);
+                    HostedNetworkingDetail::requestMissingAvatarBlobs(client, nowSeconds, snapshot->avatar);
                 }
             }
             continue;
@@ -1193,6 +2008,16 @@ inline void serviceClientReplication(
             if (const auto chunk = parseChunkPacket(event.payload); chunk.has_value()) {
                 if (mirrorWorldStore->applyChunkState(*chunk)) {
                     client.mirrorTerrainDirty = true;
+                    client.recentTerrainChunks.push_back(*chunk);
+                    HostedNetworkingDetail::networkStdoutLog(
+                        std::string("applied ") +
+                        type +
+                        " cx=" +
+                        std::to_string(chunk->cx) +
+                        " cz=" +
+                        std::to_string(chunk->cz) +
+                        " rev=" +
+                        std::to_string(chunk->revision));
                 }
             }
             continue;
@@ -1215,12 +2040,51 @@ inline void serviceClientReplication(
         if (type == "BLOB_META") {
             if (const auto meta = parseBlobMetaPacket(event.payload); meta.has_value()) {
                 acceptIncomingBlobMeta(client.blobSync, *meta);
+                HostedNetworkingDetail::updateBlobTransferStatus(
+                    client,
+                    nowSeconds,
+                    meta->kind,
+                    meta->hash,
+                    BlobTransferPhase::Receiving,
+                    "metadata accepted",
+                    meta->ownerId,
+                    meta->role,
+                    meta->chunkCount,
+                    0,
+                    meta->rawBytes);
+                HostedNetworkingDetail::networkStdoutLog(
+                    "received BLOB_META kind=" +
+                    meta->kind +
+                    " hash=" +
+                    meta->hash +
+                    " chunks=" +
+                    std::to_string(std::max(0, meta->chunkCount)));
             }
             continue;
         }
         if (type == "BLOB_CHUNK") {
             if (const auto chunk = parseBlobChunkPacket(event.payload); chunk.has_value()) {
                 const auto completed = acceptIncomingBlobChunk(client.blobSync, *chunk);
+                if (const auto incomingIt = client.blobSync.incoming.find(blobTransferKey(chunk->kind, chunk->hash));
+                    incomingIt != client.blobSync.incoming.end()) {
+                    const BlobIncomingTransfer& incoming = incomingIt->second;
+                    HostedNetworkingDetail::updateBlobTransferStatus(
+                        client,
+                        nowSeconds,
+                        chunk->kind,
+                        chunk->hash,
+                        incoming.receivedCount >= incoming.chunkCount
+                            ? BlobTransferPhase::Received
+                            : BlobTransferPhase::Receiving,
+                        incoming.receivedCount >= incoming.chunkCount
+                            ? "all chunks received"
+                            : "chunk received",
+                        incoming.meta.ownerId,
+                        incoming.meta.role,
+                        incoming.chunkCount,
+                        incoming.receivedCount,
+                        incoming.meta.rawBytes);
+                }
                 if (completed.has_value()) {
                     AvatarBlobRecord record;
                     record.kind = completed->first.kind;
@@ -1228,7 +2092,41 @@ inline void serviceClientReplication(
                     record.raw = completed->second;
                     record.meta = completed->first;
                     client.blobCache.put(record);
+                    HostedNetworkingDetail::updateBlobTransferStatus(
+                        client,
+                        nowSeconds,
+                        record.kind,
+                        record.hash,
+                        BlobTransferPhase::Received,
+                        "blob transfer complete",
+                        record.meta.ownerId,
+                        record.meta.role,
+                        record.meta.chunkCount,
+                        record.meta.chunkCount,
+                        record.meta.rawBytes);
+                    HostedNetworkingDetail::networkStdoutLog(
+                        "completed BLOB transfer kind=" +
+                        record.kind +
+                        " hash=" +
+                        record.hash +
+                        " bytes=" +
+                        std::to_string(static_cast<int>(record.raw.size())));
                 }
+            }
+            continue;
+        }
+        if (type == "TERRAIN_EDIT_ACK") {
+            if (const auto ack = parseTerrainEditAckPacket(event.payload); ack.has_value()) {
+                client.pendingTerrainEditsById.erase(ack->opId);
+                client.terrainEditAcks.push_back(*ack);
+                HostedNetworkingDetail::networkStdoutLog(
+                    std::string("received TERRAIN_EDIT_ACK op=") +
+                    std::to_string(ack->opId) +
+                    " accepted=" +
+                    (ack->accepted ? "1" : "0") +
+                    " chunks=" +
+                    std::to_string(std::max(0, ack->touchedChunks)) +
+                    (ack->reason.empty() ? std::string() : std::string(" reason=") + ack->reason));
             }
             continue;
         }
@@ -1241,13 +2139,27 @@ inline void serviceClientReplication(
                     peerIt->second.avatar.radioChannel = state->channel;
                     peerIt->second.avatar.radioTx = state->transmitting;
                 }
+                VoiceTalkerState& talker = client.voice.talkersById[state->id];
+                talker.playerId = state->id;
+                talker.channel = state->channel;
+                talker.transmitting = state->transmitting;
+                talker.lastStateAtSeconds = nowSeconds;
             }
             continue;
         }
         if (type == "VOICE_FRAME") {
             if (const auto frame = parseVoiceFramePacket(event.payload); frame.has_value()) {
-                if (frame->channel == client.voice.radioChannel && !frame->compressedData.empty()) {
-                    client.voice.inboundCompressedFrames.push_back(frame->compressedData);
+                if (!frame->compressedData.empty()) {
+                    client.voice.inboundCompressedFrames.push_back({
+                        frame->senderId,
+                        normalizeRadioChannel(frame->channel),
+                        frame->compressedData
+                    });
+                    VoiceTalkerState& talker = client.voice.talkersById[frame->senderId];
+                    talker.playerId = frame->senderId;
+                    talker.channel = normalizeRadioChannel(frame->channel);
+                    talker.transmitting = true;
+                    talker.lastFrameAtSeconds = nowSeconds;
                 }
             }
             continue;
@@ -1255,6 +2167,7 @@ inline void serviceClientReplication(
         if (type == "PEER_LEAVE") {
             if (const auto id = parsePeerLeavePacket(event.payload); id.has_value()) {
                 client.peers.erase(*id);
+                client.voice.talkersById.erase(*id);
                 if (localPeer != nullptr && localPeer->id == *id) {
                     localPeer->connected = false;
                 }
@@ -1267,7 +2180,7 @@ inline void serviceClientReplication(
         (void)sampleRemotePeer(peer, nowSeconds);
     }
 
-    flushClientOutbound(client);
+    flushClientOutbound(client, nowSeconds);
 }
 
 inline void HostedWorldServer::broadcastSnapshots(double nowSeconds)
@@ -1277,7 +2190,7 @@ inline void HostedWorldServer::broadcastSnapshots(double nowSeconds)
     }
     ++snapshotSequence_;
     for (const auto& [targetId, target] : players_) {
-        if (!target.connected || target.peerId == 0) {
+        if (!target.connected || target.peerId == 0 || !target.hasReceivedHello) {
             continue;
         }
         const float farMeters = target.aoi.snapshotFarMeters;
@@ -1308,9 +2221,10 @@ inline void HostedWorldServer::broadcastSnapshots(double nowSeconds)
             snapshot.aileron = player.actor.yoke.roll;
             snapshot.rudder = player.actor.yoke.yaw;
             snapshot.simTick = player.runtime.tick;
+            snapshot.vehicleId = player.vehicleId;
             snapshot.timestamp = nowSeconds;
             snapshot.avatar = player.avatar;
-            snapshot.avatar.role = player.flightMode ? "plane" : "walking";
+            snapshot.avatar.role = playerModeToken(player.mode);
             transport_->send(
                 target.peerId,
                 static_cast<int>(TransportLane::Snapshot),
@@ -1329,8 +2243,65 @@ inline void HostedWorldServer::broadcastCloudSnapshot(double nowSeconds)
         { "ts", formatNetFloat(nowSeconds) }
     });
     for (const auto& [playerId, player] : players_) {
-        if (player.connected && player.peerId != 0) {
+        if (player.connected && player.peerId != 0 && player.hasReceivedHello) {
             transport_->send(player.peerId, static_cast<int>(TransportLane::Control), packet, false);
+        }
+    }
+}
+
+inline void HostedWorldServer::flushBlobTransfers(double nowSeconds)
+{
+    if (!transport_) {
+        return;
+    }
+
+    constexpr double kBlobFlushIntervalSeconds = 1.0 / 60.0;
+    constexpr double kBlobBackoffSeconds = 0.25;
+    constexpr std::size_t kMaxBlobReliableBytesPerFlush = 4u * 1024u;
+    constexpr std::size_t kMaxBlobReliablePacketsPerFlush = 1u;
+
+    for (auto& [playerId, player] : players_) {
+        (void)playerId;
+        if (!player.connected || player.peerId == 0 || player.outboundBlobReliable.empty()) {
+            continue;
+        }
+        if ((nowSeconds + 1.0e-6) < player.nextBlobFlushAt) {
+            continue;
+        }
+
+        bool sendFailed = false;
+        std::size_t sentBytes = 0u;
+        std::size_t sentPackets = 0u;
+        while (!player.outboundBlobReliable.empty()) {
+            const HostedBlobOutboundPacket& packet = player.outboundBlobReliable.front();
+            if (sentPackets > 0u &&
+                (sentPackets >= kMaxBlobReliablePacketsPerFlush ||
+                 sentBytes + packet.payload.size() > kMaxBlobReliableBytesPerFlush)) {
+                break;
+            }
+            if (!transport_->send(player.peerId, static_cast<int>(TransportLane::Blob), packet.payload, true)) {
+                sendFailed = true;
+                break;
+            }
+
+            sentBytes += packet.payload.size();
+            ++sentPackets;
+
+            const std::string transferKey = packet.transferKey;
+            player.outboundBlobReliable.pop_front();
+            if (auto countIt = player.queuedBlobPacketCountsByTransfer.find(transferKey);
+                countIt != player.queuedBlobPacketCountsByTransfer.end()) {
+                countIt->second -= 1;
+                if (countIt->second <= 0) {
+                    player.queuedBlobPacketCountsByTransfer.erase(countIt);
+                }
+            }
+        }
+
+        if (sendFailed || !player.outboundBlobReliable.empty()) {
+            player.nextBlobFlushAt = nowSeconds + (sendFailed ? kBlobBackoffSeconds : kBlobFlushIntervalSeconds);
+        } else {
+            player.nextBlobFlushAt = 0.0;
         }
     }
 }
@@ -1349,11 +2320,13 @@ inline void HostedWorldServer::update(
     if (snapshotAccumulator_ >= (1.0 / 90.0)) {
         snapshotAccumulator_ = std::fmod(snapshotAccumulator_, 1.0 / 90.0);
         broadcastSnapshots(nowSeconds);
+        broadcastVehicleStates();
     }
     if (cloudAccumulator_ >= 1.0) {
         cloudAccumulator_ = std::fmod(cloudAccumulator_, 1.0);
         broadcastCloudSnapshot(nowSeconds);
     }
+    flushBlobTransfers(nowSeconds);
     if (worldStore != nullptr) {
         for (auto& [playerId, player] : players_) {
             if (!player.connected || player.peerId == 0) {
@@ -1372,12 +2345,16 @@ inline void HostedWorldServer::queueLocalVoiceFrame(int channel, std::string_vie
     }
 
     const int normalizedChannel = normalizeRadioChannel(channel);
-    const std::string packet = buildVoiceFramePacket({ normalizedChannel, std::string(compressedFrame) });
+    VoiceFramePacket frame;
+    frame.senderId = local->id;
+    frame.channel = normalizedChannel;
+    frame.compressedData = std::string(compressedFrame);
+    const std::string packet = buildVoiceFramePacket(frame);
     for (const auto& [playerId, player] : players_) {
         if (playerId == local->id || !player.connected || player.peerId == 0) {
             continue;
         }
-        const float limit = std::max(local->aoi.snapshotFarMeters, player.aoi.snapshotFarMeters);
+        const float limit = HostedNetworkingDetail::voiceRelayDistanceMeters(local->aoi, player.aoi);
         if (normalizedChannel != player.avatar.radioChannel ||
             HostedNetworkingDetail::distanceSq2(local->actor.pos, player.actor.pos) > (limit * limit)) {
             continue;
@@ -1388,24 +2365,39 @@ inline void HostedWorldServer::queueLocalVoiceFrame(int channel, std::string_vie
     }
 }
 
-inline std::vector<std::string> HostedWorldServer::drainHostLocalVoiceFrames()
+inline std::vector<QueuedVoiceFrame> HostedWorldServer::drainHostLocalVoiceFrames()
 {
-    std::vector<std::string> packets = drainLocalVoiceFrames();
-    std::vector<std::string> drained;
-    drained.reserve(packets.size());
-    for (const std::string& packet : packets) {
-        if (const auto frame = parseVoiceFramePacket(packet); frame.has_value()) {
-            drained.push_back(frame->compressedData);
-        }
+    return drainLocalVoiceFrames();
+}
+
+inline std::vector<QueuedVoiceFrame> HostedWorldServer::drainLocalVoiceFrames()
+{
+    std::vector<QueuedVoiceFrame> drained;
+    drained.swap(hostLocalReceiveFrames_);
+    return drained;
+}
+
+inline std::vector<HostedTerrainEditRequest> HostedWorldServer::drainPendingTerrainEdits()
+{
+    std::vector<HostedTerrainEditRequest> drained;
+    drained.reserve(pendingTerrainEdits_.size());
+    while (!pendingTerrainEdits_.empty()) {
+        drained.push_back(std::move(pendingTerrainEdits_.front()));
+        pendingTerrainEdits_.pop_front();
     }
     return drained;
 }
 
-inline std::vector<std::string> HostedWorldServer::drainLocalVoiceFrames()
+inline void HostedWorldServer::sendTerrainEditAck(NetPeerId peerId, const TerrainEditAck& ack)
 {
-    std::vector<std::string> drained;
-    drained.swap(hostLocalReceiveFrames_);
-    return drained;
+    if (!transport_ || peerId == 0) {
+        return;
+    }
+    transport_->send(
+        peerId,
+        static_cast<int>(TransportLane::Control),
+        buildTerrainEditAckPacket(ack),
+        true);
 }
 
 inline bool HostedWorldServer::addCrater(const TerrainCrater& crater, WorldStore* worldStore, const TerrainParams&)

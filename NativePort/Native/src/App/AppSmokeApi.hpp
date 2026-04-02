@@ -118,7 +118,7 @@ Camera buildRenderCamera(
     const FlightState& plane,
     const TerrainFieldContext& terrainContext,
     const UiState& uiState,
-    bool flightMode,
+    PlayerMode playerMode,
     float flightLookYaw,
     float flightLookPitch,
     float farClipMeters);

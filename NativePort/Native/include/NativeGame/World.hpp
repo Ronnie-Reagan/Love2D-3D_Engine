@@ -9,7 +9,9 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <random>
+#include <unordered_map>
 #include <vector>
 
 namespace NativeGame {
@@ -246,34 +248,124 @@ struct TerrainPropCollider {
     float softness = 0.0f;
 };
 
+struct TerrainMountainFrontSettings {
+    bool enabled = true;
+    float coastalBandStart = 1400.0f;
+    float coastalBandEnd = 9800.0f;
+    float foothillStart = 420.0f;
+    float foothillEnd = 3400.0f;
+    float inlandFadeStart = 14500.0f;
+    float inlandFadeEnd = 24500.0f;
+    float mountainWallStrength = 0.52f;
+    float shelfStrength = 0.12f;
+    float cliffStrength = 0.18f;
+    float ridgeWarpScale = 0.000032f;
+};
+
+struct TerrainRoadSettings {
+    bool enabled = true;
+    int desiredRoadCount = 4;
+    float laneWidthMeters = 4.0f;
+    float shoulderWidthMeters = 1.4f;
+    float cutWidthMeters = 13.0f;
+    float cutBankWidthMeters = 22.0f;
+    float maxGrade = 0.06f;
+    float maxGradeHard = 0.09f;
+    float minTurnRadiusMeters = 160.0f;
+    float preferredTurnRadiusMeters = 280.0f;
+    float stepMeters = 36.0f;
+    float sampleLookAheadMeters = 260.0f;
+    float sampleConeDegrees = 68.0f;
+    float branchChance = 0.30f;
+    float flattenStrength = 0.94f;
+    float cutStrength = 0.86f;
+    float fillStrength = 0.72f;
+    float edgeFeatherMeters = 13.0f;
+    float potholeChance = 0.008f;
+    float potholeDepthMeters = 0.05f;
+    float patchChance = 0.04f;
+    float patchRaiseMeters = 0.018f;
+    float asphaltNoiseScale = 0.07f;
+    float crackStrength = 0.18f;
+};
+
+struct TerrainRoadNode {
+    Vec3 position {};
+    Vec3 forward { 1.0f, 0.0f, 0.0f };
+    float widthMeters = 9.8f;
+    float cutWidthMeters = 16.0f;
+    float grade = 0.0f;
+    float curvature = 0.0f;
+};
+
+struct TerrainRoadPath {
+    bool loop = false;
+    std::vector<TerrainRoadNode> nodes;
+};
+
+struct TerrainRoadSample {
+    float distanceToCenter = 1.0e9f;
+    float distanceToEdge = 1.0e9f;
+    float roadMask = 0.0f;
+    float shoulderMask = 0.0f;
+    float cutMask = 0.0f;
+    float along = 0.0f;
+    float roadHeight = 0.0f;
+    float patchMask = 0.0f;
+    float potholeMask = 0.0f;
+    Vec3 centerPosition {};
+    Vec3 forward { 0.0f, 0.0f, 1.0f };
+    float widthMeters = 0.0f;
+    float grade = 0.0f;
+    float curvature = 0.0f;
+    float segmentT = 0.0f;
+    int pathIndex = -1;
+    int nodeIndex = -1;
+};
+
+struct TerrainRoadSegmentLocator {
+    int pathIndex = 0;
+    int nodeIndex = 0;
+};
+
+struct TerrainRoadNetworkIndex {
+    bool valid = false;
+    float cellSize = 256.0f;
+    float minX = 0.0f;
+    float maxX = 0.0f;
+    float minZ = 0.0f;
+    float maxZ = 0.0f;
+    std::unordered_map<std::int64_t, std::vector<TerrainRoadSegmentLocator>> cells;
+};
+
 struct TerrainParams {
     int seed = 1337;
     float chunkSize = 128.0f;
-    float worldRadius = 2048.0f;
-    float minY = -120.0f;
-    float maxY = 1200.0f;
+    float worldRadius = 24576.0f;
+    float minY = -1400.0f;
+    float maxY = 10000.0f;
     int lod0Radius = 4;
-    int lod1Radius = 16;
-    int lod2Radius = 64;
-    float terrainQuality = 3.5f;
+    int lod1Radius = 12;
+    int lod2Radius = 48;
+    float terrainQuality = 2.8f;
     bool autoQualityEnabled = false;
     float targetFrameMs = 8.3f;
-    int lod0ChunkScale = 1;
-    int lod1ChunkScale = 4;
-    int lod2ChunkScale = 16;
+    int lod0ChunkScale = 2;
+    int lod1ChunkScale = 8;
+    int lod2ChunkScale = 32;
     bool textureTilesEnabled = true;
     int lod0TextureResolution = 512;
     int lod1TextureResolution = 256;
     int lod2TextureResolution = 64;
-    float gameplayRadiusMeters = 512.0f;
-    float midFieldRadiusMeters = 2048.0f;
-    float horizonRadiusMeters = 8192.0f;
-    float lod0BaseCellSize = 3.0f;
-    float lod1BaseCellSize = 6.0f;
-    float lod2BaseCellSize = 12.0f;
-    float lod0CellSize = 3.0f;
-    float lod1CellSize = 6.0f;
-    float lod2CellSize = 12.0f;
+    float gameplayRadiusMeters = 1024.0f;
+    float midFieldRadiusMeters = 6144.0f;
+    float horizonRadiusMeters = 24576.0f;
+    float lod0BaseCellSize = 3.5f;
+    float lod1BaseCellSize = 12.0f;
+    float lod2BaseCellSize = 36.0f;
+    float lod0CellSize = 3.5f;
+    float lod1CellSize = 12.0f;
+    float lod2CellSize = 36.0f;
     int meshBuildBudget = 4;
     int workerMaxInflight = 6;
     int workerResultBudgetPerFrame = 4;
@@ -290,27 +382,27 @@ struct TerrainParams {
     bool farLodConeEnabled = true;
     float farLodConeDegrees = 110.0f;
     int rearLod2Radius = 4;
-    float baseHeight = 0.0f;
-    float heightAmplitude = 120.0f;
-    float heightFrequency = 0.0018f;
-    int heightOctaves = 5;
-    float heightLacunarity = 2.05f;
-    float heightGain = 0.52f;
-    float surfaceDetailAmplitude = 14.0f;
-    float surfaceDetailFrequency = 0.013f;
-    float ridgeAmplitude = 38.0f;
-    float ridgeFrequency = 0.0042f;
-    float ridgeSharpness = 2.1f;
-    float macroWarpAmplitude = 90.0f;
-    float macroWarpFrequency = 0.00055f;
-    float terraceStrength = 0.16f;
-    float terraceStep = 18.0f;
-    float waterLevel = -12.0f;
-    float shorelineBand = 5.0f;
+    float baseHeight = -32.0f;
+    float heightAmplitude = 1850.0f;
+    float heightFrequency = 0.00012f;
+    int heightOctaves = 6;
+    float heightLacunarity = 2.1f;
+    float heightGain = 0.5f;
+    float surfaceDetailAmplitude = 58.0f;
+    float surfaceDetailFrequency = 0.0024f;
+    float ridgeAmplitude = 1050.0f;
+    float ridgeFrequency = 0.00042f;
+    float ridgeSharpness = 2.8f;
+    float macroWarpAmplitude = 920.0f;
+    float macroWarpFrequency = 0.000038f;
+    float terraceStrength = 0.03f;
+    float terraceStep = 110.0f;
+    float waterLevel = 0.0f;
+    float shorelineBand = 22.0f;
     float waterWaveAmplitude = 1.6f;
     float waterWaveFrequency = 0.014f;
     float biomeFrequency = 0.0009f;
-    float snowLine = 140.0f;
+    float snowLine = 1750.0f;
     bool caveEnabled = false;
     float caveFrequency = 0.018f;
     float caveThreshold = 0.68f;
@@ -326,14 +418,14 @@ struct TerrainParams {
     float tunnelLengthMin = 240.0f;
     float tunnelLengthMax = 520.0f;
     float tunnelSegmentLength = 18.0f;
-    int generatorVersion = 1;
+    int generatorVersion = 3;
     bool surfaceOnlyMeshing = true;
     bool threadedMeshing = true;
     bool enableSkirts = true;
     float skirtDepth = 24.0f;
-    int maxChunkCellsPerAxis = 48;
+    int maxChunkCellsPerAxis = 56;
     int craterHistoryLimit = 64;
-    float waterRatio = 0.26f;
+    float waterRatio = 0.18f;
     TerrainDecorationSettings decoration {};
     Vec3 grassColor { 0.20f, 0.62f, 0.22f };
     Vec3 roadColor { 0.10f, 0.10f, 0.10f };
@@ -345,6 +437,9 @@ struct TerrainParams {
     Vec3 waterVar { 0.02f, 0.02f, 0.02f };
     std::vector<TerrainCrater> dynamicCraters;
     std::vector<TerrainTunnelSeed> explicitTunnelSeeds;
+    TerrainMountainFrontSettings mountainFront {};
+    TerrainRoadSettings roads {};
+    std::vector<TerrainRoadPath> explicitRoadPaths;
 };
 
 struct TerrainVerticalBoundsSample {
@@ -356,12 +451,15 @@ struct TerrainVerticalBoundsSample {
 struct TerrainFieldContext {
     TerrainParams params;
     std::vector<TerrainTunnelSeed> tunnelSeeds;
+    std::vector<TerrainRoadPath> roadPaths;
+    std::shared_ptr<const TerrainRoadNetworkIndex> roadIndex {};
     std::function<float(float, float)> sampleHeightDeltaAt {};
     std::function<float(float, float, float)> sampleVolumetricAdditiveSdfAt {};
     std::function<float(float, float, float)> sampleVolumetricSubtractiveSdfAt {};
     std::function<bool(float, float, float, float)> hasVolumetricOverridesInBounds {};
     std::function<TerrainVerticalBoundsSample(float, float, float, float)> sampleWorldVolumetricBoundsInBounds {};
     std::function<std::uint64_t(float, float, float, float)> sampleChunkRevisionSignature {};
+    std::function<TerrainRoadSample(float, float)> sampleRoadAt {};
 };
 
 struct TerrainMaterialSample {
@@ -375,6 +473,9 @@ struct TerrainMaterialSample {
     float resourceWeight = 0.0f;
     float erosionWeight = 0.0f;
     float flowWeight = 0.0f;
+    float roadWeight = 0.0f;
+    float shoulderWeight = 0.0f;
+    float asphaltPatchWeight = 0.0f;
 };
 
 struct TerrainHydraulicSample {
@@ -456,14 +557,14 @@ inline TerrainParams normalizeTerrainParams(TerrainParams params)
 {
     params.seed = std::max(1, params.seed);
     params.chunkSize = std::max(8.0f, sanitize(params.chunkSize, 128.0f));
-    params.worldRadius = std::max(params.chunkSize * 4.0f, sanitize(params.worldRadius, 2048.0f));
-    params.minY = sanitize(params.minY, -120.0f);
-    params.maxY = std::max(params.minY + 16.0f, sanitize(params.maxY, 1200.0f));
+    params.worldRadius = std::max(params.chunkSize * 4.0f, sanitize(params.worldRadius, 32768.0f));
+    params.minY = sanitize(params.minY, -1400.0f);
+    params.maxY = std::max(params.minY + 16.0f, sanitize(params.maxY, 10000.0f));
 
     params.lod0Radius = std::clamp(params.lod0Radius, 1, 12);
     params.lod1Radius = std::clamp(params.lod1Radius, params.lod0Radius, 32);
     params.lod2Radius = std::clamp(params.lod2Radius, params.lod1Radius, 96);
-    params.terrainQuality = clamp(sanitize(params.terrainQuality, 3.5f), 0.75f, 6.0f);
+    params.terrainQuality = clamp(sanitize(params.terrainQuality, 2.8f), 0.75f, 6.0f);
     params.targetFrameMs = clamp(sanitize(params.targetFrameMs, 8.3f), 4.0f, 50.0f);
 
     params.lod0ChunkScale = std::max(1, params.lod0ChunkScale);
@@ -476,13 +577,13 @@ inline TerrainParams normalizeTerrainParams(TerrainParams params)
 
     params.gameplayRadiusMeters = std::max(
         params.chunkSize,
-        sanitize(params.gameplayRadiusMeters, std::max(512.0f, params.chunkSize * static_cast<float>(std::max(params.lod0Radius, 4)))));
+        sanitize(params.gameplayRadiusMeters, std::max(1024.0f, params.chunkSize * static_cast<float>(std::max(params.lod0Radius, 4)))));
     params.midFieldRadiusMeters = std::max(
         params.gameplayRadiusMeters + params.chunkSize,
-        sanitize(params.midFieldRadiusMeters, std::max(2048.0f, params.chunkSize * static_cast<float>(std::max(params.lod1Radius, 16)))));
+        sanitize(params.midFieldRadiusMeters, std::max(6144.0f, params.chunkSize * static_cast<float>(std::max(params.lod1Radius, 12)))));
     params.horizonRadiusMeters = std::max(
         params.midFieldRadiusMeters + params.chunkSize,
-        sanitize(params.horizonRadiusMeters, std::max(8192.0f, params.chunkSize * static_cast<float>(std::max(params.lod2Radius, 64)))));
+        sanitize(params.horizonRadiusMeters, std::max(24576.0f, params.chunkSize * static_cast<float>(std::max(params.lod2Radius, 48)))));
 
     params.lod0BaseCellSize = std::max(1.0f, sanitize(params.lod0BaseCellSize, params.lod0CellSize));
     params.lod1BaseCellSize = std::max(params.lod0BaseCellSize, sanitize(params.lod1BaseCellSize, params.lod1CellSize));
@@ -506,27 +607,62 @@ inline TerrainParams normalizeTerrainParams(TerrainParams params)
     params.farLodConeDegrees = clamp(sanitize(params.farLodConeDegrees, 110.0f), 70.0f, 170.0f);
     params.rearLod2Radius = std::clamp(params.rearLod2Radius, params.lod1Radius, params.lod2Radius);
 
-    params.baseHeight = sanitize(params.baseHeight, 0.0f);
-    params.heightAmplitude = std::max(0.0f, sanitize(params.heightAmplitude, 120.0f));
-    params.heightFrequency = std::max(1.0e-5f, sanitize(params.heightFrequency, 0.0018f));
+    params.baseHeight = sanitize(params.baseHeight, -32.0f);
+    params.heightAmplitude = std::max(0.0f, sanitize(params.heightAmplitude, 1850.0f));
+    params.heightFrequency = std::max(1.0e-5f, sanitize(params.heightFrequency, 0.00012f));
     params.heightOctaves = std::max(1, params.heightOctaves);
-    params.heightLacunarity = std::max(1.1f, sanitize(params.heightLacunarity, 2.05f));
-    params.heightGain = clamp(sanitize(params.heightGain, 0.52f), 0.1f, 0.95f);
-    params.surfaceDetailAmplitude = std::max(0.0f, sanitize(params.surfaceDetailAmplitude, 14.0f));
-    params.surfaceDetailFrequency = std::max(1.0e-4f, sanitize(params.surfaceDetailFrequency, 0.013f));
-    params.ridgeAmplitude = std::max(0.0f, sanitize(params.ridgeAmplitude, 38.0f));
-    params.ridgeFrequency = std::max(1.0e-5f, sanitize(params.ridgeFrequency, 0.0042f));
-    params.ridgeSharpness = std::max(0.3f, sanitize(params.ridgeSharpness, 2.1f));
-    params.macroWarpAmplitude = std::max(0.0f, sanitize(params.macroWarpAmplitude, 90.0f));
-    params.macroWarpFrequency = std::max(1.0e-5f, sanitize(params.macroWarpFrequency, 0.00055f));
-    params.terraceStrength = clamp(sanitize(params.terraceStrength, 0.16f), 0.0f, 1.0f);
-    params.terraceStep = std::max(1.0f, sanitize(params.terraceStep, 18.0f));
-    params.waterLevel = sanitize(params.waterLevel, -12.0f);
-    params.shorelineBand = std::max(0.1f, sanitize(params.shorelineBand, 5.0f));
+    params.heightLacunarity = std::max(1.1f, sanitize(params.heightLacunarity, 2.1f));
+    params.heightGain = clamp(sanitize(params.heightGain, 0.5f), 0.1f, 0.95f);
+    params.surfaceDetailAmplitude = std::max(0.0f, sanitize(params.surfaceDetailAmplitude, 58.0f));
+    params.surfaceDetailFrequency = std::max(1.0e-4f, sanitize(params.surfaceDetailFrequency, 0.0024f));
+    params.ridgeAmplitude = std::max(0.0f, sanitize(params.ridgeAmplitude, 1050.0f));
+    params.ridgeFrequency = std::max(1.0e-5f, sanitize(params.ridgeFrequency, 0.00042f));
+    params.ridgeSharpness = std::max(0.3f, sanitize(params.ridgeSharpness, 2.8f));
+    params.macroWarpAmplitude = std::max(0.0f, sanitize(params.macroWarpAmplitude, 920.0f));
+    params.macroWarpFrequency = std::max(1.0e-5f, sanitize(params.macroWarpFrequency, 0.000038f));
+    params.terraceStrength = clamp(sanitize(params.terraceStrength, 0.03f), 0.0f, 1.0f);
+    params.terraceStep = std::max(1.0f, sanitize(params.terraceStep, 110.0f));
+    params.waterLevel = sanitize(params.waterLevel, 0.0f);
+    params.shorelineBand = std::max(0.1f, sanitize(params.shorelineBand, 22.0f));
     params.waterWaveAmplitude = std::max(0.0f, sanitize(params.waterWaveAmplitude, 1.6f));
     params.waterWaveFrequency = std::max(1.0e-4f, sanitize(params.waterWaveFrequency, 0.014f));
     params.biomeFrequency = std::max(1.0e-5f, sanitize(params.biomeFrequency, 0.0009f));
-    params.snowLine = sanitize(params.snowLine, 140.0f);
+    params.snowLine = sanitize(params.snowLine, 1750.0f);
+
+    params.mountainFront.coastalBandStart = std::max(0.0f, sanitize(params.mountainFront.coastalBandStart, 1400.0f));
+    params.mountainFront.coastalBandEnd = std::max(params.mountainFront.coastalBandStart + 100.0f, sanitize(params.mountainFront.coastalBandEnd, 9800.0f));
+    params.mountainFront.foothillStart = std::max(0.0f, sanitize(params.mountainFront.foothillStart, 420.0f));
+    params.mountainFront.foothillEnd = std::max(params.mountainFront.foothillStart + 100.0f, sanitize(params.mountainFront.foothillEnd, 3400.0f));
+    params.mountainFront.inlandFadeStart = std::max(params.mountainFront.coastalBandEnd, sanitize(params.mountainFront.inlandFadeStart, 14500.0f));
+    params.mountainFront.inlandFadeEnd = std::max(params.mountainFront.inlandFadeStart + 100.0f, sanitize(params.mountainFront.inlandFadeEnd, 24500.0f));
+    params.mountainFront.mountainWallStrength = clamp(sanitize(params.mountainFront.mountainWallStrength, 0.52f), 0.0f, 3.0f);
+    params.mountainFront.shelfStrength = clamp(sanitize(params.mountainFront.shelfStrength, 0.12f), 0.0f, 1.0f);
+    params.mountainFront.cliffStrength = clamp(sanitize(params.mountainFront.cliffStrength, 0.18f), 0.0f, 1.0f);
+    params.mountainFront.ridgeWarpScale = std::max(1.0e-6f, sanitize(params.mountainFront.ridgeWarpScale, 0.000032f));
+
+    params.roads.desiredRoadCount = std::clamp(params.roads.desiredRoadCount, 0, 16);
+    params.roads.laneWidthMeters = clamp(sanitize(params.roads.laneWidthMeters, 4.0f), 2.7f, 5.5f);
+    params.roads.shoulderWidthMeters = clamp(sanitize(params.roads.shoulderWidthMeters, 1.4f), 0.2f, 4.0f);
+    params.roads.cutWidthMeters = std::max(params.roads.laneWidthMeters * 2.0f, sanitize(params.roads.cutWidthMeters, 13.0f));
+    params.roads.cutBankWidthMeters = std::max(params.roads.cutWidthMeters, sanitize(params.roads.cutBankWidthMeters, 22.0f));
+    params.roads.maxGrade = clamp(sanitize(params.roads.maxGrade, 0.06f), 0.02f, 0.14f);
+    params.roads.maxGradeHard = clamp(sanitize(params.roads.maxGradeHard, 0.09f), params.roads.maxGrade, 0.22f);
+    params.roads.minTurnRadiusMeters = std::max(30.0f, sanitize(params.roads.minTurnRadiusMeters, 160.0f));
+    params.roads.preferredTurnRadiusMeters = std::max(params.roads.minTurnRadiusMeters, sanitize(params.roads.preferredTurnRadiusMeters, 280.0f));
+    params.roads.stepMeters = clamp(sanitize(params.roads.stepMeters, 36.0f), 8.0f, 96.0f);
+    params.roads.sampleLookAheadMeters = clamp(sanitize(params.roads.sampleLookAheadMeters, 260.0f), 60.0f, 420.0f);
+    params.roads.sampleConeDegrees = clamp(sanitize(params.roads.sampleConeDegrees, 68.0f), 20.0f, 150.0f);
+    params.roads.branchChance = clamp(sanitize(params.roads.branchChance, 0.30f), 0.0f, 0.95f);
+    params.roads.flattenStrength = clamp(sanitize(params.roads.flattenStrength, 0.94f), 0.0f, 1.0f);
+    params.roads.cutStrength = clamp(sanitize(params.roads.cutStrength, 0.86f), 0.0f, 1.0f);
+    params.roads.fillStrength = clamp(sanitize(params.roads.fillStrength, 0.72f), 0.0f, 1.0f);
+    params.roads.edgeFeatherMeters = clamp(sanitize(params.roads.edgeFeatherMeters, 13.0f), 0.5f, 30.0f);
+    params.roads.potholeChance = clamp(sanitize(params.roads.potholeChance, 0.008f), 0.0f, 0.25f);
+    params.roads.potholeDepthMeters = clamp(sanitize(params.roads.potholeDepthMeters, 0.05f), 0.0f, 0.20f);
+    params.roads.patchChance = clamp(sanitize(params.roads.patchChance, 0.04f), 0.0f, 0.25f);
+    params.roads.patchRaiseMeters = clamp(sanitize(params.roads.patchRaiseMeters, 0.018f), 0.0f, 0.08f);
+    params.roads.asphaltNoiseScale = std::max(1.0e-4f, sanitize(params.roads.asphaltNoiseScale, 0.07f));
+    params.roads.crackStrength = clamp(sanitize(params.roads.crackStrength, 0.18f), 0.0f, 1.0f);
     params.caveFrequency = std::max(1.0e-4f, sanitize(params.caveFrequency, 0.018f));
     params.caveThreshold = clamp(sanitize(params.caveThreshold, 0.68f), 0.05f, 0.95f);
     params.caveStrength = std::max(1.0f, sanitize(params.caveStrength, 42.0f));
@@ -543,11 +679,11 @@ inline TerrainParams normalizeTerrainParams(TerrainParams params)
     params.tunnelLengthMax = std::max(params.tunnelLengthMin, sanitize(params.tunnelLengthMax, 520.0f));
     params.tunnelSegmentLength = std::max(6.0f, sanitize(params.tunnelSegmentLength, 18.0f));
 
-    params.generatorVersion = std::max(2, params.generatorVersion);
+    params.generatorVersion = std::max(3, params.generatorVersion);
     params.skirtDepth = std::max(2.0f, sanitize(params.skirtDepth, 24.0f));
     params.maxChunkCellsPerAxis = std::clamp(params.maxChunkCellsPerAxis, 24, 128);
     params.craterHistoryLimit = std::max(0, params.craterHistoryLimit);
-    params.waterRatio = clamp(sanitize(params.waterRatio, 0.26f), 0.0f, 1.0f);
+    params.waterRatio = clamp(sanitize(params.waterRatio, 0.18f), 0.0f, 1.0f);
     params.decoration.density = clamp(sanitize(params.decoration.density, 1.0f), 0.0f, 3.0f);
     params.decoration.nearDensityScale = clamp(sanitize(params.decoration.nearDensityScale, 1.0f), 0.0f, 3.0f);
     params.decoration.midDensityScale = clamp(sanitize(params.decoration.midDensityScale, 0.58f), 0.0f, 2.5f);
@@ -635,6 +771,37 @@ inline bool terrainTunnelSeedListsEqual(const std::vector<TerrainTunnelSeed>& lh
             if (std::fabs(ap.x - bp.x) > 1.0e-4f ||
                 std::fabs(ap.y - bp.y) > 1.0e-4f ||
                 std::fabs(ap.z - bp.z) > 1.0e-4f) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+inline bool terrainRoadPathListsEqual(const std::vector<TerrainRoadPath>& lhs, const std::vector<TerrainRoadPath>& rhs)
+{
+    if (lhs.size() != rhs.size()) {
+        return false;
+    }
+    for (std::size_t pathIndex = 0; pathIndex < lhs.size(); ++pathIndex) {
+        const TerrainRoadPath& a = lhs[pathIndex];
+        const TerrainRoadPath& b = rhs[pathIndex];
+        if (a.loop != b.loop || a.nodes.size() != b.nodes.size()) {
+            return false;
+        }
+        for (std::size_t nodeIndex = 0; nodeIndex < a.nodes.size(); ++nodeIndex) {
+            const TerrainRoadNode& an = a.nodes[nodeIndex];
+            const TerrainRoadNode& bn = b.nodes[nodeIndex];
+            if (std::fabs(an.position.x - bn.position.x) > 1.0e-4f ||
+                std::fabs(an.position.y - bn.position.y) > 1.0e-4f ||
+                std::fabs(an.position.z - bn.position.z) > 1.0e-4f ||
+                std::fabs(an.forward.x - bn.forward.x) > 1.0e-4f ||
+                std::fabs(an.forward.y - bn.forward.y) > 1.0e-4f ||
+                std::fabs(an.forward.z - bn.forward.z) > 1.0e-4f ||
+                std::fabs(an.widthMeters - bn.widthMeters) > 1.0e-4f ||
+                std::fabs(an.cutWidthMeters - bn.cutWidthMeters) > 1.0e-4f ||
+                std::fabs(an.grade - bn.grade) > 1.0e-4f ||
+                std::fabs(an.curvature - bn.curvature) > 1.0e-4f) {
                 return false;
             }
         }
@@ -740,11 +907,65 @@ inline bool terrainParamsEquivalent(const TerrainParams& lhsInput, const Terrain
         lhs.grassColor.x == rhs.grassColor.x &&
         lhs.grassColor.y == rhs.grassColor.y &&
         lhs.grassColor.z == rhs.grassColor.z &&
+        lhs.roadColor.x == rhs.roadColor.x &&
+        lhs.roadColor.y == rhs.roadColor.y &&
+        lhs.roadColor.z == rhs.roadColor.z &&
+        lhs.fieldColor.x == rhs.fieldColor.x &&
+        lhs.fieldColor.y == rhs.fieldColor.y &&
+        lhs.fieldColor.z == rhs.fieldColor.z &&
         lhs.waterColor.x == rhs.waterColor.x &&
         lhs.waterColor.y == rhs.waterColor.y &&
         lhs.waterColor.z == rhs.waterColor.z &&
+        lhs.grassVar.x == rhs.grassVar.x &&
+        lhs.grassVar.y == rhs.grassVar.y &&
+        lhs.grassVar.z == rhs.grassVar.z &&
+        lhs.roadVar.x == rhs.roadVar.x &&
+        lhs.roadVar.y == rhs.roadVar.y &&
+        lhs.roadVar.z == rhs.roadVar.z &&
+        lhs.fieldVar.x == rhs.fieldVar.x &&
+        lhs.fieldVar.y == rhs.fieldVar.y &&
+        lhs.fieldVar.z == rhs.fieldVar.z &&
+        lhs.waterVar.x == rhs.waterVar.x &&
+        lhs.waterVar.y == rhs.waterVar.y &&
+        lhs.waterVar.z == rhs.waterVar.z &&
+        lhs.mountainFront.enabled == rhs.mountainFront.enabled &&
+        lhs.mountainFront.coastalBandStart == rhs.mountainFront.coastalBandStart &&
+        lhs.mountainFront.coastalBandEnd == rhs.mountainFront.coastalBandEnd &&
+        lhs.mountainFront.foothillStart == rhs.mountainFront.foothillStart &&
+        lhs.mountainFront.foothillEnd == rhs.mountainFront.foothillEnd &&
+        lhs.mountainFront.inlandFadeStart == rhs.mountainFront.inlandFadeStart &&
+        lhs.mountainFront.inlandFadeEnd == rhs.mountainFront.inlandFadeEnd &&
+        lhs.mountainFront.mountainWallStrength == rhs.mountainFront.mountainWallStrength &&
+        lhs.mountainFront.shelfStrength == rhs.mountainFront.shelfStrength &&
+        lhs.mountainFront.cliffStrength == rhs.mountainFront.cliffStrength &&
+        lhs.mountainFront.ridgeWarpScale == rhs.mountainFront.ridgeWarpScale &&
+        lhs.roads.enabled == rhs.roads.enabled &&
+        lhs.roads.desiredRoadCount == rhs.roads.desiredRoadCount &&
+        lhs.roads.laneWidthMeters == rhs.roads.laneWidthMeters &&
+        lhs.roads.shoulderWidthMeters == rhs.roads.shoulderWidthMeters &&
+        lhs.roads.cutWidthMeters == rhs.roads.cutWidthMeters &&
+        lhs.roads.cutBankWidthMeters == rhs.roads.cutBankWidthMeters &&
+        lhs.roads.maxGrade == rhs.roads.maxGrade &&
+        lhs.roads.maxGradeHard == rhs.roads.maxGradeHard &&
+        lhs.roads.minTurnRadiusMeters == rhs.roads.minTurnRadiusMeters &&
+        lhs.roads.preferredTurnRadiusMeters == rhs.roads.preferredTurnRadiusMeters &&
+        lhs.roads.stepMeters == rhs.roads.stepMeters &&
+        lhs.roads.sampleLookAheadMeters == rhs.roads.sampleLookAheadMeters &&
+        lhs.roads.sampleConeDegrees == rhs.roads.sampleConeDegrees &&
+        lhs.roads.branchChance == rhs.roads.branchChance &&
+        lhs.roads.flattenStrength == rhs.roads.flattenStrength &&
+        lhs.roads.cutStrength == rhs.roads.cutStrength &&
+        lhs.roads.fillStrength == rhs.roads.fillStrength &&
+        lhs.roads.edgeFeatherMeters == rhs.roads.edgeFeatherMeters &&
+        lhs.roads.potholeChance == rhs.roads.potholeChance &&
+        lhs.roads.potholeDepthMeters == rhs.roads.potholeDepthMeters &&
+        lhs.roads.patchChance == rhs.roads.patchChance &&
+        lhs.roads.patchRaiseMeters == rhs.roads.patchRaiseMeters &&
+        lhs.roads.asphaltNoiseScale == rhs.roads.asphaltNoiseScale &&
+        lhs.roads.crackStrength == rhs.roads.crackStrength &&
         terrainCraterListsEqual(lhs.dynamicCraters, rhs.dynamicCraters) &&
-        terrainTunnelSeedListsEqual(lhs.explicitTunnelSeeds, rhs.explicitTunnelSeeds);
+        terrainTunnelSeedListsEqual(lhs.explicitTunnelSeeds, rhs.explicitTunnelSeeds) &&
+        terrainRoadPathListsEqual(lhs.explicitRoadPaths, rhs.explicitRoadPaths);
 }
 
 inline float applyDynamicCratersToSurfaceHeight(float x, float z, float height, const TerrainParams& params)
@@ -778,6 +999,37 @@ inline float distancePointToSegment(const Vec3& point, const Vec3& a, const Vec3
     const float t = clamp(dot(ap, ab) / abLenSq, 0.0f, 1.0f);
     const Vec3 closest = a + (ab * t);
     return length(point - closest);
+}
+
+inline float smootherstep01(float t)
+{
+    t = clamp(t, 0.0f, 1.0f);
+    return t * t * t * (t * ((t * 6.0f) - 15.0f) + 10.0f);
+}
+
+inline float remap01(float value, float a, float b)
+{
+    if (std::fabs(b - a) <= 1.0e-6f) {
+        return value >= b ? 1.0f : 0.0f;
+    }
+    return clamp((value - a) / (b - a), 0.0f, 1.0f);
+}
+
+inline float ridgeNoise01(float x, float z, float freq, int octaves, float lacunarity, float gain, int seed)
+{
+    float amp = 1.0f;
+    float sum = 0.0f;
+    float weight = 0.0f;
+    float localFreq = freq;
+    for (int i = 0; i < octaves; ++i) {
+        const float n = (valueNoise2(x * localFreq, z * localFreq, seed + (i * 97)) * 2.0f) - 1.0f;
+        const float r = 1.0f - std::fabs(n);
+        sum += r * amp;
+        weight += amp;
+        amp *= gain;
+        localFreq *= lacunarity;
+    }
+    return weight > 1.0e-6f ? (sum / weight) : 0.0f;
 }
 
 inline std::vector<TerrainTunnelSeed> buildTunnelSeeds(const TerrainParams& inputParams)
@@ -832,28 +1084,71 @@ inline std::vector<TerrainTunnelSeed> buildTunnelSeeds(const TerrainParams& inpu
     return out;
 }
 
+inline float sampleCoastalMountainHeight(float x, float z, const TerrainFieldContext& context)
+{
+    const TerrainParams& params = context.params;
+    const TerrainMountainFrontSettings& mf = params.mountainFront;
+
+    const float inland = std::max(0.0f, z);
+    const float foothillT = smootherstep01(remap01(inland, mf.foothillStart, mf.foothillEnd));
+    const float coastalRise = smootherstep01(remap01(inland, mf.foothillStart, mf.coastalBandEnd));
+    const float inlandFade = 1.0f - smootherstep01(remap01(inland, mf.inlandFadeStart, mf.inlandFadeEnd));
+
+    const float warpX = ((fbm2(x * mf.ridgeWarpScale, z * mf.ridgeWarpScale, 3, 2.0f, 0.5f, params.seed + 501) * 2.0f) - 1.0f) * params.macroWarpAmplitude;
+    const float warpedX = x + warpX;
+
+    const float macro = fbm2(warpedX * params.heightFrequency, z * params.heightFrequency, params.heightOctaves, params.heightLacunarity, params.heightGain, params.seed + 101);
+    const float ridges = ridgeNoise01(warpedX, z, params.ridgeFrequency, 5, 2.08f, 0.52f, params.seed + 211);
+    const float shelves = fbm2(warpedX * (params.heightFrequency * 2.2f), z * (params.heightFrequency * 2.2f), 3, 2.0f, 0.55f, params.seed + 313);
+
+    const float shoreFoothills = mix(
+        params.baseHeight - 28.0f,
+        params.baseHeight + (params.heightAmplitude * 0.16f),
+        foothillT);
+    const float mountainFloor = mix(
+        shoreFoothills,
+        params.baseHeight + (params.heightAmplitude * 0.46f),
+        coastalRise);
+
+    const float macroRelief = mix(
+        -params.heightAmplitude * 0.12f,
+        params.heightAmplitude * 0.58f,
+        macro);
+    const float ridgeRelief =
+        std::pow(ridges, params.ridgeSharpness) *
+        params.ridgeAmplitude *
+        mf.mountainWallStrength;
+    const float shelfRelief =
+        ((shelves * 2.0f) - 1.0f) *
+        params.heightAmplitude *
+        0.09f *
+        mf.shelfStrength;
+    const float cliffMask = smootherstep01(remap01(ridges, 0.66f, 0.92f));
+    const float cliffLift = cliffMask * params.ridgeAmplitude * 0.24f * mf.cliffStrength;
+    const float coastalEnvelope = coastalRise * inlandFade;
+    float surface = mix(
+        params.waterLevel - (params.shorelineBand * 1.75f),
+        mountainFloor + macroRelief + ridgeRelief + shelfRelief + cliffLift,
+        coastalEnvelope);
+
+    if (inland < mf.coastalBandStart) {
+        const float shoreT = smootherstep01(remap01(inland, 0.0f, mf.coastalBandStart));
+        const float shoreBluffs =
+            ((fbm2(x * 0.0012f, z * 0.0012f, 3, 2.0f, 0.55f, params.seed + 777) * 2.0f) - 1.0f) *
+            params.heightAmplitude *
+            0.028f;
+        surface = mix(params.waterLevel - params.shorelineBand, surface + shoreBluffs, shoreT);
+    }
+
+    return surface;
+}
+
 inline float sampleProceduralSurfaceHeight(float x, float z, const TerrainFieldContext& context)
 {
     const TerrainParams& params = context.params;
-
-    const float warpN1 = (valueNoise2(x * params.macroWarpFrequency, z * params.macroWarpFrequency, params.seed + 211) * 2.0f) - 1.0f;
-    const float warpN2 = (valueNoise2(x * params.macroWarpFrequency, z * params.macroWarpFrequency, params.seed + 347) * 2.0f) - 1.0f;
-    const float wx = x + (warpN1 * params.macroWarpAmplitude);
-    const float wz = z + (warpN2 * params.macroWarpAmplitude);
-
-    const float nx = wx * params.heightFrequency;
-    const float nz = wz * params.heightFrequency;
-    const float heightNoise = (fbm2(nx, nz, params.heightOctaves, params.heightLacunarity, params.heightGain, params.seed) * 2.0f) - 1.0f;
-    const float detailNoise = (valueNoise2(wx * params.surfaceDetailFrequency, wz * params.surfaceDetailFrequency, params.seed + 907) * 2.0f) - 1.0f;
-    float ridge = (fbm2(wx * params.ridgeFrequency, wz * params.ridgeFrequency, 4, 2.03f, 0.53f, params.seed + 503) * 2.0f) - 1.0f;
-    ridge = 1.0f - std::fabs(ridge);
-    ridge = std::pow(ridge, params.ridgeSharpness);
-    const float ridgeSigned = (ridge * 2.0f) - 1.0f;
-
-    float surface = params.baseHeight +
-        (heightNoise * params.heightAmplitude) +
-        (detailNoise * params.surfaceDetailAmplitude) +
-        (ridgeSigned * params.ridgeAmplitude);
+    float surface = sampleCoastalMountainHeight(x, z, context);
+    const float detail = ((fbm2(x * params.surfaceDetailFrequency, z * params.surfaceDetailFrequency, 4, 2.0f, 0.55f, params.seed + 1301) * 2.0f) - 1.0f) * params.surfaceDetailAmplitude;
+    surface += detail;
     if (params.terraceStrength > 0.0f) {
         const float stepped = std::floor((surface / params.terraceStep) + 0.5f) * params.terraceStep;
         surface = mix(surface, stepped, params.terraceStrength);
@@ -919,6 +1214,444 @@ inline TerrainHydraulicSample sampleTerrainHydraulicMaps(float x, float z, const
     };
 }
 
+inline float sampleRoadlessHeight(float x, float z, const TerrainFieldContext& context)
+{
+    return sampleProceduralSurfaceHeight(x, z, context) + sampleTerrainHydraulicMaps(x, z, context).erosion;
+}
+
+inline float scoreRoadCandidate(
+    const Vec3& current,
+    const Vec3& forward,
+    const Vec3& candidateDir,
+    float stepMeters,
+    const TerrainFieldContext& context)
+{
+    const TerrainParams& params = context.params;
+    const TerrainRoadSettings& roads = params.roads;
+
+    const Vec3 nextPos = current + (candidateDir * stepMeters);
+    const float h0 = sampleRoadlessHeight(current.x, current.z, context);
+    const float h1 = sampleRoadlessHeight(nextPos.x, nextPos.z, context);
+    const float grade = std::fabs(h1 - h0) / std::max(1.0f, stepMeters);
+
+    const float dotForward = clamp(dot(normalize(forward), normalize(candidateDir)), -1.0f, 1.0f);
+    const float turnAngle = std::acos(dotForward);
+    const float turnRadius = turnAngle > 1.0e-4f ? (stepMeters / turnAngle) : 1.0e9f;
+
+    float score = 0.0f;
+    if (grade > roads.maxGradeHard) {
+        score -= 100000.0f;
+    } else {
+        score -= grade * 900.0f;
+    }
+    if (turnRadius < roads.minTurnRadiusMeters) {
+        score -= 100000.0f;
+    } else {
+        score -= std::fabs(turnRadius - roads.preferredTurnRadiusMeters) * 0.08f;
+    }
+
+    const float lookAhead = roads.sampleLookAheadMeters;
+    const int lookSteps = std::max(3, static_cast<int>(std::ceil(lookAhead / stepMeters)));
+    Vec3 probePos = current;
+    float accumulatedPenalty = 0.0f;
+    for (int i = 0; i < lookSteps; ++i) {
+        probePos = probePos + (candidateDir * stepMeters);
+        const float ph0 = sampleRoadlessHeight(probePos.x, probePos.z, context);
+        const float ph1 = sampleRoadlessHeight(probePos.x + (candidateDir.x * stepMeters), probePos.z + (candidateDir.z * stepMeters), context);
+        accumulatedPenalty += (std::fabs(ph1 - ph0) / std::max(1.0f, stepMeters)) * 140.0f;
+    }
+    return score - accumulatedPenalty;
+}
+
+inline TerrainRoadPath buildMountainRoadPath(const TerrainFieldContext& context, Vec3 startPos, Vec3 startForward, int seedOffset)
+{
+    const TerrainParams& params = context.params;
+    const TerrainRoadSettings& roads = params.roads;
+    std::mt19937 rng(static_cast<std::uint32_t>(params.seed + seedOffset));
+
+    TerrainRoadPath path;
+    Vec3 current = startPos;
+    current.y = sampleRoadlessHeight(current.x, current.z, context);
+
+    Vec3 forward = normalize(Vec3 { startForward.x, 0.0f, startForward.z });
+    if (lengthSquared(forward) <= 1.0e-6f) {
+        forward = { 1.0f, 0.0f, 0.0f };
+    }
+
+    const float halfCone = radians(roads.sampleConeDegrees * 0.5f);
+    const float stepMeters = roads.stepMeters;
+    const float roadLengthBudget = std::max(
+        params.chunkSize * 28.0f,
+        std::min(params.worldRadius * 0.72f, params.mountainFront.inlandFadeEnd * 0.92f));
+    const int maxSteps = std::max(120, static_cast<int>(std::ceil(roadLengthBudget / std::max(1.0f, stepMeters))));
+    std::uniform_real_distribution<float> jitterDistribution(-3.0f, 3.0f);
+
+    for (int step = 0; step < maxSteps; ++step) {
+        TerrainRoadNode node;
+        node.position = current;
+        node.forward = forward;
+        node.widthMeters = (roads.laneWidthMeters * 2.0f) + (roads.shoulderWidthMeters * 2.0f);
+        node.cutWidthMeters = roads.cutBankWidthMeters;
+        path.nodes.push_back(node);
+
+        float bestScore = -1.0e30f;
+        Vec3 bestDir = forward;
+        const int candidates = 13;
+        for (int i = 0; i < candidates; ++i) {
+            const float t = (static_cast<float>(i) / static_cast<float>(candidates - 1)) * 2.0f - 1.0f;
+            const float angle = t * halfCone;
+            const float cosA = std::cos(angle);
+            const float sinA = std::sin(angle);
+            Vec3 candidateDir {
+                (forward.x * cosA) - (forward.z * sinA),
+                0.0f,
+                (forward.x * sinA) + (forward.z * cosA)
+            };
+            candidateDir = normalize(candidateDir);
+            float score = scoreRoadCandidate(current, forward, candidateDir, stepMeters, context);
+            score += jitterDistribution(rng);
+            if (score > bestScore) {
+                bestScore = score;
+                bestDir = candidateDir;
+            }
+        }
+
+        const Vec3 next = current + (bestDir * stepMeters);
+        const float h0 = sampleRoadlessHeight(current.x, current.z, context);
+        const float h1 = sampleRoadlessHeight(next.x, next.z, context);
+        const float delta = h1 - h0;
+        const float maxRise = roads.maxGrade * stepMeters;
+        const float clampedRise = clamp(delta, -maxRise, maxRise);
+        current = { next.x, h0 + clampedRise, next.z };
+        forward = bestDir;
+
+        if (length(Vec3 { current.x, 0.0f, current.z }) > (params.worldRadius * 0.94f) ||
+            current.z >= params.mountainFront.inlandFadeEnd * 0.96f ||
+            current.y <= params.waterLevel + 6.0f) {
+            break;
+        }
+    }
+
+    return path;
+}
+
+inline std::vector<TerrainRoadPath> buildRoadPaths(const TerrainFieldContext& context)
+{
+    const TerrainParams& params = context.params;
+    if (!params.roads.enabled) {
+        return {};
+    }
+    if (!params.explicitRoadPaths.empty()) {
+        return params.explicitRoadPaths;
+    }
+
+    std::vector<TerrainRoadPath> out;
+    out.reserve(static_cast<std::size_t>(params.roads.desiredRoadCount));
+    const auto appendPath = [&](Vec3 start, Vec3 forward, int seedOffset) {
+        start.y = sampleRoadlessHeight(start.x, start.z, context);
+        TerrainRoadPath path = buildMountainRoadPath(context, start, forward, seedOffset);
+        if (path.nodes.size() > 8u) {
+            out.push_back(std::move(path));
+        }
+    };
+
+    if (params.roads.desiredRoadCount <= 0) {
+        return out;
+    }
+
+    const float arterialZ = clamp(
+        params.mountainFront.foothillStart + std::max(240.0f, params.roads.cutBankWidthMeters * 18.0f),
+        params.mountainFront.foothillStart + 120.0f,
+        params.mountainFront.foothillEnd * 0.55f);
+    const float arterialStartX = -std::min(params.worldRadius * 0.58f, params.mountainFront.inlandFadeEnd * 0.48f);
+    appendPath({ arterialStartX, 0.0f, arterialZ }, normalize(Vec3 { 1.0f, 0.0f, 0.04f }), 1000);
+
+    const TerrainRoadPath* trunk = out.empty() ? nullptr : &out.front();
+    for (int i = 1; i < params.roads.desiredRoadCount; ++i) {
+        bool appendedBranch = false;
+        if (trunk != nullptr && trunk->nodes.size() > 20u) {
+            const float branchT =
+                params.roads.desiredRoadCount <= 2
+                    ? 0.58f
+                    : mix(
+                          0.22f,
+                          0.82f,
+                          static_cast<float>(i - 1) / static_cast<float>(std::max(1, params.roads.desiredRoadCount - 2)));
+            const std::size_t maxNodeIndex = trunk->nodes.size() - 6u;
+            const std::size_t nodeIndex = std::clamp<std::size_t>(
+                static_cast<std::size_t>(std::round(static_cast<float>(trunk->nodes.size() - 1u) * branchT)),
+                6u,
+                maxNodeIndex);
+            const TerrainRoadNode& anchor = trunk->nodes[nodeIndex];
+            const float branchSign = (i % 2 == 0) ? 1.0f : -1.0f;
+            const float branchAngle = radians(mix(18.0f, 36.0f, hash01(i + 31, 53, 71, params.seed)));
+            const float yaw = branchSign * branchAngle;
+            const float cosA = std::cos(yaw);
+            const float sinA = std::sin(yaw);
+            Vec3 forward {
+                (anchor.forward.x * cosA) - (anchor.forward.z * sinA),
+                0.0f,
+                (anchor.forward.x * sinA) + (anchor.forward.z * cosA)
+            };
+            forward = normalize(forward, { 1.0f, 0.0f, 0.0f });
+            Vec3 start = anchor.position + (forward * (params.roads.stepMeters * 3.0f));
+            start.z = clamp(
+                start.z,
+                params.mountainFront.foothillStart + 80.0f,
+                params.mountainFront.coastalBandEnd * 0.92f);
+            const std::size_t beforeCount = out.size();
+            appendPath(start, forward, 1000 + (i * 73));
+            appendedBranch = out.size() > beforeCount;
+        }
+
+        if (appendedBranch) {
+            continue;
+        }
+
+        const float z = mix(
+            params.mountainFront.foothillStart + 320.0f,
+            params.mountainFront.coastalBandEnd * 0.62f,
+            hash01(i + 11, 7, 3, params.seed));
+        const float x = mix(
+            -params.worldRadius * 0.58f,
+            params.worldRadius * 0.12f,
+            hash01(i + 19, 17, 5, params.seed));
+        const float yaw = mix(-0.28f, 0.18f, hash01(i + 23, 29, 31, params.seed));
+        appendPath({ x, 0.0f, z }, normalize(Vec3 { std::cos(yaw), 0.0f, std::sin(yaw) }), 1000 + (i * 73));
+    }
+    return out;
+}
+
+inline std::int64_t terrainRoadCellKey(int cellX, int cellZ)
+{
+    return (static_cast<std::int64_t>(cellX) << 32) ^ static_cast<std::uint32_t>(cellZ);
+}
+
+inline std::shared_ptr<TerrainRoadNetworkIndex> buildRoadNetworkIndex(
+    const TerrainParams& params,
+    const std::vector<TerrainRoadPath>& roadPaths)
+{
+    auto index = std::make_shared<TerrainRoadNetworkIndex>();
+    if (roadPaths.empty()) {
+        return index;
+    }
+
+    index->cellSize = clamp(
+        std::max(params.roads.sampleLookAheadMeters * 0.75f, params.roads.cutBankWidthMeters * 6.0f),
+        128.0f,
+        1024.0f);
+
+    bool hasBounds = false;
+    for (std::size_t pathIndex = 0; pathIndex < roadPaths.size(); ++pathIndex) {
+        const TerrainRoadPath& path = roadPaths[pathIndex];
+        for (std::size_t nodeIndex = 1; nodeIndex < path.nodes.size(); ++nodeIndex) {
+            const TerrainRoadNode& a = path.nodes[nodeIndex - 1];
+            const TerrainRoadNode& b = path.nodes[nodeIndex];
+            const float influenceRadius =
+                (std::max({ a.widthMeters, b.widthMeters, a.cutWidthMeters, b.cutWidthMeters }) * 0.5f) +
+                (params.roads.shoulderWidthMeters * 1.5f) +
+                params.roads.edgeFeatherMeters;
+            const float minX = std::min(a.position.x, b.position.x) - influenceRadius;
+            const float maxX = std::max(a.position.x, b.position.x) + influenceRadius;
+            const float minZ = std::min(a.position.z, b.position.z) - influenceRadius;
+            const float maxZ = std::max(a.position.z, b.position.z) + influenceRadius;
+
+            if (!hasBounds) {
+                index->minX = minX;
+                index->maxX = maxX;
+                index->minZ = minZ;
+                index->maxZ = maxZ;
+                hasBounds = true;
+            } else {
+                index->minX = std::min(index->minX, minX);
+                index->maxX = std::max(index->maxX, maxX);
+                index->minZ = std::min(index->minZ, minZ);
+                index->maxZ = std::max(index->maxZ, maxZ);
+            }
+
+            const int cellX0 = static_cast<int>(std::floor(minX / index->cellSize));
+            const int cellX1 = static_cast<int>(std::floor(maxX / index->cellSize));
+            const int cellZ0 = static_cast<int>(std::floor(minZ / index->cellSize));
+            const int cellZ1 = static_cast<int>(std::floor(maxZ / index->cellSize));
+            for (int cellZ = cellZ0; cellZ <= cellZ1; ++cellZ) {
+                for (int cellX = cellX0; cellX <= cellX1; ++cellX) {
+                    index->cells[terrainRoadCellKey(cellX, cellZ)].push_back({
+                        static_cast<int>(pathIndex),
+                        static_cast<int>(nodeIndex)
+                    });
+                }
+            }
+        }
+    }
+
+    index->valid = hasBounds && !index->cells.empty();
+    return index;
+}
+
+inline TerrainRoadSample sampleRoadNetwork(
+    float x,
+    float z,
+    const TerrainParams& params,
+    const std::vector<TerrainRoadPath>& roadPaths,
+    const TerrainRoadNetworkIndex* roadIndex)
+{
+    TerrainRoadSample out;
+    if (roadPaths.empty()) {
+        return out;
+    }
+    const TerrainRoadSettings& roads = params.roads;
+    const Vec3 point { x, 0.0f, z };
+
+    const auto sampleSegment = [&](const TerrainRoadPath& path, std::size_t i) {
+        if (i == 0u || i >= path.nodes.size()) {
+            return;
+        }
+        const TerrainRoadNode& a = path.nodes[i - 1];
+        const TerrainRoadNode& b = path.nodes[i];
+        const Vec3 a2 { a.position.x, 0.0f, a.position.z };
+        const Vec3 b2 { b.position.x, 0.0f, b.position.z };
+        const Vec3 ab = b2 - a2;
+        const float abLenSq = lengthSquared(ab);
+        if (abLenSq <= 1.0e-6f) {
+            return;
+        }
+        const float t = clamp(dot(point - a2, ab) / abLenSq, 0.0f, 1.0f);
+        const Vec3 p = a2 + (ab * t);
+        const float dist = length(point - p);
+        const float width = mix(a.widthMeters, b.widthMeters, t) * 0.5f;
+        const float cutWidth = mix(a.cutWidthMeters, b.cutWidthMeters, t) * 0.5f;
+        const float roadY = mix(a.position.y, b.position.y, t);
+        if (dist < out.distanceToCenter) {
+            out.distanceToCenter = dist;
+            out.distanceToEdge = dist - width;
+            out.roadHeight = roadY;
+            out.roadMask = 1.0f - smootherstep01(remap01(dist, width - roads.edgeFeatherMeters, width));
+            out.shoulderMask = 1.0f - smootherstep01(remap01(dist, width, width + (roads.shoulderWidthMeters * 1.5f)));
+            out.cutMask = 1.0f - smootherstep01(remap01(dist, width, cutWidth));
+            out.along = static_cast<float>(i) + t;
+            out.centerPosition = { p.x, roadY, p.z };
+            out.forward = normalize(a.forward + ((b.forward - a.forward) * t), normalize(ab, { 1.0f, 0.0f, 0.0f }));
+            out.widthMeters = width * 2.0f;
+            out.grade = mix(a.grade, b.grade, t);
+            out.curvature = mix(a.curvature, b.curvature, t);
+            out.segmentT = t;
+            out.pathIndex = static_cast<int>(&path - roadPaths.data());
+            out.nodeIndex = static_cast<int>(i);
+            const float patchNoise = valueNoise2(x * 0.18f, z * 0.18f, params.seed + 8101);
+            const float potholeNoise = valueNoise2(x * 0.24f, z * 0.24f, params.seed + 9101);
+            out.patchMask = patchNoise > (1.0f - roads.patchChance) ? 1.0f : 0.0f;
+            out.potholeMask = potholeNoise > (1.0f - roads.potholeChance) ? 1.0f : 0.0f;
+        }
+    };
+
+    if (roadIndex != nullptr && roadIndex->valid) {
+        if (x < roadIndex->minX || x > roadIndex->maxX || z < roadIndex->minZ || z > roadIndex->maxZ) {
+            return out;
+        }
+
+        const int cellX = static_cast<int>(std::floor(x / roadIndex->cellSize));
+        const int cellZ = static_cast<int>(std::floor(z / roadIndex->cellSize));
+        const auto it = roadIndex->cells.find(terrainRoadCellKey(cellX, cellZ));
+        if (it == roadIndex->cells.end()) {
+            return out;
+        }
+
+        for (const TerrainRoadSegmentLocator& locator : it->second) {
+            if (locator.pathIndex < 0 || locator.pathIndex >= static_cast<int>(roadPaths.size())) {
+                continue;
+            }
+            sampleSegment(roadPaths[static_cast<std::size_t>(locator.pathIndex)], static_cast<std::size_t>(locator.nodeIndex));
+        }
+        return out;
+    }
+
+    for (const TerrainRoadPath& path : roadPaths) {
+        for (std::size_t i = 1; i < path.nodes.size(); ++i) {
+            sampleSegment(path, i);
+        }
+    }
+    return out;
+}
+
+inline TerrainRoadSample sampleRoadNetwork(float x, float z, const TerrainFieldContext& context)
+{
+    return sampleRoadNetwork(x, z, context.params, context.roadPaths, context.roadIndex.get());
+}
+
+inline bool terrainRoadSampleValid(const TerrainRoadSample& sample)
+{
+    return sample.pathIndex >= 0 && sample.nodeIndex > 0 && sample.roadMask > 0.0f;
+}
+
+inline Vec3 terrainRoadRight(const TerrainRoadSample& sample)
+{
+    const Vec3 flatForward = normalize(Vec3 { sample.forward.x, 0.0f, sample.forward.z }, { 0.0f, 0.0f, 1.0f });
+    return normalize(Vec3 { flatForward.z, 0.0f, -flatForward.x }, { 1.0f, 0.0f, 0.0f });
+}
+
+inline Vec3 terrainRoadPlacementPosition(
+    const TerrainRoadSample& sample,
+    float lateralOffsetMeters = 0.0f,
+    float verticalOffsetMeters = 0.0f)
+{
+    return sample.centerPosition + (terrainRoadRight(sample) * lateralOffsetMeters) + Vec3 { 0.0f, verticalOffsetMeters, 0.0f };
+}
+
+inline float terrainRoadSurfaceFriction(const TerrainRoadSample& sample)
+{
+    if (!terrainRoadSampleValid(sample)) {
+        return 0.45f;
+    }
+    float friction = mix(0.72f, 1.08f, clamp(sample.roadMask + (sample.shoulderMask * 0.2f), 0.0f, 1.0f));
+    friction -= sample.patchMask * 0.05f;
+    friction -= sample.potholeMask * 0.14f;
+    return clamp(friction, 0.28f, 1.2f);
+}
+
+inline float terrainRoadSteeringAssist(const TerrainRoadSample& sample)
+{
+    if (!terrainRoadSampleValid(sample)) {
+        return 0.0f;
+    }
+    const float curvaturePenalty = clamp(std::fabs(sample.curvature) * 96.0f, 0.0f, 1.0f);
+    const float gradePenalty = clamp(std::fabs(sample.grade) * 6.0f, 0.0f, 1.0f);
+    return clamp((sample.roadMask * 0.86f) + (sample.shoulderMask * 0.18f) - (curvaturePenalty * 0.35f) - (gradePenalty * 0.15f), 0.0f, 1.0f);
+}
+
+inline std::optional<TerrainRoadSample> findRoadSpawnSample(
+    const TerrainFieldContext& context,
+    float preferredZ = 0.0f,
+    float minDryGroundClearance = 6.0f)
+{
+    TerrainRoadSample best;
+    bool found = false;
+    float bestScore = std::numeric_limits<float>::max();
+    const float dryGround = context.params.waterLevel + std::max(minDryGroundClearance, context.params.shorelineBand * 0.5f);
+    for (const TerrainRoadPath& path : context.roadPaths) {
+        for (std::size_t nodeIndex = 1; nodeIndex < path.nodes.size(); ++nodeIndex) {
+            const TerrainRoadNode& node = path.nodes[nodeIndex];
+            if (node.position.y <= dryGround) {
+                continue;
+            }
+            const TerrainRoadSample sample = sampleRoadNetwork(node.position.x, node.position.z, context);
+            if (!terrainRoadSampleValid(sample)) {
+                continue;
+            }
+            const float score =
+                std::fabs(sample.centerPosition.x) * 0.01f +
+                std::fabs(sample.centerPosition.z - preferredZ) * 0.004f +
+                std::fabs(sample.grade) * 80.0f +
+                std::fabs(sample.curvature) * 140.0f;
+            if (!found || score < bestScore) {
+                best = sample;
+                bestScore = score;
+                found = true;
+            }
+        }
+    }
+    return found ? std::optional<TerrainRoadSample>(best) : std::nullopt;
+}
+
 inline void attachTunnelSeedToSurface(TerrainTunnelSeed& tunnel, const TerrainFieldContext& context)
 {
     if (!tunnel.hillAttached || tunnel.points.size() < 2u) {
@@ -951,14 +1684,29 @@ inline TerrainFieldContext createTerrainFieldContext(const TerrainParams& inputP
 {
     TerrainFieldContext context;
     context.params = normalizeTerrainParams(inputParams);
+
     if (!context.params.explicitTunnelSeeds.empty()) {
         context.tunnelSeeds = context.params.explicitTunnelSeeds;
     } else if (context.params.tunnelCount > 0) {
         context.tunnelSeeds = buildTunnelSeeds(context.params);
     }
+
     for (TerrainTunnelSeed& seed : context.tunnelSeeds) {
         attachTunnelSeedToSurface(seed, context);
     }
+
+    context.roadPaths = !context.params.explicitRoadPaths.empty()
+        ? context.params.explicitRoadPaths
+        : buildRoadPaths(context);
+    context.roadIndex = buildRoadNetworkIndex(context.params, context.roadPaths);
+
+    const TerrainParams roadParams = context.params;
+    const auto roadPaths = std::make_shared<const std::vector<TerrainRoadPath>>(context.roadPaths);
+    const std::shared_ptr<const TerrainRoadNetworkIndex> roadIndex = context.roadIndex;
+    context.sampleRoadAt = [roadParams, roadPaths, roadIndex](float x, float z) -> TerrainRoadSample {
+        return sampleRoadNetwork(x, z, roadParams, *roadPaths, roadIndex.get());
+    };
+
     return context;
 }
 
@@ -988,11 +1736,29 @@ inline float sampleBaseSurfaceHeight(float x, float z, const TerrainFieldContext
 
 inline float sampleSurfaceHeight(float x, float z, const TerrainFieldContext& context)
 {
+    const TerrainParams& params = context.params;
     float surface = sampleBaseSurfaceHeight(x, z, context);
     if (context.sampleHeightDeltaAt) {
         surface += sanitize(context.sampleHeightDeltaAt(x, z), 0.0f);
     }
-    return surface;
+    if (context.sampleRoadAt) {
+        const TerrainRoadSample road = context.sampleRoadAt(x, z);
+        if (road.roadMask > 0.0f || road.cutMask > 0.0f || road.shoulderMask > 0.0f) {
+            const float flatten = road.roadMask * params.roads.flattenStrength;
+            const float cutfill = road.cutMask;
+            const float delta = road.roadHeight - surface;
+            if (delta < 0.0f) {
+                surface = mix(surface, road.roadHeight, flatten + (cutfill * params.roads.cutStrength * (1.0f - flatten)));
+            } else {
+                surface = mix(surface, road.roadHeight, flatten + (cutfill * params.roads.fillStrength * (1.0f - flatten)));
+            }
+            if (road.roadMask > 0.0f) {
+                surface += road.patchMask * params.roads.patchRaiseMeters;
+                surface -= road.potholeMask * params.roads.potholeDepthMeters;
+            }
+        }
+    }
+    return clamp(surface, params.minY, params.maxY);
 }
 
 inline float sampleSurfaceHeight(float x, float z, const TerrainParams& params)
@@ -1087,31 +1853,28 @@ inline TerrainMaterialSample sampleTerrainMaterial(float x, float y, float z, co
 
     const float biomeNoise = (fbm2(x * params.biomeFrequency, z * params.biomeFrequency, 4, 2.0f, 0.54f, params.seed + 1201) * 2.0f) - 1.0f;
     const float elevation01 = clamp((surface - params.baseHeight + params.heightAmplitude) / std::max(1.0f, params.heightAmplitude * 2.0f), 0.0f, 1.0f);
-    const float wetness = clamp(
-        std::max(
-            (params.waterLevel + params.shorelineBand - surface) / std::max(0.1f, params.shorelineBand),
-            (hydraulic.moisture * 0.72f) + (hydraulic.flow * 0.18f)),
-        0.0f,
-        1.0f);
-    const float snowAltitude = clamp((surface - params.snowLine) / 90.0f, 0.0f, 1.0f);
-    const float snowNoise = clamp(((valueNoise2(x * 0.0052f, z * 0.0052f, params.seed + 2141) * 2.0f) - 1.0f) * 0.18f, -0.18f, 0.18f);
-    const float rockWeight = clamp((slope - 0.12f) * 1.5f + (hydraulic.hardness * 0.24f) + (hydraulic.flow * 0.14f), 0.0f, 1.0f);
-    const float snow = clamp(snowAltitude + snowNoise + (rockWeight * 0.08f) - (wetness * 0.04f), 0.0f, 1.0f);
-    const float biomeBlend = clamp(((biomeNoise + 1.0f) * 0.5f) + (elevation01 * 0.16f) + (hydraulic.resource * 0.10f) - (hydraulic.hardness * 0.12f), 0.0f, 1.0f);
+    const float wetness = clamp(std::max((params.waterLevel + params.shorelineBand - surface) / std::max(0.1f, params.shorelineBand), (hydraulic.moisture * 0.72f) + (hydraulic.flow * 0.18f)), 0.0f, 1.0f);
+    const float snowAltitude = clamp((surface - params.snowLine) / 700.0f, 0.0f, 1.0f);
+    const float snowNoise = clamp(((valueNoise2(x * 0.0012f, z * 0.0012f, params.seed + 2141) * 2.0f) - 1.0f) * 0.14f, -0.14f, 0.14f);
+    float rockWeight = clamp((slope - 0.1f) * 1.35f + (hydraulic.hardness * 0.24f) + (hydraulic.flow * 0.10f), 0.0f, 1.0f);
+    float snow = clamp(snowAltitude + snowNoise + (rockWeight * 0.08f) - (wetness * 0.08f), 0.0f, 1.0f);
+    float biomeBlend = clamp(((biomeNoise + 1.0f) * 0.5f) + (elevation01 * 0.16f) + (hydraulic.resource * 0.10f) - (hydraulic.hardness * 0.12f), 0.0f, 1.0f);
+
+    float roadWeight = 0.0f;
+    float shoulderWeight = 0.0f;
+    float asphaltPatchWeight = 0.0f;
+    if (context.sampleRoadAt) {
+        const TerrainRoadSample road = context.sampleRoadAt(x, z);
+        roadWeight = road.roadMask;
+        shoulderWeight = road.shoulderMask * (1.0f - roadWeight);
+        asphaltPatchWeight = road.patchMask * roadWeight;
+        rockWeight *= (1.0f - roadWeight * 0.85f);
+        snow *= (1.0f - roadWeight * 0.96f);
+        biomeBlend *= (1.0f - roadWeight * 0.92f);
+    }
 
     (void)y;
-    return {
-        surface,
-        waterHeight,
-        wetness,
-        snow,
-        rockWeight,
-        biomeBlend,
-        hydraulic.hardness,
-        hydraulic.resource,
-        clamp(-hydraulic.erosion * 0.18f, 0.0f, 1.0f),
-        hydraulic.flow
-    };
+    return { surface, waterHeight, wetness, snow, rockWeight, biomeBlend, hydraulic.hardness, hydraulic.resource, clamp(-hydraulic.erosion * 0.18f, 0.0f, 1.0f), hydraulic.flow, roadWeight, shoulderWeight, asphaltPatchWeight };
 }
 
 inline Vec3 sampleTerrainWaterColor(float x, float y, float z, const TerrainFieldContext& context)
@@ -1145,6 +1908,9 @@ inline Vec3 sampleTerrainColor(float x, float y, float z, const TerrainFieldCont
     const Vec3 rock { 0.47f, 0.45f, 0.43f };
     const Vec3 mineral { 0.58f, 0.44f, 0.34f };
     const Vec3 snowColor { 0.88f, 0.89f, 0.92f };
+    const Vec3 asphaltDark { 0.045f, 0.045f, 0.048f };
+    const Vec3 asphaltPatch { 0.09f, 0.09f, 0.095f };
+    const Vec3 shoulderSoil { 0.36f, 0.34f, 0.32f };
 
     Vec3 base = lerp(grass, forest, material.biomeBlend);
     base = lerp(base, sand, material.wetness * 0.72f);
@@ -1163,6 +1929,20 @@ inline Vec3 sampleTerrainColor(float x, float y, float z, const TerrainFieldCont
     base.x = clamp(base.x + (micro * 0.05f), 0.0f, 1.0f);
     base.y = clamp(base.y + (micro * 0.06f), 0.0f, 1.0f);
     base.z = clamp(base.z + (micro * 0.04f), 0.0f, 1.0f);
+
+    if (material.shoulderWeight > 0.0f) {
+        base = lerp(base, shoulderSoil, material.shoulderWeight * 0.72f);
+    }
+    if (material.roadWeight > 0.0f) {
+        const float grain = ((fbm2(x * params.roads.asphaltNoiseScale, z * params.roads.asphaltNoiseScale, 4, 2.0f, 0.55f, params.seed + 12001) * 2.0f) - 1.0f);
+        const float crack = std::pow(clamp(1.0f - std::fabs(((valueNoise2(x * 0.22f, z * 0.22f, params.seed + 12201) * 2.0f) - 1.0f)), 0.0f, 1.0f), 6.0f);
+        Vec3 asphalt = asphaltDark + (Vec3 { grain, grain, grain } * 0.035f);
+        asphalt = lerp(asphalt, asphaltPatch, material.asphaltPatchWeight * 0.85f);
+        asphalt = asphalt - (Vec3 { 1.0f, 1.0f, 1.0f } * (crack * params.roads.crackStrength * 0.16f));
+        asphalt = lerp(asphalt, asphalt * 0.58f, clamp(material.wetness * 0.55f, 0.0f, 0.55f));
+        base = lerp(base, asphalt, material.roadWeight);
+    }
+
     return base;
 }
 
@@ -1865,11 +2645,14 @@ struct WindState {
 };
 
 struct CloudPuff {
+    Vec3 baseOffset {};
     Vec3 offset {};
+    float baseScale = 32.0f;
     float scale = 32.0f;
+    float baseStretchY = 0.65f;
     float stretchY = 0.65f;
-    float bobPhase = 0.0f;
-    float bobAmplitude = 1.0f;
+    float driftPhase = 0.0f;
+    float driftAmplitude = 1.0f;
     float yaw = 0.0f;
     Vec3 color { 0.98f, 0.99f, 1.0f };
 };
@@ -1877,13 +2660,28 @@ struct CloudPuff {
 struct CloudGroup {
     Vec3 center {};
     float radius = 120.0f;
+    float targetRadius = 120.0f;
+    float verticalScale = 0.65f;
+    float targetVerticalScale = 0.65f;
+    float density = 1.0f;
+    float targetDensity = 1.0f;
     float driftScale = 1.0f;
+    float evolutionRate = 1.0f;
+    float alpha = 0.78f;
+    float nextMorphAt = 0.0f;
+    float nextMeshRebuildAt = 0.0f;
+    float renderRadius = 160.0f;
+    std::uint32_t noiseSeed = 1u;
+    TerrainVolumeBounds localBounds {};
+    Model volumeModel;
+    bool meshDirty = true;
     std::vector<CloudPuff> puffs;
 };
 
 struct CloudField {
-    float spawnRadius = 2200.0f;
-    float baseHeight = 460.0f;
+    float spawnRadius = 2600.0f;
+    float baseHeight = 620.0f;
+    int groupCount = 14;
     std::vector<CloudGroup> groups;
 };
 
@@ -1930,7 +2728,138 @@ inline Vec3 getWindVector3(const WindState& windState)
     };
 }
 
-inline CloudGroup randomCloudGroup(std::mt19937& rng, const Vec3& center, float baseHeight)
+inline float sampleCloudPuffSdf(const CloudGroup& group, const CloudPuff& puff, const Vec3& point)
+{
+    const Quat invYaw = quatConjugate(quatFromAxisAngle({ 0.0f, 1.0f, 0.0f }, puff.yaw));
+    const Vec3 localPoint = rotateVector(invYaw, point - puff.offset);
+    const Vec3 radii {
+        std::max(6.0f, puff.scale),
+        std::max(4.0f, puff.scale * puff.stretchY),
+        std::max(6.0f, puff.scale)
+    };
+    const Vec3 normalized {
+        localPoint.x / std::max(1.0f, radii.x),
+        localPoint.y / std::max(1.0f, radii.y),
+        localPoint.z / std::max(1.0f, radii.z)
+    };
+    const float ellipsoidSdf = (length(normalized) - 1.0f) * std::min(radii.x, std::min(radii.y, radii.z));
+    const float erosion =
+        ((fbm3(
+              localPoint.x * 0.021f,
+              localPoint.y * 0.027f,
+              localPoint.z * 0.021f,
+              3,
+              2.0f,
+              0.54f,
+              static_cast<int>(group.noiseSeed)) * 2.0f) - 1.0f) *
+        puff.scale *
+        0.11f *
+        clamp(group.density, 0.6f, 1.4f);
+    return ellipsoidSdf - erosion;
+}
+
+inline void updateCloudGroupBounds(CloudGroup& group)
+{
+    if (group.puffs.empty()) {
+        group.localBounds = {};
+        group.renderRadius = std::max(80.0f, group.radius * 1.2f);
+        return;
+    }
+
+    float minX = std::numeric_limits<float>::infinity();
+    float minY = std::numeric_limits<float>::infinity();
+    float minZ = std::numeric_limits<float>::infinity();
+    float maxX = -std::numeric_limits<float>::infinity();
+    float maxY = -std::numeric_limits<float>::infinity();
+    float maxZ = -std::numeric_limits<float>::infinity();
+    for (const CloudPuff& puff : group.puffs) {
+        const float radiusX = std::max(6.0f, puff.scale * 1.08f);
+        const float radiusY = std::max(4.0f, puff.scale * puff.stretchY * 1.16f);
+        const float radiusZ = std::max(6.0f, puff.scale * 1.08f);
+        minX = std::min(minX, puff.offset.x - radiusX);
+        minY = std::min(minY, puff.offset.y - radiusY);
+        minZ = std::min(minZ, puff.offset.z - radiusZ);
+        maxX = std::max(maxX, puff.offset.x + radiusX);
+        maxY = std::max(maxY, puff.offset.y + radiusY);
+        maxZ = std::max(maxZ, puff.offset.z + radiusZ);
+    }
+
+    const float padding = std::max(10.0f, group.radius * 0.12f);
+    group.localBounds = {
+        minX - padding,
+        maxX + padding,
+        minY - padding,
+        maxY + padding,
+        minZ - padding,
+        maxZ + padding
+    };
+    group.renderRadius = length(Vec3 {
+        std::max(std::fabs(group.localBounds.x0), std::fabs(group.localBounds.x1)),
+        std::max(std::fabs(group.localBounds.y0), std::fabs(group.localBounds.y1)),
+        std::max(std::fabs(group.localBounds.z0), std::fabs(group.localBounds.z1))
+    });
+}
+
+inline void rebuildCloudGroupVolume(CloudGroup& group)
+{
+    updateCloudGroupBounds(group);
+
+    TerrainParams cloudParams {};
+    cloudParams.seed = static_cast<int>(std::max<std::uint32_t>(1u, group.noiseSeed));
+    cloudParams.chunkSize = 64.0f;
+    cloudParams.worldRadius = 4096.0f;
+    cloudParams.minY = -4096.0f;
+    cloudParams.maxY = 4096.0f;
+    cloudParams.baseHeight = -200000.0f;
+    cloudParams.heightAmplitude = 0.0f;
+    cloudParams.surfaceDetailAmplitude = 0.0f;
+    cloudParams.ridgeAmplitude = 0.0f;
+    cloudParams.macroWarpAmplitude = 0.0f;
+    cloudParams.waterLevel = -200000.0f;
+    cloudParams.shorelineBand = 2.0f;
+    cloudParams.roads.enabled = false;
+    cloudParams.caveEnabled = false;
+    cloudParams.tunnelCount = 0;
+    cloudParams.maxChunkCellsPerAxis = 54;
+
+    TerrainFieldContext volumeContext;
+    volumeContext.params = normalizeTerrainParams(cloudParams);
+    CloudGroup sdfGroup;
+    sdfGroup.radius = group.radius;
+    sdfGroup.verticalScale = group.verticalScale;
+    const std::vector<CloudPuff> puffs = group.puffs;
+    volumeContext.sampleVolumetricAdditiveSdfAt = [sdfGroup, puffs](float x, float y, float z) -> float {
+        const Vec3 point { x, y, z };
+        float cloudSdf = std::numeric_limits<float>::infinity();
+        for (const CloudPuff& puff : puffs) {
+            cloudSdf = std::min(cloudSdf, sampleCloudPuffSdf(sdfGroup, puff, point));
+        }
+
+        const float cloudBaseY = -sdfGroup.radius * sdfGroup.verticalScale * 0.62f;
+        cloudSdf = std::max(cloudSdf, cloudBaseY - point.y);
+        const float edgeFade = clamp((std::fabs(point.y) / std::max(1.0f, sdfGroup.radius * sdfGroup.verticalScale * 1.55f)) - 0.55f, 0.0f, 1.0f);
+        return cloudSdf + (edgeFade * sdfGroup.radius * 0.04f);
+    };
+
+    const float cellSize = clamp(group.radius * 0.14f, 10.0f, 22.0f);
+    group.volumeModel = buildVolumetricTerrainPatch(volumeContext, group.localBounds, cellSize);
+    group.volumeModel.assetKey.clear();
+    for (Vec3& color : group.volumeModel.faceColors) {
+        color = { 1.0f, 1.0f, 1.0f };
+    }
+    group.meshDirty = false;
+}
+
+inline void retargetCloudGroupShape(CloudGroup& group, std::mt19937& rng, float nowSeconds)
+{
+    group.targetRadius = randomRange(rng, 140.0f, 280.0f);
+    group.targetVerticalScale = randomRange(rng, 0.48f, 0.92f);
+    group.targetDensity = randomRange(rng, 0.78f, 1.24f);
+    group.nextMorphAt = nowSeconds + randomRange(rng, 7000.0f, 20000.0f);
+    group.meshDirty = true;
+}
+
+inline CloudGroup randomCloudGroup(std::mt19937& rng, const Vec3& center, float baseHeight, float nowSeconds = 0.0f)
 {
     CloudGroup group;
     group.center = {
@@ -1938,36 +2867,50 @@ inline CloudGroup randomCloudGroup(std::mt19937& rng, const Vec3& center, float 
         baseHeight + randomRange(rng, -80.0f, 120.0f),
         center.z + randomRange(rng, -1800.0f, 1800.0f)
     };
-    group.radius = randomRange(rng, 90.0f, 220.0f);
+    group.radius = randomRange(rng, 140.0f, 260.0f);
+    group.targetRadius = group.radius;
+    group.verticalScale = randomRange(rng, 0.52f, 0.86f);
+    group.targetVerticalScale = group.verticalScale;
+    group.density = randomRange(rng, 0.82f, 1.18f);
+    group.targetDensity = group.density;
     group.driftScale = randomRange(rng, 0.65f, 1.45f);
+    group.evolutionRate = randomRange(rng, 0.55f, 1.35f);
+    group.alpha = randomRange(rng, 0.48f, 0.72f);
+    group.noiseSeed = static_cast<std::uint32_t>(randomRangeInt(rng, 1, 1 << 20));
 
-    const int puffCount = randomRangeInt(rng, 5, 12);
+    const int puffCount = randomRangeInt(rng, 6, 11);
     group.puffs.reserve(static_cast<std::size_t>(puffCount));
     for (int i = 0; i < puffCount; ++i) {
         CloudPuff puff;
-        puff.offset = {
-            randomRange(rng, -group.radius, group.radius),
-            randomRange(rng, -18.0f, 22.0f),
-            randomRange(rng, -group.radius, group.radius)
+        puff.baseOffset = {
+            randomRange(rng, -group.radius * 0.85f, group.radius * 0.85f),
+            randomRange(rng, -group.radius * 0.20f, group.radius * 0.26f),
+            randomRange(rng, -group.radius * 0.85f, group.radius * 0.85f)
         };
-        puff.scale = randomRange(rng, 28.0f, 82.0f);
-        puff.stretchY = randomRange(rng, 0.45f, 0.9f);
-        puff.bobPhase = randomRange(rng, 0.0f, kPi * 2.0f);
-        puff.bobAmplitude = randomRange(rng, 1.0f, 4.5f);
+        puff.offset = puff.baseOffset;
+        puff.baseScale = randomRange(rng, 34.0f, 92.0f);
+        puff.scale = puff.baseScale;
+        puff.baseStretchY = randomRange(rng, 0.55f, 0.95f);
+        puff.stretchY = puff.baseStretchY;
+        puff.driftPhase = randomRange(rng, 0.0f, kPi * 2.0f);
+        puff.driftAmplitude = randomRange(rng, 4.0f, 12.0f);
         puff.yaw = randomRange(rng, -kPi, kPi);
         const float tint = randomRange(rng, 0.93f, 1.0f);
         puff.color = { tint, tint, std::min(1.0f, tint + 0.02f) };
         group.puffs.push_back(puff);
     }
+    group.nextMorphAt = nowSeconds + randomRange(rng, 600.0f, 1600.0f);
+    group.nextMeshRebuildAt = nowSeconds + randomRange(rng, 5000.0f, 10000.6f);
+    rebuildCloudGroupVolume(group);
     return group;
 }
 
 inline void initializeCloudField(CloudField& cloudField, std::mt19937& rng, const Vec3& center)
 {
     cloudField.groups.clear();
-    cloudField.groups.reserve(18);
-    for (int i = 0; i < 18; ++i) {
-        cloudField.groups.push_back(randomCloudGroup(rng, center, cloudField.baseHeight));
+    cloudField.groups.reserve(static_cast<std::size_t>(std::max(1, cloudField.groupCount)));
+    for (int i = 0; i < std::max(1, cloudField.groupCount); ++i) {
+        cloudField.groups.push_back(randomCloudGroup(rng, center, cloudField.baseHeight, 0.0f));
     }
 }
 
@@ -1978,7 +2921,29 @@ inline void updateCloudField(CloudField& cloudField, WindState& windState, float
     const float recycleDistance = cloudField.spawnRadius * 1.3f;
     for (CloudGroup& group : cloudField.groups) {
         group.center += wind * (dt * group.driftScale);
-        group.center.y += std::sin((nowSeconds * 0.07f) + group.radius * 0.01f) * dt * 2.0f;
+        group.center.y += std::sin((nowSeconds * 0.06f) + group.radius * 0.012f) * dt * 1.8f;
+        if (nowSeconds >= group.nextMorphAt) {
+            retargetCloudGroupShape(group, rng, nowSeconds);
+        }
+        group.radius = mix(group.radius, group.targetRadius, clamp(dt * 0.12f * group.evolutionRate, 0.0f, 1.0f));
+        group.verticalScale = mix(group.verticalScale, group.targetVerticalScale, clamp(dt * 0.10f * group.evolutionRate, 0.0f, 1.0f));
+        group.density = mix(group.density, group.targetDensity, clamp(dt * 0.09f * group.evolutionRate, 0.0f, 1.0f));
+        group.alpha = clamp(mix(group.alpha, 0.44f + (group.density * 0.24f), clamp(dt * 0.12f, 0.0f, 1.0f)), 0.38f, 0.82f);
+        for (CloudPuff& puff : group.puffs) {
+            const float breathing = 1.0f + std::sin((nowSeconds * 0.22f * group.evolutionRate) + puff.driftPhase) * 0.08f;
+            const Vec3 drift {
+                std::cos((nowSeconds * 0.11f * group.evolutionRate) + puff.driftPhase) * puff.driftAmplitude,
+                std::sin((nowSeconds * 0.17f * group.evolutionRate) + puff.driftPhase) * puff.driftAmplitude * 0.32f,
+                std::sin((nowSeconds * 0.13f * group.evolutionRate) + puff.driftPhase + 1.7f) * puff.driftAmplitude
+            };
+            puff.offset = {
+                puff.baseOffset.x * (group.radius / 180.0f) + drift.x,
+                puff.baseOffset.y * group.verticalScale + drift.y,
+                puff.baseOffset.z * (group.radius / 180.0f) + drift.z
+            };
+            puff.scale = puff.baseScale * mix(0.82f, 1.18f, clamp(group.density, 0.0f, 1.0f)) * breathing;
+            puff.stretchY = puff.baseStretchY * mix(0.90f, 1.10f, clamp(group.verticalScale, 0.0f, 1.0f));
+        }
         const Vec3 delta = group.center - focusPoint;
         const float flatDistanceSq = (delta.x * delta.x) + (delta.z * delta.z);
         if (flatDistanceSq > (recycleDistance * recycleDistance)) {
@@ -1991,7 +2956,14 @@ inline void updateCloudField(CloudField& cloudField, WindState& windState, float
                     focusPoint.y,
                     focusPoint.z + (std::cos(respawnAngle) * respawnDistance)
                 },
-                cloudField.baseHeight);
+                cloudField.baseHeight,
+                nowSeconds);
+            continue;
+        }
+
+        if (group.meshDirty || nowSeconds >= group.nextMeshRebuildAt) {
+            rebuildCloudGroupVolume(group);
+            group.nextMeshRebuildAt = nowSeconds + randomRange(rng, 10000.8f, 11000.6f);
         }
     }
 }

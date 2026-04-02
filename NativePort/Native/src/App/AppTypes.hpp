@@ -68,6 +68,14 @@ enum class WindowMode {
     Fullscreen = 2
 };
 
+enum class ChaseCameraMode
+{
+    Close = 0,
+    Far = 1,
+    Dynamic = 2,
+    SoftCentered = 3
+};
+
 enum class PauseTab {
     Main = 0,
     Settings = 1,
@@ -436,7 +444,8 @@ struct UiState {
     float ambienceVolume = 1.0f;
     float combatVolume = 1.0f;
     float flybyVolume = 1.0f;
-    std::array<float, 5> mapZoomExtents { 200.0f, 400.0f, 800.0f, 1600.0f, 3200.0f };
+    std::array<float, 5> mapZoomExtents { 200.0f, 400.0f, 800.0f, 1600.0f, 3200.0f};
+    ChaseCameraMode chaseCameraMode = ChaseCameraMode::Dynamic;
 };
 
 struct PauseState {
@@ -938,7 +947,9 @@ struct GameSession {
     VoiceSessionState voice {};
     SessionVoiceRuntime voiceRuntime {};
     float worldTime = 0.0f;
+    PlayerMode playerMode = PlayerMode::Flight;
     bool flightMode = true;
+    VehicleId activeVehicleId = 0;
     float walkYaw = 0.0f;
     float walkPitch = 0.0f;
     float flightLookYaw = 0.0f;
@@ -961,6 +972,10 @@ struct GameSession {
     int nextGameplayObjectId = 1;
     float nextGameplaySnapshotAt = 0.0f;
     std::map<int, std::string> knownRemotePeers;
+    std::unordered_map<std::string, PlaneVisualState> remoteVisualsByKey;
+    std::unordered_map<ConstructId, ConstructBlueprint> constructBlueprintsById;
+    std::unordered_map<ConstructId, ConstructState> constructStatesById;
+    std::unordered_map<VehicleId, SharedVehicleState> sharedVehiclesById;
 };
 
 struct HudPeerIndicator {

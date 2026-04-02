@@ -27,6 +27,66 @@ std::uintmax_t directorySizeBytes(const std::filesystem::path& root)
     return totalBytes;
 }
 
+Vec3 defaultWorldSpawn(const TerrainParams& inputParams)
+{
+    const TerrainParams params = normalizeTerrainParams(inputParams);
+    const TerrainFieldContext context = createTerrainFieldContext(params);
+    const float dryGroundThreshold = params.waterLevel + std::max(24.0f, params.shorelineBand * 1.25f);
+    const float desiredGround = dryGroundThreshold + 120.0f;
+    const float maxPreferredGround = std::min(params.maxY - 400.0f, std::max(desiredGround + 1800.0f, params.snowLine * 0.55f));
+    const float xSpacing = std::max(256.0f, params.chunkSize * 4.0f);
+    const float zSpacing = std::max(384.0f, params.chunkSize * 4.0f);
+    const float zStart = std::max(
+        params.chunkSize * 8.0f,
+        std::max(
+            params.mountainFront.coastalBandStart + std::max(320.0f, params.chunkSize * 2.0f),
+            params.mountainFront.foothillStart + std::max(512.0f, params.chunkSize * 4.0f)));
+    const float zEnd = std::min(
+        params.worldRadius * 0.45f,
+        std::max(zStart + zSpacing, std::min(params.mountainFront.inlandFadeStart * 0.65f, params.mountainFront.inlandFadeEnd - params.chunkSize * 4.0f)));
+    const float lateralLimit = std::min(params.worldRadius * 0.18f, 4096.0f);
+
+    if (const auto roadSpawn = findRoadSpawnSample(context, zStart); roadSpawn.has_value()) {
+        return terrainRoadPlacementPosition(*roadSpawn, 0.0f, 190.0f);
+    }
+
+    const float initialGround = sampleSurfaceHeight(0.0f, zStart, context);
+    Vec3 bestSpawn { 0.0f, initialGround + 190.0f, zStart };
+    float bestScore = std::numeric_limits<float>::max();
+    float bestFallbackGround = initialGround;
+    Vec3 bestFallbackPos { 0.0f, initialGround + 190.0f, zStart };
+
+    for (float z = zStart; z <= zEnd; z += zSpacing) {
+        for (float x = -lateralLimit; x <= lateralLimit; x += xSpacing) {
+            const float ground = sampleSurfaceHeight(x, z, context);
+            if (ground > bestFallbackGround) {
+                bestFallbackGround = ground;
+                bestFallbackPos = { x, ground + 190.0f, z };
+            }
+            if (ground <= dryGroundThreshold) {
+                continue;
+            }
+
+            const float sampleStep = std::max(24.0f, params.chunkSize * 0.25f);
+            const float slope =
+                std::fabs(sampleSurfaceHeight(x + sampleStep, z, context) - sampleSurfaceHeight(x - sampleStep, z, context)) +
+                std::fabs(sampleSurfaceHeight(x, z + sampleStep, context) - sampleSurfaceHeight(x, z - sampleStep, context));
+            const float elevationPenalty =
+                ground > maxPreferredGround
+                    ? (ground - maxPreferredGround) * 0.45f
+                    : std::fabs(ground - desiredGround) * 0.08f;
+            const float distancePenalty = (std::fabs(x) * 0.015f) + ((z - zStart) * 0.0045f);
+            const float score = elevationPenalty + (slope * 3.2f) + distancePenalty;
+            if (score < bestScore) {
+                bestScore = score;
+                bestSpawn = { x, ground + 190.0f, z };
+            }
+        }
+    }
+
+    return bestScore < std::numeric_limits<float>::max() ? bestSpawn : bestFallbackPos;
+}
+
 }  // namespace
 
 std::string sanitizeWorldInstanceName(std::string_view value)
@@ -175,6 +235,7 @@ std::string makeSuggestedWorldId(const BootResources& boot)
 
 WorldInfoSnapshot buildWorldInfoSnapshot(const TerrainParams& terrainParams, std::string_view worldId, const Vec3& spawn)
 {
+    const Vec3 resolvedSpawn = lengthSquared(spawn) <= 1.0e-6f ? defaultWorldSpawn(terrainParams) : spawn;
     WorldInfoSnapshot info;
     info.worldId = worldId.empty() ? std::string("default") : std::string(worldId);
     info.formatVersion = std::max(1, terrainParams.generatorVersion);
@@ -185,9 +246,9 @@ WorldInfoSnapshot buildWorldInfoSnapshot(const TerrainParams& terrainParams, std
     info.heightFrequency = terrainParams.heightFrequency;
     info.waterLevel = terrainParams.waterLevel;
     info.tunnelSeeds = terrainParams.explicitTunnelSeeds;
-    info.spawnX = spawn.x;
-    info.spawnY = spawn.y;
-    info.spawnZ = spawn.z;
+    info.spawnX = resolvedSpawn.x;
+    info.spawnY = resolvedSpawn.y;
+    info.spawnZ = resolvedSpawn.z;
     return info;
 }
 

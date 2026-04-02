@@ -229,6 +229,108 @@ inline Quat quatFromAxisAngle(const Vec3& axis, float angle)
     };
 }
 
+inline Quat QuatFromBasis(const Vec3& right, const Vec3& up, const Vec3& forward)
+{
+    const float m00 = right.x;
+    const float m01 = up.x;
+    const float m02 = forward.x;
+
+    const float m10 = right.y;
+    const float m11 = up.y;
+    const float m12 = forward.y;
+
+    const float m20 = right.z;
+    const float m21 = up.z;
+    const float m22 = forward.z;
+
+    Quat q {};
+
+    const float trace = m00 + m11 + m22;
+    if (trace > 0.0f) {
+        const float s = std::sqrt(trace + 1.0f) * 2.0f;
+        q.w = 0.25f * s;
+        q.x = (m21 - m12) / s;
+        q.y = (m02 - m20) / s;
+        q.z = (m10 - m01) / s;
+    } else if (m00 > m11 && m00 > m22) {
+        const float s = std::sqrt(1.0f + m00 - m11 - m22) * 2.0f;
+        q.w = (m21 - m12) / s;
+        q.x = 0.25f * s;
+        q.y = (m01 + m10) / s;
+        q.z = (m02 + m20) / s;
+    } else if (m11 > m22) {
+        const float s = std::sqrt(1.0f + m11 - m00 - m22) * 2.0f;
+        q.w = (m02 - m20) / s;
+        q.x = (m01 + m10) / s;
+        q.y = 0.25f * s;
+        q.z = (m12 + m21) / s;
+    } else {
+        const float s = std::sqrt(1.0f + m22 - m00 - m11) * 2.0f;
+        q.w = (m10 - m01) / s;
+        q.x = (m02 + m20) / s;
+        q.y = (m12 + m21) / s;
+        q.z = 0.25f * s;
+    }
+
+    return q;
+}
+
+inline Quat quatNormalizeSafe(const Quat& q)
+{
+    const float lenSq = (q.w * q.w) + (q.x * q.x) + (q.y * q.y) + (q.z * q.z);
+    if (lenSq <= 1.0e-8f) {
+        return quatIdentity();
+    }
+
+    const float invLen = 1.0f / std::sqrt(lenSq);
+    return {
+        q.w * invLen,
+        q.x * invLen,
+        q.y * invLen,
+        q.z * invLen
+    };
+}
+
+inline Quat quatFromBasisOrthonormal(const Vec3& inputRight, const Vec3& inputUp, const Vec3& inputForward)
+{
+    Vec3 forward = normalize(inputForward, { 0.0f, 0.0f, 1.0f });
+    Vec3 up = normalize(inputUp, { 0.0f, 1.0f, 0.0f });
+    const Vec3 rightHint = normalize(inputRight, { 1.0f, 0.0f, 0.0f });
+
+    Vec3 right = cross(up, forward);
+    if (lengthSquared(right) <= 1.0e-8f) {
+        right = rightHint - (forward * dot(rightHint, forward));
+    }
+    right = normalize(right, { 1.0f, 0.0f, 0.0f });
+
+    up = cross(forward, right);
+    if (lengthSquared(up) <= 1.0e-8f) {
+        up = inputUp - (forward * dot(inputUp, forward));
+    }
+    up = normalize(up, { 0.0f, 1.0f, 0.0f });
+
+    return quatNormalizeSafe(QuatFromBasis(right, up, forward));
+}
+
+inline Quat nlerp(const Quat& a, const Quat& b, float t)
+{
+    Quat end = b;
+    const float d = (a.w * b.w) + (a.x * b.x) + (a.y * b.y) + (a.z * b.z);
+    if (d < 0.0f) {
+        end.w = -end.w;
+        end.x = -end.x;
+        end.y = -end.y;
+        end.z = -end.z;
+    }
+
+    return quatNormalizeSafe({
+        mix(a.w, end.w, t),
+        mix(a.x, end.x, t),
+        mix(a.y, end.y, t),
+        mix(a.z, end.z, t)
+    });
+}
+
 inline Vec3 rotateVector(const Quat& quat, const Vec3& v)
 {
     const Quat qv { 0.0f, v.x, v.y, v.z };

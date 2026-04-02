@@ -179,9 +179,9 @@ target_compile_definitions(TrueFlightNativeSmoke
 )
 
 if(MSVC)
-    target_compile_options(TrueFlightRuntime PRIVATE /W4 /permissive-)
-    target_compile_options(TrueFlight PRIVATE /W4 /permissive-)
-    target_compile_options(TrueFlightNativeSmoke PRIVATE /W4 /permissive-)
+    target_compile_options(TrueFlightRuntime PRIVATE /W4 /permissive- /bigobj)
+    target_compile_options(TrueFlight PRIVATE /W4 /permissive- /bigobj)
+    target_compile_options(TrueFlightNativeSmoke PRIVATE /W4 /permissive- /bigobj)
     target_compile_options(TrueFlightImGui PRIVATE /W1)
 else()
     target_compile_options(TrueFlightRuntime PRIVATE -Wall -Wextra -Wpedantic)

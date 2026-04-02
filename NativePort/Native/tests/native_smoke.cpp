@@ -11,10 +11,12 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <array>
 #include <cmath>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -81,7 +83,11 @@ public:
     bool send(NetPeerId peerId, int lane, std::string_view payload, bool reliable) override
     {
         sentPackets.push_back({ peerId, lane, reliable, std::string(payload) });
-        return std::find(peers_.begin(), peers_.end(), peerId) != peers_.end();
+        const bool knownPeer = std::find(peers_.begin(), peers_.end(), peerId) != peers_.end();
+        if (!knownPeer) {
+            return false;
+        }
+        return sendBehavior ? sendBehavior(peerId, lane, payload, reliable) : true;
     }
 
     void disconnectPeer(NetPeerId peerId) override
@@ -120,6 +126,7 @@ public:
     }
 
     std::vector<SentPacket> sentPackets;
+    std::function<bool(NetPeerId, int, std::string_view, bool)> sendBehavior;
 
 private:
     std::vector<NetPeerId> peers_;
@@ -162,10 +169,44 @@ std::string voiceFramePayloadText(const FrameT& frame)
 {
     if constexpr (requires { frame.data; }) {
         return frame.data;
+    } else if constexpr (requires { frame.compressedData; }) {
+        return frame.compressedData;
     } else if constexpr (requires { frame.payload; }) {
         return frame.payload;
     } else {
         return {};
+    }
+}
+
+inline int voiceFrameSenderId(const std::string& frame)
+{
+    const auto parsed = parseVoiceFramePacket(frame);
+    return parsed.has_value() ? parsed->senderId : 0;
+}
+
+template <typename FrameT>
+int voiceFrameSenderId(const FrameT& frame)
+{
+    if constexpr (requires { frame.senderId; }) {
+        return frame.senderId;
+    } else {
+        return voiceFrameSenderId(voiceFramePayloadText(frame));
+    }
+}
+
+inline int voiceFrameChannel(const std::string& frame)
+{
+    const auto parsed = parseVoiceFramePacket(frame);
+    return parsed.has_value() ? parsed->channel : 0;
+}
+
+template <typename FrameT>
+int voiceFrameChannel(const FrameT& frame)
+{
+    if constexpr (requires { frame.channel; }) {
+        return frame.channel;
+    } else {
+        return voiceFrameChannel(voiceFramePayloadText(frame));
     }
 }
 
@@ -195,6 +236,67 @@ FlightState makeFlightState(
     plane.throttle = throttle;
     plane.collisionRadius = collisionRadius;
     return plane;
+}
+
+ConstructPublishPacket makeSmokeConstructPublishPacket(
+    ConstructId constructId = 77,
+    ConstructRevisionId revisionId = 5,
+    int authorPlayerId = 2)
+{
+    ConstructPublishPacket publish;
+    publish.blueprint.constructId = constructId;
+    publish.blueprint.revisionId = revisionId;
+    publish.blueprint.label = "smoke_buggy";
+    publish.blueprint.bodyHalfExtents = { 1.55f, 0.75f, 2.85f };
+    publish.blueprint.seatOffsets = {
+        { 0.0f, 1.25f, 0.85f },
+        { 0.0f, 1.25f, -0.85f }
+    };
+    publish.blueprint.maxSpeedMps = 42.0f;
+    publish.blueprint.accelerationMps2 = 17.5f;
+    publish.blueprint.brakingMps2 = 24.0f;
+    publish.blueprint.steeringRate = 1.95f;
+    publish.blueprint.steeringAssist = 0.78f;
+    publish.blueprint.roadGrip = 1.08f;
+    publish.blueprint.offroadGrip = 0.52f;
+    publish.blueprint.maxHealth = 260.0f;
+    publish.blueprint.suspensionTravel = 0.34f;
+
+    publish.state.constructId = constructId;
+    publish.state.revisionId = revisionId;
+    publish.state.authorPlayerId = authorPlayerId;
+    publish.state.published = true;
+    publish.state.label = publish.blueprint.label;
+    return publish;
+}
+
+SharedVehicleState makeSmokeVehicleState(
+    VehicleId vehicleId = 41,
+    const ConstructBlueprint& blueprint = makeSmokeConstructPublishPacket().blueprint)
+{
+    SharedVehicleState vehicle;
+    vehicle.vehicleId = vehicleId;
+    vehicle.entityId = 900 + vehicleId;
+    vehicle.constructId = blueprint.constructId;
+    vehicle.constructRevisionId = blueprint.revisionId;
+    vehicle.authoritativeOwnerPlayerId = 1;
+    vehicle.driverPlayerId = 0;
+    vehicle.seatOccupants.assign(std::max<std::size_t>(std::size_t { 2 }, blueprint.seatOffsets.size()), 0);
+    vehicle.pos = { 84.0f, 12.5f, -36.0f };
+    vehicle.vel = { 6.5f, 0.0f, 14.0f };
+    vehicle.yawRadians = radians(38.0f);
+    vehicle.steerNormalized = -0.35f;
+    vehicle.throttleNormalized = 0.65f;
+    vehicle.roadAdhesion = 0.82f;
+    vehicle.surfaceFriction = 0.96f;
+    vehicle.health = 214.0f;
+    vehicle.maxHealth = blueprint.maxHealth;
+    vehicle.cage.heave = 0.18f;
+    vehicle.cage.pitch = -0.04f;
+    vehicle.cage.roll = 0.07f;
+    vehicle.cage.wheelCompression = { 0.14f, 0.19f, 0.11f, 0.17f };
+    vehicle.active = true;
+    return vehicle;
 }
 
 FlightRunResult runFlightSim(float frameDt, float totalTime, const FlightConfig& config)
@@ -645,7 +747,7 @@ void runAudioFrameChecks(bool& failed)
     runtime.engineThrottle = 0.58f;
     runtime.fuelRemainingKg = 120.0f;
 
-    const int engineCount = clamp(flightConfig.engineCount, 1, kMaxFlightEngines);
+    const int engineCount = std::clamp(flightConfig.engineCount, 1, kMaxFlightEngines);
     for (int i = 0; i < kMaxFlightEngines; ++i) {
         if (i < engineCount) {
             runtime.crankRpm[i] = 2140.0f;
@@ -735,6 +837,7 @@ void runAudioFrameChecks(bool& failed)
 
     GameSession session {};
     session.flightMode = false;
+    session.playerMode = PlayerMode::Walking;
     session.plane.pos = { 0.0f, 2.0f, 0.0f };
     session.plane.vel = { 0.0f, 0.0f, 0.0f };
     session.audioGunshotImpulse = 0.65f;
@@ -895,6 +998,105 @@ void runTerrainLodChecks(bool& failed)
         failed);
 
     const TerrainFieldContext terrainContext = createTerrainFieldContext(params);
+    require(
+        !terrainContext.roadPaths.empty(),
+        "Road generation regressed: default terrain context should populate at least one procedural road path",
+        failed);
+    const auto roadSpawn = findRoadSpawnSample(terrainContext, 0.0f);
+    require(roadSpawn.has_value(), "Road spawn queries regressed: no drivable spawn sample was found on the default terrain", failed);
+    if (roadSpawn.has_value()) {
+        require(terrainRoadSampleValid(*roadSpawn), "Road spawn query returned an invalid terrain-road sample", failed);
+        require(roadSpawn->widthMeters > 2.0f, "Road spawn sample should expose a usable road width", failed);
+        const Vec3 placedOnRoad = terrainRoadPlacementPosition(*roadSpawn, 1.5f, 0.75f);
+        require(
+            std::fabs(placedOnRoad.y - (roadSpawn->centerPosition.y + 0.75f)) < 1.0e-4f,
+            "Road placement helper did not preserve the requested vertical offset",
+            failed);
+        require(
+            lengthSquared(placedOnRoad - roadSpawn->centerPosition) > 0.5f,
+            "Road placement helper should honor lateral offsets away from the centerline",
+            failed);
+        const float roadFriction = terrainRoadSurfaceFriction(*roadSpawn);
+        require(roadFriction >= 0.45f && roadFriction <= 1.2f, "Road surface friction helper returned an out-of-range value", failed);
+        const float steeringAssist = terrainRoadSteeringAssist(*roadSpawn);
+        require(steeringAssist > 0.0f && steeringAssist <= 1.0f, "Road steering assist helper should report a positive normalized assist on valid roads", failed);
+
+        FlightState drivingState = makeFlightState();
+        drivingState.pos = terrainRoadPlacementPosition(*roadSpawn, 0.0f, 1.2f);
+        drivingState.rot = HostedNetworkingDetail::vehicleRotationFromYaw(std::atan2(roadSpawn->forward.x, roadSpawn->forward.z));
+        drivingState.vel = roadSpawn->forward * 18.0f;
+
+        UiState driveChaseUi = defaultUiState();
+        driveChaseUi.chaseCamera = true;
+        const Camera driveChaseCamera = buildRenderCamera(
+            drivingState,
+            terrainContext,
+            driveChaseUi,
+            PlayerMode::Driving,
+            0.0f,
+            0.0f,
+            computeWorldFarClip(defaultGraphicsSettings()));
+        require(
+            length(driveChaseCamera.pos - drivingState.pos) > 4.0f,
+            "Driving chase camera regressed back to the walking shoulder camera distance",
+            failed);
+        require(
+            driveChaseCamera.pos.y > drivingState.pos.y,
+            "Driving chase camera should sit above the vehicle seat for road visibility",
+            failed);
+
+        UiState driveCockpitUi = defaultUiState();
+        driveCockpitUi.chaseCamera = false;
+        const Camera driveCockpitCamera = buildRenderCamera(
+            drivingState,
+            terrainContext,
+            driveCockpitUi,
+            PlayerMode::Driving,
+            0.0f,
+            0.0f,
+            computeWorldFarClip(defaultGraphicsSettings()));
+        require(
+            driveCockpitCamera.pos.y < (drivingState.pos.y + 0.8f),
+            "Driving first-person camera should stay near the vehicle seat instead of using walking eye height",
+            failed);
+    }
+
+    const std::array<Vec2, 5> terrainProbePoints {
+        Vec2{ 0.0f, 0.0f },
+        Vec2{ 512.0f, 0.0f },
+        Vec2{ -512.0f, 0.0f },
+        Vec2{ 0.0f, 512.0f },
+        Vec2{ 0.0f, -512.0f }
+    };
+    float nearbyMinHeight = std::numeric_limits<float>::infinity();
+    float nearbyMaxHeight = -std::numeric_limits<float>::infinity();
+    for (const Vec2& point : terrainProbePoints) {
+        const float height = sampleGroundHeight(point.x, point.y, terrainContext);
+        nearbyMinHeight = std::min(nearbyMinHeight, height);
+        nearbyMaxHeight = std::max(nearbyMaxHeight, height);
+    }
+    require(
+        nearbyMaxHeight < 2600.0f,
+        "Default terrain regressed to extreme mountain-front heights near the playable origin",
+        failed);
+    require(
+        (nearbyMaxHeight - nearbyMinHeight) < 3200.0f,
+        "Default terrain regressed to excessive near-origin vertical relief that buries roads and spawn areas",
+        failed);
+
+    TerrainParams modifiedRoadParams = params;
+    modifiedRoadParams.roads.desiredRoadCount += 1;
+    require(
+        !terrainParamsEquivalent(params, modifiedRoadParams),
+        "Terrain parameter equivalence regressed: road-generation changes must invalidate cached terrain",
+        failed);
+
+    const WorldInfoSnapshot spawnInfo = buildWorldInfoSnapshot(params, "smoke_spawn");
+    require(
+        sampleGroundHeight(spawnInfo.spawnX, spawnInfo.spawnZ, terrainContext) > (params.waterLevel + 12.0f),
+        "Default world spawn regressed below the playable dry-ground threshold",
+        failed);
+
     const Model nearPatch = buildSurfaceTerrainPatch(
         terrainContext,
         { -64.0f, 64.0f, -64.0f, 64.0f, false, 0.0f, 0.0f, 0.0f, 0.0f },
@@ -902,6 +1104,64 @@ void runTerrainLodChecks(bool& failed)
     require(
         !nearPatch.vertices.empty() && nearPatch.vertexNormals.size() == nearPatch.vertices.size(),
         "Surface terrain patch no longer generates per-vertex normals for near-field lighting",
+        failed);
+}
+
+void runCloudFieldChecks(bool& failed)
+{
+    CloudField cloudField;
+    WindState windState {};
+    std::mt19937 rng(123456u);
+    const Vec3 focusPoint {};
+
+    initializeCloudField(cloudField, rng, focusPoint);
+    require(
+        cloudField.groups.size() == static_cast<std::size_t>(std::max(1, cloudField.groupCount)),
+        "Cloud field initialization should honor the configured group count",
+        failed);
+    require(
+        std::all_of(
+            cloudField.groups.begin(),
+            cloudField.groups.end(),
+            [](const CloudGroup& group)
+            {
+                return !group.puffs.empty() && group.renderRadius > 0.0f;
+            }),
+        "Cloud initialization should create populated volumetric groups with valid render bounds",
+        failed);
+    require(
+        std::any_of(
+            cloudField.groups.begin(),
+            cloudField.groups.end(),
+            [](const CloudGroup& group)
+            {
+                return !group.volumeModel.vertices.empty();
+            }),
+        "Cloud initialization regressed: no volumetric cloud mesh was built",
+        failed);
+
+    updateCloudField(cloudField, windState, 1.0f / 30.0f, 9.0f, focusPoint, rng);
+    updateCloudField(cloudField, windState, 1.0f / 30.0f, 30.0f, { 9000.0f, 0.0f, 0.0f }, rng);
+
+    require(
+        std::all_of(
+            cloudField.groups.begin(),
+            cloudField.groups.end(),
+            [](const CloudGroup& group)
+            {
+                return !group.puffs.empty() && group.nextMorphAt > 0.0f && group.nextMeshRebuildAt > 0.0f;
+            }),
+        "Cloud lifecycle update should keep each group scheduled for future morph/mesh work",
+        failed);
+    require(
+        std::any_of(
+            cloudField.groups.begin(),
+            cloudField.groups.end(),
+            [](const CloudGroup& group)
+            {
+                return !group.volumeModel.vertices.empty();
+            }),
+        "Cloud update/regeneration regressed: volumetric meshes disappeared after simulation",
         failed);
 }
 
@@ -932,7 +1192,8 @@ void runTerrainEditBoundsChecks(bool& failed)
     chunk.heightDeltas.assign(static_cast<std::size_t>((chunk.resolution + 1) * (chunk.resolution + 1)), 0.0f);
     chunk.revision = 1;
     chunk.materialRevision = 1;
-    chunk.volumetricOverrides.push_back({ "sphere_sub", 84.0f, -260.0f, 64.0f, 28.0f });
+    const float deepOverrideY = options.groundParams.minY - 220.0f;
+    chunk.volumetricOverrides.push_back({ "sphere_sub", 84.0f, deepOverrideY, 64.0f, 28.0f });
     require(world.applyChunkState(chunk), "Terrain edit smoke failed to inject a deep volumetric override", failed);
 
     TerrainFieldContext terrainContext = createTerrainFieldContext(options.groundParams);
@@ -1365,30 +1626,15 @@ void runTerrainDecorationChecks(bool& failed)
 
 std::string buildSmokeHelloPacket(const AvatarManifest& avatar)
 {
-    return encodePacket("HELLO", {
+    WorldKeyValueFields fields {
         { "role", sanitizeRole(avatar.role) },
         { "callsign", sanitizeCallsign(avatar.callsign) },
         { "radio", std::to_string(normalizeRadioChannel(avatar.radioChannel)) },
-        { "ptt", avatar.radioTx ? "1" : "0" },
-        { "planeModelHash", avatar.plane.modelHash },
-        { "planeScale", formatNetFloat(avatar.plane.scale) },
-        { "planeSkinHash", avatar.plane.skinHash },
-        { "planeYaw", formatNetFloat(avatar.plane.yawDegrees) },
-        { "planePitch", formatNetFloat(avatar.plane.pitchDegrees) },
-        { "planeRoll", formatNetFloat(avatar.plane.rollDegrees) },
-        { "planeOffX", formatNetFloat(avatar.plane.offset.x) },
-        { "planeOffY", formatNetFloat(avatar.plane.offset.y) },
-        { "planeOffZ", formatNetFloat(avatar.plane.offset.z) },
-        { "walkingModelHash", avatar.walking.modelHash },
-        { "walkingScale", formatNetFloat(avatar.walking.scale) },
-        { "walkingSkinHash", avatar.walking.skinHash },
-        { "walkingYaw", formatNetFloat(avatar.walking.yawDegrees) },
-        { "walkingPitch", formatNetFloat(avatar.walking.pitchDegrees) },
-        { "walkingRoll", formatNetFloat(avatar.walking.rollDegrees) },
-        { "walkingOffX", formatNetFloat(avatar.walking.offset.x) },
-        { "walkingOffY", formatNetFloat(avatar.walking.offset.y) },
-        { "walkingOffZ", formatNetFloat(avatar.walking.offset.z) }
-    });
+        { "ptt", avatar.radioTx ? "1" : "0" }
+    };
+    appendAvatarRoleConfigFields(fields, "plane", avatar.plane);
+    appendAvatarRoleConfigFields(fields, "walking", avatar.walking);
+    return encodePacket("HELLO", fields);
 }
 
 void runNetworkingSmokeChecks(bool& failed)
@@ -1401,12 +1647,20 @@ void runNetworkingSmokeChecks(bool& failed)
     avatar.plane.modelHash = "plane-alpha";
     avatar.plane.scale = 1.8f;
     avatar.plane.skinHash = "paint-alpha";
+    avatar.plane.modelFormat = "glb";
+    avatar.plane.forwardAxisYawDegrees = -32.0f;
+    avatar.plane.importRotation = quatNormalize(quatFromAxisAngle({ 0.0f, 1.0f, 0.0f }, radians(18.0f)));
     avatar.plane.yawDegrees = 12.5f;
     avatar.plane.pitchDegrees = -3.25f;
     avatar.plane.rollDegrees = 4.75f;
     avatar.walking.modelHash = "walker-alpha";
     avatar.walking.scale = 1.2f;
     avatar.walking.skinHash = "walk-paint";
+    avatar.walking.assetKey = "builtin:walking_biped";
+    avatar.walking.modelFormat = "builtin";
+    avatar.walking.forwardAxisYawDegrees = 0.0f;
+    avatar.walking.importRotation = quatIdentity();
+    avatar.walking.builtinWalkingRig = true;
 
     {
         const std::string helloPacket = buildSmokeHelloPacket(avatar);
@@ -1415,6 +1669,11 @@ void runNetworkingSmokeChecks(bool& failed)
         NetPlayerInput input {};
         input.tick = 31;
         input.role = "walking";
+        input.reportedPos = { 48.0f, 26.0f, -12.0f };
+        input.reportedRot = quatNormalize(quatFromAxisAngle({ 0.0f, 1.0f, 0.0f }, radians(32.0f)));
+        input.reportedVel = { 6.0f, 0.5f, -3.0f };
+        input.reportedAngVel = { 0.2f, 0.1f, -0.05f };
+        input.reportedSimTick = 777;
         input.walkYaw = 1.75f;
         input.walkPitch = -0.6f;
         input.throttle = 0.85f;
@@ -1428,8 +1687,19 @@ void runNetworkingSmokeChecks(bool& failed)
         input.flightThrottleUp = true;
         input.flightAirBrakes = true;
         input.flightAfterburner = true;
+        input.terrainEditOpId = 42;
         input.avatar = avatar;
         const std::string inputPacket = buildInputPacket(input);
+
+        NetPlayerInput drivingInput = input;
+        drivingInput.tick = 32;
+        drivingInput.role = "driving";
+        drivingInput.vehicleId = 17;
+        drivingInput.driveThrottle = 0.72f;
+        drivingInput.driveSteer = -0.38f;
+        drivingInput.driveBrake = true;
+        drivingInput.avatar.role = "driving";
+        const std::string drivingInputPacket = buildInputPacket(drivingInput);
 
         NetPlayerSnapshot snapshot {};
         snapshot.id = 7;
@@ -1447,12 +1717,66 @@ void runNetworkingSmokeChecks(bool& failed)
         snapshot.avatar = avatar;
         const std::string snapshotPacket = buildSnapshotPacket(snapshot);
 
+        AvatarManifest drivingAvatar = avatar;
+        drivingAvatar.role = "driving";
+        NetPlayerSnapshot drivingSnapshot = snapshot;
+        drivingSnapshot.id = 8;
+        drivingSnapshot.ack = 32;
+        drivingSnapshot.vehicleId = drivingInput.vehicleId;
+        drivingSnapshot.avatar = drivingAvatar;
+        const std::string drivingSnapshotPacket = buildSnapshotPacket(drivingSnapshot);
+
+        const ModeSwitchPacket modeSwitch {
+            44,
+            "driving",
+            38.0f,
+            14.0f,
+            -28.0f,
+            drivingInput.vehicleId,
+            0.8f,
+            -0.2f
+        };
+        const std::string modeSwitchPacket = buildModeSwitchPacket(modeSwitch);
+
+        const ConstructPublishPacket constructPublish = makeSmokeConstructPublishPacket();
+        const std::string constructPublishPacket = buildConstructPublishPacket(constructPublish);
+        SharedVehicleState vehicleState = makeSmokeVehicleState(41, constructPublish.blueprint);
+        const std::string vehicleStatePacket = buildVehicleStatePacket(vehicleState);
+        const VehicleSpawnPacket vehicleSpawn { vehicleState, "bootstrap" };
+        const std::string vehicleSpawnPacket = buildVehicleSpawnPacket(vehicleSpawn);
+        const VehicleSeatPacket vehicleSeat { vehicleState.vehicleId, 7, 0, true };
+        const std::string vehicleSeatPacket = buildVehicleSeatPacket(vehicleSeat);
+
         const std::string voicePacket = buildVoiceStatePacket({ 7, 3, true });
         VoiceFramePacket voiceFrame {};
+        voiceFrame.senderId = 7;
         voiceFrame.channel = 3;
         voiceFrame.data = std::string("VOICE_FRAME_SMOKE_PAYLOAD");
         const std::string voiceFramePacket = buildVoiceFramePacket(voiceFrame);
         const std::string craterPacket = buildCraterPacket({ 44.0f, 0.0f, -18.0f, 9.5f, 3.5f, 0.2f });
+        const TerrainEditRequest terrainEditRequest {
+            42,
+            7,
+            "terrain_add",
+            { 18.0f, 22.0f, -14.0f },
+            normalize(Vec3{ 0.0f, 1.0f, 0.25f }, { 0.0f, 1.0f, 0.0f }),
+            14.0f,
+            14.0f,
+            12.75
+        };
+        const TerrainEditAck terrainEditAck {
+            42,
+            7,
+            true,
+            "terrain_add",
+            { 18.0f, 22.0f, -14.0f },
+            14.0f,
+            14.0f,
+            3,
+            "applied"
+        };
+        const std::string terrainEditRequestPacket = buildTerrainEditRequestPacket(terrainEditRequest);
+        const std::string terrainEditAckPacket = buildTerrainEditAckPacket(terrainEditAck);
         const std::string worldInfoPacket = buildWorldInfoPacket({
             "smoke-world",
             3,
@@ -1480,6 +1804,9 @@ void runNetworkingSmokeChecks(bool& failed)
             require(parsedManifest->callsign == avatar.callsign, "Avatar manifest callsign did not round-trip", failed);
             require(parsedManifest->radioChannel == avatar.radioChannel, "Avatar manifest radio channel did not round-trip", failed);
             require(parsedManifest->plane.modelHash == avatar.plane.modelHash, "Avatar manifest plane model hash did not round-trip", failed);
+            require(parsedManifest->plane.modelFormat == avatar.plane.modelFormat, "Avatar manifest model format did not round-trip", failed);
+            require(std::fabs(parsedManifest->plane.forwardAxisYawDegrees - avatar.plane.forwardAxisYawDegrees) < 1.0e-4f, "Avatar manifest forward-axis yaw did not round-trip", failed);
+            require(parsedManifest->walking.builtinWalkingRig, "Avatar manifest walking rig flag did not round-trip", failed);
         }
 
         const auto parsedHello = parseAvatarManifestPacket("AVATAR_MANIFEST|" + helloPacket.substr(6));
@@ -1493,6 +1820,22 @@ void runNetworkingSmokeChecks(bool& failed)
             require(std::fabs(parsedInput->yokeYaw - 0.55f) < 1.0e-4f, "Input analog state did not round-trip", failed);
             require(std::fabs(parsedInput->manualElevatorTrim + 0.08f) < 1.0e-4f, "Input elevator trim did not round-trip", failed);
             require(std::fabs(parsedInput->manualRudderTrim - 0.05f) < 1.0e-4f, "Input rudder trim did not round-trip", failed);
+            require(parsedInput->reportedSimTick == 777, "Input reported sim tick did not round-trip", failed);
+            require(std::fabs(parsedInput->reportedPos.x - 48.0f) < 1.0e-4f, "Input reported position did not round-trip", failed);
+            require(std::fabs(parsedInput->reportedVel.z + 3.0f) < 1.0e-4f, "Input reported velocity did not round-trip", failed);
+            require(parsedInput->avatar.plane.modelFormat == avatar.plane.modelFormat, "Input avatar model format did not round-trip", failed);
+            require(parsedInput->avatar.walking.builtinWalkingRig, "Input avatar walking rig flag did not round-trip", failed);
+            require(parsedInput->terrainEditOpId == input.terrainEditOpId, "Input terrain edit op id did not round-trip", failed);
+        }
+
+        const auto parsedDrivingInput = parseInputPacket(drivingInputPacket);
+        require(parsedDrivingInput.has_value(), "Driving input packet did not parse", failed);
+        if (parsedDrivingInput.has_value()) {
+            require(parsedDrivingInput->role == "driving", "Driving input role did not round-trip", failed);
+            require(parsedDrivingInput->vehicleId == drivingInput.vehicleId, "Driving input vehicle id did not round-trip", failed);
+            require(std::fabs(parsedDrivingInput->driveThrottle - drivingInput.driveThrottle) < 1.0e-4f, "Driving input throttle did not round-trip", failed);
+            require(std::fabs(parsedDrivingInput->driveSteer - drivingInput.driveSteer) < 1.0e-4f, "Driving input steer did not round-trip", failed);
+            require(parsedDrivingInput->driveBrake == drivingInput.driveBrake, "Driving input brake flag did not round-trip", failed);
         }
 
         const auto parsedSnapshot = parseSnapshotPacket(snapshotPacket);
@@ -1501,6 +1844,60 @@ void runNetworkingSmokeChecks(bool& failed)
             require(parsedSnapshot->id == 7 && parsedSnapshot->ack == 31, "Snapshot ids did not round-trip", failed);
             require(parsedSnapshot->avatar.role == "walking", "Snapshot avatar role did not round-trip", failed);
             require(parsedSnapshot->avatar.radioTx, "Snapshot radio state did not round-trip", failed);
+            require(parsedSnapshot->avatar.plane.modelFormat == avatar.plane.modelFormat, "Snapshot avatar model format did not round-trip", failed);
+            require(parsedSnapshot->avatar.walking.builtinWalkingRig, "Snapshot avatar walking rig flag did not round-trip", failed);
+        }
+
+        const auto parsedDrivingSnapshot = parseSnapshotPacket(drivingSnapshotPacket);
+        require(parsedDrivingSnapshot.has_value(), "Driving snapshot packet did not parse", failed);
+        if (parsedDrivingSnapshot.has_value()) {
+            require(parsedDrivingSnapshot->avatar.role == "driving", "Driving snapshot avatar role did not round-trip", failed);
+            require(parsedDrivingSnapshot->vehicleId == drivingSnapshot.vehicleId, "Driving snapshot vehicle id did not round-trip", failed);
+        }
+
+        const auto parsedModeSwitch = parseModeSwitchPacket(modeSwitchPacket);
+        require(parsedModeSwitch.has_value(), "Mode-switch packet did not parse", failed);
+        if (parsedModeSwitch.has_value()) {
+            require(parsedModeSwitch->role == modeSwitch.role, "Mode-switch role did not round-trip", failed);
+            require(parsedModeSwitch->vehicleId == modeSwitch.vehicleId, "Mode-switch vehicle id did not round-trip", failed);
+            require(std::fabs(parsedModeSwitch->walkYaw - modeSwitch.walkYaw) < 1.0e-4f, "Mode-switch walk yaw did not round-trip", failed);
+            require(std::fabs(parsedModeSwitch->walkPitch - modeSwitch.walkPitch) < 1.0e-4f, "Mode-switch walk pitch did not round-trip", failed);
+        }
+
+        const auto parsedConstructPublish = parseConstructPublishPacket(constructPublishPacket);
+        require(parsedConstructPublish.has_value(), "Construct publish packet did not parse", failed);
+        if (parsedConstructPublish.has_value()) {
+            require(parsedConstructPublish->blueprint.constructId == constructPublish.blueprint.constructId, "Construct publish id did not round-trip", failed);
+            require(parsedConstructPublish->state.authorPlayerId == constructPublish.state.authorPlayerId, "Construct publish author id did not round-trip", failed);
+            require(parsedConstructPublish->blueprint.seatOffsets.size() == constructPublish.blueprint.seatOffsets.size(), "Construct publish seat offsets did not round-trip", failed);
+            require(std::fabs(parsedConstructPublish->blueprint.suspensionTravel - constructPublish.blueprint.suspensionTravel) < 1.0e-4f, "Construct publish suspension travel did not round-trip", failed);
+        }
+
+        const auto parsedVehicleState = parseVehicleStatePacket(vehicleStatePacket);
+        require(parsedVehicleState.has_value(), "Vehicle state packet did not parse", failed);
+        if (parsedVehicleState.has_value()) {
+            require(parsedVehicleState->vehicleId == vehicleState.vehicleId, "Vehicle state id did not round-trip", failed);
+            require(parsedVehicleState->seatOccupants == vehicleState.seatOccupants, "Vehicle seat occupancy did not round-trip", failed);
+            require(std::fabs(parsedVehicleState->surfaceFriction - vehicleState.surfaceFriction) < 1.0e-4f, "Vehicle state friction did not round-trip", failed);
+            require(std::fabs(parsedVehicleState->cage.heave - vehicleState.cage.heave) < 1.0e-4f, "Vehicle cage heave did not round-trip", failed);
+            require(std::fabs(parsedVehicleState->cage.wheelCompression[1] - vehicleState.cage.wheelCompression[1]) < 1.0e-4f, "Vehicle cage wheel compression did not round-trip", failed);
+        }
+
+        const auto parsedVehicleSpawn = parseVehicleSpawnPacket(vehicleSpawnPacket);
+        require(parsedVehicleSpawn.has_value(), "Vehicle spawn packet did not parse", failed);
+        if (parsedVehicleSpawn.has_value()) {
+            require(parsedVehicleSpawn->reason == vehicleSpawn.reason, "Vehicle spawn reason did not round-trip", failed);
+            require(parsedVehicleSpawn->state.vehicleId == vehicleState.vehicleId, "Vehicle spawn state did not round-trip", failed);
+            require(std::fabs(parsedVehicleSpawn->state.cage.roll - vehicleState.cage.roll) < 1.0e-4f, "Vehicle spawn cage roll did not round-trip", failed);
+        }
+
+        const auto parsedVehicleSeat = parseVehicleSeatPacket(vehicleSeatPacket);
+        require(parsedVehicleSeat.has_value(), "Vehicle seat packet did not parse", failed);
+        if (parsedVehicleSeat.has_value()) {
+            require(parsedVehicleSeat->vehicleId == vehicleSeat.vehicleId, "Vehicle seat vehicle id did not round-trip", failed);
+            require(parsedVehicleSeat->playerId == vehicleSeat.playerId, "Vehicle seat player id did not round-trip", failed);
+            require(parsedVehicleSeat->seatIndex == vehicleSeat.seatIndex, "Vehicle seat index did not round-trip", failed);
+            require(parsedVehicleSeat->entering == vehicleSeat.entering, "Vehicle seat enter/exit flag did not round-trip", failed);
         }
 
         const auto parsedVoice = parseVoiceStatePacket(voicePacket);
@@ -1508,14 +1905,46 @@ void runNetworkingSmokeChecks(bool& failed)
 
         const auto parsedVoiceFrame = parseVoiceFramePacket(voiceFramePacket);
         require(parsedVoiceFrame.has_value(), "Voice frame packet did not parse", failed);
-        require(voiceFramePacket.find("sender=") == std::string::npos, "Voice frame packet should not include a sender id", failed);
+        require(voiceFramePacket.find("id=") != std::string::npos, "Voice frame packet should include a sender id", failed);
         if (parsedVoiceFrame.has_value()) {
+            require(parsedVoiceFrame->senderId == voiceFrame.senderId, "Voice frame sender id did not round-trip", failed);
             require(parsedVoiceFrame->channel == voiceFrame.channel, "Voice frame channel did not round-trip", failed);
             require(parsedVoiceFrame->data == voiceFrame.data, "Voice frame payload did not round-trip", failed);
         }
 
         const auto parsedCrater = parseCraterPacket(craterPacket);
         require(parsedCrater.has_value() && std::fabs(parsedCrater->radius - 9.5f) < 1.0e-4f, "Crater packet did not round-trip", failed);
+
+        require(
+            terrainEditRequestPacket.find("TERRAIN_EDIT_REQUEST|") == 0,
+            "Terrain edit request packet should keep its packet type prefix",
+            failed);
+        const auto parsedTerrainEditRequest = parseTerrainEditRequestPacket(terrainEditRequestPacket);
+        require(parsedTerrainEditRequest.has_value(), "Terrain edit request packet did not parse", failed);
+        if (parsedTerrainEditRequest.has_value()) {
+            require(parsedTerrainEditRequest->opId == terrainEditRequest.opId, "Terrain edit request op id did not round-trip", failed);
+            require(parsedTerrainEditRequest->playerId == terrainEditRequest.playerId, "Terrain edit request player id did not round-trip", failed);
+            require(parsedTerrainEditRequest->kind == terrainEditRequest.kind, "Terrain edit request kind did not round-trip", failed);
+            require(std::fabs(parsedTerrainEditRequest->center.x - terrainEditRequest.center.x) < 1.0e-4f, "Terrain edit request center did not round-trip", failed);
+            require(std::fabs(parsedTerrainEditRequest->radius - terrainEditRequest.radius) < 1.0e-4f, "Terrain edit request radius did not round-trip", failed);
+            require(std::fabs(parsedTerrainEditRequest->magnitude - terrainEditRequest.magnitude) < 1.0e-4f, "Terrain edit request magnitude did not round-trip", failed);
+            require(std::fabs(parsedTerrainEditRequest->requestedAt - terrainEditRequest.requestedAt) < 1.0e-4, "Terrain edit request timestamp did not round-trip", failed);
+        }
+
+        require(
+            terrainEditAckPacket.find("TERRAIN_EDIT_ACK|") == 0,
+            "Terrain edit ack packet should keep its packet type prefix",
+            failed);
+        const auto parsedTerrainEditAck = parseTerrainEditAckPacket(terrainEditAckPacket);
+        require(parsedTerrainEditAck.has_value(), "Terrain edit ack packet did not parse", failed);
+        if (parsedTerrainEditAck.has_value()) {
+            require(parsedTerrainEditAck->opId == terrainEditAck.opId, "Terrain edit ack op id did not round-trip", failed);
+            require(parsedTerrainEditAck->playerId == terrainEditAck.playerId, "Terrain edit ack player id did not round-trip", failed);
+            require(parsedTerrainEditAck->accepted == terrainEditAck.accepted, "Terrain edit ack accepted flag did not round-trip", failed);
+            require(parsedTerrainEditAck->kind == terrainEditAck.kind, "Terrain edit ack kind did not round-trip", failed);
+            require(parsedTerrainEditAck->touchedChunks == terrainEditAck.touchedChunks, "Terrain edit ack chunk count did not round-trip", failed);
+            require(parsedTerrainEditAck->reason == terrainEditAck.reason, "Terrain edit ack reason did not round-trip", failed);
+        }
 
         const auto parsedWorldInfo = parseWorldInfoPacket(worldInfoPacket);
         require(parsedWorldInfo.has_value(), "World info packet did not parse", failed);
@@ -1599,6 +2028,425 @@ void runNetworkingSmokeChecks(bool& failed)
     }
 
     {
+        auto clientTransport = std::make_shared<RecordingTransport>(std::vector<NetPeerId> { 1 });
+        ClientReplicationState client {};
+        client.transport = clientTransport;
+        client.serverPeerId = 1;
+        client.outboundReliable.push_back("HELLO|callsign=Pilot");
+        client.outboundReliable.push_back("BLOB_META|kind=model:glb|hash=blob-a|ownerId=9|role=plane|modelHash=blob-a|rawBytes=12|encodedBytes=16|chunkSize=8|chunkCount=2");
+        client.outboundReliable.push_back("BLOB_CHUNK|kind=model:glb|hash=blob-a|idx=1|data=QUJDREVGR0g=");
+        client.outboundReliable.push_back("BLOB_CHUNK|kind=model:glb|hash=blob-a|idx=2|data=SUpLTE1O");
+
+        bool failNextBlobChunk = true;
+        clientTransport->sendBehavior =
+            [&failNextBlobChunk](NetPeerId, int, std::string_view payload, bool) {
+                const std::string type = HostedNetworkingDetail::packetType(std::string(payload));
+                if (failNextBlobChunk && type == "BLOB_CHUNK") {
+                    failNextBlobChunk = false;
+                    return false;
+                }
+                return true;
+            };
+
+        flushClientOutbound(client, 1.0);
+
+        require(client.outboundReliable.size() == 2u, "Reliable blob packets should remain queued after the first paced blob flush", failed);
+        if (client.outboundReliable.size() == 2u) {
+            require(
+                HostedNetworkingDetail::packetType(client.outboundReliable[0]) == "BLOB_CHUNK" &&
+                    HostedNetworkingDetail::packetType(client.outboundReliable[1]) == "BLOB_CHUNK",
+                "Reliable blob retry queue should keep the failed chunk and the remaining chunks",
+                failed);
+        }
+
+        clientTransport->clearSentPackets();
+        flushClientOutbound(client, 1.5);
+        require(client.outboundReliable.size() == 2u, "Reliable blob packets should remain queued after the first deferred chunk fails", failed);
+        flushClientOutbound(client, 1.76);
+        flushClientOutbound(client, 1.78);
+        require(client.outboundReliable.empty(), "Reliable blob retry queue did not drain after the transport recovered", failed);
+        require(clientTransport->sentPackets.size() >= 2u, "Reliable blob retry should resend the deferred chunk packets", failed);
+    }
+
+    {
+        auto clientTransport = std::make_shared<RecordingTransport>(std::vector<NetPeerId> { 1 });
+        ClientReplicationState client {};
+        client.transport = clientTransport;
+        client.serverPeerId = 1;
+
+        const std::string blobData(2048u, 'A');
+        for (int index = 1; index <= 80; ++index) {
+            client.outboundReliable.push_back(
+                "BLOB_CHUNK|kind=model:glb|hash=blob-b|idx=" + std::to_string(index) + "|data=" + blobData);
+        }
+
+        flushClientOutbound(client, 2.0);
+
+        require(
+            !client.outboundReliable.empty() && client.outboundReliable.size() < 80u,
+            "Large reliable blob flushes should be paced across frames instead of draining in one burst",
+            failed);
+    }
+
+    {
+        auto hostTransport = std::make_shared<RecordingTransport>(std::vector<NetPeerId> { 1 });
+        HostedWorldServer server(hostTransport);
+
+        AvatarBlobRecord record;
+        record.kind = "model:glb";
+        record.raw = std::string(30000u, 'B');
+        record.hash = sha256Hex(record.raw);
+        record.meta.kind = record.kind;
+        record.meta.hash = record.hash;
+        record.meta.modelHash = record.hash;
+        record.meta.ownerId = "host";
+        record.meta.role = "plane";
+        server.cacheBlob(record);
+
+        const TerrainParams terrain = defaultTerrainParams();
+        const TerrainFieldContext terrainContext = createTerrainFieldContext(terrain);
+        hostTransport->pushMessage(1, static_cast<int>(TransportLane::Control), buildBlobRequestPacket(record.kind, record.hash), true);
+        server.serviceIncoming(terrain, terrainContext, nullptr);
+
+        server.update(1.0, 1.0f / 60.0f, terrainContext, defaultFlightConfig(), {}, nullptr);
+        require(
+            hostTransport->sentPackets.size() == 1u,
+            "Hosted blob replies should be paced instead of sending the entire transfer in one update",
+            failed);
+
+        server.update(1.01, 1.0f / 60.0f, terrainContext, defaultFlightConfig(), {}, nullptr);
+        require(
+            hostTransport->sentPackets.size() == 1u,
+            "Hosted blob pacing should respect the inter-flush interval",
+            failed);
+
+        server.update(1.02, 1.0f / 60.0f, terrainContext, defaultFlightConfig(), {}, nullptr);
+        require(
+            hostTransport->sentPackets.size() > 1u,
+            "Hosted blob pacing should resume on the next allowed flush window",
+            failed);
+    }
+
+    {
+        auto clientTransport = std::make_shared<RecordingTransport>(std::vector<NetPeerId> { 1 });
+        ClientReplicationState client {};
+        client.transport = clientTransport;
+        TerrainParams mirroredTerrain = defaultTerrainParams();
+        (void)clientTransport->poll();
+        const std::string rawBlob = std::string("SMOKE_REMOTE_MODEL");
+        const std::string remoteModelHash = sha256Hex(rawBlob);
+
+        AvatarManifest remoteAvatar = avatar;
+        remoteAvatar.role = "plane";
+        remoteAvatar.plane.modelFormat = "glb";
+        remoteAvatar.plane.modelHash = remoteModelHash;
+        clientTransport->pushMessage(1, static_cast<int>(TransportLane::Control), buildAvatarManifestPacket(12, remoteAvatar), true);
+
+        serviceClientReplication(client, 3.0, mirroredTerrain, nullptr, nullptr);
+
+        require(
+            client.peers.find(12) != client.peers.end() && client.peers[12].connected,
+            "Client replication did not keep the remote avatar manifest peer",
+            failed);
+        require(client.outboundReliable.size() == 1u, "Remote avatar manifest should queue exactly one blob request", failed);
+        if (client.outboundReliable.size() == 1u) {
+            require(
+                HostedNetworkingDetail::packetType(client.outboundReliable.front()) == "BLOB_REQUEST",
+                "Remote avatar manifest should queue a BLOB_REQUEST",
+                failed);
+            const auto requestFields = parseKeyValueFields(splitPacketFields(client.outboundReliable.front()));
+            require(requestFields["kind"] == "model:glb", "Queued blob request kind did not match the remote avatar format", failed);
+            require(requestFields["hash"] == remoteAvatar.plane.modelHash, "Queued blob request hash did not match the remote avatar model hash", failed);
+        }
+        require(
+            client.nextBlobRequestAtByKey.find(blobTransferKey("model:glb", remoteAvatar.plane.modelHash)) != client.nextBlobRequestAtByKey.end(),
+            "Blob request rate limiter did not track the requested remote model",
+            failed);
+
+        BlobSyncState transferState = createBlobSyncState();
+        BlobMetaPacket baseMeta;
+        baseMeta.ownerId = "12";
+        baseMeta.role = "plane";
+        baseMeta.modelHash = remoteAvatar.plane.modelHash;
+        const BlobOutgoingTransfer outgoing = prepareOutgoingBlobTransfer(
+            transferState,
+            "model:glb",
+            remoteAvatar.plane.modelHash,
+            rawBlob,
+            baseMeta,
+            8);
+        clientTransport->pushMessage(
+            1,
+            static_cast<int>(TransportLane::Blob),
+            encodePacket("BLOB_META", {
+                { "kind", outgoing.meta.kind },
+                { "hash", outgoing.meta.hash },
+                { "ownerId", outgoing.meta.ownerId },
+                { "role", outgoing.meta.role },
+                { "modelHash", outgoing.meta.modelHash },
+                { "rawBytes", std::to_string(outgoing.meta.rawBytes) },
+                { "encodedBytes", std::to_string(outgoing.meta.encodedBytes) },
+                { "chunkSize", std::to_string(outgoing.meta.chunkSize) },
+                { "chunkCount", std::to_string(outgoing.meta.chunkCount) }
+            }),
+            true);
+        for (int index = 0; index < outgoing.chunkCount; ++index) {
+            clientTransport->pushMessage(
+                1,
+                static_cast<int>(TransportLane::Blob),
+                encodePacket("BLOB_CHUNK", {
+                    { "kind", outgoing.kind },
+                    { "hash", outgoing.hash },
+                    { "idx", std::to_string(index + 1) },
+                    { "data", outgoing.chunks[static_cast<std::size_t>(index)] }
+                }),
+                true);
+        }
+
+        serviceClientReplication(client, 4.0, mirroredTerrain, nullptr, nullptr);
+
+        require(client.blobCache.has("model:glb", remoteAvatar.plane.modelHash), "Client blob cache did not store the remote avatar model", failed);
+        if (const AvatarBlobRecord* cached = client.blobCache.get("model:glb", remoteAvatar.plane.modelHash); cached != nullptr) {
+            require(cached->meta.modelHash == remoteAvatar.plane.modelHash, "Cached remote avatar model hash did not match the manifest", failed);
+        } else {
+            require(false, "Client blob cache lookup failed for the remote avatar model", failed);
+        }
+        if (const auto statusIt = client.blobStatusByKey.find(blobTransferKey("model:glb", remoteAvatar.plane.modelHash));
+            statusIt != client.blobStatusByKey.end()) {
+            require(statusIt->second.phase == BlobTransferPhase::Received, "Remote avatar blob transfer did not reach the received phase", failed);
+        } else {
+            require(false, "Client blob status was not tracked for the remote avatar model", failed);
+        }
+
+        client.outboundReliable.clear();
+        clientTransport->pushMessage(1, static_cast<int>(TransportLane::Control), buildAvatarManifestPacket(12, remoteAvatar), true);
+        serviceClientReplication(client, 5.0, mirroredTerrain, nullptr, nullptr);
+        require(client.outboundReliable.empty(), "Client should not re-request a cached remote avatar blob", failed);
+    }
+
+    {
+        auto hostTransport = std::make_shared<RecordingTransport>(std::vector<NetPeerId> { 1 });
+        HostedWorldServer server(hostTransport);
+        const TerrainParams terrain = defaultTerrainParams();
+        const TerrainFieldContext terrainContext = createTerrainFieldContext(terrain);
+
+        server.serviceIncoming(terrain, terrainContext, nullptr);
+
+        TerrainEditRequest request;
+        request.opId = 91;
+        request.kind = "terrain_remove";
+        request.center = { 12.0f, 6.0f, -4.0f };
+        request.radius = 12.0f;
+        request.magnitude = -15.0f;
+        request.requestedAt = 2.5;
+        hostTransport->pushMessage(1, static_cast<int>(TransportLane::Control), buildTerrainEditRequestPacket(request), true);
+        server.serviceIncoming(terrain, terrainContext, nullptr);
+
+        const std::vector<HostedTerrainEditRequest> pendingTerrainEdits = server.drainPendingTerrainEdits();
+        require(pendingTerrainEdits.size() == 1u, "Hosted server did not queue exactly one terrain edit request", failed);
+        if (pendingTerrainEdits.size() == 1u) {
+            require(pendingTerrainEdits.front().peerId == 1, "Hosted terrain edit request did not preserve the sender peer id", failed);
+            require(pendingTerrainEdits.front().request.opId == request.opId, "Hosted terrain edit request op id did not round-trip through the queue", failed);
+            require(pendingTerrainEdits.front().request.playerId == 2, "Hosted terrain edit request should be rewritten to the authoritative player id", failed);
+            require(pendingTerrainEdits.front().request.kind == request.kind, "Hosted terrain edit request kind did not survive queueing", failed);
+        }
+    }
+
+    {
+        auto clientTransport = std::make_shared<RecordingTransport>(std::vector<NetPeerId> { 1 });
+        ClientReplicationState client {};
+        client.transport = clientTransport;
+        TerrainEditRequest pendingTerrainEdit;
+        pendingTerrainEdit.opId = 91;
+        pendingTerrainEdit.playerId = 2;
+        pendingTerrainEdit.kind = "terrain_remove";
+        pendingTerrainEdit.center = { 12.0f, 6.0f, -4.0f };
+        pendingTerrainEdit.radius = 12.0f;
+        pendingTerrainEdit.magnitude = -15.0f;
+        pendingTerrainEdit.requestedAt = 2.5;
+        TerrainEditAck appliedTerrainEditAck;
+        appliedTerrainEditAck.opId = pendingTerrainEdit.opId;
+        appliedTerrainEditAck.playerId = pendingTerrainEdit.playerId;
+        appliedTerrainEditAck.accepted = true;
+        appliedTerrainEditAck.kind = pendingTerrainEdit.kind;
+        appliedTerrainEditAck.center = pendingTerrainEdit.center;
+        appliedTerrainEditAck.radius = pendingTerrainEdit.radius;
+        appliedTerrainEditAck.magnitude = pendingTerrainEdit.magnitude;
+        appliedTerrainEditAck.touchedChunks = 3;
+        appliedTerrainEditAck.reason = "applied";
+        client.pendingTerrainEditsById[pendingTerrainEdit.opId] = pendingTerrainEdit;
+        TerrainParams mirroredTerrain = defaultTerrainParams();
+        clientTransport->pushMessage(1, static_cast<int>(TransportLane::Control), buildTerrainEditAckPacket(appliedTerrainEditAck), true);
+
+        serviceClientReplication(client, 6.0, mirroredTerrain, nullptr, nullptr);
+
+        require(client.pendingTerrainEditsById.empty(), "Terrain edit ack should retire the pending terrain edit request", failed);
+        require(client.terrainEditAcks.size() == 1u, "Terrain edit ack should be queued for the app layer", failed);
+        if (client.terrainEditAcks.size() == 1u) {
+            require(client.terrainEditAcks.front().accepted, "Queued terrain edit ack should preserve acceptance state", failed);
+            require(client.terrainEditAcks.front().reason == appliedTerrainEditAck.reason, "Queued terrain edit ack should preserve the reason text", failed);
+        }
+    }
+
+    {
+        auto clientTransport = std::make_shared<RecordingTransport>(std::vector<NetPeerId> { 1 });
+        ClientReplicationState client {};
+        client.transport = clientTransport;
+        client.localAvatar = avatar;
+        TerrainParams mirroredTerrain = defaultTerrainParams();
+        RemotePeerState localPeer;
+
+        NetPlayerSnapshot localSnapshot {};
+        localSnapshot.id = 9;
+        localSnapshot.ack = 14;
+        localSnapshot.pos = { 180.0f, 240.0f, -96.0f };
+        localSnapshot.rot = quatNormalize(quatFromAxisAngle({ 0.0f, 1.0f, 0.0f }, radians(26.0f)));
+        localSnapshot.vel = { 12.0f, 0.0f, 44.0f };
+        localSnapshot.angVel = { 0.0f, 0.3f, 0.0f };
+        localSnapshot.simTick = 901;
+        localSnapshot.timestamp = 4.0;
+        localSnapshot.avatar = avatar;
+
+        clientTransport->pushMessage(1, static_cast<int>(TransportLane::Snapshot), buildSnapshotPacket(localSnapshot), false);
+        clientTransport->pushMessage(1, static_cast<int>(TransportLane::Control), buildJoinOkPacket(9), true);
+
+        serviceClientReplication(client, 4.0, mirroredTerrain, nullptr, &localPeer);
+
+        require(client.joinAcknowledged && client.localPlayerId == 9, "Client replication did not accept JOIN_OK for the local player", failed);
+        require(client.peers.find(9) == client.peers.end(), "Client replication should not keep a stale remote peer entry for the local player id", failed);
+        require(localPeer.id == 9 && localPeer.connected, "Client replication should keep the local peer identity after JOIN_OK", failed);
+    }
+
+    {
+        auto clientTransport = std::make_shared<RecordingTransport>(std::vector<NetPeerId> { 1 });
+        ClientReplicationState client {};
+        client.transport = clientTransport;
+        TerrainParams mirroredTerrain = defaultTerrainParams();
+        const ConstructPublishPacket publish = makeSmokeConstructPublishPacket(104, 6, 3);
+        SharedVehicleState replicatedVehicle = makeSmokeVehicleState(88, publish.blueprint);
+        replicatedVehicle.vel = { 9.0f, 0.0f, 5.0f };
+        replicatedVehicle.cage.roll = 0.11f;
+        const VehicleSeatPacket enterSeat { replicatedVehicle.vehicleId, 9, 0, true };
+        const VehicleSeatPacket exitSeat { replicatedVehicle.vehicleId, 9, 0, false };
+
+        clientTransport->pushMessage(1, static_cast<int>(TransportLane::Control), buildConstructPublishPacket(publish), true);
+        clientTransport->pushMessage(1, static_cast<int>(TransportLane::Control), buildVehicleSpawnPacket({ replicatedVehicle, "bootstrap" }), true);
+        clientTransport->pushMessage(1, static_cast<int>(TransportLane::Snapshot), buildVehicleStatePacket(replicatedVehicle), false);
+        clientTransport->pushMessage(1, static_cast<int>(TransportLane::Control), buildVehicleSeatPacket(enterSeat), true);
+
+        serviceClientReplication(client, 7.0, mirroredTerrain, nullptr, nullptr);
+
+        require(
+            client.constructBlueprints.find(publish.blueprint.constructId) != client.constructBlueprints.end(),
+            "Client replication did not store replicated construct blueprints",
+            failed);
+        require(
+            client.constructStates.find(publish.state.constructId) != client.constructStates.end(),
+            "Client replication did not store replicated construct state",
+            failed);
+        require(
+            client.sharedVehicles.find(replicatedVehicle.vehicleId) != client.sharedVehicles.end(),
+            "Client replication did not store replicated shared vehicles",
+            failed);
+        if (const auto vehicleIt = client.sharedVehicles.find(replicatedVehicle.vehicleId); vehicleIt != client.sharedVehicles.end()) {
+            require(vehicleIt->second.driverPlayerId == enterSeat.playerId, "Client replication did not apply vehicle seat-enter events", failed);
+            require(
+                !vehicleIt->second.seatOccupants.empty() && vehicleIt->second.seatOccupants.front() == enterSeat.playerId,
+                "Client replication did not track the occupied driver seat",
+                failed);
+            require(std::fabs(vehicleIt->second.cage.roll - replicatedVehicle.cage.roll) < 1.0e-4f, "Client replication lost replicated soft-body cage state", failed);
+        }
+
+        clientTransport->pushMessage(1, static_cast<int>(TransportLane::Control), buildVehicleSeatPacket(exitSeat), true);
+        serviceClientReplication(client, 8.0, mirroredTerrain, nullptr, nullptr);
+        if (const auto vehicleIt = client.sharedVehicles.find(replicatedVehicle.vehicleId); vehicleIt != client.sharedVehicles.end()) {
+            require(vehicleIt->second.driverPlayerId == 0, "Client replication did not clear the driver id on vehicle exit", failed);
+            require(
+                !vehicleIt->second.seatOccupants.empty() && vehicleIt->second.seatOccupants.front() == 0,
+                "Client replication did not clear the occupied seat on vehicle exit",
+                failed);
+        }
+    }
+
+    {
+        auto hostTransport = std::make_shared<RecordingTransport>(std::vector<NetPeerId> { 1 });
+        HostedWorldServer server(hostTransport);
+        const TerrainParams terrain = defaultTerrainParams();
+        const TerrainFieldContext terrainContext = createTerrainFieldContext(terrain);
+        const ConstructPublishPacket publish = makeSmokeConstructPublishPacket(133, 9, 1);
+        SharedVehicleState vehicle = makeSmokeVehicleState(1337, publish.blueprint);
+        server.setSharedWorldState(
+            { { publish.blueprint.constructId, publish.blueprint } },
+            { { publish.state.constructId, publish.state } },
+            { { vehicle.vehicleId, vehicle } });
+
+        server.serviceIncoming(terrain, terrainContext, nullptr);
+        hostTransport->pushMessage(1, static_cast<int>(TransportLane::Control), buildSmokeHelloPacket(avatar), true);
+        server.serviceIncoming(terrain, terrainContext, nullptr);
+
+        hostTransport->clearSentPackets();
+        const VehicleSeatPacket enterSeat { vehicle.vehicleId, 2, 0, true };
+        hostTransport->pushMessage(1, static_cast<int>(TransportLane::Control), buildVehicleSeatPacket(enterSeat), true);
+        server.serviceIncoming(terrain, terrainContext, nullptr);
+
+        require(
+            server.sharedVehicles().find(vehicle.vehicleId) != server.sharedVehicles().end(),
+            "Hosted vehicle enter test lost the shared vehicle state",
+            failed);
+        if (const auto vehicleIt = server.sharedVehicles().find(vehicle.vehicleId); vehicleIt != server.sharedVehicles().end()) {
+            require(vehicleIt->second.driverPlayerId == 2, "Hosted server did not apply driver seat entry", failed);
+            require(
+                !vehicleIt->second.seatOccupants.empty() && vehicleIt->second.seatOccupants.front() == 2,
+                "Hosted server did not mark the occupied driver seat",
+                failed);
+        }
+        if (const HostedPlayerState* player = mutableHostedPlayer(server, 2); player != nullptr) {
+            require(player->mode == PlayerMode::Driving, "Hosted server did not switch the entering player into driving mode", failed);
+            require(player->vehicleId == vehicle.vehicleId, "Hosted server did not bind the entering player to the active vehicle", failed);
+        } else {
+            require(false, "Hosted vehicle enter test could not find the replicated player state", failed);
+        }
+        require(
+            std::any_of(
+                hostTransport->sentPackets.begin(),
+                hostTransport->sentPackets.end(),
+                [&enterSeat](const RecordingTransport::SentPacket& packet) {
+                    return packet.peerId == 1 &&
+                        packet.lane == static_cast<int>(TransportLane::Control) &&
+                        packet.payload == buildVehicleSeatPacket(enterSeat);
+                }),
+            "Hosted server did not relay vehicle seat-enter packets back to connected peers",
+            failed);
+
+        hostTransport->clearSentPackets();
+        const VehicleSeatPacket exitSeat { vehicle.vehicleId, 2, 0, false };
+        hostTransport->pushMessage(1, static_cast<int>(TransportLane::Control), buildVehicleSeatPacket(exitSeat), true);
+        server.serviceIncoming(terrain, terrainContext, nullptr);
+        if (const auto vehicleIt = server.sharedVehicles().find(vehicle.vehicleId); vehicleIt != server.sharedVehicles().end()) {
+            require(vehicleIt->second.driverPlayerId == 0, "Hosted server did not clear the driver on vehicle exit", failed);
+            require(
+                !vehicleIt->second.seatOccupants.empty() && vehicleIt->second.seatOccupants.front() == 0,
+                "Hosted server did not clear the occupied seat on vehicle exit",
+                failed);
+        }
+        if (const HostedPlayerState* player = mutableHostedPlayer(server, 2); player != nullptr) {
+            require(player->mode == PlayerMode::Walking, "Hosted server did not return the exiting player to walking mode", failed);
+            require(player->vehicleId == 0, "Hosted server did not clear the exiting player's active vehicle id", failed);
+        }
+        require(
+            std::any_of(
+                hostTransport->sentPackets.begin(),
+                hostTransport->sentPackets.end(),
+                [&exitSeat](const RecordingTransport::SentPacket& packet) {
+                    return packet.peerId == 1 &&
+                        packet.lane == static_cast<int>(TransportLane::Control) &&
+                        packet.payload == buildVehicleSeatPacket(exitSeat);
+                }),
+            "Hosted server did not relay vehicle seat-exit packets back to connected peers",
+            failed);
+    }
+
+    {
         const std::filesystem::path root = repoRoot();
         const std::filesystem::path tempRoot = root / "build/native-smoke-net-temp";
         std::error_code ec;
@@ -1614,7 +2462,24 @@ void runNetworkingSmokeChecks(bool& failed)
         hostOptions.groundParams = defaultTerrainParams();
         hostOptions.groundParams.seed = 9090;
         hostOptions.groundParams.chunkSize = 128.0f;
+        hostOptions.groundParams.worldRadius = 48000.0f;
+        hostOptions.groundParams.minY = -2200.0f;
+        hostOptions.groundParams.maxY = 22000.0f;
+        hostOptions.groundParams.baseHeight = -180.0f;
+        hostOptions.groundParams.waterLevel = -24.0f;
+        hostOptions.groundParams.heightAmplitude = 6200.0f;
+        hostOptions.groundParams.heightFrequency = 0.00021f;
+        hostOptions.groundParams.macroWarpAmplitude = 4100.0f;
+        hostOptions.groundParams.caveEnabled = true;
+        hostOptions.groundParams.caveStrength = 58.0f;
         hostOptions.groundParams.tunnelCount = 1;
+        hostOptions.groundParams.mountainFront.coastalBandEnd = 21000.0f;
+        hostOptions.groundParams.roads.desiredRoadCount = 3;
+        hostOptions.groundParams.roads.stepMeters = 36.0f;
+        TerrainRoadPath explicitRoad;
+        explicitRoad.nodes.push_back({ { -220.0f, 420.0f, 900.0f }, { 1.0f, 0.0f, 0.0f }, 10.2f, 18.0f, 0.03f, 0.0f });
+        explicitRoad.nodes.push_back({ { 120.0f, 435.0f, 1120.0f }, { 0.9f, 0.0f, 0.3f }, 10.2f, 18.0f, 0.04f, 0.01f });
+        hostOptions.groundParams.explicitRoadPaths.push_back(explicitRoad);
 
         WorldStoreOptions mirrorOptions = hostOptions;
         mirrorOptions.name = "net_client";
@@ -1638,7 +2503,18 @@ void runNetworkingSmokeChecks(bool& failed)
 
         auto [hostTransport, clientTransport] = LoopbackTransport::createLinkedPair();
         HostedWorldServer server(hostTransport);
-        server.setLocalAuthoritativeState(makeFlightState({ 0.0f, 220.0f, 0.0f }), FlightRuntimeState {}, false, 0.0f, 0.0f, avatar);
+        const ConstructPublishPacket sharedConstruct = makeSmokeConstructPublishPacket(91, 12, 1);
+        SharedVehicleState sharedVehicle = makeSmokeVehicleState(64, sharedConstruct.blueprint);
+        sharedVehicle.pos = { -120.0f, 14.0f, 980.0f };
+        sharedVehicle.vel = { 4.0f, 0.0f, 9.5f };
+        sharedVehicle.cage.heave = 0.22f;
+        sharedVehicle.cage.pitch = 0.05f;
+        sharedVehicle.cage.roll = -0.03f;
+        server.setSharedWorldState(
+            { { sharedConstruct.blueprint.constructId, sharedConstruct.blueprint } },
+            { { sharedConstruct.state.constructId, sharedConstruct.state } },
+            { { sharedVehicle.vehicleId, sharedVehicle } });
+        server.setLocalAuthoritativeState(makeFlightState({ 0.0f, 220.0f, 0.0f }), FlightRuntimeState {}, PlayerMode::Walking, 0, 0.0f, 0.0f, avatar);
         const TerrainFieldContext hostTerrainContext = createTerrainFieldContext(hostOptions.groundParams);
 
         (void)clientTransport->poll();
@@ -1652,6 +2528,8 @@ void runNetworkingSmokeChecks(bool& failed)
         bool sawWorldInfo = false;
         bool sawWorldSync = false;
         bool sawChunk = false;
+        bool sawConstructPublish = false;
+        bool sawVehicleSpawn = false;
         TerrainParams mirroredTerrain = defaultTerrainParams();
         for (const NetEvent& event : bootstrapEvents) {
             if (event.type != NetEvent::Type::Message) {
@@ -1669,18 +2547,30 @@ void runNetworkingSmokeChecks(bool& failed)
                 }
             } else if (type == "WORLD_SYNC") {
                 sawWorldSync = true;
-                const auto kv = parseKeyValueFields(splitPacketFields(event.payload));
-                mirroredTerrain.seed = std::max(1, std::atoi(kv["seed"].c_str()));
-                mirroredTerrain.chunkSize = std::max(8.0f, std::strtof(kv["chunk"].c_str(), nullptr));
-                mirroredTerrain.lod0Radius = std::max(1, std::atoi(kv["lod0"].c_str()));
-                mirroredTerrain.lod1Radius = std::max(mirroredTerrain.lod0Radius, std::atoi(kv["lod1"].c_str()));
-                mirroredTerrain.lod2Radius = std::max(mirroredTerrain.lod1Radius, std::atoi(kv["lod2"].c_str()));
-                mirroredTerrain.splitLodEnabled = kv["splitLod"] == "1";
-                mirroredTerrain.highResSplitRatio = clampNetFloat(std::strtof(kv["splitRatio"].c_str(), nullptr), 0.0f, 1.0f);
+                require(applyWorldSyncPacket(event.payload, mirroredTerrain), "WORLD_SYNC packet did not apply to the mirrored terrain state", failed);
             } else if (type == "CHUNK_STATE" || type == "CHUNK_PATCH") {
                 sawChunk = true;
                 if (const auto chunk = parseChunkPacket(event.payload); chunk.has_value()) {
                     require(mirrorWorld.applyChunkState(*chunk), "Mirror world failed to apply CHUNK_STATE/CHUNK_PATCH", failed);
+                }
+            } else if (type == "CONSTRUCT_PUBLISH") {
+                sawConstructPublish = true;
+                const auto publish = parseConstructPublishPacket(event.payload);
+                require(publish.has_value(), "Hosted bootstrap construct publish did not parse", failed);
+                if (publish.has_value()) {
+                    require(
+                        publish->blueprint.constructId == sharedConstruct.blueprint.constructId &&
+                            publish->state.revisionId == sharedConstruct.state.revisionId,
+                        "Hosted bootstrap construct publish did not preserve the shared construct revision",
+                        failed);
+                }
+            } else if (type == "VEHICLE_SPAWN") {
+                sawVehicleSpawn = true;
+                const auto spawn = parseVehicleSpawnPacket(event.payload);
+                require(spawn.has_value(), "Hosted bootstrap vehicle spawn did not parse", failed);
+                if (spawn.has_value()) {
+                    require(spawn->state.vehicleId == sharedVehicle.vehicleId, "Hosted bootstrap vehicle id did not match the shared world vehicle", failed);
+                    require(std::fabs(spawn->state.cage.heave - sharedVehicle.cage.heave) < 1.0e-4f, "Hosted bootstrap vehicle cage state did not round-trip", failed);
                 }
             }
         }
@@ -1689,8 +2579,44 @@ void runNetworkingSmokeChecks(bool& failed)
         require(sawWorldInfo, "Hosted bootstrap did not emit WORLD_INFO", failed);
         require(sawWorldSync, "Hosted bootstrap did not emit WORLD_SYNC", failed);
         require(sawChunk, "Hosted bootstrap did not emit any chunk state", failed);
-        require(mirroredTerrain.seed == hostOptions.groundParams.seed, "WORLD_SYNC seed did not round-trip into the mirrored terrain state", failed);
-        require(std::fabs(mirroredTerrain.chunkSize - hostOptions.groundParams.chunkSize) < 1.0e-4f, "WORLD_SYNC chunk size did not round-trip into the mirrored terrain state", failed);
+        require(sawConstructPublish, "Hosted bootstrap did not emit construct publication for shared vehicles", failed);
+        require(sawVehicleSpawn, "Hosted bootstrap did not emit vehicle spawn state for shared vehicles", failed);
+        if (!terrainParamsEquivalent(hostOptions.groundParams, mirroredTerrain)) {
+            const TerrainParams expected = normalizeTerrainParams(hostOptions.groundParams);
+            const TerrainParams actual = normalizeTerrainParams(mirroredTerrain);
+            std::cerr
+                << "WORLD_SYNC diff:"
+                << " worldRadius=" << expected.worldRadius << "/" << actual.worldRadius
+                << " waterLevel=" << expected.waterLevel << "/" << actual.waterLevel
+                << " caveEnabled=" << expected.caveEnabled << "/" << actual.caveEnabled
+                << " tunnelCount=" << expected.tunnelCount << "/" << actual.tunnelCount
+                << " roads=" << expected.roads.desiredRoadCount << "/" << actual.roads.desiredRoadCount
+                << " roadPaths=" << expected.explicitRoadPaths.size() << "/" << actual.explicitRoadPaths.size()
+                << " roadPathEqual=" << terrainRoadPathListsEqual(expected.explicitRoadPaths, actual.explicitRoadPaths)
+                << " craterEqual=" << terrainCraterListsEqual(expected.dynamicCraters, actual.dynamicCraters)
+                << " tunnelSeedEqual=" << terrainTunnelSeedListsEqual(expected.explicitTunnelSeeds, actual.explicitTunnelSeeds)
+                << " mountainFrontEnd=" << expected.mountainFront.coastalBandEnd << "/" << actual.mountainFront.coastalBandEnd
+                << " surfaceOnlyMeshing=" << expected.surfaceOnlyMeshing << "/" << actual.surfaceOnlyMeshing
+                << "\n";
+            if (!expected.explicitRoadPaths.empty() && !actual.explicitRoadPaths.empty()) {
+                const TerrainRoadNode& expectedNode = expected.explicitRoadPaths.front().nodes.front();
+                const TerrainRoadNode& actualNode = actual.explicitRoadPaths.front().nodes.front();
+                std::cerr
+                    << "WORLD_SYNC road node diff:"
+                    << " posX=" << expectedNode.position.x << "/" << actualNode.position.x
+                    << " forwardX=" << expectedNode.forward.x << "/" << actualNode.forward.x
+                    << " forwardZ=" << expectedNode.forward.z << "/" << actualNode.forward.z
+                    << " width=" << expectedNode.widthMeters << "/" << actualNode.widthMeters
+                    << " cutWidth=" << expectedNode.cutWidthMeters << "/" << actualNode.cutWidthMeters
+                    << " grade=" << expectedNode.grade << "/" << actualNode.grade
+                    << " curvature=" << expectedNode.curvature << "/" << actualNode.curvature
+                    << "\n";
+            }
+        }
+        require(
+            terrainParamsEquivalent(hostOptions.groundParams, mirroredTerrain),
+            "WORLD_SYNC did not round-trip the host terrain parameters into the mirrored terrain state",
+            failed);
 
         const WorldMeta mirrorMeta = mirrorWorld.getMeta();
         require(mirrorMeta.worldId == "net_host", "Mirror world did not adopt the host world id", failed);
@@ -1699,14 +2625,35 @@ void runNetworkingSmokeChecks(bool& failed)
         server.update(1.0, 1.0f / 30.0f, createTerrainFieldContext(hostOptions.groundParams), defaultFlightConfig(), {}, &hostWorld);
         const std::vector<NetEvent> snapshotEvents = clientTransport->poll();
         bool sawSnapshot = false;
+        bool sawVehicleState = false;
         for (const NetEvent& event : snapshotEvents) {
-            if (event.type == NetEvent::Type::Message && HostedNetworkingDetail::packetType(event.payload) == "SNAPSHOT") {
+            if (event.type != NetEvent::Type::Message) {
+                continue;
+            }
+            const std::string packetType = HostedNetworkingDetail::packetType(event.payload);
+            if (packetType == "SNAPSHOT") {
                 sawSnapshot = true;
                 const auto snapshot = parseSnapshotPacket(event.payload);
                 require(snapshot.has_value() && snapshot->id == 1, "Host snapshot did not encode the local player state", failed);
+            } else if (packetType == "VEHICLE_STATE") {
+                sawVehicleState = true;
+                const auto vehicle = parseVehicleStatePacket(event.payload);
+                require(vehicle.has_value(), "Hosted vehicle-state replication packet did not parse", failed);
+                if (vehicle.has_value()) {
+                    require(vehicle->vehicleId == sharedVehicle.vehicleId, "Hosted vehicle-state replication lost the vehicle id", failed);
+                    const auto authoritativeVehicle = server.sharedVehicles().find(sharedVehicle.vehicleId);
+                    require(authoritativeVehicle != server.sharedVehicles().end(), "Hosted vehicle-state replication lost the authoritative shared vehicle", failed);
+                    if (authoritativeVehicle != server.sharedVehicles().end()) {
+                        require(
+                            std::fabs(vehicle->cage.pitch - authoritativeVehicle->second.cage.pitch) < 1.0e-4f,
+                            "Hosted vehicle-state replication lost the soft-body cage pitch",
+                            failed);
+                    }
+                }
             }
         }
         require(sawSnapshot, "Hosted server did not emit any snapshots", failed);
+        require(sawVehicleState, "Hosted server did not emit any shared vehicle state replication", failed);
 
         auto voiceTransport = std::make_shared<RecordingTransport>(std::vector<NetPeerId> { 2, 3 });
         server.setTransport(voiceTransport);
@@ -1717,6 +2664,7 @@ void runNetworkingSmokeChecks(bool& failed)
         require(peerTwo != nullptr && peerThree != nullptr, "Hosted server did not keep remote players alive for voice routing checks", failed);
         if (peerTwo != nullptr && peerThree != nullptr) {
             VoiceFramePacket relayFrame {};
+            relayFrame.senderId = 2;
             relayFrame.channel = 3;
             relayFrame.data = "HOSTED_VOICE_RELAY_SMOKE";
             const std::string relayPacket = buildVoiceFramePacket(relayFrame);
@@ -1735,11 +2683,10 @@ void runNetworkingSmokeChecks(bool& failed)
             const auto localVoiceFrames = collectHostLocalVoiceFrames(server);
             require(!localVoiceFrames.empty(), "Hosted server did not expose remote voice frames to the local host", failed);
             if (!localVoiceFrames.empty()) {
-                const auto parsedLocalFrame = parseVoiceFramePacket(voiceFramePayloadText(localVoiceFrames.front()));
                 require(
-                    parsedLocalFrame.has_value() &&
-                        parsedLocalFrame->channel == relayFrame.channel &&
-                        parsedLocalFrame->data == relayFrame.data,
+                    voiceFrameSenderId(localVoiceFrames.front()) == 2 &&
+                        voiceFrameChannel(localVoiceFrames.front()) == relayFrame.channel &&
+                        voiceFramePayloadText(localVoiceFrames.front()) == relayFrame.data,
                     "Hosted server did not preserve the remote voice frame for local playback",
                     failed);
             }
@@ -1751,6 +2698,20 @@ void runNetworkingSmokeChecks(bool& failed)
                     return packet.peerId == 3 && packet.lane == static_cast<int>(TransportLane::Voice) && packet.payload == relayPacket;
                 });
             require(relayedToPeerThree != voiceTransport->sentPackets.end(), "Hosted server did not relay voice to the matching remote peer", failed);
+
+            voiceTransport->clearSentPackets();
+            peerTwo->avatar.radioChannel = 4;
+            voiceTransport->pushMessage(2, static_cast<int>(TransportLane::Voice), relayPacket, false);
+            server.serviceIncoming(hostOptions.groundParams, hostTerrainContext, &hostWorld);
+            require(
+                std::any_of(
+                    voiceTransport->sentPackets.begin(),
+                    voiceTransport->sentPackets.end(),
+                    [&relayPacket](const RecordingTransport::SentPacket& packet) {
+                        return packet.peerId == 3 && packet.lane == static_cast<int>(TransportLane::Voice) && packet.payload == relayPacket;
+                    }),
+                "Hosted server should route voice using the frame channel rather than stale avatar state",
+                failed);
 
             voiceTransport->clearSentPackets();
             peerThree->avatar.radioChannel = 4;
@@ -1866,6 +2827,7 @@ int main()
         file << "terrain.prop_tree_line_offset=-24\n";
         file << "terrain.prop_collision=0\n";
         file << "terrain.prop_seed_offset=222\n";
+        file << "online.voice_loopback=1\n";
         file << "controls.flight_pitch_down.primary=key:26\n";
         file << "controls.voice_ptt.primary=key:" << static_cast<int>(SDL_SCANCODE_B) << "\n";
     }
@@ -1914,14 +2876,46 @@ int main()
     require(std::abs(lightingSettings.skyTint.y - 0.88f) < 0.001f, "Lighting sky tint did not load from preferences", failed);
     require(std::abs(lightingSettings.fogDensity - 0.0007f) < 0.00001f, "Lighting fog density did not load from preferences", failed);
     require(std::abs(lightingSettings.fogColor.z - 0.91f) < 0.001f, "Lighting fog color did not load from preferences", failed);
+    require(onlineSettings.voiceLoopback, "Online voice loopback toggle did not load from preferences", failed);
     require(!hudSettings.showSpeedometer, "HUD speedometer toggle did not load from preferences", failed);
     require(!hudSettings.showCrosshair, "HUD crosshair toggle did not load from HUD preferences", failed);
     require(hudSettings.speedometerRedlineKph == 900, "HUD speedometer redline did not load from preferences", failed);
+    require(hudSettings.instruments.airspeed.redlineKph == 900, "Legacy-only HUD airspeed settings should migrate into the six-pack instrument", failed);
     require(std::abs(hudSettings.mapPanel.x - 0.42f) < 0.001f, "HUD map X position did not load from HUD preferences", failed);
     require(std::abs(hudSettings.mapPanel.widthScale - 1.4f) < 0.001f, "HUD map width scale did not load from HUD preferences", failed);
     require(hudSettings.mapPanel.textColor.r == 101, "HUD map text color did not load from HUD preferences", failed);
     require(hudSettings.debugFooter.backgroundOpacity == 96, "HUD debug background opacity did not load from HUD preferences", failed);
     require(hudSettings.showPeerIndicators, "HUD peer-indicator toggle did not load from HUD preferences", failed);
+    {
+        const std::filesystem::path mixedHudSettingsPath = tempRoot / "HUD-mixed-settings.ini";
+        std::ofstream file(mixedHudSettingsPath, std::ios::binary | std::ios::trunc);
+        file << "hud.speedometer_max_kph=980\n";
+        file << "hud.speedometer_redline_kph=910\n";
+        file << "hud.instrument.airspeed.max_kph=820\n";
+        file << "hud.instrument.airspeed.redline_kph=640\n";
+        file << "hud.instrument.airspeed.major_step_kph=80\n";
+
+        HudSettings mixedHudSettings = defaultHudSettings();
+        std::string mixedHudError;
+        require(
+            loadHudPreferences(mixedHudSettingsPath, mixedHudSettings, &mixedHudError),
+            "Mixed HUD preference file failed to load: " + mixedHudError,
+            failed);
+        require(
+            mixedHudSettings.instruments.airspeed.maxKph == 820 &&
+                mixedHudSettings.speedometerMaxKph == 820,
+            "Instrument airspeed max should remain authoritative when legacy HUD keys are also present",
+            failed);
+        require(
+            mixedHudSettings.instruments.airspeed.redlineKph == 640 &&
+                mixedHudSettings.speedometerRedlineKph == 640,
+            "Instrument airspeed redline should remain authoritative when legacy HUD keys are also present",
+            failed);
+        require(
+            mixedHudSettings.instruments.airspeed.majorStepKph == 80,
+            "Instrument HUD settings should still load when mixed with legacy speedometer keys",
+            failed);
+    }
     {
         const ControlActionBinding* pitchDown = findControlAction(controls, InputActionId::FlightPitchDown);
         require(pitchDown != nullptr, "Pitch down control binding missing after preference load", failed);
@@ -2099,12 +3093,13 @@ int main()
         require(
             savedContents.find("ui.walking_move_speed=18") != std::string::npos &&
             savedContents.find("ui.ui_scale=1.3") != std::string::npos &&
-            savedContents.find("ui.scale_hud_with_ui=1") != std::string::npos &&
-            savedContents.find("graphics.window_mode=borderless") != std::string::npos &&
+                savedContents.find("ui.scale_hud_with_ui=1") != std::string::npos &&
+                savedContents.find("graphics.window_mode=borderless") != std::string::npos &&
                 savedContents.find("lighting.show_sun_marker=1") != std::string::npos &&
                 savedContents.find("lighting.sun_yaw_degrees=35") != std::string::npos &&
                 savedContents.find("lighting.gi_specular=0.23") != std::string::npos &&
                 savedContents.find("lighting.fog_b=0.91") != std::string::npos &&
+                savedContents.find("online.voice_loopback=1") != std::string::npos &&
                 savedContents.find("hud.show_speedometer=0") != std::string::npos &&
                 savedContents.find("terrain.prop_density=1.7") != std::string::npos &&
                 savedContents.find("terrain.prop_collision=0") != std::string::npos,
@@ -2124,6 +3119,7 @@ int main()
                 savedHudContents.find("hud.style.map.x=0.42") != std::string::npos &&
                 savedHudContents.find("hud.style.map.width_scale=1.4") != std::string::npos &&
                 savedHudContents.find("hud.style.debug.background_opacity=96") != std::string::npos &&
+                savedHudContents.find("hud.instrument.airspeed.redline_kph=900") != std::string::npos &&
                 savedHudContents.find("hud.show_peer_indicators=1") != std::string::npos,
             "Saved HUD preferences did not persist element layout/style keys correctly",
             failed);
@@ -2150,7 +3146,7 @@ int main()
         GraphicsSettings farClipSettings = defaultGraphicsSettings();
         farClipSettings.drawDistance = 9200.0f;
         const TerrainFieldContext terrainContext = createTerrainFieldContext(defaultTerrainParams());
-        const Camera farClipCamera = buildRenderCamera(makeFlightState(), terrainContext, uiState, true, 0.0f, 0.0f, computeWorldFarClip(farClipSettings));
+        const Camera farClipCamera = buildRenderCamera(makeFlightState(), terrainContext, uiState, PlayerMode::Flight, 0.0f, 0.0f, computeWorldFarClip(farClipSettings));
         require(
             farClipCamera.farClipMeters > farClipSettings.drawDistance,
             "Render camera far clip should track the configured gameplay draw distance",
@@ -2230,6 +3226,7 @@ int main()
     runAudioFrameChecks(failed);
     runCullingAndWalkingRigChecks(failed);
     runTerrainLodChecks(failed);
+    runCloudFieldChecks(failed);
     runTerrainEditBoundsChecks(failed);
     runTerrainStreamingChecks(failed);
     runPressureGovernorChecks(failed);

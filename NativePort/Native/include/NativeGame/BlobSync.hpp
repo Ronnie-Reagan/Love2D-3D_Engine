@@ -140,7 +140,7 @@ inline BlobOutgoingTransfer prepareOutgoingBlobTransfer(
     std::string_view hash,
     const std::string& rawBytes,
     const BlobMetaPacket& baseMeta = {},
-    int chunkSize = 720)
+    int chunkSize = 768)
 {
     BlobOutgoingTransfer transfer;
     transfer.kind = std::string(kind);
