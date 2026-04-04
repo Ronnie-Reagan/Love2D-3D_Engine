@@ -2888,12 +2888,14 @@ int main()
     require(hudSettings.showPeerIndicators, "HUD peer-indicator toggle did not load from HUD preferences", failed);
     {
         const std::filesystem::path mixedHudSettingsPath = tempRoot / "HUD-mixed-settings.ini";
-        std::ofstream file(mixedHudSettingsPath, std::ios::binary | std::ios::trunc);
-        file << "hud.speedometer_max_kph=980\n";
-        file << "hud.speedometer_redline_kph=910\n";
-        file << "hud.instrument.airspeed.max_kph=820\n";
-        file << "hud.instrument.airspeed.redline_kph=640\n";
-        file << "hud.instrument.airspeed.major_step_kph=80\n";
+        {
+            std::ofstream file(mixedHudSettingsPath, std::ios::binary | std::ios::trunc);
+            file << "hud.speedometer_max_kph=980\n";
+            file << "hud.speedometer_redline_kph=910\n";
+            file << "hud.instrument.airspeed.max_kph=820\n";
+            file << "hud.instrument.airspeed.redline_kph=640\n";
+            file << "hud.instrument.airspeed.major_step_kph=80\n";
+        }
 
         HudSettings mixedHudSettings = defaultHudSettings();
         std::string mixedHudError;

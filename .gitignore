@@ -5,7 +5,6 @@ build/
 out/
 vc140.pdb
 steamworks_sdk_164/
-NativePort/Docs
 NativePort/third_party/imgui/*
 !NativePort/third_party/imgui/backends/
 !NativePort/third_party/imgui/misc/
@@ -33,6 +32,6 @@ NativePort/third_party/imgui/misc/cpp/*
 !NativePort/third_party/imgui/misc/cpp/imgui_stdlib.cpp
 !NativePort/third_party/imgui/misc/cpp/imgui_stdlib.h
 local-audits
-
+!NativePort\Docs\GameplayLoopBrainstorming.md
 
 

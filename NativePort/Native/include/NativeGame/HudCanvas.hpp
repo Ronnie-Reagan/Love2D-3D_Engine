@@ -180,8 +180,16 @@ public:
 
     void resize(int width, int height)
     {
-        width_ = std::max(1, width);
-        height_ = std::max(1, height);
+        const int newWidth = std::max(1, width);
+        const int newHeight = std::max(1, height);
+
+        if (newWidth == width_ && newHeight == height_)
+        {
+            return;
+        }
+
+        width_ = newWidth;
+        height_ = newHeight;
         pixels_.assign(static_cast<std::size_t>(width_ * height_ * 4), 0);
     }
 

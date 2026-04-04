@@ -542,6 +542,78 @@ inline Quat vehicleRotationFromYaw(float yawRadians)
     return quatNormalize(quatFromAxisAngle({ 0.0f, 1.0f, 0.0f }, yawRadians));
 }
 
+struct VehicleHandlingPreset {
+    float throttleResponseActive = 12.0f;
+    float throttleResponseRelease = 5.5f;
+    float steerResponseActive = 14.0f;
+    float steerResponseRelease = 9.5f;
+    float tractionBase = 0.36f;
+    float tractionFrictionScale = 0.62f;
+    float tractionRoadMin = 0.88f;
+    float tractionRoadMax = 1.18f;
+    float tractionClampMin = 0.18f;
+    float tractionClampMax = 5.0f;
+    float enginePullLowSpeed = 2.5f;
+    float enginePullHighSpeed = 0.56f;
+    float engineReverseScale = 0.78f;
+    float rollingDragRoad = 0.35f;
+    float rollingDragOffroad = 1.55f;
+    float rollingDragSpeedLow = 0.80f;
+    float rollingDragSpeedHigh = 1.12f;
+    float aeroDrag = 0.0092f;
+    float throttleNeutralEpsilon = 0.08f;
+    float brakeRoadScale = 0.96f;
+    float brakeRoadMaxScale = 1.32f;
+    float steerRateLowSpeed = 1.15f;
+    float steerRateHighSpeed = 0.32f;
+    float steerRateRoadMin = 0.60f;
+    float steerRateRoadMax = 1.12f;
+    float roadAlignGainMin = 0.2f;
+    float roadAlignGainScale = 0.62f;
+    float roadAlignRate = 2.1f;
+    float lateralDampingOffroad = 0.95f;
+    float lateralDampingRoad = 4.2f;
+    float velocityConvergeBase = 2.2f;
+    float velocityConvergeFrictionScale = 1.4f;
+    float slopeGravity = 9.80665f;
+    float slopeResistanceScale = 1.0f;
+    float slopeSlipScale = 1.6f;
+    float slipTractionStart = 0.45f;
+    float slipTractionScale = 0.75f;
+    float wheelSpinGain = 0.28f;
+    float wheelSpinLateralInfluence = 0.35f;
+    float frontProbeExtra = 0.9f;
+    float sideProbeExtra = 0.65f;
+    float collisionMargin = 0.22f;
+    float collisionSidePush = 0.65f;
+    float collisionSideVelScale = 0.24f;
+    float bodyClearance = 0.35f;
+    float wheelbaseExtra = 0.65f;
+    float trackExtra = 0.38f;
+    float pitchClamp = 0.34f;
+    float rollClamp = 0.30f;
+    float frontProbeHeightBias = 0.55f;
+    float suspensionRestScale = 0.72f;
+    float suspensionScale = 1.4f;
+    float cageHeaveFromCompression = 0.75f;
+    float cageHeaveResponseRate = 11.0f;
+    float cagePitchResponseRate = 9.0f;
+    float cageRollResponseRate = 8.8f;
+    float cagePitchFromThrottle = 0.25f;
+    float cageRollFromSteer = 0.255f;
+    float cagePitchSign = -1.0f;
+    float cageRollSign = -1.0f;
+    float cageSteerRollSign = -1.0f;
+};
+
+inline VehicleHandlingPreset simVehicleHandlingPreset()
+{
+    // Single SIM tuning block for quick handling iteration.
+    // Example: invert roll direction by setting cageRollSign or cageSteerRollSign to +1.
+    VehicleHandlingPreset tuning;
+    return tuning;
+}
+
 inline void ensureVehicleSeatCount(SharedVehicleState& vehicle, const ConstructBlueprint& blueprint)
 {
     const std::size_t desiredSeats = std::max<std::size_t>(1u, blueprint.seatOffsets.empty() ? 1u : blueprint.seatOffsets.size());
@@ -658,10 +730,11 @@ inline void simulateSharedVehicle(
     const TerrainFieldContext& terrainContext,
     float dt)
 {
-    dt = clamp(dt, 0.0f, 0.05f);
+    dt = dt;
     if (dt <= 0.0f || !vehicle.active) {
         return;
     }
+    const VehicleHandlingPreset tuning = simVehicleHandlingPreset();
 
     ensureVehicleSeatCount(vehicle, blueprint);
     const float throttleInput = driverInput != nullptr ? clamp(driverInput->driveThrottle, -1.0f, 1.0f) : 0.0f;
@@ -674,15 +747,58 @@ inline void simulateSharedVehicle(
         : blueprint.offroadGrip;
     const float steeringAssist = terrainRoadSteeringAssist(road) * blueprint.steeringAssist;
 
-    vehicle.steerNormalized = mix(vehicle.steerNormalized, steerInput, clamp(dt * 7.0f, 0.0f, 1.0f));
-    vehicle.throttleNormalized = mix(vehicle.throttleNormalized, throttleInput, clamp(dt * 5.0f, 0.0f, 1.0f));
+    const float throttleResponse = throttleInput != 0.0f ? tuning.throttleResponseActive : tuning.throttleResponseRelease;
+    const float steerResponse = steerInput != 0.0f ? tuning.steerResponseActive : tuning.steerResponseRelease;
+    vehicle.steerNormalized = mix(vehicle.steerNormalized, steerInput, clamp(dt * steerResponse, 0.0f, 1.0f));
+    vehicle.throttleNormalized = mix(vehicle.throttleNormalized, throttleInput, clamp(dt * throttleResponse, 0.0f, 1.0f));
 
     Vec3 forward = vehicleForwardFromYaw(vehicle.yawRadians);
+    const Vec3 right { forward.z, 0.0f, -forward.x };
     float forwardSpeed = dot(vehicle.vel, forward);
-    const float accelRate = vehicle.throttleNormalized >= 0.0f ? blueprint.accelerationMps2 : blueprint.brakingMps2 * 0.65f;
-    forwardSpeed += vehicle.throttleNormalized * accelRate * dt;
+    const float speed01 = clamp(std::fabs(forwardSpeed) / std::max(1.0f, blueprint.maxSpeedMps), 0.0f, 1.0f);
+    const float wheelbaseProbe = std::max(0.9f, blueprint.bodyHalfExtents.z + tuning.wheelbaseExtra);
+    const float uphillHeight = sampleSurfaceHeight(vehicle.pos.x + (forward.x * wheelbaseProbe), vehicle.pos.z + (forward.z * wheelbaseProbe), terrainContext);
+    const float downhillHeight = sampleSurfaceHeight(vehicle.pos.x - (forward.x * wheelbaseProbe), vehicle.pos.z - (forward.z * wheelbaseProbe), terrainContext);
+    const float grade = (uphillHeight - downhillHeight) / std::max(0.5f, wheelbaseProbe * 2.0f);
+
+    const float baseTraction = clamp((tuning.tractionBase + (friction * tuning.tractionFrictionScale)) * mix(tuning.tractionRoadMin, tuning.tractionRoadMax, roadAdhesion), tuning.tractionClampMin, tuning.tractionClampMax);
+    const float desiredWheelSpeed =
+        vehicle.throttleNormalized >= 0.0f
+            ? vehicle.throttleNormalized * blueprint.maxSpeedMps
+            : vehicle.throttleNormalized * blueprint.maxSpeedMps * 0.42f;
+    const float wheelSlipSpeed = desiredWheelSpeed - forwardSpeed;
+    const float wheelSlipNorm = clamp(std::fabs(wheelSlipSpeed) / std::max(3.0f, blueprint.maxSpeedMps * 0.55f), 0.0f, 1.6f);
+    const float lateralSlipNorm = clamp(std::fabs(dot(vehicle.vel, right)) / std::max(2.0f, blueprint.maxSpeedMps * 0.35f), 0.0f, 1.4f);
+    const float slipPenalty = clamp(
+        std::max(0.0f, wheelSlipNorm - tuning.slipTractionStart) * tuning.slipTractionScale +
+            (lateralSlipNorm * tuning.wheelSpinLateralInfluence),
+        0.0f,
+        0.72f);
+    const float traction = baseTraction * (1.0f - slipPenalty);
+    const float enginePull = std::max(0.0f, vehicle.throttleNormalized) * blueprint.accelerationMps2 * mix(tuning.enginePullLowSpeed, tuning.enginePullHighSpeed, speed01) * traction;
+    const float engineReverse = std::min(0.0f, vehicle.throttleNormalized) * blueprint.brakingMps2 * tuning.engineReverseScale * traction;
+    const float spinAssist = std::max(0.0f, vehicle.throttleNormalized) * wheelSlipNorm * tuning.wheelSpinGain * std::max(0.2f, 1.0f - roadAdhesion);
+    forwardSpeed += (enginePull + engineReverse) * dt;
+    forwardSpeed += spinAssist * blueprint.accelerationMps2 * dt;
+
+    const float gravityAlongSlope = tuning.slopeGravity * grade;
+    forwardSpeed -= gravityAlongSlope * tuning.slopeResistanceScale * dt;
+    forwardSpeed -= gravityAlongSlope * std::max(0.0f, 1.0f - traction) * tuning.slopeSlipScale * dt;
+
+    const float rollingDrag = mix(tuning.rollingDragRoad, tuning.rollingDragOffroad, 1.0f - roadAdhesion) * mix(tuning.rollingDragSpeedLow, tuning.rollingDragSpeedHigh, speed01);
+    const float aeroDrag = tuning.aeroDrag * forwardSpeed * std::fabs(forwardSpeed);
+    if (std::fabs(vehicle.throttleNormalized) < tuning.throttleNeutralEpsilon) {
+        if (forwardSpeed > 0.0f) {
+            forwardSpeed = std::max(0.0f, forwardSpeed - ((rollingDrag + std::fabs(aeroDrag)) * dt));
+        } else if (forwardSpeed < 0.0f) {
+            forwardSpeed = std::min(0.0f, forwardSpeed + ((rollingDrag + std::fabs(aeroDrag)) * dt));
+        }
+    } else {
+        forwardSpeed -= aeroDrag * dt;
+    }
+
     if (brake) {
-        const float brakeStep = blueprint.brakingMps2 * dt;
+        const float brakeStep = blueprint.brakingMps2 * mix(tuning.brakeRoadScale, tuning.brakeRoadMaxScale, roadAdhesion) * dt;
         if (forwardSpeed > 0.0f) {
             forwardSpeed = std::max(0.0f, forwardSpeed - brakeStep);
         } else if (forwardSpeed < 0.0f) {
@@ -691,30 +807,172 @@ inline void simulateSharedVehicle(
     }
     forwardSpeed = clamp(forwardSpeed, -(blueprint.maxSpeedMps * 0.35f), blueprint.maxSpeedMps);
 
-    const float steerRate = blueprint.steeringRate * mix(1.0f, 0.28f, clamp(std::fabs(forwardSpeed) / std::max(1.0f, blueprint.maxSpeedMps), 0.0f, 1.0f));
+    const float yawBeforeUpdate = vehicle.yawRadians;
+    const float steerRate = blueprint.steeringRate * mix(tuning.steerRateLowSpeed, tuning.steerRateHighSpeed, speed01) * mix(tuning.steerRateRoadMin, tuning.steerRateRoadMax, roadAdhesion);
     vehicle.yawRadians = wrapAngle(vehicle.yawRadians + (vehicle.steerNormalized * steerRate * dt));
     if (terrainRoadSampleValid(road)) {
         const float desiredYaw = std::atan2(road.forward.x, road.forward.z);
-        vehicle.yawRadians = wrapAngle(vehicle.yawRadians + wrapAngle(desiredYaw - vehicle.yawRadians) * steeringAssist * dt * 2.4f);
+        const float alignmentGain = steeringAssist * clamp((speed01 * tuning.roadAlignGainScale) + tuning.roadAlignGainMin, 0.0f, 1.0f);
+        vehicle.yawRadians = wrapAngle(vehicle.yawRadians + wrapAngle(desiredYaw - vehicle.yawRadians) * alignmentGain * dt * tuning.roadAlignRate);
     }
+    const float yawRateActual = dt > 1.0e-4f
+        ? wrapAngle(vehicle.yawRadians - yawBeforeUpdate) / dt
+        : 0.0f;
 
     forward = vehicleForwardFromYaw(vehicle.yawRadians);
-    const Vec3 targetVel = forward * forwardSpeed;
-    vehicle.vel += (targetVel - vehicle.vel) * clamp(dt * (3.0f + (friction * 2.0f)), 0.0f, 1.0f);
+    const Vec3 rightUpdated { forward.z, 0.0f, -forward.x };
+    float lateralSpeed = dot(vehicle.vel, rightUpdated);
+    const float lateralDamping =
+        mix(tuning.lateralDampingOffroad, tuning.lateralDampingRoad, roadAdhesion) *
+        clamp(0.55f + (traction * 0.45f), 0.25f, 1.15f);
+    lateralSpeed = mix(lateralSpeed, 0.0f, clamp(dt * lateralDamping, 0.0f, 1.0f));
+    const Vec3 targetVel = (forward * forwardSpeed) + (rightUpdated * lateralSpeed);
+    vehicle.vel += (targetVel - vehicle.vel) * clamp(dt * (tuning.velocityConvergeBase + (friction * tuning.velocityConvergeFrictionScale)), 0.0f, 1.0f);
     vehicle.vel.y = 0.0f;
-    vehicle.pos += vehicle.vel * dt;
-    vehicle.pos.y = sampleSurfaceHeight(vehicle.pos.x, vehicle.pos.z, terrainContext) + blueprint.bodyHalfExtents.y + 0.35f;
+
+    Vec3 nextPos = vehicle.pos + (vehicle.vel * dt);
+    const float bodyClearance = blueprint.bodyHalfExtents.y + tuning.bodyClearance;
+    nextPos.y = sampleSurfaceHeight(nextPos.x, nextPos.z, terrainContext) + bodyClearance;
+
+    const float frontProbeDistance = blueprint.bodyHalfExtents.z + tuning.frontProbeExtra;
+    const float sideProbeDistance = blueprint.bodyHalfExtents.x + tuning.sideProbeExtra;
+    Vec3 frontProbe = nextPos + (forward * frontProbeDistance);
+    const float frontProbeGround = sampleSurfaceHeight(frontProbe.x, frontProbe.z, terrainContext);
+    frontProbe.y = std::max(frontProbe.y, frontProbeGround + (blueprint.bodyHalfExtents.y * tuning.frontProbeHeightBias));
+    const Vec3 leftProbe = nextPos - (rightUpdated * sideProbeDistance);
+    const Vec3 rightProbe = nextPos + (rightUpdated * sideProbeDistance);
+    const float collisionMargin = tuning.collisionMargin;
+    const float frontSdf = sampleSdf(frontProbe.x, frontProbe.y, frontProbe.z, terrainContext);
+    if (frontSdf < collisionMargin) {
+        nextPos -= forward * (collisionMargin - frontSdf);
+        forwardSpeed = std::min(forwardSpeed, 0.0f) * 0.25f;
+        vehicle.vel = forward * forwardSpeed;
+    }
+    const float leftSdf = sampleSdf(leftProbe.x, leftProbe.y, leftProbe.z, terrainContext);
+    if (leftSdf < collisionMargin) {
+        nextPos += rightUpdated * ((collisionMargin - leftSdf) * tuning.collisionSidePush);
+        vehicle.vel += rightUpdated * std::max(0.0f, -lateralSpeed) * tuning.collisionSideVelScale;
+    }
+    const float rightSdf = sampleSdf(rightProbe.x, rightProbe.y, rightProbe.z, terrainContext);
+    if (rightSdf < collisionMargin) {
+        nextPos -= rightUpdated * ((collisionMargin - rightSdf) * tuning.collisionSidePush);
+        vehicle.vel -= rightUpdated * std::max(0.0f, lateralSpeed) * tuning.collisionSideVelScale;
+    }
+    nextPos.y = sampleSurfaceHeight(nextPos.x, nextPos.z, terrainContext) + bodyClearance;
+    vehicle.pos = nextPos;
+
+    const float wheelbase = std::max(0.9f, blueprint.bodyHalfExtents.z + tuning.wheelbaseExtra);
+    const float track = std::max(0.65f, blueprint.bodyHalfExtents.x + tuning.trackExtra);
+
+    const Vec3 frontCenter = vehicle.pos + (forward * wheelbase);
+    const Vec3 rearCenter  = vehicle.pos - (forward * wheelbase);
+    const Vec3 leftCenter  = vehicle.pos - (rightUpdated * track);
+    const Vec3 rightCenter = vehicle.pos + (rightUpdated * track);
+
+    const float frontHeight = sampleSurfaceHeight(frontCenter.x, frontCenter.z, terrainContext);
+    const float rearHeight = sampleSurfaceHeight(rearCenter.x, rearCenter.z, terrainContext);
+    const float leftHeightGround = sampleSurfaceHeight(leftCenter.x, leftCenter.z, terrainContext);
+    const float rightHeightGround = sampleSurfaceHeight(rightCenter.x, rightCenter.z, terrainContext);
+
+    const float terrainPitch = clamp(
+        std::atan2(frontHeight - rearHeight, wheelbase * 2.0f),
+        -tuning.pitchClamp,
+        tuning.pitchClamp);
+
+    const float terrainRoll = clamp(
+        std::atan2(rightHeightGround - leftHeightGround, track * 2.0f),
+        -tuning.rollClamp,
+        tuning.rollClamp);
+
+    const float suspensionRestY = vehicle.pos.y - (blueprint.bodyHalfExtents.y * tuning.suspensionRestScale);
+    const float suspensionScale = std::max(0.04f, blueprint.suspensionTravel * tuning.suspensionScale);
+
+    const float flCompression = clamp(
+        (suspensionRestY - sampleSurfaceHeight((vehicle.pos - rightUpdated * track + forward * wheelbase).x,
+                                            (vehicle.pos - rightUpdated * track + forward * wheelbase).z,
+                                            terrainContext)) / suspensionScale,
+        0.0f, 1.0f);
+
+    const float frCompression = clamp(
+        (suspensionRestY - sampleSurfaceHeight((vehicle.pos + rightUpdated * track + forward * wheelbase).x,
+                                            (vehicle.pos + rightUpdated * track + forward * wheelbase).z,
+                                            terrainContext)) / suspensionScale,
+        0.0f, 1.0f);
+
+    const float rlCompression = clamp(
+        (suspensionRestY - sampleSurfaceHeight((vehicle.pos - rightUpdated * track - forward * wheelbase).x,
+                                            (vehicle.pos - rightUpdated * track - forward * wheelbase).z,
+                                            terrainContext)) / suspensionScale,
+        0.0f, 1.0f);
+
+    const float rrCompression = clamp(
+        (suspensionRestY - sampleSurfaceHeight((vehicle.pos + rightUpdated * track - forward * wheelbase).x,
+                                            (vehicle.pos + rightUpdated * track - forward * wheelbase).z,
+                                            terrainContext)) / suspensionScale,
+        0.0f, 1.0f);
+
     vehicle.roadAdhesion = roadAdhesion;
-    vehicle.surfaceFriction = friction;
-    vehicle.cage.heave = mix(vehicle.cage.heave, road.potholeMask * blueprint.suspensionTravel, clamp(dt * 8.0f, 0.0f, 1.0f));
-    vehicle.cage.pitch = mix(vehicle.cage.pitch, -vehicle.throttleNormalized * 0.12f, clamp(dt * 6.0f, 0.0f, 1.0f));
-    vehicle.cage.roll = mix(vehicle.cage.roll, -vehicle.steerNormalized * 0.18f, clamp(dt * 6.0f, 0.0f, 1.0f));
-    const float wheelBaseCompression = clamp(std::fabs(forwardSpeed) / std::max(1.0f, blueprint.maxSpeedMps), 0.0f, 1.0f) * blueprint.suspensionTravel;
+    vehicle.surfaceFriction = friction * (1.0f - slipPenalty);
+
+    const float avgCompression = (flCompression + frCompression + rlCompression + rrCompression) * 0.25f;
+    vehicle.cage.heave = mix(
+        vehicle.cage.heave,
+        (avgCompression - 0.5f) * blueprint.suspensionTravel * tuning.cageHeaveFromCompression,
+        clamp(dt * tuning.cageHeaveResponseRate, 0.0f, 1.0f));
+
+    const float gravityAccel = 9.80665f;
+    const float comHeight = std::max(0.20f, blueprint.bodyHalfExtents.y + (blueprint.suspensionTravel * 0.35f));
+
+    // positive terrainRoll means right side is higher, so gravity pulls laterally toward the left
+    const float gravityLateralAccel = -std::sin(-terrainRoll) * gravityAccel;
+
+    // centripetal / cornering contribution from actual yaw motion, not just steer input
+    const float turnLateralAccel = forwardSpeed * yawRateActual;
+
+    // total lateral load seen by the sprung mass
+    const float totalLateralAccel = turnLateralAccel + gravityLateralAccel;
+
+    // support-plane bank
+    const float bankRollTarget = -terrainRoll * tuning.cageRollSign;
+
+    // suspension asymmetry gives a little extra visual compliance
+    const float suspensionRollTarget = clamp(
+        (((frCompression + rrCompression) - (flCompression + rlCompression)) * 0.5f) *
+            (tuning.rollClamp * 0.85f) *
+            tuning.cageRollSign,
+        -tuning.rollClamp,
+        tuning.rollClamp);
+
+    // COM-height-based load roll
+    const float loadRollTarget = clamp(
+        std::atan2(totalLateralAccel * comHeight, std::max(0.25f, gravityAccel * track)) *
+            tuning.cageRollFromSteer *
+            tuning.cageSteerRollSign,
+        -tuning.rollClamp,
+        tuning.rollClamp);
+
+    const float rollTarget = clamp(
+        bankRollTarget +
+            (loadRollTarget * 0.85f) +
+            (suspensionRollTarget * 0.35f),
+        -tuning.rollClamp,
+        tuning.rollClamp);
+
+    vehicle.cage.pitch = mix(
+        vehicle.cage.pitch,
+        (terrainPitch * tuning.cagePitchSign) - (vehicle.throttleNormalized * tuning.cagePitchFromThrottle),
+        clamp(dt * tuning.cagePitchResponseRate, 0.0f, 1.0f));
+
+    vehicle.cage.roll = mix(
+        vehicle.cage.roll,
+        rollTarget,
+        clamp(dt * tuning.cageRollResponseRate, 0.0f, 1.0f));
+
     vehicle.cage.wheelCompression = {
-        wheelBaseCompression + (road.patchMask * 0.05f),
-        wheelBaseCompression + (road.potholeMask * 0.08f),
-        wheelBaseCompression + (road.potholeMask * 0.08f),
-        wheelBaseCompression + (road.patchMask * 0.05f)
+        clamp(flCompression + (road.patchMask * 0.08f), 0.0f, 1.0f),
+        clamp(frCompression + (road.potholeMask * 0.10f), 0.0f, 1.0f),
+        clamp(rlCompression + (road.potholeMask * 0.10f), 0.0f, 1.0f),
+        clamp(rrCompression + (road.patchMask * 0.08f), 0.0f, 1.0f)
     };
 }
 

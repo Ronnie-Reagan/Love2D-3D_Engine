@@ -54,9 +54,9 @@ LightingSettings defaultLightingSettings()
     settings.showSunMarker = false;
     settings.sunYawDegrees = 20.0f;
     settings.sunPitchDegrees = 50.0f;
-    settings.sunIntensity = 1.3f;
-    settings.ambient = 0.13f;
-    settings.markerDistance = 1400.0f;
+    settings.sunIntensity = 0.5f;
+    settings.ambient = 0.06f;
+    settings.markerDistance = 5000.0f;
     settings.markerSize = 180.0f;
     settings.shadowEnabled = true;
     settings.shadowSoftness = 1.6f;

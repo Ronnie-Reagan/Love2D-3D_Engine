@@ -93,6 +93,10 @@ add_library(TrueFlightImGui STATIC
 )
 
 add_library(TrueFlightRuntime STATIC
+    Native/src/App/AppLogging.cpp
+    Native/src/App/GamepadControls.cpp
+    Native/src/App/ImGuiSupport.cpp
+    Native/src/App/TerrainStreamController.cpp
     Native/src/App/AppState.cpp
     Native/src/App/InputBindings.cpp
     Native/src/App/MenuController.cpp

@@ -1,0 +1,921 @@
+#if 0
+int run(int argc, char** argv)
+try
+{
+    logToStdout("[boot] TrueFlight startup");
+
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
+        SDL_Log("SDL_Init failed: %s", SDL_GetError());
+        return 1;
+    }
+
+    const bool audioSubsystemReady = SDL_InitSubSystem(SDL_INIT_AUDIO);
+    if (!audioSubsystemReady) {
+        SDL_Log("SDL audio init failed: %s", SDL_GetError());
+    }
+    const bool gamepadSubsystemReady = SDL_InitSubSystem(SDL_INIT_GAMEPAD);
+    if (!gamepadSubsystemReady) {
+        SDL_Log("SDL gamepad init failed: %s", SDL_GetError());
+    }
+
+    SDL_Window* window = SDL_CreateWindow("TrueFlight", 1280, 720, SDL_WINDOW_RESIZABLE);
+    if (window == nullptr) {
+        SDL_Log("SDL_CreateWindow failed: %s", SDL_GetError());
+        SDL_Quit();
+        return 1;
+    }
+
+    const auto shaderDirectory = findAssetPath("Shaders");
+    if (shaderDirectory.empty()) {
+        SDL_Log("Unable to locate compiled shaders directory.");
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+
+    VulkanRenderer nativeRenderer;
+    std::string rendererError;
+    if (!nativeRenderer.initialize(window, shaderDirectory, &rendererError)) {
+        SDL_Log("Vulkan renderer initialization failed: %s", rendererError.c_str());
+        nativeRenderer.shutdown();
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+
+    const std::string rendererLabel = std::string("Renderer: ") + (nativeRenderer.backendName() != nullptr ? nativeRenderer.backendName() : "unknown");
+
+    const Vec3 skyColor { 0.64f, 0.73f, 0.84f };
+    const float sunYaw = radians(20.0f);
+    const float sunPitch = radians(50.0f);
+    const Vec3 sunDirection = normalize(Vec3 {
+        std::cos(sunPitch) * std::sin(sunYaw),
+        std::sin(sunPitch),
+        std::cos(sunPitch) * std::cos(sunYaw)
+    });
+    RendererLightingState legacyLightingState {};
+    legacyLightingState.sunDirection = sunDirection;
+    legacyLightingState.skyColor = skyColor;
+    legacyLightingState.fogColor = skyColor;
+    legacyLightingState.backgroundColor = skyColor;
+
+    TerrainParams terrainParams = defaultTerrainParams();
+    const TerrainParams defaultTerrainParamsValues = defaultTerrainParams();
+    GeoConfig geoConfig {};
+    const UiState defaultUiStateValues = defaultUiState();
+    UiState uiState = defaultUiStateValues;
+    PauseState pauseState {};
+
+    AircraftProfile planeProfile {};
+    planeProfile.visualPrefs.scale = 3.0f;
+    FlightConfig& config = planeProfile.flightConfig;
+    PropAudioConfig& propAudioConfig = planeProfile.propAudioConfig;
+    VisualPreferenceData& planePrefs = planeProfile.visualPrefs;
+    const FlightConfig defaultConfig = defaultFlightConfig();
+    const PropAudioConfig defaultPropAudioConfigValues = defaultPropAudioConfig();
+    const std::filesystem::path preferencesPath = getPreferenceFilePath();
+    VisualPreferenceData walkingPrefs {};
+    walkingPrefs.scale = 1.0f;
+    std::string preferenceError;
+    if (!loadPreferences(preferencesPath, uiState, planeProfile, terrainParams, walkingPrefs, &preferenceError) && !preferenceError.empty()) {
+        SDL_Log("Native preference load failed: %s", preferenceError.c_str());
+    }
+    std::optional<WorldStore> worldStore;
+    const std::string terrainWorldName = "native_default";
+    {
+        WorldStoreOptions worldOptions;
+        worldOptions.name = terrainWorldName;
+        worldOptions.storageRoot = getWorldStorageDirectory();
+        worldOptions.createIfMissing = true;
+        worldOptions.regionSize = 8;
+        worldOptions.chunkResolution = 16;
+        worldOptions.groundParams = terrainParams;
+
+        std::string worldError;
+        if (auto openedWorld = WorldStore::open(worldOptions, &worldError); openedWorld.has_value()) {
+            worldStore = std::move(*openedWorld);
+            const WorldInfoSnapshot worldInfo = buildWorldInfoSnapshot(terrainParams, terrainWorldName);
+            if (!worldStore->applyWorldInfo(worldInfo, &worldError) && !worldError.empty()) {
+                SDL_Log("Native world metadata update failed: %s", worldError.c_str());
+            }
+            terrainParams = worldStore->buildGroundParams(terrainParams).terrainParams;
+        } else if (!worldError.empty()) {
+            SDL_Log("Native world store unavailable: %s", worldError.c_str());
+        }
+    }
+
+    WorldStore* worldStorePtr = worldStore.has_value() ? &*worldStore : nullptr;
+    const std::string terrainWorldId = worldStore.has_value() ? worldStore->getMeta().worldId : terrainWorldName;
+    std::optional<TerrainChunkBakeCache> terrainChunkBakeCache;
+    {
+        std::string cacheError;
+        terrainChunkBakeCache = TerrainChunkBakeCache::open(getTerrainChunkCacheDirectory(), &cacheError);
+        if (!terrainChunkBakeCache.has_value() && !cacheError.empty()) {
+            SDL_Log("Native terrain chunk cache unavailable: %s", cacheError.c_str());
+        }
+    }
+
+    TerrainVisualCache terrainCache {};
+    TerrainFieldContext terrainContext {};
+    refreshTerrainContext(terrainParams, terrainContext, terrainCache, worldStorePtr);
+
+    std::mt19937 worldRng(static_cast<std::uint32_t>(terrainParams.seed));
+    WindState windState {};
+    windState.speed = 0.0f;
+    windState.targetSpeed = 0.0f;
+    windState.gustAmplitude = 0.0f;
+    windState.gustFrequency = 0.0f;
+    windState.nextTargetAt = std::numeric_limits<float>::infinity();
+    CloudField cloudField {};
+    initializeCloudField(cloudField, worldRng, { 0.0f, 0.0f, 0.0f });
+
+    PlaneVisualState planeVisual;
+    planeVisual.defaultScale = 3.0f;
+    setBuiltinPlaneModel(planeVisual);
+    PlaneVisualState walkingVisual;
+    walkingVisual.defaultScale = 1.0f;
+    setBuiltinWalkingModel(walkingVisual);
+    PaintUiState paintUi {};
+
+    const auto restoreVisual = [&](PlaneVisualState& visual, const VisualPreferenceData& prefs, const std::filesystem::path& fallbackPath, const char* logLabel) {
+        restoreVisualFromPreferences(visual, prefs, fallbackPath, logLabel);
+    };
+
+    std::filesystem::path planeFallbackPath {};
+    if (const auto glbPath = findAssetPath("portSource/Assets/Models/DualEngine.glb"); !glbPath.empty()) {
+        planeFallbackPath = glbPath;
+    } else if (const auto stlPath = findAssetPath("portSource/Assets/Models/DualEngine.stl"); !stlPath.empty()) {
+        planeFallbackPath = stlPath;
+    }
+    restoreVisual(planeVisual, planePrefs, planeFallbackPath, "plane");
+    restoreVisual(walkingVisual, walkingPrefs, {}, "walking");
+    const Model cloudModel = makeOctahedronModel();
+    std::vector<AssetEntry> assetCatalog = scanModelAssets();
+
+    FlightState plane;
+    FlightRuntimeState runtime;
+    resetFlight(plane, runtime, terrainContext);
+
+    ProceduralAudioState audioState {};
+    if (audioSubsystemReady) {
+        std::string audioError;
+        if (!audioState.initialize(48000, 1024, 8, &audioError) && !audioError.empty()) {
+            SDL_Log("Native audio disabled: %s", audioError.c_str());
+        }
+    }
+
+    HudCanvas hudCanvas(1280, 720);
+
+    bool running = true;
+    bool windowHasFocus = true;
+    bool mouseCaptured = false;
+    bool preferencesDirty = false;
+    float preferencesNextSaveAt = 0.0f;
+    setMouseCapture(window, true);
+    mouseCaptured = true;
+    float fpsSmoothed = 120.0f;
+    float worldTime = 0.0f;
+    std::uint64_t previousCounter = SDL_GetPerformanceCounter();
+    const double counterFrequency = static_cast<double>(SDL_GetPerformanceFrequency());
+
+    while (running) {
+        const float uiNowSeconds = static_cast<float>(SDL_GetTicks()) * 0.001f;
+        float frameMouseDx = 0.0f;
+        float frameMouseDy = 0.0f;
+        int throttleWheelDelta = 0;
+        int trimWheelDelta = 0;
+
+        SDL_Event event {};
+        while (SDL_PollEvent(&event)) {
+            if (event.type == SDL_EVENT_QUIT) {
+                running = false;
+            } else if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
+                windowHasFocus = false;
+                uiState.zoomHeld = false;
+                uiState.mapHeld = false;
+                uiState.mapUsedForZoom = false;
+            } else if (event.type == SDL_EVENT_WINDOW_FOCUS_GAINED) {
+                windowHasFocus = true;
+            } else if (event.type == SDL_EVENT_MOUSE_MOTION) {
+                if (pauseState.active) {
+                    int pauseWidth = 0;
+                    int pauseHeight = 0;
+                    SDL_GetWindowSizeInPixels(window, &pauseWidth, &pauseHeight);
+                    handlePauseMouseMove(
+                        pauseState,
+                        paintUi,
+                        planeVisual,
+                        walkingVisual,
+                        pauseWidth,
+                        pauseHeight,
+                        assetCatalog.size(),
+                        static_cast<float>(event.motion.x),
+                        static_cast<float>(event.motion.y));
+                } else if (mouseCaptured) {
+                    frameMouseDx += static_cast<float>(event.motion.xrel);
+                    frameMouseDy += static_cast<float>(event.motion.yrel);
+                }
+            } else if (event.type == SDL_EVENT_MOUSE_WHEEL) {
+                if (pauseState.active) {
+                    handlePauseMouseWheel(
+                        pauseState,
+                        uiState,
+                        propAudioConfig,
+                        plane,
+                        config,
+                        terrainParams,
+                        terrainContext,
+                        terrainCache,
+                        planeVisual,
+                        walkingVisual,
+                        paintUi,
+                        preferencesDirty,
+                        preferencesNextSaveAt,
+                        worldStorePtr,
+                        static_cast<int>(event.wheel.y),
+                        assetCatalog.size(),
+                        uiNowSeconds);
+                } else {
+                    const bool trimModifier = (SDL_GetModState() & SDL_KMOD_CTRL) != 0;
+                    if (trimModifier) {
+                        trimWheelDelta += static_cast<int>(event.wheel.y);
+                    } else {
+                        throttleWheelDelta += static_cast<int>(event.wheel.y);
+                    }
+                }
+            } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+                if (pauseState.active) {
+                    int pauseWidth = 0;
+                    int pauseHeight = 0;
+                    SDL_GetWindowSizeInPixels(window, &pauseWidth, &pauseHeight);
+                    handlePauseMouseButtonDown(
+                        pauseState,
+                        uiState,
+                        propAudioConfig,
+                        plane,
+                        runtime,
+                        config,
+                        terrainParams,
+                        terrainContext,
+                        terrainCache,
+                        defaultUiStateValues,
+                        defaultPropAudioConfigValues,
+                        defaultConfig,
+                        defaultTerrainParamsValues,
+                        assetCatalog,
+                        planeVisual,
+                        walkingVisual,
+                        paintUi,
+                        running,
+                        preferencesDirty,
+                        preferencesNextSaveAt,
+                        worldStorePtr,
+                        pauseWidth,
+                        pauseHeight,
+                        static_cast<float>(event.button.x),
+                        static_cast<float>(event.button.y),
+                        event.button.button,
+                        uiNowSeconds);
+                } else if (event.button.button == SDL_BUTTON_RIGHT) {
+                    uiState.zoomHeld = true;
+                }
+            } else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP) {
+                if (pauseState.active && event.button.button == SDL_BUTTON_LEFT) {
+                    paintUi.draggingCanvas = false;
+                }
+                if (event.button.button == SDL_BUTTON_RIGHT) {
+                    uiState.zoomHeld = false;
+                }
+            } else if (event.type == SDL_EVENT_DROP_FILE) {
+                std::string loadStatus;
+                const std::filesystem::path droppedPath = event.drop.data != nullptr ? std::filesystem::path(event.drop.data) : std::filesystem::path {};
+                CharacterSubTab dropRole = CharacterSubTab::Plane;
+                if (pauseState.active && (pauseState.tab == PauseTab::Characters || pauseState.tab == PauseTab::Paint)) {
+                    dropRole = activeRoleForTab(pauseState, pauseState.tab);
+                }
+                PlaneVisualState& dropVisual = visualForRole(dropRole, planeVisual, walkingVisual);
+                const bool loaded = !droppedPath.empty() && loadPlaneModelFromPath(droppedPath, dropVisual, &loadStatus);
+                if (loadStatus.empty()) {
+                    loadStatus = "Dropped file could not be processed.";
+                }
+                setPauseActive(pauseState, uiState, true);
+                pauseState.tab = PauseTab::Characters;
+                pauseState.charactersSubTab = dropRole;
+                pauseState.selectedIndex = 0;
+                setPauseStatus(pauseState, loadStatus, uiNowSeconds, loaded ? 3.5f : 4.5f);
+                SDL_Log("%s", loadStatus.c_str());
+                assetCatalog = scanModelAssets();
+                if (loaded) {
+                    schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
+                }
+            } else if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
+                const SDL_Scancode scancode = event.key.scancode;
+                if (scancode == SDL_SCANCODE_ESCAPE) {
+                    if (!pauseState.active) {
+                        assetCatalog = scanModelAssets();
+                    }
+                    setPauseActive(pauseState, uiState, !pauseState.active);
+                    continue;
+                }
+
+                if (pauseState.active) {
+                    PlaneVisualState& selectedCharacterVisual = visualForRole(pauseState.charactersSubTab, planeVisual, walkingVisual);
+                    PlaneVisualState& selectedPaintVisual = visualForRole(pauseState.paintSubTab, planeVisual, walkingVisual);
+                    const auto adjustPausedSelection = [&](int direction) {
+                        if (pauseState.tab == PauseTab::Settings) {
+                            if (pauseState.settingsSubTab == SettingsSubTab::Flight) {
+                                adjustTuningValue(config, pauseState.selectedIndex, direction);
+                            } else if (pauseState.settingsSubTab == SettingsSubTab::Terrain) {
+                                adjustTerrainValue(terrainParams, pauseState.selectedIndex, direction);
+                                applyTerrainRuntimeChange(terrainParams, terrainContext, terrainCache, plane, worldStorePtr);
+                            } else {
+                                adjustSettingsRowValue(uiState, propAudioConfig, pauseState.settingsSubTab, pauseState.selectedIndex, direction);
+                            }
+                            schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
+                        } else if (pauseState.tab == PauseTab::Hud) {
+                            adjustHudValue(uiState, pauseState.selectedIndex, direction);
+                            schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
+                        } else if (pauseState.tab == PauseTab::Characters) {
+                            if (characterRowCanAdjust(pauseState, pauseState.selectedIndex)) {
+                                adjustCharacterRowValue(pauseState, selectedCharacterVisual, pauseState.selectedIndex, direction);
+                                schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
+                            }
+                        } else if (pauseState.tab == PauseTab::Paint) {
+                            if (pauseState.selectedIndex >= 0 && pauseState.selectedIndex <= 4) {
+                                adjustPaintRowValue(paintUi, pauseState.selectedIndex, direction);
+                            }
+                        }
+                    };
+
+                    const auto resetSelectedPauseRow = [&]() {
+                        if (pauseState.tab == PauseTab::Settings) {
+                            if (pauseState.settingsSubTab == SettingsSubTab::Flight) {
+                                resetTuningValue(config, defaultConfig, pauseState.selectedIndex);
+                                setPauseStatus(pauseState, "Reset selected flight value to default.", uiNowSeconds, 2.2f);
+                            } else if (pauseState.settingsSubTab == SettingsSubTab::Terrain) {
+                                resetTerrainValue(terrainParams, defaultTerrainParamsValues, pauseState.selectedIndex);
+                                applyTerrainRuntimeChange(terrainParams, terrainContext, terrainCache, plane, worldStorePtr);
+                                setPauseStatus(pauseState, "Reset selected terrain value to default.", uiNowSeconds, 2.2f);
+                            } else {
+                                resetSettingsRowValue(uiState, defaultUiStateValues, propAudioConfig, defaultPropAudioConfigValues, pauseState.settingsSubTab, pauseState.selectedIndex);
+                                setPauseStatus(pauseState, "Reset selected setting to default.", uiNowSeconds, 2.2f);
+                            }
+                            schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
+                        } else if (pauseState.tab == PauseTab::Hud) {
+                            resetHudValue(uiState, defaultUiStateValues, pauseState.selectedIndex);
+                            setPauseStatus(pauseState, "Reset selected HUD setting to default.", uiNowSeconds, 2.2f);
+                            schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
+                        } else if (pauseState.tab == PauseTab::Characters) {
+                            if (characterRowCanReset(pauseState, pauseState.selectedIndex)) {
+                                resetCharacterRowValue(pauseState, selectedCharacterVisual, pauseState.selectedIndex);
+                                setPauseStatus(
+                                    pauseState,
+                                    pauseState.characterEditorMode == CharacterEditorMode::Rig
+                                        ? "Reset selected rig cutout value."
+                                        : "Reset selected character transform value.",
+                                    uiNowSeconds,
+                                    2.2f);
+                                schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
+                            }
+                        } else if (pauseState.tab == PauseTab::Paint) {
+                            resetPaintRowValue(paintUi, pauseState.selectedIndex);
+                            setPauseStatus(pauseState, "Reset selected paint control.", uiNowSeconds, 2.2f);
+                        }
+                    };
+
+                    const auto activatePaintAction = [&]() {
+                        switch (pauseState.selectedIndex) {
+                        case 5:
+                            if (paintUndo(selectedPaintVisual)) {
+                                setPauseStatus(pauseState, "Undid last paint step.", uiNowSeconds, 2.2f);
+                            }
+                            break;
+                        case 6:
+                            if (paintRedo(selectedPaintVisual)) {
+                                setPauseStatus(pauseState, "Redid paint step.", uiNowSeconds, 2.2f);
+                            }
+                            break;
+                        case 7:
+                            if (fillPaintOverlay(selectedPaintVisual, paintUi.colorIndex)) {
+                                setPauseStatus(pauseState, "Filled active paint overlay.", uiNowSeconds, 2.2f);
+                            }
+                            break;
+                        case 8:
+                            if (clearPaintOverlay(selectedPaintVisual)) {
+                                setPauseStatus(pauseState, "Cleared active paint overlay.", uiNowSeconds, 2.2f);
+                            }
+                            break;
+                        case 9: {
+                            std::string paintHash;
+                            std::string paintError;
+                            if (commitPaintOverlay(getPaintStorageDirectory(), selectedPaintVisual, &paintHash, &paintError)) {
+                                setPauseStatus(pauseState, "Committed paint overlay " + paintHash.substr(0, std::min<std::size_t>(8, paintHash.size())) + ".", uiNowSeconds, 2.6f);
+                                schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
+                            } else if (!paintError.empty()) {
+                                setPauseStatus(pauseState, paintError, uiNowSeconds, 3.6f);
+                            }
+                            break;
+                        }
+                        case 10: {
+                            if (selectedPaintVisual.paintHash.empty()) {
+                                setPauseStatus(pauseState, "No saved paint overlay is stored for this role.", uiNowSeconds, 3.0f);
+                                break;
+                            }
+                            std::string paintError;
+                            if (loadPaintOverlayByHash(selectedPaintVisual.paintHash, selectedPaintVisual, &paintError)) {
+                                setPauseStatus(pauseState, "Reloaded committed paint overlay.", uiNowSeconds, 2.4f);
+                            } else if (!paintError.empty()) {
+                                setPauseStatus(pauseState, paintError, uiNowSeconds, 3.6f);
+                            }
+                            break;
+                        }
+                        default:
+                            break;
+                        }
+                    };
+
+                    if (scancode == SDL_SCANCODE_TAB || scancode == SDL_SCANCODE_H) {
+                        cyclePauseTab(pauseState, 1);
+                    } else if ((scancode == SDL_SCANCODE_Q || scancode == SDL_SCANCODE_LEFTBRACKET) &&
+                        (pauseState.tab == PauseTab::Settings || pauseState.tab == PauseTab::Characters || pauseState.tab == PauseTab::Paint)) {
+                        cyclePauseSubTab(pauseState, -1);
+                    } else if ((scancode == SDL_SCANCODE_E || scancode == SDL_SCANCODE_RIGHTBRACKET) &&
+                        (pauseState.tab == PauseTab::Settings || pauseState.tab == PauseTab::Characters || pauseState.tab == PauseTab::Paint)) {
+                        cyclePauseSubTab(pauseState, 1);
+                    } else if (scancode == SDL_SCANCODE_W || scancode == SDL_SCANCODE_UP) {
+                        movePauseSelection(pauseState, -1, assetCatalog.size());
+                    } else if (scancode == SDL_SCANCODE_S || scancode == SDL_SCANCODE_DOWN) {
+                        movePauseSelection(pauseState, 1, assetCatalog.size());
+                    } else if (scancode == SDL_SCANCODE_A || scancode == SDL_SCANCODE_LEFT) {
+                        adjustPausedSelection(-1);
+                    } else if (scancode == SDL_SCANCODE_D || scancode == SDL_SCANCODE_RIGHT) {
+                        adjustPausedSelection(1);
+                    } else if (scancode == SDL_SCANCODE_BACKSPACE && pauseState.tab == PauseTab::Settings) {
+                        if (pauseState.settingsSubTab == SettingsSubTab::Flight) {
+                            config = defaultConfig;
+                            setPauseStatus(pauseState, "Restored native flight-model defaults.", uiNowSeconds);
+                        } else if (pauseState.settingsSubTab == SettingsSubTab::Terrain) {
+                            terrainParams = defaultTerrainParamsValues;
+                            applyTerrainRuntimeChange(terrainParams, terrainContext, terrainCache, plane, worldStorePtr);
+                            setPauseStatus(pauseState, "Restored native terrain defaults.", uiNowSeconds);
+                        } else {
+                            for (int index = 0; index < pauseItemCount(pauseState, 0); ++index) {
+                                resetSettingsRowValue(uiState, defaultUiStateValues, propAudioConfig, defaultPropAudioConfigValues, pauseState.settingsSubTab, index);
+                            }
+                            setPauseStatus(pauseState, "Restored native settings defaults.", uiNowSeconds);
+                        }
+                        schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
+                    } else if (scancode == SDL_SCANCODE_BACKSPACE && pauseState.tab == PauseTab::Hud) {
+                        for (int index = 0; index < pauseItemCount(pauseState, 0); ++index) {
+                            resetHudValue(uiState, defaultUiStateValues, index);
+                        }
+                        setPauseStatus(pauseState, "Restored native HUD defaults.", uiNowSeconds);
+                        schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
+                    } else if (scancode == SDL_SCANCODE_BACKSPACE && pauseState.tab == PauseTab::Characters) {
+                        if (pauseState.characterEditorMode == CharacterEditorMode::Rig) {
+                            for (int slotIndex = 0; slotIndex < static_cast<int>(selectedCharacterVisual.rigCutouts.size()); ++slotIndex) {
+                                selectedCharacterVisual.rigCutouts[static_cast<std::size_t>(slotIndex)] = defaultVisualRigCutout(slotIndex);
+                            }
+                            rebuildVisualRigModels(selectedCharacterVisual);
+                            setPauseStatus(pauseState, "Cleared saved rig cutouts for this role.", uiNowSeconds);
+                        } else {
+                            if (pauseState.charactersSubTab == CharacterSubTab::Player) {
+                                setBuiltinWalkingModel(selectedCharacterVisual);
+                            } else {
+                                setBuiltinPlaneModel(selectedCharacterVisual);
+                            }
+                            setPauseStatus(pauseState, "Restored selected role to builtin defaults.", uiNowSeconds);
+                            assetCatalog = scanModelAssets();
+                        }
+                        schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
+                    } else if (scancode == SDL_SCANCODE_BACKSPACE && pauseState.tab == PauseTab::Paint) {
+                        if (clearPaintOverlay(selectedPaintVisual)) {
+                            setPauseStatus(pauseState, "Cleared active paint overlay.", uiNowSeconds);
+                        }
+                    } else if (scancode == SDL_SCANCODE_F5 && pauseState.tab == PauseTab::Characters) {
+                        if (pauseState.characterEditorMode == CharacterEditorMode::Rig) {
+                            rebuildVisualRigModels(selectedCharacterVisual);
+                            setPauseStatus(pauseState, "Rebuilt animated cutout partitions for this model.", uiNowSeconds, 2.2f);
+                        } else {
+                            assetCatalog = scanModelAssets();
+                            pauseState.selectedIndex = std::clamp(pauseState.selectedIndex, 0, std::max(0, pauseItemCount(pauseState, assetCatalog.size()) - 1));
+                            setPauseStatus(pauseState, "Refreshed portSource/Assets/Models catalog.", uiNowSeconds, 2.2f);
+                        }
+                    } else if (scancode == SDL_SCANCODE_RETURN || scancode == SDL_SCANCODE_SPACE) {
+                        if (pauseState.tab == PauseTab::Main) {
+                            const int activatedIndex = pauseState.selectedIndex;
+                            activatePauseSelection(pauseState, uiState, plane, runtime, terrainContext, running);
+                            if (activatedIndex >= 2 && activatedIndex <= 4) {
+                                schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
+                            }
+                        } else if (pauseState.tab == PauseTab::Settings) {
+                            resetSelectedPauseRow();
+                        } else if (pauseState.tab == PauseTab::Characters) {
+                            if (pauseState.selectedIndex == 0) {
+                                adjustCharacterRowValue(pauseState, selectedCharacterVisual, pauseState.selectedIndex, 1);
+                                schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
+                            } else if (characterRowCanReset(pauseState, pauseState.selectedIndex)) {
+                                resetSelectedPauseRow();
+                            } else if (characterRowOpensModelPrompt(pauseState, pauseState.selectedIndex)) {
+                                beginModelPathPrompt(pauseState, pauseState.charactersSubTab, selectedCharacterVisual.sourcePath.generic_string());
+                            } else if (characterRowLoadsBuiltinModel(pauseState, pauseState.selectedIndex)) {
+                                if (pauseState.charactersSubTab == CharacterSubTab::Player) {
+                                    setBuiltinWalkingModel(selectedCharacterVisual);
+                                    setPauseStatus(pauseState, "Loaded builtin player biped.", uiNowSeconds, 2.2f);
+                                } else {
+                                    setBuiltinPlaneModel(selectedCharacterVisual);
+                                    setPauseStatus(pauseState, "Loaded builtin cube.", uiNowSeconds, 2.2f);
+                                }
+                                schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
+                            } else if (pauseState.selectedIndex >= kCharacterAssetListStart &&
+                                pauseState.selectedIndex < characterItemCount(pauseState, assetCatalog.size())) {
+                                const AssetEntry& asset = assetCatalog[static_cast<std::size_t>(pauseState.selectedIndex - kCharacterAssetListStart)];
+                                std::string loadStatus;
+                                loadPlaneModelFromPath(asset.path, selectedCharacterVisual, &loadStatus);
+                                setPauseStatus(pauseState, loadStatus, uiNowSeconds, asset.supported ? 3.0f : 4.5f);
+                                if (asset.supported) {
+                                    schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
+                                }
+                            }
+                        } else if (pauseState.tab == PauseTab::Paint) {
+                            if (pauseState.selectedIndex <= 4) {
+                                resetSelectedPauseRow();
+                            } else {
+                                activatePaintAction();
+                            }
+                        } else if (pauseState.tab == PauseTab::Hud) {
+                            resetSelectedPauseRow();
+                        }
+                    }
+                    continue;
+                }
+
+                if (scancode == SDL_SCANCODE_C) {
+                    uiState.chaseCamera = !uiState.chaseCamera;
+                    schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
+                } else if (scancode == SDL_SCANCODE_G) {
+                    if (applyLocalizedTerrainCrater(terrainParams, terrainContext, terrainCache, plane, worldStorePtr, 10.0f, 4.0f, 0.15f)) {
+                        SDL_Log("Applied localized terrain crater at plane position");
+                    }
+                } else if (scancode == SDL_SCANCODE_M) {
+                    uiState.mapHeld = true;
+                    uiState.mapUsedForZoom = false;
+                } else if (scancode == SDL_SCANCODE_UP && uiState.mapHeld) {
+                    changeMapZoom(uiState, -1);
+                    uiState.mapUsedForZoom = true;
+                    schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
+                } else if (scancode == SDL_SCANCODE_DOWN && uiState.mapHeld) {
+                    changeMapZoom(uiState, 1);
+                    uiState.mapUsedForZoom = true;
+                    schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
+                } else if (scancode == SDL_SCANCODE_F3) {
+                    uiState.showDebug = !uiState.showDebug;
+                    schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
+                } else if (scancode == SDL_SCANCODE_R) {
+                    resetFlight(plane, runtime, terrainContext, plane.pos.x, plane.pos.z);
+                }
+            } else if (event.type == SDL_EVENT_KEY_UP && !event.key.repeat) {
+                if (event.key.scancode == SDL_SCANCODE_M) {
+                    const bool shouldToggle = uiState.mapHeld && !uiState.mapUsedForZoom && !pauseState.active;
+                    uiState.mapHeld = false;
+                    uiState.mapUsedForZoom = false;
+                    if (shouldToggle) {
+                        uiState.showMap = !uiState.showMap;
+                        schedulePreferencesSave(preferencesDirty, preferencesNextSaveAt, uiNowSeconds);
+                    }
+                }
+            }
+        }
+
+        const std::uint64_t currentCounter = SDL_GetPerformanceCounter();
+        const double dtSeconds = static_cast<double>(currentCounter - previousCounter) / counterFrequency;
+        previousCounter = currentCounter;
+        const float dt = clamp(static_cast<float>(dtSeconds), 1.0f / 240.0f, 0.05f);
+        const float nowSeconds = worldTime + dt;
+        fpsSmoothed = mix(fpsSmoothed, 1.0f / std::max(dt, 1.0e-4f), 0.08f);
+        refreshPauseStatus(pauseState, uiNowSeconds);
+
+        const bool* keys = SDL_GetKeyboardState(nullptr);
+        const bool altHeld = keys[SDL_SCANCODE_LALT] || keys[SDL_SCANCODE_RALT];
+        const bool wantMouseCapture = windowHasFocus && !pauseState.active && !altHeld;
+        if (wantMouseCapture != mouseCaptured) {
+            setMouseCapture(window, wantMouseCapture);
+            mouseCaptured = wantMouseCapture;
+        }
+
+        if (!pauseState.active) {
+            if (mouseCaptured) {
+                applyFlightMouseInput(uiState, plane, frameMouseDx, frameMouseDy, nowSeconds);
+            }
+            adjustElevatorTrimFromWheel(config, plane, trimWheelDelta);
+            if (!uiState.mapHeld) {
+                adjustThrottleFromWheel(plane, throttleWheelDelta);
+            }
+        }
+
+        InputState input {};
+        if (!pauseState.active) {
+            const bool throttleBlocked = uiState.mapHeld;
+            input.flightPitchDown = keys[SDL_SCANCODE_W];
+            input.flightPitchUp = keys[SDL_SCANCODE_S];
+            input.flightRollLeft = keys[SDL_SCANCODE_A];
+            input.flightRollRight = keys[SDL_SCANCODE_D];
+            input.flightYawLeft = keys[SDL_SCANCODE_Q];
+            input.flightYawRight = keys[SDL_SCANCODE_E];
+            input.flightThrottleUp = !throttleBlocked && keys[SDL_SCANCODE_UP];
+            input.flightThrottleDown = !throttleBlocked && keys[SDL_SCANCODE_DOWN];
+            input.flightAirBrakes = keys[SDL_SCANCODE_SPACE];
+        }
+
+        FlightEnvironment environment {};
+        environment.wind = getWindVector3(windState);
+        environment.groundHeightAt = [&terrainContext](float x, float z) {
+            return sampleGroundHeight(x, z, terrainContext);
+        };
+        environment.sampleSdf = [&terrainContext](float x, float y, float z) {
+            return sampleSdf(x, y, z, terrainContext);
+        };
+        environment.sampleNormal = [&terrainContext](float x, float y, float z) {
+            return sampleTerrainNormal(x, y, z, terrainContext);
+        };
+        environment.collisionRadius = plane.collisionRadius;
+
+        if (!pauseState.active) {
+            updateCloudField(cloudField, windState, dt, nowSeconds, plane.pos, worldRng);
+            environment.wind = getWindVector3(windState);
+            if (!runtime.crashed) {
+                stepFlight(plane, runtime, dt, nowSeconds, input, environment, config);
+            }
+            worldTime = nowSeconds;
+        }
+
+        const ProceduralAudioFrame audioFrame = buildProceduralAudioFrame(
+            plane,
+            runtime,
+            environment,
+            terrainContext,
+            config,
+            uiState,
+            propAudioConfig,
+            0.0f,
+            0.0f,
+            windowHasFocus && !runtime.crashed,
+            pauseState.active,
+            dt);
+        audioState.update(audioFrame);
+
+        if (preferencesDirty && uiNowSeconds >= preferencesNextSaveAt) {
+            std::string saveError;
+            if (savePreferences(preferencesPath, uiState, planeProfile, terrainParams, planeVisual, walkingVisual, &saveError)) {
+                if (worldStorePtr != nullptr) {
+                    worldStorePtr->flushDirty(nullptr);
+                }
+                preferencesDirty = false;
+            } else {
+                SDL_Log("Native preference save failed: %s", saveError.c_str());
+                preferencesNextSaveAt = uiNowSeconds + 3.0f;
+            }
+        }
+
+        const Camera renderCamera = buildRenderCamera(plane, terrainContext, uiState, true, 0.0f, 0.0f, computeWorldFarClip(graphicsSettings));
+        const TerrainVisualCache& terrainVisuals = ensureTerrainVisualCache(
+            terrainCache,
+            plane.pos,
+            plane.flightVel,
+            terrainContext,
+            terrainChunkBakeCache,
+            terrainWorldId);
+
+        std::vector<RenderObject> opaqueObjects;
+        opaqueObjects.reserve(((terrainVisuals.nearTiles.size() + terrainVisuals.farTiles.size()) * 2u) + 4u);
+        std::vector<RenderObject> translucentObjects;
+        translucentObjects.reserve(
+            (terrainVisuals.nearTiles.size() + terrainVisuals.farTiles.size()) +
+            (cloudField.groups.size() * 12u));
+        for (const TerrainFarTile& tile : terrainVisuals.farTiles) {
+            if (!tile.active) {
+                continue;
+            }
+
+            opaqueObjects.push_back({
+                &tile.terrainModel,
+                {},
+                quatIdentity(),
+                { 1.0f, 1.0f, 1.0f },
+                { 1.0f, 1.0f, 1.0f },
+                1.0f,
+                450.0f,
+                9000.0f,
+                true,
+                true
+            });
+
+            if (!tile.propModel.faces.empty()) {
+                opaqueObjects.push_back({
+                    &tile.propModel,
+                    {},
+                    quatIdentity(),
+                    { 1.0f, 1.0f, 1.0f },
+                    { 1.0f, 1.0f, 1.0f },
+                    1.0f,
+                    450.0f,
+                    9000.0f,
+                    true,
+                    true
+                });
+            }
+
+            if (!tile.waterModel.faces.empty()) {
+                translucentObjects.push_back({
+                    &tile.waterModel,
+                    {},
+                    quatIdentity(),
+                    { 1.0f, 1.0f, 1.0f },
+                    { 1.0f, 1.0f, 1.0f },
+                    1.0f,
+                    450.0f,
+                    9000.0f,
+                    false,
+                    true
+                });
+            }
+        }
+        for (const TerrainFarTile& tile : terrainVisuals.nearTiles) {
+            if (!tile.active) {
+                continue;
+            }
+
+            opaqueObjects.push_back({
+                &tile.terrainModel,
+                {},
+                quatIdentity(),
+                { 1.0f, 1.0f, 1.0f },
+                { 1.0f, 1.0f, 1.0f },
+                1.0f,
+                120.0f,
+                3200.0f,
+                false,
+                true
+            });
+
+            if (!tile.propModel.faces.empty()) {
+                opaqueObjects.push_back({
+                    &tile.propModel,
+                    {},
+                    quatIdentity(),
+                    { 1.0f, 1.0f, 1.0f },
+                    { 1.0f, 1.0f, 1.0f },
+                    1.0f,
+                    120.0f,
+                    3200.0f,
+                    false,
+                    true
+                });
+            }
+
+            if (!tile.waterModel.faces.empty()) {
+                translucentObjects.push_back({
+                    &tile.waterModel,
+                    {},
+                    quatIdentity(),
+                    { 1.0f, 1.0f, 1.0f },
+                    { 1.0f, 1.0f, 1.0f },
+                    1.0f,
+                    120.0f,
+                    3200.0f,
+                    false,
+                    true
+                });
+            }
+        }
+
+        const Quat planeRenderRotation = quatNormalize(quatMultiply(plane.rot, composeVisualRotationOffset(planeVisual)));
+        const Vec3 planeRenderPosition = plane.pos + rotateVector(planeRenderRotation, planeVisual.modelOffset);
+        if (uiState.chaseCamera) {
+            appendVisualRenderObjects(
+                opaqueObjects,
+                planeVisual,
+                planeRenderPosition,
+                planeRenderRotation,
+                planeVisual.scale,
+                { 1.0f, 1.0f, 1.0f },
+                1.0f,
+                400.0f,
+                2600.0f,
+                true,
+                uiNowSeconds,
+                runtime.propRpm,
+                clamp(runtime.aileronDeflection / std::max(radians(1.0f), config.maxAileronDeflectionRad), -1.0f, 1.0f));
+        }
+
+        if (pauseState.active && (pauseState.tab == PauseTab::Characters || pauseState.tab == PauseTab::Paint)) {
+            const PlaneVisualState& previewVisual =
+                pauseState.tab == PauseTab::Paint
+                    ? visualForRole(pauseState.paintSubTab, planeVisual, walkingVisual)
+                    : visualForRole(pauseState.charactersSubTab, planeVisual, walkingVisual);
+            const Vec3 cameraForward = forwardFromRotation(renderCamera.rot);
+            const Vec3 cameraRight = rightFromRotation(renderCamera.rot);
+            const Vec3 cameraUp = upFromRotation(renderCamera.rot);
+            const Quat previewSpin = previewVisual.previewAutoSpin
+                ? quatFromAxisAngle({ 0.0f, 1.0f, 0.0f }, uiNowSeconds * 0.8f)
+                : quatIdentity();
+            const Quat previewRotation = quatNormalize(quatMultiply(previewSpin, composeVisualRotationOffset(previewVisual)));
+            const Vec3 previewAnchor = renderCamera.pos + (cameraForward * 34.0f) + (cameraRight * 18.0f) - (cameraUp * 6.0f);
+            const Vec3 previewPosition = previewAnchor + rotateVector(previewRotation, previewVisual.modelOffset);
+            appendVisualRenderObjects(
+                opaqueObjects,
+                previewVisual,
+                previewPosition,
+                previewRotation,
+                previewVisual.scale * previewVisual.previewZoom,
+                { 1.0f, 1.0f, 1.0f },
+                1.0f,
+                40.0f,
+                160.0f,
+                true,
+                uiNowSeconds,
+                pauseState.tab == PauseTab::Characters && pauseState.characterEditorMode == CharacterEditorMode::Rig ? 1850.0f : 0.0f,
+                pauseState.tab == PauseTab::Characters && pauseState.characterEditorMode == CharacterEditorMode::Rig ? std::sin(uiNowSeconds * 1.4f) : 0.0f);
+        }
+
+        for (const CloudGroup& group : cloudField.groups) {
+            for (const CloudPuff& puff : group.puffs) {
+                translucentObjects.push_back({
+                    &cloudModel,
+                    group.center + puff.offset + Vec3 { 0.0f, std::sin((worldTime * 0.2f) + puff.bobPhase) * puff.bobAmplitude, 0.0f },
+                    quatFromAxisAngle({ 0.0f, 1.0f, 0.0f }, puff.yaw),
+                    { puff.scale, puff.scale * puff.stretchY, puff.scale },
+                    puff.color,
+                    0.78f,
+                    500.0f,
+                    3000.0f,
+                    true
+                });
+            }
+        }
+
+        std::sort(translucentObjects.begin(), translucentObjects.end(), [&renderCamera](const RenderObject& lhs, const RenderObject& rhs) {
+            return lengthSquared(lhs.pos - renderCamera.pos) > lengthSquared(rhs.pos - renderCamera.pos);
+        });
+
+        int drawableWidth = 0;
+        int drawableHeight = 0;
+        SDL_GetWindowSizeInPixels(window, &drawableWidth, &drawableHeight);
+        hudCanvas.resize(drawableWidth, drawableHeight);
+        hudCanvas.clear({ 0, 0, 0, 0 });
+        drawHud(
+            hudCanvas,
+            drawableWidth,
+            drawableHeight,
+            plane,
+            runtime,
+            terrainContext,
+            geoConfig,
+            windState,
+            uiState,
+            planeVisual.label,
+            rendererLabel,
+            fpsSmoothed,
+            mouseCaptured);
+        if (pauseState.active) {
+            drawPauseMenu(hudCanvas, drawableWidth, drawableHeight, pauseState, uiState, config, propAudioConfig, terrainParams, assetCatalog, planeVisual, walkingVisual, paintUi);
+        }
+
+        const RendererFrameSettings frameSettings {
+            graphicsSettings.renderScale,
+            graphicsSettings.textureMipmaps
+        };
+        if (!nativeRenderer.render(renderCamera, frameSettings, legacyLightingState, opaqueObjects, translucentObjects, hudCanvas, &rendererError)) {
+            SDL_Log("Vulkan render failed: %s", rendererError.c_str());
+            running = false;
+        }
+    }
+
+    if (preferencesDirty) {
+        std::string saveError;
+        if (!savePreferences(preferencesPath, uiState, planeProfile, terrainParams, planeVisual, walkingVisual, &saveError)) {
+            SDL_Log("Native preference save on shutdown failed: %s", saveError.c_str());
+        }
+    }
+    if (worldStorePtr != nullptr) {
+        worldStorePtr->flushDirty(nullptr);
+    }
+
+    audioState.shutdown();
+    if (audioSubsystemReady) {
+        SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    }
+    nativeRenderer.shutdown();
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    return 0;
+}
+catch (const std::exception& exception) {
+    logToStdout(std::string("[fatal] top-level exception: ") + exception.what());
+    return 1;
+}
+catch (...) {
+    logToStdout("[fatal] top-level non-standard exception");
+    return 1;
+}
+#endif

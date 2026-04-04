@@ -5,6 +5,12 @@
 #include "imgui_impl_sdlgpu3.h"
 #include "imgui_stdlib.h"
 
+#include "App/AppLogging.hpp"
+#include "App/GamepadControls.hpp"
+#include "App/AppRunner.hpp"
+#include "App/ImGuiSupport.hpp"
+#include "App/RuntimeTuning.hpp"
+#include "App/TerrainStreamController.hpp"
 #include "NativeGame/Flight.hpp"
 #include "NativeGame/GltfLoader.hpp"
 #include "NativeGame/Hash.hpp"
@@ -87,346 +93,13 @@ namespace TrueFlightApp
     constexpr float kWalkingJumpSpeed = 5.4f;
     constexpr float kWalkingGravity = -9.5f;
     constexpr float kWalkingTerminalVelocity = -54.0f;
-    constexpr float kWalkingGroundSnapDistance = 0.45f;
+    constexpr float kWalkingGroundSnapDistance = 0.10f;
     constexpr float kWalkingHalfHeight = 1.8f;
     constexpr float kWalkingCollisionRadius = 0.55f;
-    constexpr float kGamepadStickDeadzone = 0.25f;
-    constexpr float kGamepadTriggerDeadzone = 0.06f;
-    constexpr float kGamepadMenuStickDeadzone = 0.55f;
-    constexpr float kGamepadMenuTriggerPressThreshold = 0.55f;
-    constexpr float kGamepadMenuRepeatDelay = 0.32f;
-    constexpr float kGamepadMenuRepeatInterval = 0.11f;
     constexpr float kUiScaleStep = 0.1f;
-    const float kGamepadFlightLookPitchLimitRadians = radians(80.0f);
-    constexpr float kGamepadFlightLookYawSpeed = 2.2f;
-    constexpr float kGamepadFlightLookPitchSpeed = 1.7f;
-    constexpr float kGamepadFlightLookReturnRate = 3.8f;
-    constexpr float kGamepadWalkingLookYawSpeed = 2.8f;
-    constexpr float kGamepadWalkingLookPitchSpeed = 2.4f;
     constexpr float kTrimStepsPerSecond = 8.0f;
-    constexpr float kGamepadTrimStepsPerSecond = 8.0f;
-    constexpr float kGamepadProjectileCooldownSec = 0.2f;
-    constexpr float kPrimaryFireCooldownSec = 0.085f;
-    constexpr float kBombDropCooldownSec = 0.9f;
-    constexpr float kTerrainGunCooldownSec = 0.12f;
-    constexpr float kGameplaySnapshotIntervalSec = 1.0f / 60.0f;
-    constexpr float kProjectileLifetimeSec = 10.0f;
-    constexpr float kBombLifetimeSec = 60.0f;
-    constexpr int kEnemyTargetCount = 6;
-    constexpr int kEnemyEscortSquadCount = 2;
-    constexpr int kEnemyEscortAircraftPerSquad = 3;
-    constexpr float kEnemyEscortRespawnDelaySec = 12.0f;
-    constexpr float kEnemyEscortPatrolAltitude = 135.0f;
-    constexpr float kPlaneHullMaxStrength = 100.0f;
-    constexpr float kPlaneFuselageMaxStrength = 100.0f;
-    constexpr float kPlaneWearMax = 100.0f;
-
-    ImVec4 imguiColor(float r, float g, float b, float a = 1.0f)
-    {
-        return ImVec4(r, g, b, a);
-    }
-
-    void applyTrueFlightImGuiStyle(float contentScale)
-    {
-        ImGui::StyleColorsDark();
-        ImGuiStyle &style = ImGui::GetStyle();
-        style = ImGuiStyle{};
-        style.WindowPadding = ImVec2(14.0f, 12.0f);
-        style.FramePadding = ImVec2(10.0f, 7.0f);
-        style.ItemSpacing = ImVec2(10.0f, 8.0f);
-        style.ItemInnerSpacing = ImVec2(8.0f, 6.0f);
-        style.CellPadding = ImVec2(8.0f, 6.0f);
-        style.IndentSpacing = 18.0f;
-        style.ScrollbarSize = 14.0f;
-        style.GrabMinSize = 12.0f;
-        style.WindowBorderSize = 1.0f;
-        style.ChildBorderSize = 1.0f;
-        style.PopupBorderSize = 1.0f;
-        style.FrameBorderSize = 1.0f;
-        style.TabBorderSize = 1.0f;
-        style.WindowRounding = 8.0f;
-        style.ChildRounding = 8.0f;
-        style.FrameRounding = 6.0f;
-        style.PopupRounding = 6.0f;
-        style.ScrollbarRounding = 8.0f;
-        style.GrabRounding = 6.0f;
-        style.TabRounding = 6.0f;
-        style.ScaleAllSizes(std::max(0.75f, contentScale));
-
-        ImVec4 *colors = style.Colors;
-        colors[ImGuiCol_Text] = imguiColor(0.92f, 0.95f, 0.98f);
-        colors[ImGuiCol_TextDisabled] = imguiColor(0.56f, 0.62f, 0.70f);
-        colors[ImGuiCol_WindowBg] = imguiColor(0.05f, 0.08f, 0.12f, 0.94f);
-        colors[ImGuiCol_ChildBg] = imguiColor(0.07f, 0.10f, 0.14f, 0.92f);
-        colors[ImGuiCol_PopupBg] = imguiColor(0.06f, 0.09f, 0.13f, 0.98f);
-        colors[ImGuiCol_Border] = imguiColor(0.31f, 0.42f, 0.56f, 0.85f);
-        colors[ImGuiCol_FrameBg] = imguiColor(0.11f, 0.16f, 0.22f, 0.92f);
-        colors[ImGuiCol_FrameBgHovered] = imguiColor(0.16f, 0.23f, 0.31f, 0.95f);
-        colors[ImGuiCol_FrameBgActive] = imguiColor(0.20f, 0.29f, 0.38f, 1.00f);
-        colors[ImGuiCol_TitleBg] = imguiColor(0.05f, 0.08f, 0.12f, 0.98f);
-        colors[ImGuiCol_TitleBgActive] = imguiColor(0.09f, 0.14f, 0.20f, 0.98f);
-        colors[ImGuiCol_MenuBarBg] = imguiColor(0.07f, 0.11f, 0.16f, 0.96f);
-        colors[ImGuiCol_ScrollbarBg] = imguiColor(0.06f, 0.08f, 0.11f, 0.60f);
-        colors[ImGuiCol_ScrollbarGrab] = imguiColor(0.21f, 0.30f, 0.40f, 0.95f);
-        colors[ImGuiCol_ScrollbarGrabHovered] = imguiColor(0.28f, 0.39f, 0.51f, 0.95f);
-        colors[ImGuiCol_ScrollbarGrabActive] = imguiColor(0.36f, 0.50f, 0.64f, 1.00f);
-        colors[ImGuiCol_CheckMark] = imguiColor(0.60f, 0.90f, 0.76f, 1.00f);
-        colors[ImGuiCol_SliderGrab] = imguiColor(0.42f, 0.70f, 0.96f, 0.95f);
-        colors[ImGuiCol_SliderGrabActive] = imguiColor(0.63f, 0.86f, 1.00f, 1.00f);
-        colors[ImGuiCol_Button] = imguiColor(0.16f, 0.24f, 0.33f, 0.96f);
-        colors[ImGuiCol_ButtonHovered] = imguiColor(0.24f, 0.35f, 0.47f, 1.00f);
-        colors[ImGuiCol_ButtonActive] = imguiColor(0.30f, 0.44f, 0.58f, 1.00f);
-        colors[ImGuiCol_Header] = imguiColor(0.13f, 0.20f, 0.28f, 0.94f);
-        colors[ImGuiCol_HeaderHovered] = imguiColor(0.20f, 0.31f, 0.42f, 1.00f);
-        colors[ImGuiCol_HeaderActive] = imguiColor(0.26f, 0.39f, 0.51f, 1.00f);
-        colors[ImGuiCol_Separator] = imguiColor(0.31f, 0.42f, 0.56f, 0.80f);
-        colors[ImGuiCol_ResizeGrip] = imguiColor(0.38f, 0.56f, 0.73f, 0.45f);
-        colors[ImGuiCol_ResizeGripHovered] = imguiColor(0.47f, 0.69f, 0.88f, 0.78f);
-        colors[ImGuiCol_ResizeGripActive] = imguiColor(0.58f, 0.82f, 1.00f, 0.95f);
-        colors[ImGuiCol_Tab] = imguiColor(0.12f, 0.18f, 0.25f, 0.96f);
-        colors[ImGuiCol_TabHovered] = imguiColor(0.23f, 0.34f, 0.46f, 1.00f);
-        colors[ImGuiCol_TabActive] = imguiColor(0.18f, 0.28f, 0.38f, 1.00f);
-        colors[ImGuiCol_TabDimmed] = imguiColor(0.10f, 0.14f, 0.20f, 0.92f);
-        colors[ImGuiCol_TabDimmedSelected] = imguiColor(0.16f, 0.24f, 0.33f, 1.00f);
-        colors[ImGuiCol_TableHeaderBg] = imguiColor(0.11f, 0.16f, 0.23f, 0.98f);
-        colors[ImGuiCol_TableBorderStrong] = imguiColor(0.24f, 0.34f, 0.46f, 0.95f);
-        colors[ImGuiCol_TableBorderLight] = imguiColor(0.15f, 0.21f, 0.29f, 0.75f);
-        colors[ImGuiCol_TableRowBg] = imguiColor(0.00f, 0.00f, 0.00f, 0.00f);
-        colors[ImGuiCol_TableRowBgAlt] = imguiColor(0.09f, 0.13f, 0.19f, 0.30f);
-        colors[ImGuiCol_TextSelectedBg] = imguiColor(0.24f, 0.44f, 0.66f, 0.35f);
-        colors[ImGuiCol_DockingPreview] = imguiColor(0.42f, 0.70f, 0.96f, 0.42f);
-        colors[ImGuiCol_DockingEmptyBg] = imguiColor(0.05f, 0.08f, 0.12f, 1.00f);
-        colors[ImGuiCol_NavHighlight] = imguiColor(0.63f, 0.86f, 1.00f, 1.00f);
-        colors[ImGuiCol_ModalWindowDimBg] = imguiColor(0.01f, 0.02f, 0.03f, 0.55f);
-    }
-
-    ImU32 imguiPackedColor(const HudColor &color)
-    {
-        return IM_COL32(color.r, color.g, color.b, color.a);
-    }
-
-    class ImGuiHudCanvas
-    {
-    public:
-        explicit ImGuiHudCanvas(ImDrawList *drawList = nullptr)
-            : drawList_(drawList != nullptr ? drawList : ImGui::GetBackgroundDrawList())
-        {
-            ImGuiIO &io = ImGui::GetIO();
-            font_ = io.FontDefault;
-            if (font_ == nullptr && io.Fonts != nullptr && !io.Fonts->Fonts.empty())
-            {
-                font_ = io.Fonts->Fonts.front();
-            }
-            baseFontSize_ = 13.0f;
-            if (font_ != nullptr && font_->LegacySize > 1.0f)
-            {
-                baseFontSize_ = std::max(11.0f, font_->LegacySize * 0.72f);
-            }
-        }
-
-        void setTransform(float scaleX, float scaleY, float offsetX, float offsetY)
-        {
-            scaleX_ = scaleX;
-            scaleY_ = scaleY;
-            offsetX_ = offsetX;
-            offsetY_ = offsetY;
-        }
-
-        void resetTransform()
-        {
-            scaleX_ = 1.0f;
-            scaleY_ = 1.0f;
-            offsetX_ = 0.0f;
-            offsetY_ = 0.0f;
-        }
-
-        float textWidth(std::string_view text) const
-        {
-            if (font_ == nullptr || text.empty())
-            {
-                return 0.0f;
-            }
-            return font_->CalcTextSizeA(baseFontSize_, 1000000.0f, 0.0f, text.data(), text.data() + text.size()).x;
-        }
-
-        void fillRect(float x, float y, float w, float h, HudColor color)
-        {
-            const ImVec2 a = transformPoint(x, y);
-            const ImVec2 b = transformPoint(x + w, y + h);
-            drawList_->AddRectFilled(rectMin(a, b), rectMax(a, b), imguiPackedColor(color));
-        }
-
-        void strokeRect(float x, float y, float w, float h, HudColor color)
-        {
-            const ImVec2 a = transformPoint(x, y);
-            const ImVec2 b = transformPoint(x + w, y + h);
-            drawList_->AddRect(rectMin(a, b), rectMax(a, b), imguiPackedColor(color), 0.0f, 0, lineThickness());
-        }
-
-        void line(float x0, float y0, float x1, float y1, HudColor color)
-        {
-            drawList_->AddLine(transformPoint(x0, y0), transformPoint(x1, y1), imguiPackedColor(color), lineThickness());
-        }
-
-        void point(float x, float y, HudColor color)
-        {
-            drawList_->AddCircleFilled(transformPoint(x, y), std::max(1.0f, lineThickness() * 0.8f), imguiPackedColor(color), 12);
-        }
-
-        void text(float x, float y, std::string_view label, HudColor color)
-        {
-            if (font_ == nullptr || label.empty())
-            {
-                return;
-            }
-
-            drawList_->AddText(
-                font_,
-                fontSize(),
-                transformPoint(x, y),
-                imguiPackedColor(color),
-                label.data(),
-                label.data() + label.size());
-        }
-
-    private:
-        static ImVec2 rectMin(const ImVec2 &a, const ImVec2 &b)
-        {
-            return {std::min(a.x, b.x), std::min(a.y, b.y)};
-        }
-
-        static ImVec2 rectMax(const ImVec2 &a, const ImVec2 &b)
-        {
-            return {std::max(a.x, b.x), std::max(a.y, b.y)};
-        }
-
-        ImVec2 transformPoint(float x, float y) const
-        {
-            return {
-                offsetX_ + (x * scaleX_),
-                offsetY_ + (y * scaleY_)};
-        }
-
-        float uniformScale() const
-        {
-            return std::max(0.01f, (std::fabs(scaleX_) + std::fabs(scaleY_)) * 0.5f);
-        }
-
-        float lineThickness() const
-        {
-            return std::max(1.0f, uniformScale());
-        }
-
-        float fontSize() const
-        {
-            return std::max(8.0f, baseFontSize_ * uniformScale());
-        }
-
-        ImDrawList *drawList_ = nullptr;
-        ImFont *font_ = nullptr;
-        float baseFontSize_ = 13.0f;
-        float scaleX_ = 1.0f;
-        float scaleY_ = 1.0f;
-        float offsetX_ = 0.0f;
-        float offsetY_ = 0.0f;
-    };
-
-    std::mutex &stdoutLogMutex()
-    {
-        static std::mutex mutex;
-        return mutex;
-    }
-
-    void logToStdout(std::string_view message)
-    {
-        std::lock_guard<std::mutex> lock(stdoutLogMutex());
-        std::cout << message << std::endl;
-    }
-
-    const char *sdlLogPriorityLabel(SDL_LogPriority priority)
-    {
-        switch (priority)
-        {
-        case SDL_LOG_PRIORITY_VERBOSE:
-            return "verbose";
-        case SDL_LOG_PRIORITY_DEBUG:
-            return "debug";
-        case SDL_LOG_PRIORITY_INFO:
-            return "info";
-        case SDL_LOG_PRIORITY_WARN:
-            return "warn";
-        case SDL_LOG_PRIORITY_ERROR:
-            return "error";
-        case SDL_LOG_PRIORITY_CRITICAL:
-            return "critical";
-        default:
-            return "log";
-        }
-    }
-
-    SDL_LogOutputFunction gPreviousSdlLogOutput = nullptr;
-    void *gPreviousSdlLogUserdata = nullptr;
-
-    void SDLCALL mirrorSdlLogToStdout(void *, int category, SDL_LogPriority priority, const char *message)
-    {
-        {
-            std::lock_guard<std::mutex> lock(stdoutLogMutex());
-            std::cout << "[sdl][" << category << "][" << sdlLogPriorityLabel(priority) << "] "
-                      << (message != nullptr ? message : "") << std::endl;
-        }
-        if (gPreviousSdlLogOutput != nullptr)
-        {
-            gPreviousSdlLogOutput(gPreviousSdlLogUserdata, category, priority, message);
-        }
-    }
-
-    void installStdoutLogMirror()
-    {
-        std::cout.setf(std::ios::unitbuf);
-        SDL_GetLogOutputFunction(&gPreviousSdlLogOutput, &gPreviousSdlLogUserdata);
-        SDL_SetLogOutputFunction(&mirrorSdlLogToStdout, nullptr);
-    }
-
-    void installTerminateLogging()
-    {
-        std::set_terminate([]
-                           {
-        try {
-            if (const std::exception_ptr current = std::current_exception(); current) {
-                std::rethrow_exception(current);
-            }
-        } catch (const std::exception& exception) {
-            logToStdout(std::string("[fatal] unhandled exception: ") + exception.what());
-        } catch (...) {
-            logToStdout("[fatal] unhandled non-standard exception");
-        }
-        std::abort(); });
-    }
-
-#ifdef _WIN32
-    LONG WINAPI trueFlightUnhandledExceptionFilter(EXCEPTION_POINTERS *exceptionPointers)
-    {
-        std::ostringstream stream;
-        stream << "[fatal] unhandled structured exception 0x"
-               << std::hex
-               << std::uppercase
-               << (exceptionPointers != nullptr && exceptionPointers->ExceptionRecord != nullptr
-                       ? exceptionPointers->ExceptionRecord->ExceptionCode
-                       : 0u);
-        logToStdout(stream.str());
-        return EXCEPTION_EXECUTE_HANDLER;
-    }
-
-    void installStructuredExceptionLogging()
-    {
-        SetUnhandledExceptionFilter(&trueFlightUnhandledExceptionFilter);
-    }
-#else
-    void installStructuredExceptionLogging()
-    {
-    }
-#endif
-
+    constexpr RuntimeTuning kDefaultRuntimeTuning = defaultRuntimeTuning();
+    const GamepadControlConfig kGamepadControlConfig = defaultGamepadControlConfig();
     enum class AppScreen
     {
         BootLoading = 0,
@@ -622,9 +295,9 @@ namespace TrueFlightApp
         bool showSunMarker = false;
         float sunYawDegrees = 20.0f;
         float sunPitchDegrees = 50.0f;
-        float sunIntensity = 1.3f;
-        float ambient = 0.16f;
-        float markerDistance = 1400.0f;
+        float sunIntensity = 0.5f;
+        float ambient = 0.06f;
+        float markerDistance = 5000.0f;
         float markerSize = 180.0f;
         bool shadowEnabled = true;
         float shadowSoftness = 1.6f;
@@ -934,16 +607,16 @@ namespace TrueFlightApp
         float localSpeedKph = 0.0f;
         float peerAltitudeAgl = 0.0f;
         float localAltitudeAgl = 0.0f;
-        float hullStrength = kPlaneHullMaxStrength;
-        float fuselageStrength = kPlaneFuselageMaxStrength;
+        float hullStrength = kDefaultRuntimeTuning.planeHullMaxStrength;
+        float fuselageStrength = kDefaultRuntimeTuning.planeFuselageMaxStrength;
         float wear = 0.0f;
         int targetsDestroyed = 0;
     };
 
     struct PlaneDurabilityState
     {
-        float hullStrength = kPlaneHullMaxStrength;
-        float fuselageStrength = kPlaneFuselageMaxStrength;
+        float hullStrength = kDefaultRuntimeTuning.planeHullMaxStrength;
+        float fuselageStrength = kDefaultRuntimeTuning.planeFuselageMaxStrength;
         float wear = 0.0f;
         int targetsDestroyed = 0;
     };
@@ -1454,8 +1127,8 @@ namespace TrueFlightApp
         float localSpeedKph = 0.0f;
         float peerAltitudeAgl = 0.0f;
         float localAltitudeAgl = 0.0f;
-        float hullStrength = kPlaneHullMaxStrength;
-        float fuselageStrength = kPlaneFuselageMaxStrength;
+        float hullStrength = kDefaultRuntimeTuning.planeHullMaxStrength;
+        float fuselageStrength = kDefaultRuntimeTuning.planeFuselageMaxStrength;
         float wear = 0.0f;
         int targetsDestroyed = 0;
         bool terraformMode = false;
@@ -1586,9 +1259,26 @@ namespace TrueFlightApp
     constexpr int kInstrumentDialStyleRowCount = 34;
     constexpr int kControlsVisibleRows = 10;
     constexpr int kSettingsVisibleRows = 13;
+    constexpr int kFlightSettingCount = 15;
     constexpr int kCharacterSettingCount = 14;
     constexpr int kCharacterAssetListStart = kCharacterSettingCount;
     constexpr int kPaintSettingCount = 11;
+    constexpr std::array<const char *, kFlightSettingCount> kFlightTuningLabels{
+        "Mass",
+        "Max Thrust",
+        "CLalpha",
+        "CD0",
+        "Induced Drag K",
+        "CmAlpha",
+        "Pitch Control",
+        "Roll Control",
+        "Yaw Control",
+        "Elevator Limit",
+        "Aileron Limit",
+        "Auto Trim",
+        "Ground Friction",
+        "Engine Model",
+        "Engine Count"};
     constexpr std::array<const char *, 8> kPauseTabs{"Home", "Settings", "Characters", "Paint", "HUD", "Instruments", "Controls", "Help"};
 
     struct HelpLine
@@ -1716,7 +1406,6 @@ namespace TrueFlightApp
         TerrainFieldContext &terrainContext,
         WorldStore *worldStore,
         std::shared_ptr<std::shared_mutex> worldStoreMutex = {});
-    void resetTerrainVisualStreamState(TerrainVisualStreamState *streamState);
     Quat composeWalkingRotation(float yaw, float pitch);
     void syncWalkingLookFromRotation(const Quat &rotation, float &walkYaw, float &walkPitch);
     const char *hudSubTabLabel(HudSubTab subTab);
@@ -2248,110 +1937,6 @@ namespace TrueFlightApp
         return frame;
     }
 
-    float normalizeGamepadStickAxis(Sint16 rawValue, float deadzone = kGamepadStickDeadzone)
-    {
-        const float normalized = clamp(static_cast<float>(rawValue) / 32767.0f, -1.0f, 1.0f);
-        const float magnitude = std::fabs(normalized);
-        if (magnitude <= deadzone)
-        {
-            return 0.0f;
-        }
-
-        const float scaled = (magnitude - deadzone) / std::max(0.001f, 1.0f - deadzone);
-        return std::copysign(clamp(scaled, 0.0f, 1.0f), normalized);
-    }
-
-    float normalizeGamepadTriggerAxis(Sint16 rawValue, float deadzone = kGamepadTriggerDeadzone)
-    {
-        const float normalized = clamp(static_cast<float>(rawValue) / 32767.0f, 0.0f, 1.0f);
-        if (normalized <= deadzone)
-        {
-            return 0.0f;
-        }
-        return clamp((normalized - deadzone) / std::max(0.001f, 1.0f - deadzone), 0.0f, 1.0f);
-    }
-
-    bool gamepadButtonDown(const GamepadState &gamepad, SDL_GamepadButton button)
-    {
-        const std::size_t index = static_cast<std::size_t>(button);
-        return index < gamepad.buttons.size() ? gamepad.buttons[index] : false;
-    }
-
-    bool gamepadButtonPressed(const GamepadState &gamepad, SDL_GamepadButton button)
-    {
-        const std::size_t index = static_cast<std::size_t>(button);
-        return index < gamepad.buttons.size() && gamepad.buttons[index] && !gamepad.previousButtons[index];
-    }
-
-    float gamepadAxisValue(const GamepadState &gamepad, SDL_GamepadAxis axis)
-    {
-        const std::size_t index = static_cast<std::size_t>(axis);
-        return index < gamepad.axes.size() ? gamepad.axes[index] : 0.0f;
-    }
-
-    bool gamepadAxisPressed(const GamepadState &gamepad, SDL_GamepadAxis axis, float threshold)
-    {
-        const std::size_t index = static_cast<std::size_t>(axis);
-        return index < gamepad.axes.size() &&
-               gamepad.axes[index] >= threshold &&
-               gamepad.previousAxes[index] < threshold;
-    }
-
-    void pollGamepadState(GamepadState &gamepad)
-    {
-        gamepad.previousButtons = gamepad.buttons;
-        gamepad.previousAxes = gamepad.axes;
-        std::fill(gamepad.buttons.begin(), gamepad.buttons.end(), false);
-        std::fill(gamepad.axes.begin(), gamepad.axes.end(), 0.0f);
-
-        if (gamepad.handle == nullptr)
-        {
-            return;
-        }
-
-        SDL_UpdateGamepads();
-        for (int buttonIndex = 0; buttonIndex < SDL_GAMEPAD_BUTTON_COUNT; ++buttonIndex)
-        {
-            gamepad.buttons[static_cast<std::size_t>(buttonIndex)] =
-                SDL_GetGamepadButton(gamepad.handle, static_cast<SDL_GamepadButton>(buttonIndex));
-        }
-        gamepad.axes[static_cast<std::size_t>(SDL_GAMEPAD_AXIS_LEFTX)] =
-            normalizeGamepadStickAxis(SDL_GetGamepadAxis(gamepad.handle, SDL_GAMEPAD_AXIS_LEFTX));
-        gamepad.axes[static_cast<std::size_t>(SDL_GAMEPAD_AXIS_LEFTY)] =
-            normalizeGamepadStickAxis(SDL_GetGamepadAxis(gamepad.handle, SDL_GAMEPAD_AXIS_LEFTY));
-        gamepad.axes[static_cast<std::size_t>(SDL_GAMEPAD_AXIS_RIGHTX)] =
-            normalizeGamepadStickAxis(SDL_GetGamepadAxis(gamepad.handle, SDL_GAMEPAD_AXIS_RIGHTX));
-        gamepad.axes[static_cast<std::size_t>(SDL_GAMEPAD_AXIS_RIGHTY)] =
-            normalizeGamepadStickAxis(SDL_GetGamepadAxis(gamepad.handle, SDL_GAMEPAD_AXIS_RIGHTY));
-        gamepad.axes[static_cast<std::size_t>(SDL_GAMEPAD_AXIS_LEFT_TRIGGER)] =
-            normalizeGamepadTriggerAxis(SDL_GetGamepadAxis(gamepad.handle, SDL_GAMEPAD_AXIS_LEFT_TRIGGER));
-        gamepad.axes[static_cast<std::size_t>(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER)] =
-            normalizeGamepadTriggerAxis(SDL_GetGamepadAxis(gamepad.handle, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
-    }
-
-    int consumeRepeatedGamepadDirection(bool negativeHeld, bool positiveHeld, float nowSeconds, int &heldDirection, float &repeatAt)
-    {
-        const int direction = positiveHeld ? 1 : (negativeHeld ? -1 : 0);
-        if (direction == 0)
-        {
-            heldDirection = 0;
-            repeatAt = nowSeconds;
-            return 0;
-        }
-        if (direction != heldDirection)
-        {
-            heldDirection = direction;
-            repeatAt = nowSeconds + kGamepadMenuRepeatDelay;
-            return direction;
-        }
-        if (nowSeconds >= repeatAt)
-        {
-            repeatAt = nowSeconds + kGamepadMenuRepeatInterval;
-            return direction;
-        }
-        return 0;
-    }
-
     Quat applyCameraLookOffset(const Quat &baseRotation, float yawOffset, float pitchOffset)
     {
         Quat rotation = baseRotation;
@@ -2366,62 +1951,6 @@ namespace TrueFlightApp
             rotation = quatNormalize(quatMultiply(quatFromAxisAngle(right, pitchOffset), rotation));
         }
         return rotation;
-    }
-
-    void applyWalkingGamepadLook(
-        UiState &uiState,
-        FlightState &actor,
-        float &walkYaw,
-        float &walkPitch,
-        float lookX,
-        float lookY,
-        float dt)
-    {
-        float pitchAxis = lookY;
-        if (uiState.invertLookY)
-        {
-            pitchAxis = -pitchAxis;
-        }
-        if (std::fabs(lookX) <= 1.0e-4f && std::fabs(pitchAxis) <= 1.0e-4f)
-        {
-            return;
-        }
-
-        walkPitch = clamp(
-            walkPitch + (pitchAxis * kGamepadWalkingLookPitchSpeed * dt),
-            -kWalkingPitchLimitRadians,
-            kWalkingPitchLimitRadians);
-        walkYaw = wrapAngle(walkYaw + (lookX * kGamepadWalkingLookYawSpeed * dt));
-        actor.rot = composeWalkingRotation(walkYaw, walkPitch);
-    }
-
-    void applyFlightGamepadLook(
-        UiState &uiState,
-        float &lookYaw,
-        float &lookPitch,
-        float lookX,
-        float lookY,
-        float dt)
-    {
-        float pitchAxis = lookY;
-        if (uiState.invertLookY)
-        {
-            pitchAxis = -pitchAxis;
-        }
-
-        if (std::fabs(lookX) <= 1.0e-4f && std::fabs(pitchAxis) <= 1.0e-4f)
-        {
-            const float returnAlpha = clamp(kGamepadFlightLookReturnRate * dt, 0.0f, 1.0f);
-            lookYaw = mix(lookYaw, 0.0f, returnAlpha);
-            lookPitch = mix(lookPitch, 0.0f, returnAlpha);
-            return;
-        }
-
-        lookYaw = wrapAngle(lookYaw + (lookX * kGamepadFlightLookYawSpeed * dt));
-        lookPitch = clamp(
-            lookPitch + (pitchAxis * kGamepadFlightLookPitchSpeed * dt),
-            -kGamepadFlightLookPitchLimitRadians,
-            kGamepadFlightLookPitchLimitRadians);
     }
 
     void invalidateTerrainCache(TerrainVisualCache &terrainCache, TerrainVisualStreamState *streamState = nullptr)
@@ -4736,380 +4265,39 @@ namespace TrueFlightApp
         }
     };
 
-    int terrainBandPriorityRank(TerrainFarTileBand band)
-    {
-        switch (band)
-        {
-        case TerrainFarTileBand::Near:
-            return 0;
-        case TerrainFarTileBand::Mid:
-            return 1;
-        case TerrainFarTileBand::Horizon:
-        default:
-            return 2;
-        }
-    }
-
-    bool terrainStreamRequestMoreValuable(const TerrainTileRequest &lhs, const TerrainTileRequest &rhs)
-    {
-        const auto lhsKey = std::tuple{
-            terrainBandPriorityRank(lhs.band),
-            terrainTileDetailRank(lhs.detail),
-            lhs.priority};
-        const auto rhsKey = std::tuple{
-            terrainBandPriorityRank(rhs.band),
-            terrainTileDetailRank(rhs.detail),
-            rhs.priority};
-        return lhsKey < rhsKey;
-    }
-
-    std::size_t terrainStreamOutstandingCountLocked(const TerrainVisualStreamState &state)
-    {
-        return state.queuedRequests.size() + state.inflightRequestKeys.size() + state.completedResults.size();
-    }
-
-    void updateTerrainStreamStatsLocked(TerrainVisualStreamState &state)
-    {
-        state.stats.queuedCount = static_cast<int>(state.queuedRequests.size());
-        state.stats.inflightCount = static_cast<int>(state.inflightRequestKeys.size());
-        state.stats.completedCount = static_cast<int>(state.completedResults.size());
-    }
-
-    bool terrainStreamRequestIsDesiredLocked(
-        const TerrainVisualStreamState &state,
-        const TerrainTileRequest &request,
-        std::uint64_t generation)
-    {
-        if (generation != state.generation)
-        {
-            return false;
-        }
-        const auto desiredIt = state.desiredRequests.find(terrainTileIdentityKey(request.band, request.tileX, request.tileZ));
-        return desiredIt != state.desiredRequests.end() && terrainTileRequestsEquivalent(desiredIt->second, request);
-    }
-
-    void dropTerrainQueuedRequestAtLocked(TerrainVisualStreamState &state, std::size_t index)
-    {
-        const TerrainChunkBuildRequest &droppedRequest = state.queuedRequests[index];
-        state.queuedRequestKeys.erase(terrainTileRequestKey(droppedRequest.request));
-        state.queuedRequests.erase(state.queuedRequests.begin() + static_cast<std::ptrdiff_t>(index));
-        state.stats.droppedRequestCount += 1u;
-    }
-
-    void dropTerrainCompletedResultAtLocked(TerrainVisualStreamState &state, std::size_t index)
-    {
-        state.completedResults.erase(state.completedResults.begin() + static_cast<std::ptrdiff_t>(index));
-        state.stats.droppedResultCount += 1u;
-    }
-
-    std::size_t findWorstTerrainCompletedResultIndexLocked(const TerrainVisualStreamState &state)
-    {
-        std::size_t worstIndex = 0;
-        for (std::size_t index = 1; index < state.completedResults.size(); ++index)
-        {
-            if (terrainStreamRequestMoreValuable(state.completedResults[worstIndex].request, state.completedResults[index].request))
-            {
-                worstIndex = index;
-            }
-        }
-        return worstIndex;
-    }
-
     std::size_t findBestTerrainCompletedResultIndexLocked(const TerrainVisualStreamState &state)
     {
+        const auto bandRank = [](TerrainFarTileBand band)
+        {
+            switch (band)
+            {
+            case TerrainFarTileBand::Near:
+                return 0;
+            case TerrainFarTileBand::Mid:
+                return 1;
+            case TerrainFarTileBand::Horizon:
+            default:
+                return 2;
+            }
+        };
+
         std::size_t bestIndex = 0;
         for (std::size_t index = 1; index < state.completedResults.size(); ++index)
         {
-            if (terrainStreamRequestMoreValuable(state.completedResults[index].request, state.completedResults[bestIndex].request))
+            const auto candidateKey = std::tuple{
+                bandRank(state.completedResults[index].request.band),
+                terrainTileDetailRank(state.completedResults[index].request.detail),
+                state.completedResults[index].request.priority};
+            const auto bestKey = std::tuple{
+                bandRank(state.completedResults[bestIndex].request.band),
+                terrainTileDetailRank(state.completedResults[bestIndex].request.detail),
+                state.completedResults[bestIndex].request.priority};
+            if (candidateKey < bestKey)
             {
                 bestIndex = index;
             }
         }
         return bestIndex;
-    }
-
-    void trimTerrainStreamBacklogLocked(TerrainVisualStreamState &state)
-    {
-        state.completedResults.erase(
-            std::remove_if(
-                state.completedResults.begin(),
-                state.completedResults.end(),
-                [&](const TerrainChunkBuildResult &result)
-                {
-                    return !terrainStreamRequestIsDesiredLocked(state, result.request, result.generation);
-                }),
-            state.completedResults.end());
-
-        state.queuedRequests.erase(
-            std::remove_if(
-                state.queuedRequests.begin(),
-                state.queuedRequests.end(),
-                [&](const TerrainChunkBuildRequest &request)
-                {
-                    if (terrainStreamRequestIsDesiredLocked(state, request.request, request.generation))
-                    {
-                        return false;
-                    }
-                    state.queuedRequestKeys.erase(terrainTileRequestKey(request.request));
-                    state.stats.droppedRequestCount += 1u;
-                    return true;
-                }),
-            state.queuedRequests.end());
-
-        std::sort(
-            state.queuedRequests.begin(),
-            state.queuedRequests.end(),
-            [](const TerrainChunkBuildRequest &lhs, const TerrainChunkBuildRequest &rhs)
-            {
-                return terrainStreamRequestMoreValuable(lhs.request, rhs.request);
-            });
-
-        while (state.maxCompletedResults > 0 && static_cast<int>(state.completedResults.size()) > state.maxCompletedResults)
-        {
-            dropTerrainCompletedResultAtLocked(state, findWorstTerrainCompletedResultIndexLocked(state));
-        }
-
-        while (state.maxPendingRequests > 0 && static_cast<int>(terrainStreamOutstandingCountLocked(state)) > state.maxPendingRequests)
-        {
-            if (!state.queuedRequests.empty())
-            {
-                dropTerrainQueuedRequestAtLocked(state, state.queuedRequests.size() - 1u);
-                continue;
-            }
-            if (!state.completedResults.empty())
-            {
-                dropTerrainCompletedResultAtLocked(state, findWorstTerrainCompletedResultIndexLocked(state));
-                continue;
-            }
-            break;
-        }
-        updateTerrainStreamStatsLocked(state);
-    }
-
-    void terrainStreamWorkerLoop(TerrainVisualStreamState &state)
-    {
-        for (;;)
-        {
-            TerrainChunkBuildRequest request;
-            std::string requestKey;
-            {
-                std::unique_lock<std::mutex> lock(state.mutex);
-                state.condition.wait(lock, [&state]
-                                     { return state.stopRequested || !state.queuedRequests.empty(); });
-                if (state.stopRequested)
-                {
-                    return;
-                }
-
-                bool foundRequest = false;
-                while (!state.queuedRequests.empty())
-                {
-                    request = std::move(state.queuedRequests.front());
-                    state.queuedRequests.pop_front();
-                    requestKey = terrainTileRequestKey(request.request);
-                    state.queuedRequestKeys.erase(requestKey);
-                    if (!terrainStreamRequestIsDesiredLocked(state, request.request, request.generation) ||
-                        request.generationContext == nullptr)
-                    {
-                        continue;
-                    }
-
-                    state.inflightRequestKeys[terrainTileIdentityKey(request.request.band, request.request.tileX, request.request.tileZ)] = requestKey;
-                    updateTerrainStreamStatsLocked(state);
-                    foundRequest = true;
-                    break;
-                }
-
-                if (!foundRequest)
-                {
-                    continue;
-                }
-            }
-
-            CompiledTerrainChunk compiledChunk = buildTerrainTileChunk(
-                request.request.band,
-                request.request.detail,
-                request.request.tileX,
-                request.request.tileZ,
-                request.generationContext->terrainContext,
-                request.generationContext->bakeCache,
-                request.generationContext->terrainWorldId,
-                request.request.paramsSignature,
-                request.request.sourceSignature);
-
-            {
-                std::lock_guard<std::mutex> lock(state.mutex);
-                const std::string identityKey = terrainTileIdentityKey(request.request.band, request.request.tileX, request.request.tileZ);
-                const auto inflightIt = state.inflightRequestKeys.find(identityKey);
-                if (inflightIt != state.inflightRequestKeys.end() && inflightIt->second == requestKey)
-                {
-                    state.inflightRequestKeys.erase(inflightIt);
-                }
-                if (terrainStreamRequestIsDesiredLocked(state, request.request, request.generation))
-                {
-                    const auto existingIt = std::find_if(
-                        state.completedResults.begin(),
-                        state.completedResults.end(),
-                        [&](const TerrainChunkBuildResult &existing)
-                        {
-                            return terrainTileIdentityKey(existing.request.band, existing.request.tileX, existing.request.tileZ) == identityKey;
-                        });
-                    if (existingIt != state.completedResults.end())
-                    {
-                        if (terrainStreamRequestMoreValuable(request.request, existingIt->request))
-                        {
-                            state.completedResults.erase(existingIt);
-                            state.stats.droppedResultCount += 1u;
-                        }
-                        else
-                        {
-                            updateTerrainStreamStatsLocked(state);
-                            continue;
-                        }
-                    }
-
-                    if (state.maxCompletedResults > 0 && static_cast<int>(state.completedResults.size()) >= state.maxCompletedResults)
-                    {
-                        const std::size_t worstIndex = findWorstTerrainCompletedResultIndexLocked(state);
-                        if (terrainStreamRequestMoreValuable(request.request, state.completedResults[worstIndex].request))
-                        {
-                            dropTerrainCompletedResultAtLocked(state, worstIndex);
-                        }
-                        else
-                        {
-                            updateTerrainStreamStatsLocked(state);
-                            continue;
-                        }
-                    }
-
-                    state.completedResults.push_back({request.request, std::move(compiledChunk), request.generation});
-                    trimTerrainStreamBacklogLocked(state);
-                }
-                updateTerrainStreamStatsLocked(state);
-            }
-        }
-    }
-
-    void synchronizeTerrainStreamWorkers(TerrainVisualStreamState &state, int requestedWorkerCount)
-    {
-        const int workerCount = std::clamp(requestedWorkerCount, 1, 6);
-        if (state.workerCount == workerCount && static_cast<int>(state.workers.size()) == workerCount)
-        {
-            return;
-        }
-
-        state.shutdown();
-        state.workerCount = workerCount;
-        for (int workerIndex = 0; workerIndex < workerCount; ++workerIndex)
-        {
-            state.workers.emplace_back([&state]
-                                       { terrainStreamWorkerLoop(state); });
-        }
-    }
-
-    void resetTerrainVisualStreamState(TerrainVisualStreamState *streamState)
-    {
-        if (streamState == nullptr)
-        {
-            return;
-        }
-
-        std::lock_guard<std::mutex> lock(streamState->mutex);
-        streamState->queuedRequests.clear();
-        streamState->completedResults.clear();
-        streamState->desiredRequests.clear();
-        streamState->queuedRequestKeys.clear();
-        streamState->inflightRequestKeys.clear();
-        streamState->activeGenerationContext.reset();
-        streamState->generation += 1u;
-        streamState->stats = {};
-        updateTerrainStreamStatsLocked(*streamState);
-    }
-
-    void enqueueTerrainTileRequests(
-        TerrainVisualStreamState &streamState,
-        const std::vector<TerrainTileRequest> &missingRequests,
-        const std::vector<TerrainTileRequest> &upgradeRequests,
-        int missingBudget,
-        int upgradeBudget,
-        int maxPendingRequests,
-        int maxCompletedResults,
-        const TerrainFieldContext &terrainContext,
-        const std::optional<TerrainChunkBakeCache> &bakeCache,
-        std::string_view terrainWorldId)
-    {
-        std::lock_guard<std::mutex> lock(streamState.mutex);
-        streamState.maxPendingRequests = maxPendingRequests;
-        streamState.maxCompletedResults = maxCompletedResults;
-        streamState.desiredRequests.clear();
-        if (!streamState.activeGenerationContext || streamState.activeGenerationContext->generation != streamState.generation)
-        {
-            auto generationContext = std::make_shared<TerrainStreamGenerationSnapshot>();
-            generationContext->terrainContext = terrainContext;
-            generationContext->bakeCache = bakeCache;
-            generationContext->terrainWorldId = terrainWorldId.empty() ? std::string("default") : std::string(terrainWorldId);
-            generationContext->generation = streamState.generation;
-            streamState.activeGenerationContext = std::move(generationContext);
-        }
-
-        const auto recordDesiredRequest = [&](const TerrainTileRequest &request)
-        {
-            streamState.desiredRequests[terrainTileIdentityKey(request.band, request.tileX, request.tileZ)] = request;
-        };
-        for (const TerrainTileRequest &request : missingRequests)
-        {
-            recordDesiredRequest(request);
-        }
-        for (const TerrainTileRequest &request : upgradeRequests)
-        {
-            recordDesiredRequest(request);
-        }
-
-        const auto queueRequest = [&](const TerrainTileRequest &request)
-        {
-            const std::string requestKey = terrainTileRequestKey(request);
-            if (streamState.queuedRequestKeys.find(requestKey) != streamState.queuedRequestKeys.end())
-            {
-                return;
-            }
-
-            const std::string identityKey = terrainTileIdentityKey(request.band, request.tileX, request.tileZ);
-            const auto queuedIt = std::find_if(
-                streamState.queuedRequests.begin(),
-                streamState.queuedRequests.end(),
-                [&](const TerrainChunkBuildRequest &queued)
-                {
-                    return terrainTileIdentityKey(queued.request.band, queued.request.tileX, queued.request.tileZ) == identityKey;
-                });
-            if (queuedIt != streamState.queuedRequests.end())
-            {
-                return;
-            }
-            const auto inflightIt = streamState.inflightRequestKeys.find(identityKey);
-            if (inflightIt != streamState.inflightRequestKeys.end())
-            {
-                return;
-            }
-
-            TerrainChunkBuildRequest buildRequest;
-            buildRequest.request = request;
-            buildRequest.generationContext = streamState.activeGenerationContext;
-            buildRequest.generation = streamState.generation;
-            streamState.queuedRequests.push_back(std::move(buildRequest));
-            streamState.queuedRequestKeys[requestKey] = identityKey;
-        };
-
-        for (int index = 0; index < std::min<int>(static_cast<int>(missingRequests.size()), missingBudget); ++index)
-        {
-            queueRequest(missingRequests[static_cast<std::size_t>(index)]);
-        }
-        for (int index = 0; index < std::min<int>(static_cast<int>(upgradeRequests.size()), upgradeBudget); ++index)
-        {
-            queueRequest(upgradeRequests[static_cast<std::size_t>(index)]);
-        }
-
-        trimTerrainStreamBacklogLocked(streamState);
-        streamState.condition.notify_all();
     }
 
     bool shouldApplyTerrainChunkResult(
@@ -5399,7 +4587,9 @@ namespace TrueFlightApp
                     result = std::move(streamState->completedResults[bestIndex]);
                     streamState->completedResults.erase(
                         streamState->completedResults.begin() + static_cast<std::ptrdiff_t>(bestIndex));
-                    updateTerrainStreamStatsLocked(*streamState);
+                    streamState->stats.queuedCount = static_cast<int>(streamState->queuedRequests.size());
+                    streamState->stats.inflightCount = static_cast<int>(streamState->inflightRequestKeys.size());
+                    streamState->stats.completedCount = static_cast<int>(streamState->completedResults.size());
                 }
 
                 if (result.generation != streamState->generation)
@@ -6267,21 +5457,6 @@ namespace TrueFlightApp
         return effective;
     }
 
-    TerrainStreamStats snapshotTerrainStreamStats(TerrainVisualStreamState *streamState)
-    {
-        if (streamState == nullptr)
-        {
-            return {};
-        }
-
-        std::lock_guard<std::mutex> lock(streamState->mutex);
-        TerrainStreamStats stats = streamState->stats;
-        stats.queuedCount = static_cast<int>(streamState->queuedRequests.size());
-        stats.inflightCount = static_cast<int>(streamState->inflightRequestKeys.size());
-        stats.completedCount = static_cast<int>(streamState->completedResults.size());
-        return stats;
-    }
-
     std::string formatByteCountCompact(std::uint64_t bytes)
     {
         std::ostringstream output;
@@ -6662,7 +5837,7 @@ namespace TrueFlightApp
         case SettingsSubTab::Sound:
             return kSoundSettingCount;
         case SettingsSubTab::Flight:
-            return 13;
+            return kFlightSettingCount;
         case SettingsSubTab::Terrain:
             return kTerrainSettingCount;
         case SettingsSubTab::Lighting:
@@ -7547,12 +6722,14 @@ namespace TrueFlightApp
         boot.previousSteamOnlineValid = true;
     }
 
-    PlaneDurabilityState sanitizePlaneDurabilityState(const PlaneDurabilityState &state)
+    PlaneDurabilityState sanitizePlaneDurabilityState(
+        const PlaneDurabilityState &state,
+        const RuntimeTuning &tuning = kDefaultRuntimeTuning)
     {
         PlaneDurabilityState out = state;
-        out.hullStrength = clamp(sanitize(out.hullStrength, kPlaneHullMaxStrength), 0.0f, kPlaneHullMaxStrength);
-        out.fuselageStrength = clamp(sanitize(out.fuselageStrength, kPlaneFuselageMaxStrength), 0.0f, kPlaneFuselageMaxStrength);
-        out.wear = clamp(sanitize(out.wear, 0.0f), 0.0f, kPlaneWearMax);
+        out.hullStrength = clamp(sanitize(out.hullStrength, tuning.planeHullMaxStrength), 0.0f, tuning.planeHullMaxStrength);
+        out.fuselageStrength = clamp(sanitize(out.fuselageStrength, tuning.planeFuselageMaxStrength), 0.0f, tuning.planeFuselageMaxStrength);
+        out.wear = clamp(sanitize(out.wear, 0.0f), 0.0f, tuning.planeWearMax);
         out.targetsDestroyed = std::max(0, out.targetsDestroyed);
         return out;
     }
@@ -7651,22 +6828,28 @@ namespace TrueFlightApp
         escort.bankRadians = clamp(escort.bankRadians, radians(-70.0f), radians(70.0f));
     }
 
-    PlaneDurabilityState &ensurePlaneDurabilityState(std::unordered_map<int, PlaneDurabilityState> &states, int playerId)
+    PlaneDurabilityState &ensurePlaneDurabilityState(
+        std::unordered_map<int, PlaneDurabilityState> &states,
+        int playerId,
+        const RuntimeTuning &tuning = kDefaultRuntimeTuning)
     {
-        return states[playerId] = sanitizePlaneDurabilityState(states[playerId]);
+        return states[playerId] = sanitizePlaneDurabilityState(states[playerId], tuning);
     }
 
-    PlaneDurabilityState lookupPlaneDurabilityState(const GameSession &session, int playerId)
+    PlaneDurabilityState lookupPlaneDurabilityState(
+        const GameSession &session,
+        int playerId,
+        const RuntimeTuning &tuning = kDefaultRuntimeTuning)
     {
         const auto authoritativeIt = session.planeDurabilityByPlayerId.find(playerId);
         if (authoritativeIt != session.planeDurabilityByPlayerId.end())
         {
-            return sanitizePlaneDurabilityState(authoritativeIt->second);
+            return sanitizePlaneDurabilityState(authoritativeIt->second, tuning);
         }
         const auto replicatedIt = session.replicatedDurabilityByPlayerId.find(playerId);
         if (replicatedIt != session.replicatedDurabilityByPlayerId.end())
         {
-            return sanitizePlaneDurabilityState(replicatedIt->second);
+            return sanitizePlaneDurabilityState(replicatedIt->second, tuning);
         }
         return {};
     }
@@ -7680,7 +6863,9 @@ namespace TrueFlightApp
         return false;
     }
 
-    std::vector<PeerStatComparison> buildPeerStatComparisons(const GameSession &session)
+    std::vector<PeerStatComparison> buildPeerStatComparisons(
+        const GameSession &session,
+        const RuntimeTuning &runtimeTuning = kDefaultRuntimeTuning)
     {
         std::vector<PeerStatComparison> comparisons;
         const float localGround = sampleGroundHeight(session.plane.pos.x, session.plane.pos.z, session.terrainContext);
@@ -7695,7 +6880,7 @@ namespace TrueFlightApp
                 {
                     continue;
                 }
-                const PlaneDurabilityState durability = lookupPlaneDurabilityState(session, playerId);
+                const PlaneDurabilityState durability = lookupPlaneDurabilityState(session, playerId, runtimeTuning);
                 const float peerGround = sampleGroundHeight(player.actor.pos.x, player.actor.pos.z, session.terrainContext);
                 comparisons.push_back({sanitizeCallsign(player.avatar.callsign),
                                        length(player.actor.pos - session.plane.pos),
@@ -7718,7 +6903,7 @@ namespace TrueFlightApp
                 {
                     continue;
                 }
-                const PlaneDurabilityState durability = lookupPlaneDurabilityState(session, peer.id);
+                const PlaneDurabilityState durability = lookupPlaneDurabilityState(session, peer.id, runtimeTuning);
                 const float peerGround = sampleGroundHeight(peer.displayPos.x, peer.displayPos.z, session.terrainContext);
                 comparisons.push_back({sanitizeCallsign(peer.avatar.callsign),
                                        length(peer.displayPos - session.plane.pos),
@@ -7803,8 +6988,8 @@ namespace TrueFlightApp
     FlightConfig buildRuntimeFlightConfig(const FlightConfig &baseConfig)
     {
         FlightConfig config = baseConfig;
-        config.physicsHz = std::max(config.physicsHz, 180.0f);
-        config.maxSubsteps = std::max(config.maxSubsteps, 10);
+        config.physicsHz = std::max(config.physicsHz, 120.0f);
+        config.maxSubsteps = std::max(config.maxSubsteps, 8);
         return config;
     }
 
@@ -8278,7 +7463,7 @@ namespace TrueFlightApp
         return std::nullopt;
     }
 
-    void ensureEnemyTargetsGenerated(GameSession &session)
+    void ensureEnemyTargetsGenerated(GameSession &session, const RuntimeTuning &tuning)
     {
         if (!session.enemyTargets.empty())
         {
@@ -8287,12 +7472,12 @@ namespace TrueFlightApp
 
         const TerrainParams &params = session.terrainContext.params;
         const float ringRadius = std::max(220.0f, params.gameplayRadiusMeters * 0.82f);
-        const int maxAttempts = kEnemyTargetCount * 6;
-        for (int attempt = 0; attempt < maxAttempts && static_cast<int>(session.enemyTargets.size()) < kEnemyTargetCount; ++attempt)
+        const int maxAttempts = tuning.enemyTargetCount * 6;
+        for (int attempt = 0; attempt < maxAttempts && static_cast<int>(session.enemyTargets.size()) < tuning.enemyTargetCount; ++attempt)
         {
             const int index = static_cast<int>(session.enemyTargets.size());
             const float angle =
-                ((static_cast<float>(attempt) + (hash01(attempt, params.seed, 17, 91) * 0.45f)) / static_cast<float>(kEnemyTargetCount)) *
+                ((static_cast<float>(attempt) + (hash01(attempt, params.seed, 17, 91) * 0.45f)) / static_cast<float>(tuning.enemyTargetCount)) *
                 (2.0f * kPi);
             const float radialJitter = ((hash01(attempt, 7, params.seed, 23) * 2.0f) - 1.0f) * ringRadius * 0.24f;
             const float offsetX = std::sin(angle) * (ringRadius + radialJitter);
@@ -8332,7 +7517,7 @@ namespace TrueFlightApp
         return -1000 - escort.id;
     }
 
-    void ensureEnemyEscortsGenerated(GameSession &session)
+    void ensureEnemyEscortsGenerated(GameSession &session, const RuntimeTuning &tuning)
     {
         if (!session.enemyEscorts.empty() || session.enemyTargets.empty())
         {
@@ -8340,7 +7525,7 @@ namespace TrueFlightApp
         }
 
         session.enemyEscortSquadrons.clear();
-        for (int squadIndex = 0; squadIndex < kEnemyEscortSquadCount; ++squadIndex)
+        for (int squadIndex = 0; squadIndex < tuning.enemyEscortSquadCount; ++squadIndex)
         {
             EnemyEscortSquadState squad;
             squad.id = squadIndex + 1;
@@ -8351,7 +7536,7 @@ namespace TrueFlightApp
         {
             for (const EnemyTargetState &target : session.enemyTargets)
             {
-                if (((target.id - 1) % kEnemyEscortSquadCount) == squadIndex)
+                if (((target.id - 1) % tuning.enemyEscortSquadCount) == squadIndex)
                 {
                     return target;
                 }
@@ -8359,16 +7544,16 @@ namespace TrueFlightApp
             return session.enemyTargets.front();
         };
 
-        for (int squadIndex = 0; squadIndex < kEnemyEscortSquadCount; ++squadIndex)
+        for (int squadIndex = 0; squadIndex < tuning.enemyEscortSquadCount; ++squadIndex)
         {
             const EnemyTargetState &seedTarget = firstTargetForSquad(squadIndex);
             EnemyEscortSquadState &squad = session.enemyEscortSquadrons[static_cast<std::size_t>(squadIndex)];
             squad.assignedTargetId = seedTarget.id;
-            squad.guardAnchor = seedTarget.pos + Vec3{0.0f, kEnemyEscortPatrolAltitude, 0.0f};
+            squad.guardAnchor = seedTarget.pos + Vec3{0.0f, tuning.enemyEscortPatrolAltitude, 0.0f};
             squad.interceptPoint = squad.guardAnchor;
             squad.formationForward = normalize(Vec3{-seedTarget.pos.z, 0.0f, seedTarget.pos.x}, {0.0f, 0.0f, 1.0f});
 
-            for (int wingIndex = 0; wingIndex < kEnemyEscortAircraftPerSquad; ++wingIndex)
+            for (int wingIndex = 0; wingIndex < tuning.enemyEscortAircraftPerSquad; ++wingIndex)
             {
                 const float angle = seedTarget.yawRadians + (-0.45f + (0.45f * static_cast<float>(wingIndex)));
                 const float radius = 68.0f + (static_cast<float>(wingIndex) * 18.0f);
@@ -8378,7 +7563,7 @@ namespace TrueFlightApp
                 escort.wingIndex = wingIndex;
                 escort.pos = seedTarget.pos + Vec3{
                                                   std::sin(angle) * radius,
-                                                  kEnemyEscortPatrolAltitude + 12.0f + (8.0f * static_cast<float>(wingIndex)),
+                                                  tuning.enemyEscortPatrolAltitude + 12.0f + (8.0f * static_cast<float>(wingIndex)),
                                                   std::cos(angle) * radius};
                 escort.vel = normalize(squad.guardAnchor - escort.pos, squad.formationForward) * escort.desiredSpeedMps;
                 syncEscortAttitudeFromVelocity(escort);
@@ -9036,29 +8221,70 @@ namespace TrueFlightApp
         return bestVehicleId;
     }
 
-    void ensureDefaultSharedRoadVehicles(GameSession &session)
+    void ensureDefaultSharedRoadVehicles(GameSession& session)
     {
-        if (!session.sharedVehiclesById.empty())
+        constexpr std::size_t kTargetVehicleCount = 12;
+        constexpr float kMinVehicleSpacingMeters = 140.0f;
+
+        auto hasVehicleId = [&](VehicleId id) -> bool
         {
-            return;
-        }
+            return session.sharedVehiclesById.find(id) != session.sharedVehiclesById.end();
+        };
 
-        ConstructBlueprint blueprint;
-        blueprint.constructId = 1;
-        blueprint.revisionId = 1;
-        blueprint.label = "road_buggy";
+        auto nextFreeVehicleId = [&]() -> VehicleId
+        {
+            VehicleId id = 1;
+            while (hasVehicleId(id))
+            {
+                ++id;
+            }
+            return id;
+        };
 
-        ConstructState state;
-        state.constructId = blueprint.constructId;
-        state.revisionId = blueprint.revisionId;
-        state.authorPlayerId = 1;
-        state.published = true;
-        state.label = blueprint.label;
+        auto ensureBlueprintState = [&]() -> ConstructBlueprint&
+        {
+            auto blueprintIt = session.constructBlueprintsById.find(1);
+            if (blueprintIt == session.constructBlueprintsById.end())
+            {
+                ConstructBlueprint blueprint;
+                blueprint.constructId = 1;
+                blueprint.revisionId = 1;
+                blueprint.label = "road_buggy";
+                session.constructBlueprintsById[blueprint.constructId] = blueprint;
+                blueprintIt = session.constructBlueprintsById.find(1);
+            }
 
-        session.constructBlueprintsById[blueprint.constructId] = blueprint;
-        session.constructStatesById[state.constructId] = state;
+            auto stateIt = session.constructStatesById.find(1);
+            if (stateIt == session.constructStatesById.end())
+            {
+                ConstructState state;
+                state.constructId = 1;
+                state.revisionId = 1;
+                state.authorPlayerId = 1;
+                state.published = true;
+                state.label = blueprintIt->second.label;
+                session.constructStatesById[state.constructId] = state;
+            }
 
-        const auto spawnVehicleAtRoad = [&](VehicleId vehicleId, float preferredZ)
+            return blueprintIt->second;
+        };
+
+        ConstructBlueprint& blueprint = ensureBlueprintState();
+
+        auto isFarEnoughFromExisting = [&](const Vec3& pos) -> bool
+        {
+            const float minDistSq = kMinVehicleSpacingMeters * kMinVehicleSpacingMeters;
+            for (const auto& [_, other] : session.sharedVehiclesById)
+            {
+                if (lengthSquared(other.pos - pos) < minDistSq)
+                {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        const auto trySpawnVehicleAtRoad = [&](VehicleId vehicleId, float preferredZ) -> bool
         {
             SharedVehicleState vehicle;
             vehicle.vehicleId = vehicleId;
@@ -9070,31 +8296,124 @@ namespace TrueFlightApp
             vehicle.maxHealth = blueprint.maxHealth;
             vehicle.seatOccupants.resize(std::max<std::size_t>(1u, blueprint.seatOffsets.size()), 0);
 
-            if (const auto roadSpawn = findRoadSpawnSample(session.terrainContext, preferredZ); roadSpawn.has_value())
+            constexpr std::array<float, 9> probeOffsets = {
+                0.0f,
+                220.0f,
+                -220.0f,
+                440.0f,
+                -440.0f,
+                700.0f,
+                -700.0f,
+                1000.0f,
+                -1000.0f
+            };
+
+            for (float probeOffset : probeOffsets)
             {
-                vehicle.pos = terrainRoadPlacementPosition(*roadSpawn, 0.0f, blueprint.bodyHalfExtents.y + 0.35f);
+                const auto roadSpawn = findRoadSpawnSample(session.terrainContext, preferredZ + probeOffset);
+                if (!roadSpawn.has_value())
+                {
+                    continue;
+                }
+
+                const Vec3 spawnPos =
+                    terrainRoadPlacementPosition(*roadSpawn, 0.0f, blueprint.bodyHalfExtents.y + 0.35f);
+
+                if (!isFarEnoughFromExisting(spawnPos))
+                {
+                    continue;
+                }
+
+                vehicle.pos = spawnPos;
                 vehicle.yawRadians = std::atan2(roadSpawn->forward.x, roadSpawn->forward.z);
-                vehicle.roadAdhesion = clamp(roadSpawn->roadMask + (roadSpawn->shoulderMask * 0.2f), 0.0f, 1.0f);
+                vehicle.roadAdhesion = clamp(
+                    roadSpawn->roadMask + (roadSpawn->shoulderMask * 0.2f),
+                    0.0f,
+                    1.0f);
                 vehicle.surfaceFriction = terrainRoadSurfaceFriction(*roadSpawn) * blueprint.roadGrip;
+
+                session.sharedVehiclesById[vehicle.vehicleId] = vehicle;
+                return true;
             }
-            else
-            {
-                const float ground = sampleGroundHeight(session.plane.pos.x, session.plane.pos.z, session.terrainContext);
-                vehicle.pos = {session.plane.pos.x + static_cast<float>(vehicleId * 8), ground + blueprint.bodyHalfExtents.y + 0.35f, session.plane.pos.z + 32.0f};
-                vehicle.yawRadians = 0.0f;
-                vehicle.surfaceFriction = blueprint.offroadGrip;
-            }
+
+            return false;
+        };
+
+        const auto spawnVehicleFallback = [&](VehicleId vehicleId, std::size_t index)
+        {
+            SharedVehicleState vehicle;
+            vehicle.vehicleId = vehicleId;
+            vehicle.entityId = vehicleId;
+            vehicle.constructId = blueprint.constructId;
+            vehicle.constructRevisionId = blueprint.revisionId;
+            vehicle.authoritativeOwnerPlayerId = 1;
+            vehicle.health = blueprint.maxHealth;
+            vehicle.maxHealth = blueprint.maxHealth;
+            vehicle.seatOccupants.resize(std::max<std::size_t>(1u, blueprint.seatOffsets.size()), 0);
+
+            const float row = static_cast<float>(index / 4);
+            const float col = static_cast<float>(index % 4);
+
+            const float offsetX = (col - 1.5f) * 16.0f;
+            const float offsetZ = 40.0f + (row * 22.0f);
+
+            const float x = session.plane.pos.x + offsetX;
+            const float z = session.plane.pos.z + offsetZ;
+            const float ground = sampleGroundHeight(x, z, session.terrainContext);
+
+            vehicle.pos = { x, ground + blueprint.bodyHalfExtents.y + 0.35f, z };
+            vehicle.yawRadians = 0.0f;
+            vehicle.roadAdhesion = 0.0f;
+            vehicle.surfaceFriction = blueprint.offroadGrip;
+
             session.sharedVehiclesById[vehicle.vehicleId] = vehicle;
         };
 
-        spawnVehicleAtRoad(1, session.plane.pos.z);
-        if (const SharedVehicleState *firstVehicle = lookupSessionVehicle(session, 1); firstVehicle != nullptr)
+        if (session.sharedVehiclesById.size() >= kTargetVehicleCount)
         {
-            const auto secondRoad = findRoadSpawnSample(session.terrainContext, session.plane.pos.z + 900.0f);
-            if (secondRoad.has_value() && lengthSquared(secondRoad->centerPosition - firstVehicle->pos) > (220.0f * 220.0f))
+            return;
+        }
+
+        const std::array<float, 16> preferredRoadZOffsets = {
+            0.0f,
+            350.0f,
+            -350.0f,
+            700.0f,
+            -700.0f,
+            1100.0f,
+            -1100.0f,
+            1550.0f,
+            -1550.0f,
+            2050.0f,
+            -2050.0f,
+            2600.0f,
+            -2600.0f,
+            3200.0f,
+            -3200.0f,
+            4000.0f
+        };
+
+        std::size_t spawnedOrExistingCount = session.sharedVehiclesById.size();
+        std::size_t spawnAttemptIndex = 0;
+
+        while (spawnedOrExistingCount < kTargetVehicleCount)
+        {
+            const VehicleId vehicleId = nextFreeVehicleId();
+
+            bool spawned = false;
+            if (spawnAttemptIndex < preferredRoadZOffsets.size())
             {
-                spawnVehicleAtRoad(2, secondRoad->centerPosition.z);
+                const float preferredZ = session.plane.pos.z + preferredRoadZOffsets[spawnAttemptIndex];
+                spawned = trySpawnVehicleAtRoad(vehicleId, preferredZ);
             }
+
+            if (!spawned)
+            {
+                spawnVehicleFallback(vehicleId, spawnedOrExistingCount);
+            }
+
+            ++spawnedOrExistingCount;
+            ++spawnAttemptIndex;
         }
     }
 
@@ -9320,14 +8639,105 @@ namespace TrueFlightApp
         config.groundAmbienceGain = clamp(config.groundAmbienceGain, 0.0f, 2.0f);
     }
 
+    const char *flightEngineModelToken(FlightEngineModel model)
+    {
+        switch (model)
+        {
+        case FlightEngineModel::Turbojet:
+            return "turbojet";
+        case FlightEngineModel::RadialProp:
+        default:
+            return "radial_prop";
+        }
+    }
+
+    FlightEngineModel flightEngineModelFromToken(std::string_view token)
+    {
+        const std::string normalized = toLowerAscii(std::string(token));
+        if (normalized == "turbojet" || normalized == "jet" || normalized == "jet_engine")
+        {
+            return FlightEngineModel::Turbojet;
+        }
+        return FlightEngineModel::RadialProp;
+    }
+
+    const char *flightEngineModelLabel(FlightEngineModel model)
+    {
+        return model == FlightEngineModel::Turbojet ? "Turbojet" : "Radial Prop";
+    }
+
+    FlightEngineModel cycleFlightEngineModel(FlightEngineModel model, int direction)
+    {
+        if (direction == 0)
+        {
+            return model;
+        }
+        int index = static_cast<int>(model);
+        constexpr int count = 2;
+        index = (index + (direction > 0 ? 1 : -1) + count) % count;
+        return static_cast<FlightEngineModel>(index);
+    }
+
+    void normalizeFlightEngineModelConfig(FlightConfig &config)
+    {
+        config.engineCount = std::clamp(config.engineCount, 1, kMaxFlightEngines);
+        if (config.engineModel == FlightEngineModel::Turbojet)
+        {
+            config.idleCrankRpm = clamp(config.idleCrankRpm, 22.0f, 45.0f);
+            config.maxCrankRpm = clamp(config.maxCrankRpm, config.idleCrankRpm + 20.0f, 130.0f);
+            config.propellerGearRatio = clamp(config.propellerGearRatio, 0.25f, 1.5f);
+            config.propellerDiameterMeters = clamp(config.propellerDiameterMeters, 0.5f, 1.5f);
+            config.afterburnerMultiplier = clamp(config.afterburnerMultiplier, 1.0f, 2.2f);
+        }
+        else
+        {
+            config.idleCrankRpm = clamp(config.idleCrankRpm, 450.0f, 1400.0f);
+            config.maxCrankRpm = clamp(config.maxCrankRpm, config.idleCrankRpm + 400.0f, 4200.0f);
+            config.propellerGearRatio = clamp(config.propellerGearRatio, 0.25f, 4.0f);
+            config.propellerDiameterMeters = clamp(config.propellerDiameterMeters, 0.8f, 5.0f);
+            config.afterburnerMultiplier = 1.0f;
+        }
+    }
+
+    void applyFlightEngineModelPreset(FlightConfig &config, FlightEngineModel model)
+    {
+        config.engineModel = model;
+        if (model == FlightEngineModel::Turbojet)
+        {
+            config.engineCount = std::clamp(config.engineCount, 1, 4);
+            config.maxThrustSeaLevel = std::max(config.maxThrustSeaLevel, 4200.0f);
+            config.afterburnerMultiplier = std::max(config.afterburnerMultiplier, 1.35f);
+            config.maxEffectivePropSpeed = std::max(config.maxEffectivePropSpeed, 240.0f);
+            config.idleCrankRpm = 32.0f;
+            config.maxCrankRpm = 100.0f;
+            config.propellerGearRatio = 1.0f;
+            config.propellerDiameterMeters = 0.8f;
+            config.maxBrakePowerKw = std::max(config.maxBrakePowerKw, 850.0f);
+            config.engineCylinderCount = std::max(config.engineCylinderCount, 1);
+            config.engineDisplacementLiters = std::max(config.engineDisplacementLiters, 8.0f);
+        }
+        else
+        {
+            config.engineCount = std::clamp(config.engineCount, 1, kMaxFlightEngines);
+            config.maxThrustSeaLevel = std::min(config.maxThrustSeaLevel, 4200.0f);
+            config.afterburnerMultiplier = 1.0f;
+            config.maxEffectivePropSpeed = clamp(config.maxEffectivePropSpeed, 65.0f, 160.0f);
+            config.idleCrankRpm = 650.0f;
+            config.maxCrankRpm = 2700.0f;
+            config.propellerGearRatio = 1.0f;
+            config.propellerDiameterMeters = 1.93f;
+            config.maxBrakePowerKw = clamp(config.maxBrakePowerKw, 120.0f, 520.0f);
+            config.engineCylinderCount = std::clamp(config.engineCylinderCount, 5, 18);
+            config.engineDisplacementLiters = clamp(config.engineDisplacementLiters, 3.5f, 60.0f);
+        }
+        normalizeFlightEngineModelConfig(config);
+    }
+
     void clampTuningConfig(FlightConfig &config)
     {
         config.massKg = clamp(config.massKg, 450.0f, 4000.0f);
         config.maxThrustSeaLevel = clamp(config.maxThrustSeaLevel, 800.0f, 12000.0f);
-        config.idleCrankRpm = clamp(config.idleCrankRpm, 450.0f, 1400.0f);
-        config.maxCrankRpm = clamp(config.maxCrankRpm, config.idleCrankRpm + 400.0f, 4200.0f);
-        config.propellerGearRatio = clamp(config.propellerGearRatio, 0.25f, 4.0f);
-        config.propellerDiameterMeters = clamp(config.propellerDiameterMeters, 0.5f, 5.0f);
+        normalizeFlightEngineModelConfig(config);
         config.engineDisplacementLiters = clamp(config.engineDisplacementLiters, 0.8f, 60.0f);
         config.engineCylinderCount = std::clamp(config.engineCylinderCount, 1, 18);
         config.maxBrakePowerKw = clamp(config.maxBrakePowerKw, 20.0f, 2500.0f);
@@ -9353,6 +8763,7 @@ namespace TrueFlightApp
         config.spinRollMoment = clamp(config.spinRollMoment, 0.0f, 1.5f);
         config.spinYawMoment = clamp(config.spinYawMoment, 0.0f, 1.5f);
         config.groundFriction = clamp(config.groundFriction, 0.20f, 0.995f);
+        config.engineCount = std::clamp(config.engineCount, 1, kMaxFlightEngines);
     }
 
     bool nearlyEqualFlightPreferenceValue(float a, float b, float tolerance = 1.0e-3f)
@@ -11192,6 +10603,8 @@ namespace TrueFlightApp
         file << "flight.max_aileron_deg=" << degrees(config.maxAileronDeflectionRad) << "\n";
         file << "flight.auto_trim=" << (config.enableAutoTrim ? 1 : 0) << "\n";
         file << "flight.ground_friction=" << config.groundFriction << "\n";
+        file << "flight.engine_model=" << flightEngineModelToken(config.engineModel) << "\n";
+        file << "flight.engine_count=" << config.engineCount << "\n";
         file << "terrain.seed=" << terrainParams.seed << "\n";
         file << "terrain.chunk_size=" << terrainParams.chunkSize << "\n";
         file << "terrain.world_radius=" << terrainParams.worldRadius << "\n";
@@ -11970,6 +11383,14 @@ namespace TrueFlightApp
             else if (key == "flight.ground_friction")
             {
                 config.groundFriction = parseFloatValue(value, config.groundFriction);
+            }
+            else if (key == "flight.engine_model")
+            {
+                config.engineModel = flightEngineModelFromToken(value);
+            }
+            else if (key == "flight.engine_count")
+            {
+                config.engineCount = parseIntValue(value, config.engineCount);
             }
             else if (applyTerrainPreferenceValue(terrainParams, key, value))
             {
@@ -14562,6 +13983,10 @@ namespace TrueFlightApp
             std::snprintf(buffer, sizeof(buffer), "%.2f", config.groundFriction);
             return buffer;
         }
+        case 13:
+            return flightEngineModelLabel(config.engineModel);
+        case 14:
+            return std::to_string(config.engineCount);
         default:
             return {};
         }
@@ -14597,6 +14022,10 @@ namespace TrueFlightApp
             return "Automatic trim assist for near-level cruise.";
         case 12:
             return "Tangential damping applied on terrain contact.";
+        case 13:
+            return "Switch between radial-prop and turbojet propulsion models.";
+        case 14:
+            return "Active engine count used by the propulsion model.";
         default:
             return "";
         }
@@ -14654,6 +14083,15 @@ namespace TrueFlightApp
         case 12:
             config.groundFriction = clamp(config.groundFriction + (0.01f * static_cast<float>(direction)), 0.20f, 0.995f);
             break;
+        case 13:
+            if (direction != 0)
+            {
+                applyFlightEngineModelPreset(config, cycleFlightEngineModel(config.engineModel, direction));
+            }
+            break;
+        case 14:
+            config.engineCount = std::clamp(config.engineCount + direction, 1, kMaxFlightEngines);
+            break;
         default:
             break;
         }
@@ -14701,6 +14139,12 @@ namespace TrueFlightApp
             break;
         case 12:
             config.groundFriction = defaults.groundFriction;
+            break;
+        case 13:
+            config.engineModel = defaults.engineModel;
+            break;
+        case 14:
+            config.engineCount = defaults.engineCount;
             break;
         default:
             break;
@@ -16370,8 +15814,8 @@ namespace TrueFlightApp
         lookYaw = wrapAngle(lookYaw + (clampedDx * sensitivity * 4.4f));
         lookPitch = clamp(
             lookPitch + (pitchAxis * sensitivity * 3.6f),
-            -kGamepadFlightLookPitchLimitRadians,
-            kGamepadFlightLookPitchLimitRadians);
+            -kGamepadControlConfig.flightLookPitchLimitRadians,
+            kGamepadControlConfig.flightLookPitchLimitRadians);
     }
 
     std::array<std::string, 6> buildPauseMainItems(const UiState &uiState)
@@ -17107,22 +16551,7 @@ namespace TrueFlightApp
         {
             if (pauseState.settingsSubTab == SettingsSubTab::Flight)
             {
-                const std::array<const char *, 13> labels{
-                    "Mass",
-                    "Max Thrust",
-                    "CLalpha",
-                    "CD0",
-                    "Induced Drag K",
-                    "CmAlpha",
-                    "Pitch Control",
-                    "Roll Control",
-                    "Yaw Control",
-                    "Elevator Limit",
-                    "Aileron Limit",
-                    "Auto Trim",
-                    "Ground Friction"};
-
-                for (std::size_t i = 0; i < labels.size(); ++i)
+                for (std::size_t i = 0; i < kFlightTuningLabels.size(); ++i)
                 {
                     const RectF rowRect = pauseRowRect(layout, pauseState, assetCatalog.size(), static_cast<int>(i));
                     const bool selected = static_cast<int>(i) == pauseState.selectedIndex;
@@ -17132,7 +16561,7 @@ namespace TrueFlightApp
                         canvas.strokeRect(rowRect.x, rowRect.y, rowRect.w, rowRect.h, makeHudColor(220, 238, 255, 255));
                     }
 
-                    canvas.text(rowRect.x + 10.0f, rowRect.y + 8.0f, labels[i], makeHudColor(240, 247, 255, 255));
+                    canvas.text(rowRect.x + 10.0f, rowRect.y + 8.0f, kFlightTuningLabels[i], makeHudColor(240, 247, 255, 255));
                     canvas.text(rowRect.x + 250.0f, rowRect.y + 8.0f, formatTuningValue(static_cast<int>(i), config), makeHudColor(162, 230, 186, 255));
                 }
                 canvas.text(contentX, layout.panelY + layout.panelH - 62.0f, tuningHelpText(pauseState.selectedIndex), makeHudColor(205, 225, 242, 255));
@@ -21472,9 +20901,7 @@ namespace TrueFlightApp
         {
             if (pauseState.settingsSubTab == SettingsSubTab::Flight)
             {
-                const std::array<const char *, 13> labels{
-                    "Mass", "Max Thrust", "CLalpha", "CD0", "Induced Drag K", "CmAlpha", "Pitch Control", "Roll Control", "Yaw Control", "Elevator Limit", "Aileron Limit", "Auto Trim", "Ground Friction"};
-                for (std::size_t i = 0; i < labels.size(); ++i)
+                for (std::size_t i = 0; i < kFlightTuningLabels.size(); ++i)
                 {
                     const RectF rowRect = menuRowRect(layout, pauseState, controls, assetCatalog.size(), static_cast<int>(i));
                     const bool selected = static_cast<int>(i) == pauseState.selectedIndex;
@@ -21483,7 +20910,7 @@ namespace TrueFlightApp
                         canvas.fillRect(rowRect.x, rowRect.y, rowRect.w, rowRect.h, makeHudColor(46, 83, 124, 210));
                         canvas.strokeRect(rowRect.x, rowRect.y, rowRect.w, rowRect.h, makeHudColor(220, 238, 255, 255));
                     }
-                    canvas.text(rowRect.x + 10.0f, rowRect.y + 8.0f, labels[i], makeHudColor(240, 247, 255, 255));
+                    canvas.text(rowRect.x + 10.0f, rowRect.y + 8.0f, kFlightTuningLabels[i], makeHudColor(240, 247, 255, 255));
                     canvas.text(rowRect.x + 250.0f, rowRect.y + 8.0f, formatTuningValue(static_cast<int>(i), config), makeHudColor(162, 230, 186, 255));
                 }
                 canvas.text(contentX, layout.panelY + layout.panelH - 62.0f, tuningHelpText(pauseState.selectedIndex), makeHudColor(205, 225, 242, 255));
@@ -23822,6 +23249,7 @@ namespace TrueFlightApp
     bool startGameSession(
         GameSession &session,
         BootResources &boot,
+        const RuntimeTuning &runtimeTuning,
         bool audioSubsystemReady,
         SDL_Window *window,
         VulkanRenderer &renderer,
@@ -24258,8 +23686,8 @@ namespace TrueFlightApp
         if (session.onlineRole != OnlineSessionRole::Client)
         {
             ensureDefaultSharedRoadVehicles(session);
-            ensureEnemyTargetsGenerated(session);
-            ensureEnemyEscortsGenerated(session);
+            ensureEnemyTargetsGenerated(session, runtimeTuning);
+            ensureEnemyEscortsGenerated(session, runtimeTuning);
         }
 
         {
@@ -24438,6 +23866,7 @@ namespace TrueFlightApp
         const FlightConfig defaultFlightConfigValues = defaultFlightConfig();
         const PropAudioConfig defaultPropAudioConfigValues = defaultPropAudioConfig();
         const TerrainParams defaultTerrainParamsValues = defaultTerrainParams();
+        const RuntimeTuning runtimeTuning = defaultRuntimeTuning();
 
         BootResources boot;
         boot.uiState = defaultUiStateValues;
@@ -24904,7 +24333,7 @@ namespace TrueFlightApp
             {
                 gamepad.name = "gamepad";
             }
-            pollGamepadState(gamepad);
+            pollGamepadState(gamepad, kGamepadControlConfig);
             if (announce)
             {
                 setPauseStatus(menuState, std::string("Controller ready: ") + gamepad.name + ".", nowSeconds, 2.6f);
@@ -25463,7 +24892,7 @@ namespace TrueFlightApp
 
         auto localDurabilityState = [&]() -> PlaneDurabilityState &
         {
-            return ensurePlaneDurabilityState(session->planeDurabilityByPlayerId, localGameplayPlayerId());
+            return ensurePlaneDurabilityState(session->planeDurabilityByPlayerId, localGameplayPlayerId(), runtimeTuning);
         };
 
         auto localWeaponState = [&]() -> WeaponCooldownState &
@@ -25505,7 +24934,7 @@ namespace TrueFlightApp
 
             session->clientReplication.pendingTerrainEditsById[request->opId] = *request;
             session->clientReplication.outboundReliable.push_back(buildTerrainEditRequestPacket(*request));
-            weaponState.nextTerrainShotAt = nowSeconds + kTerrainGunCooldownSec;
+            weaponState.nextTerrainShotAt = nowSeconds + runtimeTuning.terrainGunCooldownSec;
             accumulateCombatAudioEvent(*session, request->center, 0.0f, 0.28f, 0.0f, 0.0f);
 
             if (nowSeconds >= session->clientReplication.nextTerrainHudNotificationAt)
@@ -25769,14 +25198,14 @@ namespace TrueFlightApp
                         brushMagnitude,
                         impactNormal,
                         terrainAdd ? "terrain_add" : "terrain_remove");
-                    cooldown = nowSeconds + kTerrainGunCooldownSec;
+                    cooldown = nowSeconds + runtimeTuning.terrainGunCooldownSec;
                     accumulateCombatAudioEvent(*session, samplePos, 0.0f, 0.28f, 0.0f, 0.0f);
                     return;
                 }
             }
             const float muzzleSpeed = terrainShot ? 180.0f : (actorFlightMode ? 840.0f : 580.0f);
             const float radius = terrainShot ? 0.22f : (actorFlightMode ? 0.085f : 0.05f);
-            const float ttl = terrainShot ? 1.4f : kProjectileLifetimeSec;
+            const float ttl = terrainShot ? 1.4f : runtimeTuning.projectileLifetimeSec;
             const float damage = terrainShot ? 0.0f : (actorFlightMode ? 48.0f : 36.0f);
             const float gravityScale = terrainShot ? 0.05f : (actorFlightMode ? 0.92f : 1.0f);
             spawnGameplayObject(
@@ -25791,7 +25220,7 @@ namespace TrueFlightApp
                 0.0f,
                 0.0f,
                 0.0f);
-            cooldown = nowSeconds + (terrainShot ? kTerrainGunCooldownSec : kPrimaryFireCooldownSec);
+            cooldown = nowSeconds + (terrainShot ? runtimeTuning.terrainGunCooldownSec : runtimeTuning.primaryFireCooldownSec);
             accumulateCombatAudioEvent(
                 *session,
                 muzzlePos,
@@ -25822,13 +25251,13 @@ namespace TrueFlightApp
                 actor.pos - (up * 0.9f) - (forward * 0.6f),
                 actor.flightVel - (up * 2.0f),
                 0.34f,
-                kBombLifetimeSec,
+                runtimeTuning.bombLifetimeSec,
                 72.0f,
                 1.0f,
                 28.0f,
                 16.0f,
                 6.8f);
-            weaponState.nextBombDropAt = nowSeconds + kBombDropCooldownSec;
+            weaponState.nextBombDropAt = nowSeconds + runtimeTuning.bombDropCooldownSec;
             accumulateCombatAudioEvent(*session, actor.pos, 0.0f, 0.0f, 1.0f, 0.0f);
         };
 
@@ -25839,8 +25268,8 @@ namespace TrueFlightApp
                 return;
             }
 
-            ensureEnemyTargetsGenerated(*session);
-            ensureEnemyEscortsGenerated(*session);
+            ensureEnemyTargetsGenerated(*session, runtimeTuning);
+            ensureEnemyEscortsGenerated(*session, runtimeTuning);
             applyDurabilityWear(localDurabilityState(), session->plane, session->runtime, session->flightMode, dt);
 
             if (localTerrainAdd || localTerrainRemove)
@@ -25864,7 +25293,12 @@ namespace TrueFlightApp
                     {
                         continue;
                     }
-                    applyDurabilityWear(ensurePlaneDurabilityState(session->planeDurabilityByPlayerId, playerId), player.actor, player.runtime, player.flightMode, dt);
+                    applyDurabilityWear(
+                        ensurePlaneDurabilityState(session->planeDurabilityByPlayerId, playerId, runtimeTuning),
+                        player.actor,
+                        player.runtime,
+                        player.flightMode,
+                        dt);
                     session->weaponStateByPlayerId[playerId].terraformMode = player.input.terraformMode;
                     if (player.input.terrainGunAdd || player.input.terrainGunRemove)
                     {
@@ -25954,7 +25388,7 @@ namespace TrueFlightApp
                 }
                 EnemyEscortSquadState *squad = findSquadForEscort(escort.squadId);
                 const Vec3 forward = squad != nullptr ? squad->formationForward : Vec3{0.0f, 0.0f, 1.0f};
-                Vec3 spawnAnchor = squad != nullptr ? squad->guardAnchor : Vec3{0.0f, kEnemyEscortPatrolAltitude, 0.0f};
+                Vec3 spawnAnchor = squad != nullptr ? squad->guardAnchor : Vec3{0.0f, runtimeTuning.enemyEscortPatrolAltitude, 0.0f};
                 const Vec3 offset = escortFormationOffset(escort.wingIndex, forward);
                 spawnAnchor += offset;
                 const float ground = sampleGroundHeight(spawnAnchor.x, spawnAnchor.z, session->terrainContext);
@@ -25979,7 +25413,7 @@ namespace TrueFlightApp
                     float nearestThreatDistance = std::numeric_limits<float>::infinity();
                     for (const EnemyTargetState &target : session->enemyTargets)
                     {
-                        if (target.health <= 0.0f || ((target.id - 1) % kEnemyEscortSquadCount) != ((squad.id - 1) % kEnemyEscortSquadCount))
+                        if (target.health <= 0.0f || ((target.id - 1) % runtimeTuning.enemyEscortSquadCount) != ((squad.id - 1) % runtimeTuning.enemyEscortSquadCount))
                         {
                             continue;
                         }
@@ -26022,7 +25456,7 @@ namespace TrueFlightApp
                     }
 
                     squad.assignedTargetId = assignedTarget->id;
-                    squad.guardAnchor = assignedTarget->pos + Vec3{0.0f, kEnemyEscortPatrolAltitude, 0.0f};
+                    squad.guardAnchor = assignedTarget->pos + Vec3{0.0f, runtimeTuning.enemyEscortPatrolAltitude, 0.0f};
                     squad.formationForward = normalize(Vec3{-assignedTarget->pos.z, 0.0f, assignedTarget->pos.x}, {0.0f, 0.0f, 1.0f});
                     if (nearestThreat != nullptr && nearestThreatDistance < 700.0f)
                     {
@@ -26042,7 +25476,7 @@ namespace TrueFlightApp
                         squad.interceptPoint = squad.guardAnchor;
                     }
                 }
-                session->enemyAirDirector.nextStrategicUpdateAt = nowSeconds + 0.55f;
+                session->enemyAirDirector.nextStrategicUpdateAt = nowSeconds + 0.8f;
             }
 
             for (EnemyEscortAircraftState &escort : session->enemyEscorts)
@@ -26205,7 +25639,7 @@ namespace TrueFlightApp
                         {
                             target.health = 0.0f;
                             target.respawnAt = session->worldTime + 8.0f;
-                            ensurePlaneDurabilityState(session->planeDurabilityByPlayerId, ownerId).targetsDestroyed += 1;
+                            ensurePlaneDurabilityState(session->planeDurabilityByPlayerId, ownerId, runtimeTuning).targetsDestroyed += 1;
                         }
                     }
                     for (EnemyEscortAircraftState &escort : session->enemyEscorts)
@@ -26224,7 +25658,7 @@ namespace TrueFlightApp
                         if (escort.health <= 0.0f)
                         {
                             escort.health = 0.0f;
-                            escort.respawnAt = session->worldTime + kEnemyEscortRespawnDelaySec;
+                            escort.respawnAt = session->worldTime + runtimeTuning.enemyEscortRespawnDelaySec;
                         }
                     }
                 }
@@ -26244,7 +25678,7 @@ namespace TrueFlightApp
                     const float alpha = 1.0f - clamp(distance / std::max(1.0f, blastRadius + radius), 0.0f, 1.0f);
                     const float blastScale = clamp(maxDamage / 46.0f, 0.65f, 2.4f);
                     applyPlaneDamage(
-                        ensurePlaneDurabilityState(session->planeDurabilityByPlayerId, playerId),
+                        ensurePlaneDurabilityState(session->planeDurabilityByPlayerId, playerId, runtimeTuning),
                         26.0f * blastScale * alpha,
                         33.0f * blastScale * alpha,
                         14.0f * blastScale * alpha);
@@ -26317,7 +25751,7 @@ namespace TrueFlightApp
                             {
                                 target.health = 0.0f;
                                 target.respawnAt = session->worldTime + 8.0f;
-                                ensurePlaneDurabilityState(session->planeDurabilityByPlayerId, object.ownerId).targetsDestroyed += 1;
+                                ensurePlaneDurabilityState(session->planeDurabilityByPlayerId, object.ownerId, runtimeTuning).targetsDestroyed += 1;
                             }
                         }
                         if (object.kind == GameplayObjectKind::Bomb)
@@ -26344,7 +25778,7 @@ namespace TrueFlightApp
                             if (escort.health <= 0.0f)
                             {
                                 escort.health = 0.0f;
-                                escort.respawnAt = session->worldTime + kEnemyEscortRespawnDelaySec;
+                                escort.respawnAt = session->worldTime + runtimeTuning.enemyEscortRespawnDelaySec;
                             }
                         }
                         if (object.kind == GameplayObjectKind::Bomb)
@@ -26372,7 +25806,7 @@ namespace TrueFlightApp
                         if (object.kind == GameplayObjectKind::Projectile || object.kind == GameplayObjectKind::Bomb)
                         {
                             applyPlaneDamage(
-                                ensurePlaneDurabilityState(session->planeDurabilityByPlayerId, playerId),
+                                ensurePlaneDurabilityState(session->planeDurabilityByPlayerId, playerId, runtimeTuning),
                                 object.damage * 0.72f,
                                 object.damage,
                                 object.damage * 0.35f);
@@ -26468,7 +25902,7 @@ namespace TrueFlightApp
                         transport->send(player.peerId, static_cast<int>(TransportLane::Snapshot), packet, false);
                     }
                 }
-                session->nextGameplaySnapshotAt = nowSeconds + kGameplaySnapshotIntervalSec;
+                session->nextGameplaySnapshotAt = nowSeconds + runtimeTuning.gameplaySnapshotIntervalSec;
             }
         };
 
@@ -26576,7 +26010,7 @@ namespace TrueFlightApp
             screen = AppScreen::WorldLoading;
             session.emplace();
             std::string sessionError;
-            if (startGameSession(*session, boot, audioSubsystemReady, window, nativeRenderer, rendererLabel, &sessionError))
+            if (startGameSession(*session, boot, runtimeTuning, audioSubsystemReady, window, nativeRenderer, rendererLabel, &sessionError))
             {
                 screen = AppScreen::InFlight;
                 setSessionPlayerMode(*session, PlayerMode::Flight, 0);
@@ -27575,14 +27009,14 @@ namespace TrueFlightApp
                 clampMenuSelection();
             }
 
-            if (gamepadAxisPressed(gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, kGamepadMenuTriggerPressThreshold) &&
+            if (gamepadAxisPressed(gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, kGamepadControlConfig.menuTriggerPressThreshold) &&
                 pauseTabHasSubTabs(menuState.tab))
             {
                 cyclePauseSubTab(menuState, -1);
                 boot.paintUi.draggingCanvas = false;
                 clampMenuSelection();
             }
-            else if (gamepadAxisPressed(gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, kGamepadMenuTriggerPressThreshold) &&
+            else if (gamepadAxisPressed(gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, kGamepadControlConfig.menuTriggerPressThreshold) &&
                      pauseTabHasSubTabs(menuState.tab))
             {
                 cyclePauseSubTab(menuState, 1);
@@ -27592,24 +27026,36 @@ namespace TrueFlightApp
 
             const bool navUp =
                 gamepadButtonDown(gamepad, SDL_GAMEPAD_BUTTON_DPAD_UP) ||
-                gamepadAxisValue(gamepad, SDL_GAMEPAD_AXIS_LEFTY) <= -kGamepadMenuStickDeadzone;
+                gamepadAxisValue(gamepad, SDL_GAMEPAD_AXIS_LEFTY) <= -kGamepadControlConfig.menuStickDeadzone;
             const bool navDown =
                 gamepadButtonDown(gamepad, SDL_GAMEPAD_BUTTON_DPAD_DOWN) ||
-                gamepadAxisValue(gamepad, SDL_GAMEPAD_AXIS_LEFTY) >= kGamepadMenuStickDeadzone;
+                gamepadAxisValue(gamepad, SDL_GAMEPAD_AXIS_LEFTY) >= kGamepadControlConfig.menuStickDeadzone;
             const bool navLeft =
                 gamepadButtonDown(gamepad, SDL_GAMEPAD_BUTTON_DPAD_LEFT) ||
-                gamepadAxisValue(gamepad, SDL_GAMEPAD_AXIS_LEFTX) <= -kGamepadMenuStickDeadzone;
+                gamepadAxisValue(gamepad, SDL_GAMEPAD_AXIS_LEFTX) <= -kGamepadControlConfig.menuStickDeadzone;
             const bool navRight =
                 gamepadButtonDown(gamepad, SDL_GAMEPAD_BUTTON_DPAD_RIGHT) ||
-                gamepadAxisValue(gamepad, SDL_GAMEPAD_AXIS_LEFTX) >= kGamepadMenuStickDeadzone;
+                gamepadAxisValue(gamepad, SDL_GAMEPAD_AXIS_LEFTX) >= kGamepadControlConfig.menuStickDeadzone;
 
-            const int verticalMove = consumeRepeatedGamepadDirection(navUp, navDown, nowSeconds, gamepad.verticalRepeatDirection, gamepad.verticalRepeatAt);
+            const int verticalMove = consumeRepeatedGamepadDirection(
+                navUp,
+                navDown,
+                nowSeconds,
+                gamepad.verticalRepeatDirection,
+                gamepad.verticalRepeatAt,
+                kGamepadControlConfig);
             if (verticalMove != 0)
             {
                 moveMenuSelection(verticalMove);
             }
 
-            const int horizontalMove = consumeRepeatedGamepadDirection(navLeft, navRight, nowSeconds, gamepad.horizontalRepeatDirection, gamepad.horizontalRepeatAt);
+            const int horizontalMove = consumeRepeatedGamepadDirection(
+                navLeft,
+                navRight,
+                nowSeconds,
+                gamepad.horizontalRepeatDirection,
+                gamepad.horizontalRepeatAt,
+                kGamepadControlConfig);
             if (horizontalMove != 0)
             {
                 adjustSelectedRow(horizontalMove, nowSeconds);
@@ -28841,6 +28287,22 @@ namespace TrueFlightApp
                     case 12:
                         return makeFloatSliderRow(std::move(label), std::move(valueText), helpText, disabled, boot.planeProfile.flightConfig.groundFriction, 0.20f, 0.995f, 0.01f, [&, index](float newValue)
                                                   { menuState.selectedIndex = index; clampMenuSelection(); boot.planeProfile.flightConfig.groundFriction = newValue; commitFlightSettings(); }, buildSelectionReset(index));
+                    case 13:
+                        return makeEnumRow(std::move(label), std::move(valueText), helpText, disabled, [&, index](int direction)
+                                           {
+                                               if (direction == 0)
+                                               {
+                                                   return;
+                                               }
+                                               menuState.selectedIndex = index;
+                                               clampMenuSelection();
+                                               applyFlightEngineModelPreset(boot.planeProfile.flightConfig, cycleFlightEngineModel(boot.planeProfile.flightConfig.engineModel, direction));
+                                               commitFlightSettings();
+                                           },
+                                           buildSelectionReset(index));
+                    case 14:
+                        return makeIntSliderRow(std::move(label), std::move(valueText), helpText, disabled, boot.planeProfile.flightConfig.engineCount, 1, kMaxFlightEngines, 1, [&, index](float newValue)
+                                                { menuState.selectedIndex = index; clampMenuSelection(); boot.planeProfile.flightConfig.engineCount = static_cast<int>(std::round(newValue)); commitFlightSettings(); }, buildSelectionReset(index));
                     default:
                         return makeReadOnlyRow(std::move(label), std::move(valueText), helpText, disabled);
                     }
@@ -29616,15 +29078,11 @@ namespace TrueFlightApp
 
                                         if (subTab == SettingsSubTab::Flight)
                                         {
-                                            static constexpr std::array<const char *, 13> kFlightLabels{
-                                                "Mass", "Max Thrust", "CLalpha", "CD0", "Induced Drag K", "CmAlpha",
-                                                "Pitch Control", "Roll Control", "Yaw Control", "Elevator Limit",
-                                                "Aileron Limit", "Auto Trim", "Ground Friction"};
                                             drawStepperTable(
                                                 "##FlightSettings",
-                                                static_cast<int>(kFlightLabels.size()),
+                                                static_cast<int>(kFlightTuningLabels.size()),
                                                 [&](int index)
-                                                { return kFlightLabels[static_cast<std::size_t>(index)]; },
+                                                { return kFlightTuningLabels[static_cast<std::size_t>(index)]; },
                                                 [&](int index)
                                                 { return formatTuningValue(index, boot.planeProfile.flightConfig); },
                                                 [&](int index)
@@ -31264,8 +30722,11 @@ namespace TrueFlightApp
             const std::uint64_t currentCounter = SDL_GetPerformanceCounter();
             const double dtSeconds = static_cast<double>(currentCounter - previousCounter) / counterFrequency;
             previousCounter = currentCounter;
-            const float dt = clamp(static_cast<float>(dtSeconds), 1.0f / 240.0f, 0.05f);
-            fpsSmoothed = mix(fpsSmoothed, 1.0f / std::max(dt, 1.0e-4f), 0.08f);
+
+            const float realDt = static_cast<float>(dtSeconds);
+            const float dt = realDt;
+
+            fpsSmoothed = mix(fpsSmoothed, 1.0f / std::max(realDt, 1.0e-6f), 0.08f);
             if (uiNowSeconds >= runtimeGovernor.nextPressureSampleAt)
             {
                 SystemPressureSnapshot sampledPressure;
@@ -31289,7 +30750,7 @@ namespace TrueFlightApp
                 session->steamOnline = boot.steamOnline;
             }
             ensureGamepadOpen(uiNowSeconds, false);
-            pollGamepadState(gamepad);
+            pollGamepadState(gamepad, kGamepadControlConfig);
             handleGamepadGameplayButtons(uiNowSeconds);
             handleGamepadMenuInput(uiNowSeconds);
 
@@ -31408,6 +30869,7 @@ namespace TrueFlightApp
                         if (!altLookHeld || std::fabs(gamepadRightX) > 1.0e-4f || std::fabs(gamepadRightY) > 1.0e-4f)
                         {
                             applyFlightGamepadLook(
+                                kGamepadControlConfig,
                                 boot.uiState,
                                 session->flightLookYaw,
                                 session->flightLookPitch,
@@ -31419,7 +30881,7 @@ namespace TrueFlightApp
                         const float trimAxis =
                             (gamepadButtonDown(gamepad, SDL_GAMEPAD_BUTTON_DPAD_UP) ? 1.0f : 0.0f) -
                             (gamepadButtonDown(gamepad, SDL_GAMEPAD_BUTTON_DPAD_DOWN) ? 1.0f : 0.0f);
-                        gamepad.trimAccumulator += trimAxis * kGamepadTrimStepsPerSecond * dt;
+                        gamepad.trimAccumulator += trimAxis * kGamepadControlConfig.trimStepsPerSecond * dt;
                         while (gamepad.trimAccumulator >= 1.0f)
                         {
                             ++trimWheelSteps;
@@ -31481,14 +30943,18 @@ namespace TrueFlightApp
                         gamepad.trimAccumulator = 0.0f;
                         pitchTrimAccumulator = 0.0f;
                         rudderTrimAccumulator = 0.0f;
-                        applyWalkingGamepadLook(
+                        const bool walkingLookChanged = applyWalkingGamepadLookAngles(
+                            kGamepadControlConfig,
                             boot.uiState,
-                            session->plane,
                             session->walkYaw,
                             session->walkPitch,
                             gamepadRightX,
                             gamepadRightY,
                             dt);
+                        if (walkingLookChanged)
+                        {
+                            session->plane.rot = composeWalkingRotation(session->walkYaw, session->walkPitch);
+                        }
                     }
                     if (session->flightMode)
                     {
@@ -31606,7 +31072,14 @@ namespace TrueFlightApp
 
                 if (!menuVisible())
                 {
-                    updateCloudField(session->cloudField, session->windState, dt, session->worldTime + dt, session->plane.pos, session->worldRng);
+                    updateCloudField(
+                        session->cloudField,
+                        session->windState,
+                        dt,
+                        session->worldTime + dt,
+                        session->plane.pos,
+                        session->runtime.lastAtmosphere,
+                        session->worldRng);
                     environment.wind = getWindVector3(session->windState);
                     if (sessionIsFlightMode(*session) && !session->runtime.crashed)
                     {
@@ -31935,7 +31408,44 @@ namespace TrueFlightApp
                     menuVisible(),
                     dt,
                     flightAfterburnerActive);
-                if (!session->flightMode)
+                if (sessionIsDrivingMode(*session))
+                {
+                    const SharedVehicleState *vehicle = lookupSessionVehicle(*session, session->activeVehicleId);
+                    const float vehicleSpeed = vehicle != nullptr ? length(vehicle->vel) : length(session->plane.vel);
+                    const float vehicleThrottle = vehicle != nullptr ? clamp(vehicle->throttleNormalized, -1.0f, 1.0f) : 0.0f;
+                    const float vehicleSteer = vehicle != nullptr ? clamp(vehicle->steerNormalized, -1.0f, 1.0f) : 0.0f;
+                    const float throttle01 = std::max(0.0f, vehicleThrottle);
+                    const float speed01 = clamp(vehicleSpeed / 38.0f, 0.0f, 1.0f);
+                    const float roadGrip =
+                        vehicle != nullptr
+                            ? clamp((vehicle->roadAdhesion * 0.72f) + (clamp(vehicle->surfaceFriction, 0.0f, 1.6f) * 0.18f), 0.0f, 1.0f)
+                            : 0.85f;
+                    const float commandedWheelSpeed = throttle01 * mix(12.0f, 48.0f, 1.0f - roadGrip);
+                    const float wheelSlipMps = std::max(0.0f, commandedWheelSpeed - (vehicleSpeed * 0.78f));
+                    const float wheelSpin01 = clamp((wheelSlipMps / 18.0f) + (throttle01 * (1.0f - roadGrip) * 0.35f), 0.0f, 1.2f);
+
+                    audioFrame.onGround = true;
+                    audioFrame.exteriorView = true;
+                    audioFrame.afterburner = false;
+                    audioFrame.engineThrottle = throttle01;
+                    audioFrame.crankRpm = mix(820.0f, 4650.0f, clamp((speed01 * 0.58f) + (throttle01 * 0.36f) + (wheelSpin01 * 0.62f), 0.0f, 1.0f));
+                    audioFrame.propRpm = audioFrame.crankRpm;
+                    audioFrame.manifoldPressureKpa = mix(35.0f, 122.0f, throttle01);
+                    audioFrame.fuelFlowKgPerSec = (throttle01 * 0.045f) + (wheelSpin01 * 0.012f);
+                    audioFrame.enginePowerKw = (throttle01 * 95.0f) + (wheelSpin01 * 18.0f);
+                    audioFrame.trueAirspeed = vehicleSpeed;
+                    audioFrame.dynamicPressure = 0.0f;
+                    audioFrame.thrustNewton = 0.0f;
+                    audioFrame.alphaRad = 0.0f;
+                    audioFrame.betaRad = vehicleSteer * 0.05f;
+                    audioFrame.verticalSpeed = session->plane.vel.y;
+                    audioFrame.angularRateRad = std::fabs(vehicleSteer) * mix(0.4f, 2.4f, speed01);
+                    audioFrame.pitchRateRad = std::fabs(session->plane.flightAngVel.x);
+                    audioFrame.yawRateRad = std::fabs(session->plane.flightAngVel.y);
+                    audioFrame.rollRateRad = std::fabs(session->plane.flightAngVel.z);
+                    audioFrame.engineVolume *= mix(0.30f, 0.92f, clamp(throttle01 + (speed01 * 0.4f) + (wheelSpin01 * 0.35f), 0.0f, 1.2f));
+                }
+                else if (!session->flightMode)
                 {
                     audioFrame.onGround = session->plane.onGround;
                     audioFrame.exteriorView = true;
@@ -32022,7 +31532,7 @@ namespace TrueFlightApp
                 int remotePeerCount = 0;
                 std::vector<HudPeerIndicator> hudPeerIndicators;
                 std::vector<HudTargetIndicator> hudTargetIndicators;
-                std::vector<PeerStatComparison> peerComparisons = buildPeerStatComparisons(*session);
+                std::vector<PeerStatComparison> peerComparisons = buildPeerStatComparisons(*session, runtimeTuning);
                 const float localGround = sampleGroundHeight(session->plane.pos.x, session->plane.pos.z, session->terrainContext);
                 const float localSpeedKph = (session->flightMode ? session->plane.debug.speed : length(session->plane.vel)) * 3.6f;
                 const float localAltitudeAgl = session->plane.pos.y - localGround;
@@ -32034,7 +31544,7 @@ namespace TrueFlightApp
                         {
                             ++remotePeerCount;
                             const float peerGround = sampleGroundHeight(player.actor.pos.x, player.actor.pos.z, session->terrainContext);
-                            const PlaneDurabilityState durability = lookupPlaneDurabilityState(*session, playerId);
+                            const PlaneDurabilityState durability = lookupPlaneDurabilityState(*session, playerId, runtimeTuning);
                             hudPeerIndicators.push_back({player.actor.pos,
                                                          player.avatar.callsign,
                                                          player.avatar.radioChannel,
@@ -32060,7 +31570,7 @@ namespace TrueFlightApp
                         {
                             ++remotePeerCount;
                             const float peerGround = sampleGroundHeight(peer.displayPos.x, peer.displayPos.z, session->terrainContext);
-                            const PlaneDurabilityState durability = lookupPlaneDurabilityState(*session, peer.id);
+                            const PlaneDurabilityState durability = lookupPlaneDurabilityState(*session, peer.id, runtimeTuning);
                             hudPeerIndicators.push_back({peer.displayPos,
                                                          peer.avatar.callsign,
                                                          peer.avatar.radioChannel,

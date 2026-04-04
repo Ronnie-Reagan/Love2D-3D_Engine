@@ -1,16 +1,22 @@
 #pragma once
 
+#include "NativeGame/Flight.hpp"
 #include "NativeGame/Math.hpp"
 #include "NativeGame/StlLoader.hpp"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <random>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -1908,8 +1914,17 @@ inline Vec3 sampleTerrainColor(float x, float y, float z, const TerrainFieldCont
     const Vec3 rock { 0.47f, 0.45f, 0.43f };
     const Vec3 mineral { 0.58f, 0.44f, 0.34f };
     const Vec3 snowColor { 0.88f, 0.89f, 0.92f };
-    const Vec3 asphaltDark { 0.045f, 0.045f, 0.048f };
-    const Vec3 asphaltPatch { 0.09f, 0.09f, 0.095f };
+    const Vec3 roadTint = clampColor3(params.roadColor, { 0.11f, 0.11f, 0.115f });
+    const Vec3 asphaltDark {
+        clamp(roadTint.x * 0.72f, 0.02f, 0.25f),
+        clamp(roadTint.y * 0.72f, 0.02f, 0.25f),
+        clamp(roadTint.z * 0.72f, 0.02f, 0.25f)
+    };
+    const Vec3 asphaltPatch {
+        clamp(roadTint.x * 1.06f, 0.03f, 0.32f),
+        clamp(roadTint.y * 1.06f, 0.03f, 0.32f),
+        clamp(roadTint.z * 1.06f, 0.03f, 0.32f)
+    };
     const Vec3 shoulderSoil { 0.36f, 0.34f, 0.32f };
 
     Vec3 base = lerp(grass, forest, material.biomeBlend);
@@ -1940,7 +1955,8 @@ inline Vec3 sampleTerrainColor(float x, float y, float z, const TerrainFieldCont
         asphalt = lerp(asphalt, asphaltPatch, material.asphaltPatchWeight * 0.85f);
         asphalt = asphalt - (Vec3 { 1.0f, 1.0f, 1.0f } * (crack * params.roads.crackStrength * 0.16f));
         asphalt = lerp(asphalt, asphalt * 0.58f, clamp(material.wetness * 0.55f, 0.0f, 0.55f));
-        base = lerp(base, asphalt, material.roadWeight);
+        const float roadBlend = clamp((material.roadWeight * 1.18f) + (material.shoulderWeight * 0.12f), 0.0f, 1.0f);
+        base = lerp(base, asphalt, roadBlend);
     }
 
     return base;
@@ -2667,11 +2683,18 @@ struct CloudGroup {
     float targetDensity = 1.0f;
     float driftScale = 1.0f;
     float evolutionRate = 1.0f;
+    float humidity = 0.62f;
+    float opticalDepth = 0.52f;
+    float layerBase = 560.0f;
+    float layerTop = 980.0f;
     float alpha = 0.78f;
     float nextMorphAt = 0.0f;
     float nextMeshRebuildAt = 0.0f;
     float renderRadius = 160.0f;
     std::uint32_t noiseSeed = 1u;
+    std::uint64_t stableId = 0u;
+    std::uint64_t pendingBuildId = 0u;
+    std::uint64_t lastAppliedBuildId = 0u;
     TerrainVolumeBounds localBounds {};
     Model volumeModel;
     bool meshDirty = true;
@@ -2681,7 +2704,11 @@ struct CloudGroup {
 struct CloudField {
     float spawnRadius = 2600.0f;
     float baseHeight = 620.0f;
+    float layerThickness = 420.0f;
+    float coverage = 0.72f;
+    float humidityResponse = 0.78f;
     int groupCount = 14;
+    std::size_t maxMeshBuildResultsPerUpdate = 4u;
     std::vector<CloudGroup> groups;
 };
 
@@ -2695,6 +2722,43 @@ inline int randomRangeInt(std::mt19937& rng, int minValue, int maxValue)
 {
     std::uniform_int_distribution<int> distribution(minValue, maxValue);
     return distribution(rng);
+}
+
+inline std::uint64_t nextCloudGroupStableId()
+{
+    static std::atomic<std::uint64_t> nextId { 1u };
+    return nextId.fetch_add(1u, std::memory_order_relaxed);
+}
+
+inline std::uint64_t nextCloudMeshBuildId()
+{
+    static std::atomic<std::uint64_t> nextId { 1u };
+    return nextId.fetch_add(1u, std::memory_order_relaxed);
+}
+
+inline float cloudLayerWeight(const CloudField& cloudField, float altitudeMeters)
+{
+    const float halfThickness = std::max(110.0f, cloudField.layerThickness * 0.5f);
+    const float normalizedDistance = std::fabs(altitudeMeters - cloudField.baseHeight) / halfThickness;
+    return clamp(1.0f - normalizedDistance, 0.0f, 1.0f);
+}
+
+inline float estimateCloudHumidityFromAtmosphere(const AtmosphereSample& atmosphere, float phase)
+{
+    const float densityFactor = clamp((atmosphere.sigma - 0.24f) / 0.90f, 0.0f, 1.0f);
+    const float temperatureC = atmosphere.temperatureK - 273.15f;
+    const float warmthPenalty = clamp((temperatureC - 16.0f) / 28.0f, 0.0f, 1.0f);
+    const float wave = 0.5f + (0.5f * std::sin(phase));
+    return clamp((densityFactor * 0.78f) + (wave * 0.18f) - (warmthPenalty * 0.10f), 0.05f, 0.99f);
+}
+
+inline Vec3 clampCloudColor(const Vec3& color)
+{
+    return {
+        clamp(color.x, 0.18f, 1.22f),
+        clamp(color.y, 0.18f, 1.22f),
+        clamp(color.z, 0.20f, 1.24f)
+    };
 }
 
 inline void pickNextWindTarget(WindState& windState, std::mt19937& rng, float nowSeconds = 0.0f)
@@ -2758,12 +2822,13 @@ inline float sampleCloudPuffSdf(const CloudGroup& group, const CloudPuff& puff, 
     return ellipsoidSdf - erosion;
 }
 
-inline void updateCloudGroupBounds(CloudGroup& group)
+inline TerrainVolumeBounds computeCloudGroupBounds(const CloudGroup& group, float* outRenderRadius = nullptr)
 {
     if (group.puffs.empty()) {
-        group.localBounds = {};
-        group.renderRadius = std::max(80.0f, group.radius * 1.2f);
-        return;
+        if (outRenderRadius != nullptr) {
+            *outRenderRadius = std::max(80.0f, group.radius * 1.2f);
+        }
+        return {};
     }
 
     float minX = std::numeric_limits<float>::infinity();
@@ -2785,7 +2850,7 @@ inline void updateCloudGroupBounds(CloudGroup& group)
     }
 
     const float padding = std::max(10.0f, group.radius * 0.12f);
-    group.localBounds = {
+    const TerrainVolumeBounds bounds {
         minX - padding,
         maxX + padding,
         minY - padding,
@@ -2793,19 +2858,85 @@ inline void updateCloudGroupBounds(CloudGroup& group)
         minZ - padding,
         maxZ + padding
     };
-    group.renderRadius = length(Vec3 {
-        std::max(std::fabs(group.localBounds.x0), std::fabs(group.localBounds.x1)),
-        std::max(std::fabs(group.localBounds.y0), std::fabs(group.localBounds.y1)),
-        std::max(std::fabs(group.localBounds.z0), std::fabs(group.localBounds.z1))
-    });
+    if (outRenderRadius != nullptr) {
+        *outRenderRadius = length(Vec3 {
+            std::max(std::fabs(bounds.x0), std::fabs(bounds.x1)),
+            std::max(std::fabs(bounds.y0), std::fabs(bounds.y1)),
+            std::max(std::fabs(bounds.z0), std::fabs(bounds.z1))
+        });
+    }
+    return bounds;
 }
 
-inline void rebuildCloudGroupVolume(CloudGroup& group)
+inline void updateCloudGroupBounds(CloudGroup& group)
 {
-    updateCloudGroupBounds(group);
+    group.localBounds = computeCloudGroupBounds(group, &group.renderRadius);
+}
+
+struct CloudMeshBuildRequest {
+    std::size_t groupIndex = 0u;
+    std::uint64_t groupStableId = 0u;
+    std::uint64_t buildId = 0u;
+    float centerY = 0.0f;
+    float radius = 120.0f;
+    float verticalScale = 0.65f;
+    float density = 1.0f;
+    float humidity = 0.5f;
+    float opticalDepth = 0.5f;
+    float renderRadius = 160.0f;
+    std::uint32_t noiseSeed = 1u;
+    TerrainVolumeBounds localBounds {};
+    std::vector<CloudPuff> puffs;
+};
+
+struct CloudMeshBuildResult {
+    std::size_t groupIndex = 0u;
+    std::uint64_t groupStableId = 0u;
+    std::uint64_t buildId = 0u;
+    TerrainVolumeBounds localBounds {};
+    float renderRadius = 0.0f;
+    Model volumeModel;
+    bool built = false;
+};
+
+inline Vec3 shadeCloudFaceColor(
+    const CloudMeshBuildRequest& request,
+    const Vec3& faceCenter,
+    const Vec3& faceNormal)
+{
+    const float absoluteAltitude = request.centerY + faceCenter.y;
+    const AtmosphereSample faceAtmosphere = sampleAtmosphere(absoluteAltitude);
+    const float sigma = clamp(faceAtmosphere.sigma, 0.08f, 1.05f);
+    const float verticalSpan = std::max(1.0f, request.localBounds.y1 - request.localBounds.y0);
+    const float topFactor = clamp((faceCenter.y - request.localBounds.y0) / verticalSpan, 0.0f, 1.0f);
+    const float upFactor = clamp((faceNormal.y * 0.5f) + 0.5f, 0.0f, 1.0f);
+    const float densityShadow = clamp(request.opticalDepth * (1.0f - topFactor), 0.0f, 1.6f);
+    const float silverLining = std::pow(upFactor, 1.8f) * (0.22f + (0.34f * request.humidity));
+    const Vec3 coolTint { 0.63f, 0.72f, 0.84f };
+    const Vec3 warmTint { 0.98f, 0.97f, 0.94f };
+    Vec3 color = lerp(coolTint, warmTint, mix(topFactor, upFactor, 0.62f));
+    color *= mix(0.62f, 1.14f, sigma);
+    color *= 1.0f - (0.44f * densityShadow);
+    color += Vec3 { silverLining, silverLining * 0.98f, silverLining * 0.94f };
+    const float blueShift = clamp((1.0f - sigma) * 1.1f, 0.0f, 1.0f);
+    color = lerp(color, Vec3 { 0.72f, 0.80f, 0.93f }, blueShift * 0.34f);
+    return clampCloudColor(color);
+}
+
+inline CloudMeshBuildResult buildCloudMeshFromRequest(const CloudMeshBuildRequest& request)
+{
+    CloudMeshBuildResult result;
+    result.groupIndex = request.groupIndex;
+    result.groupStableId = request.groupStableId;
+    result.buildId = request.buildId;
+    result.localBounds = request.localBounds;
+    result.renderRadius = request.renderRadius;
+    if (request.puffs.empty()) {
+        return result;
+    }
 
     TerrainParams cloudParams {};
-    cloudParams.seed = static_cast<int>(std::max<std::uint32_t>(1u, group.noiseSeed));
+    cloudParams.seed = static_cast<int>(std::max<std::uint32_t>(1u, request.noiseSeed));
     cloudParams.chunkSize = 64.0f;
     cloudParams.worldRadius = 4096.0f;
     cloudParams.minY = -4096.0f;
@@ -2820,88 +2951,331 @@ inline void rebuildCloudGroupVolume(CloudGroup& group)
     cloudParams.roads.enabled = false;
     cloudParams.caveEnabled = false;
     cloudParams.tunnelCount = 0;
-    cloudParams.maxChunkCellsPerAxis = 54;
+    cloudParams.maxChunkCellsPerAxis = 48;
 
     TerrainFieldContext volumeContext;
     volumeContext.params = normalizeTerrainParams(cloudParams);
     CloudGroup sdfGroup;
-    sdfGroup.radius = group.radius;
-    sdfGroup.verticalScale = group.verticalScale;
-    const std::vector<CloudPuff> puffs = group.puffs;
-    volumeContext.sampleVolumetricAdditiveSdfAt = [sdfGroup, puffs](float x, float y, float z) -> float {
+    sdfGroup.radius = request.radius;
+    sdfGroup.verticalScale = request.verticalScale;
+    sdfGroup.density = request.density;
+    sdfGroup.noiseSeed = request.noiseSeed;
+    const std::vector<CloudPuff> puffs = request.puffs;
+    volumeContext.sampleVolumetricAdditiveSdfAt = [sdfGroup, puffs, request](float x, float y, float z) -> float {
         const Vec3 point { x, y, z };
         float cloudSdf = std::numeric_limits<float>::infinity();
         for (const CloudPuff& puff : puffs) {
             cloudSdf = std::min(cloudSdf, sampleCloudPuffSdf(sdfGroup, puff, point));
         }
 
-        const float cloudBaseY = -sdfGroup.radius * sdfGroup.verticalScale * 0.62f;
+        const float cloudBaseY = -sdfGroup.radius * sdfGroup.verticalScale * mix(0.54f, 0.72f, request.humidity);
         cloudSdf = std::max(cloudSdf, cloudBaseY - point.y);
-        const float edgeFade = clamp((std::fabs(point.y) / std::max(1.0f, sdfGroup.radius * sdfGroup.verticalScale * 1.55f)) - 0.55f, 0.0f, 1.0f);
-        return cloudSdf + (edgeFade * sdfGroup.radius * 0.04f);
+        const float verticalLimit = std::max(1.0f, sdfGroup.radius * sdfGroup.verticalScale * 1.58f);
+        const float edgeFade = clamp((std::fabs(point.y) / verticalLimit) - 0.52f, 0.0f, 1.0f);
+        return cloudSdf + (edgeFade * sdfGroup.radius * mix(0.035f, 0.06f, request.opticalDepth));
     };
 
-    const float cellSize = clamp(group.radius * 0.14f, 10.0f, 22.0f);
-    group.volumeModel = buildVolumetricTerrainPatch(volumeContext, group.localBounds, cellSize);
-    group.volumeModel.assetKey.clear();
-    for (Vec3& color : group.volumeModel.faceColors) {
-        color = { 1.0f, 1.0f, 1.0f };
+    const float detailBias = clamp((request.humidity * 0.55f) + (request.opticalDepth * 0.45f), 0.0f, 1.0f);
+    const float cellSize = clamp(request.radius * mix(0.18f, 0.10f, detailBias), 12.0f, 24.0f);
+    result.volumeModel = buildVolumetricTerrainPatch(volumeContext, request.localBounds, cellSize);
+    result.volumeModel.assetKey.clear();
+    result.volumeModel.faceColors.resize(result.volumeModel.faces.size(), { 1.0f, 1.0f, 1.0f });
+    for (std::size_t faceIndex = 0; faceIndex < result.volumeModel.faces.size(); ++faceIndex) {
+        const Face& face = result.volumeModel.faces[faceIndex];
+        if (face.indices.size() < 3u) {
+            continue;
+        }
+
+        Vec3 center {};
+        int validVertices = 0;
+        for (const int index : face.indices) {
+            if (index < 0 || static_cast<std::size_t>(index) >= result.volumeModel.vertices.size()) {
+                continue;
+            }
+            center += result.volumeModel.vertices[static_cast<std::size_t>(index)];
+            ++validVertices;
+        }
+        if (validVertices <= 0) {
+            continue;
+        }
+        center = center / static_cast<float>(validVertices);
+
+        const auto fetchVertex = [&](const std::size_t indexInFace) -> Vec3 {
+            const int vertexIndex = face.indices[indexInFace];
+            if (vertexIndex < 0 || static_cast<std::size_t>(vertexIndex) >= result.volumeModel.vertices.size()) {
+                return center;
+            }
+            return result.volumeModel.vertices[static_cast<std::size_t>(vertexIndex)];
+        };
+        const Vec3 a = fetchVertex(0u);
+        const Vec3 b = fetchVertex(1u);
+        const Vec3 c = fetchVertex(2u);
+        const Vec3 normal = normalize(cross(b - a, c - a), { 0.0f, 1.0f, 0.0f });
+        result.volumeModel.faceColors[faceIndex] = shadeCloudFaceColor(request, center, normal);
     }
+    result.built = !result.volumeModel.faces.empty();
+    return result;
+}
+
+class CloudMeshWorkerQueue {
+public:
+    CloudMeshWorkerQueue() = default;
+
+    ~CloudMeshWorkerQueue()
+    {
+        shutdown();
+    }
+
+    void enqueue(CloudMeshBuildRequest request)
+    {
+        ensureStarted();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stopRequested_) {
+                return;
+            }
+            queuedRequests_.push_back(std::move(request));
+        }
+        condition_.notify_one();
+    }
+
+    std::vector<CloudMeshBuildResult> drainCompleted(std::size_t maxResults)
+    {
+        std::vector<CloudMeshBuildResult> drained;
+        std::lock_guard<std::mutex> lock(mutex_);
+        const std::size_t count = maxResults == 0u
+                                      ? completedResults_.size()
+                                      : std::min(maxResults, completedResults_.size());
+        drained.reserve(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            drained.push_back(std::move(completedResults_.front()));
+            completedResults_.pop_front();
+        }
+        return drained;
+    }
+
+private:
+    void ensureStarted()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (started_) {
+            return;
+        }
+
+        const unsigned int logicalCores = std::max(1u, std::thread::hardware_concurrency());
+        const unsigned int desiredWorkers = std::clamp(logicalCores > 2u ? (logicalCores / 2u) : 1u, 1u, 4u);
+        workers_.reserve(desiredWorkers);
+        for (unsigned int workerIndex = 0u; workerIndex < desiredWorkers; ++workerIndex) {
+            workers_.emplace_back([this]() { workerLoop(); });
+        }
+        started_ = true;
+    }
+
+    void shutdown()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopRequested_ = true;
+        }
+        condition_.notify_all();
+        for (std::thread& worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+        workers_.clear();
+    }
+
+    void workerLoop()
+    {
+        while (true) {
+            CloudMeshBuildRequest request;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                condition_.wait(lock, [this]() { return stopRequested_ || !queuedRequests_.empty(); });
+                if (stopRequested_ && queuedRequests_.empty()) {
+                    return;
+                }
+                request = std::move(queuedRequests_.front());
+                queuedRequests_.pop_front();
+            }
+
+            CloudMeshBuildResult result = buildCloudMeshFromRequest(request);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                completedResults_.push_back(std::move(result));
+            }
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool started_ = false;
+    bool stopRequested_ = false;
+    std::deque<CloudMeshBuildRequest> queuedRequests_;
+    std::deque<CloudMeshBuildResult> completedResults_;
+    std::vector<std::thread> workers_;
+};
+
+inline CloudMeshWorkerQueue& cloudMeshWorkerQueue()
+{
+    static CloudMeshWorkerQueue queue;
+    return queue;
+}
+
+inline void queueCloudGroupMeshBuild(CloudField& cloudField, std::size_t groupIndex)
+{
+    if (groupIndex >= cloudField.groups.size()) {
+        return;
+    }
+    CloudGroup& group = cloudField.groups[groupIndex];
+    if (group.pendingBuildId != 0u) {
+        return;
+    }
+
+    updateCloudGroupBounds(group);
+    CloudMeshBuildRequest request;
+    request.groupIndex = groupIndex;
+    request.groupStableId = group.stableId;
+    request.buildId = nextCloudMeshBuildId();
+    request.centerY = group.center.y;
+    request.radius = group.radius;
+    request.verticalScale = group.verticalScale;
+    request.density = group.density;
+    request.humidity = group.humidity;
+    request.opticalDepth = group.opticalDepth;
+    request.renderRadius = group.renderRadius;
+    request.noiseSeed = group.noiseSeed;
+    request.localBounds = group.localBounds;
+    request.puffs = group.puffs;
+    group.pendingBuildId = request.buildId;
+    cloudMeshWorkerQueue().enqueue(std::move(request));
+}
+
+inline void applyCloudMeshBuildResult(CloudGroup& group, CloudMeshBuildResult result, float nowSeconds)
+{
+    if (!result.built) {
+        group.pendingBuildId = 0u;
+        group.meshDirty = true;
+        return;
+    }
+
+    group.localBounds = result.localBounds;
+    group.renderRadius = result.renderRadius;
+    group.volumeModel = std::move(result.volumeModel);
+    group.volumeModel.cacheRevision = result.buildId;
+    group.lastAppliedBuildId = result.buildId;
+    group.pendingBuildId = 0u;
     group.meshDirty = false;
+    group.nextMeshRebuildAt = nowSeconds + mix(18.0f, 42.0f, clamp(group.evolutionRate / 1.8f, 0.0f, 1.0f));
+}
+
+inline void drainCompletedCloudMeshBuilds(CloudField& cloudField, float nowSeconds)
+{
+    const std::size_t maxResults = std::max<std::size_t>(1u, cloudField.maxMeshBuildResultsPerUpdate);
+    std::vector<CloudMeshBuildResult> completed = cloudMeshWorkerQueue().drainCompleted(maxResults);
+    for (CloudMeshBuildResult& result : completed) {
+        if (result.groupIndex >= cloudField.groups.size()) {
+            continue;
+        }
+        CloudGroup& group = cloudField.groups[result.groupIndex];
+        if (group.stableId != result.groupStableId || group.pendingBuildId != result.buildId) {
+            continue;
+        }
+        applyCloudMeshBuildResult(group, std::move(result), nowSeconds);
+    }
+}
+
+inline void rebuildCloudGroupVolume(CloudGroup& group)
+{
+    updateCloudGroupBounds(group);
+    CloudMeshBuildRequest request;
+    request.groupStableId = group.stableId;
+    request.buildId = nextCloudMeshBuildId();
+    request.centerY = group.center.y;
+    request.radius = group.radius;
+    request.verticalScale = group.verticalScale;
+    request.density = group.density;
+    request.humidity = group.humidity;
+    request.opticalDepth = group.opticalDepth;
+    request.renderRadius = group.renderRadius;
+    request.noiseSeed = group.noiseSeed;
+    request.localBounds = group.localBounds;
+    request.puffs = group.puffs;
+    CloudMeshBuildResult result = buildCloudMeshFromRequest(request);
+    applyCloudMeshBuildResult(group, std::move(result), 0.0f);
 }
 
 inline void retargetCloudGroupShape(CloudGroup& group, std::mt19937& rng, float nowSeconds)
 {
-    group.targetRadius = randomRange(rng, 140.0f, 280.0f);
-    group.targetVerticalScale = randomRange(rng, 0.48f, 0.92f);
-    group.targetDensity = randomRange(rng, 0.78f, 1.24f);
-    group.nextMorphAt = nowSeconds + randomRange(rng, 7000.0f, 20000.0f);
+    group.targetRadius = randomRange(rng, 150.0f, 310.0f);
+    group.targetVerticalScale = randomRange(rng, 0.48f, 0.96f);
+    group.targetDensity = randomRange(rng, 0.72f, 1.36f);
+    group.nextMorphAt = nowSeconds + randomRange(rng, 220.0f, 900.0f);
     group.meshDirty = true;
 }
 
-inline CloudGroup randomCloudGroup(std::mt19937& rng, const Vec3& center, float baseHeight, float nowSeconds = 0.0f)
+inline CloudGroup randomCloudGroup(
+    std::mt19937& rng,
+    const Vec3& center,
+    float baseHeight,
+    float nowSeconds = 0.0f,
+    bool buildMeshImmediately = false)
 {
     CloudGroup group;
+    group.stableId = nextCloudGroupStableId();
     group.center = {
         center.x + randomRange(rng, -1800.0f, 1800.0f),
-        baseHeight + randomRange(rng, -80.0f, 120.0f),
+        baseHeight + randomRange(rng, -120.0f, 140.0f),
         center.z + randomRange(rng, -1800.0f, 1800.0f)
     };
-    group.radius = randomRange(rng, 140.0f, 260.0f);
+    group.radius = randomRange(rng, 150.0f, 270.0f);
     group.targetRadius = group.radius;
-    group.verticalScale = randomRange(rng, 0.52f, 0.86f);
+    group.verticalScale = randomRange(rng, 0.52f, 0.90f);
     group.targetVerticalScale = group.verticalScale;
-    group.density = randomRange(rng, 0.82f, 1.18f);
+    group.density = randomRange(rng, 0.84f, 1.20f);
     group.targetDensity = group.density;
     group.driftScale = randomRange(rng, 0.65f, 1.45f);
     group.evolutionRate = randomRange(rng, 0.55f, 1.35f);
-    group.alpha = randomRange(rng, 0.48f, 0.72f);
+    group.alpha = randomRange(rng, 0.46f, 0.76f);
     group.noiseSeed = static_cast<std::uint32_t>(randomRangeInt(rng, 1, 1 << 20));
 
-    const int puffCount = randomRangeInt(rng, 6, 11);
+    const AtmosphereSample atmosphere = sampleAtmosphere(group.center.y);
+    group.humidity = estimateCloudHumidityFromAtmosphere(atmosphere, randomRange(rng, 0.0f, kPi * 2.0f));
+    group.opticalDepth = clamp(group.density * mix(0.38f, 1.22f, group.humidity), 0.24f, 1.58f);
+    const float layerHalf = randomRange(rng, 180.0f, 320.0f);
+    group.layerBase = group.center.y - layerHalf;
+    group.layerTop = group.center.y + layerHalf;
+
+    const int puffCount = randomRangeInt(rng, 8, 16);
     group.puffs.reserve(static_cast<std::size_t>(puffCount));
     for (int i = 0; i < puffCount; ++i) {
         CloudPuff puff;
         puff.baseOffset = {
-            randomRange(rng, -group.radius * 0.85f, group.radius * 0.85f),
-            randomRange(rng, -group.radius * 0.20f, group.radius * 0.26f),
-            randomRange(rng, -group.radius * 0.85f, group.radius * 0.85f)
+            randomRange(rng, -group.radius * 0.88f, group.radius * 0.88f),
+            randomRange(rng, -group.radius * 0.22f, group.radius * 0.32f),
+            randomRange(rng, -group.radius * 0.88f, group.radius * 0.88f)
         };
         puff.offset = puff.baseOffset;
-        puff.baseScale = randomRange(rng, 34.0f, 92.0f);
+        puff.baseScale = randomRange(rng, 26.0f, 88.0f);
         puff.scale = puff.baseScale;
-        puff.baseStretchY = randomRange(rng, 0.55f, 0.95f);
+        puff.baseStretchY = randomRange(rng, 0.52f, 1.00f);
         puff.stretchY = puff.baseStretchY;
         puff.driftPhase = randomRange(rng, 0.0f, kPi * 2.0f);
-        puff.driftAmplitude = randomRange(rng, 4.0f, 12.0f);
+        puff.driftAmplitude = randomRange(rng, 3.2f, 11.5f);
         puff.yaw = randomRange(rng, -kPi, kPi);
-        const float tint = randomRange(rng, 0.93f, 1.0f);
-        puff.color = { tint, tint, std::min(1.0f, tint + 0.02f) };
+        const float tint = randomRange(rng, 0.90f, 1.0f);
+        puff.color = { tint, tint, std::min(1.0f, tint + 0.03f) };
         group.puffs.push_back(puff);
     }
-    group.nextMorphAt = nowSeconds + randomRange(rng, 600.0f, 1600.0f);
-    group.nextMeshRebuildAt = nowSeconds + randomRange(rng, 5000.0f, 10000.6f);
-    rebuildCloudGroupVolume(group);
+    group.nextMorphAt = nowSeconds + randomRange(rng, 240.0f, 980.0f);
+    group.nextMeshRebuildAt = nowSeconds + randomRange(rng, 16.0f, 42.0f);
+    updateCloudGroupBounds(group);
+    group.meshDirty = true;
+    if (buildMeshImmediately) {
+        rebuildCloudGroupVolume(group);
+        group.nextMeshRebuildAt = nowSeconds + randomRange(rng, 22.0f, 56.0f);
+    }
     return group;
 }
 
@@ -2910,30 +3284,71 @@ inline void initializeCloudField(CloudField& cloudField, std::mt19937& rng, cons
     cloudField.groups.clear();
     cloudField.groups.reserve(static_cast<std::size_t>(std::max(1, cloudField.groupCount)));
     for (int i = 0; i < std::max(1, cloudField.groupCount); ++i) {
-        cloudField.groups.push_back(randomCloudGroup(rng, center, cloudField.baseHeight, 0.0f));
+        cloudField.groups.push_back(randomCloudGroup(rng, center, cloudField.baseHeight, 0.0f, i == 0));
+    }
+    for (std::size_t groupIndex = 1u; groupIndex < cloudField.groups.size(); ++groupIndex) {
+        queueCloudGroupMeshBuild(cloudField, groupIndex);
     }
 }
 
-inline void updateCloudField(CloudField& cloudField, WindState& windState, float dt, float nowSeconds, const Vec3& focusPoint, std::mt19937& rng)
+inline void updateCloudField(
+    CloudField& cloudField,
+    WindState& windState,
+    float dt,
+    float nowSeconds,
+    const Vec3& focusPoint,
+    const AtmosphereSample& focusAtmosphere,
+    std::mt19937& rng)
 {
+    if (cloudField.groups.empty()) {
+        return;
+    }
+
+    drainCompletedCloudMeshBuilds(cloudField, nowSeconds);
     updateWind(windState, dt, nowSeconds, rng);
     const Vec3 wind = getWindVector3(windState);
     const float recycleDistance = cloudField.spawnRadius * 1.3f;
-    for (CloudGroup& group : cloudField.groups) {
+
+    const float weatherHumidity = estimateCloudHumidityFromAtmosphere(focusAtmosphere, nowSeconds * 0.05f);
+    cloudField.coverage = mix(cloudField.coverage, clamp(0.38f + (weatherHumidity * 0.56f), 0.20f, 0.98f), clamp(dt * 0.08f, 0.0f, 1.0f));
+    const float targetLayerThickness = mix(260.0f, 680.0f, weatherHumidity);
+    cloudField.layerThickness = mix(cloudField.layerThickness, targetLayerThickness, clamp(dt * 0.10f, 0.0f, 1.0f));
+    cloudField.baseHeight = mix(cloudField.baseHeight, mix(480.0f, 780.0f, weatherHumidity), clamp(dt * 0.04f, 0.0f, 1.0f));
+
+    for (std::size_t groupIndex = 0u; groupIndex < cloudField.groups.size(); ++groupIndex) {
+        CloudGroup& group = cloudField.groups[groupIndex];
         group.center += wind * (dt * group.driftScale);
-        group.center.y += std::sin((nowSeconds * 0.06f) + group.radius * 0.012f) * dt * 1.8f;
+
+        const float phase = (nowSeconds * 0.03f * group.evolutionRate) + static_cast<float>(group.stableId % 1048573u) * 0.000013f;
+        const AtmosphereSample localAtmosphere = sampleAtmosphere(group.center.y);
+        const float localHumidity = estimateCloudHumidityFromAtmosphere(localAtmosphere, phase + 1.9f);
+        const float layerWeight = cloudLayerWeight(cloudField, group.center.y);
+        const float humidityTarget = clamp(mix(localHumidity, cloudField.coverage, cloudField.humidityResponse), 0.05f, 0.99f);
+
+        group.humidity = mix(group.humidity, humidityTarget, clamp(dt * 0.26f, 0.0f, 1.0f));
+        group.layerBase = cloudField.baseHeight - (cloudField.layerThickness * mix(0.48f, 0.62f, group.humidity));
+        group.layerTop = cloudField.baseHeight + (cloudField.layerThickness * mix(0.38f, 0.58f, group.humidity));
+
+        const float thermalLift = std::sin(phase + group.radius * 0.01f) * mix(0.4f, 2.8f, group.humidity);
+        const float yTarget = clamp(group.center.y + (thermalLift * dt), group.layerBase, group.layerTop);
+        group.center.y = mix(group.center.y, yTarget, clamp(dt * 0.82f, 0.0f, 1.0f));
+
         if (nowSeconds >= group.nextMorphAt) {
             retargetCloudGroupShape(group, rng, nowSeconds);
         }
+
+        group.targetDensity = mix(group.targetDensity, mix(0.62f, 1.38f, group.humidity * layerWeight), clamp(dt * 0.10f, 0.0f, 1.0f));
         group.radius = mix(group.radius, group.targetRadius, clamp(dt * 0.12f * group.evolutionRate, 0.0f, 1.0f));
         group.verticalScale = mix(group.verticalScale, group.targetVerticalScale, clamp(dt * 0.10f * group.evolutionRate, 0.0f, 1.0f));
-        group.density = mix(group.density, group.targetDensity, clamp(dt * 0.09f * group.evolutionRate, 0.0f, 1.0f));
-        group.alpha = clamp(mix(group.alpha, 0.44f + (group.density * 0.24f), clamp(dt * 0.12f, 0.0f, 1.0f)), 0.38f, 0.82f);
+        group.density = mix(group.density, group.targetDensity, clamp(dt * 0.11f * group.evolutionRate, 0.0f, 1.0f));
+        group.opticalDepth = mix(group.opticalDepth, clamp(group.density * mix(0.34f, 1.24f, group.humidity), 0.20f, 1.65f), clamp(dt * 0.18f, 0.0f, 1.0f));
+        group.alpha = clamp(mix(group.alpha, 0.20f + (group.opticalDepth * 0.50f), clamp(dt * 0.20f, 0.0f, 1.0f)), 0.20f, 0.90f);
+
         for (CloudPuff& puff : group.puffs) {
-            const float breathing = 1.0f + std::sin((nowSeconds * 0.22f * group.evolutionRate) + puff.driftPhase) * 0.08f;
+            const float breathing = 1.0f + std::sin((nowSeconds * 0.24f * group.evolutionRate) + puff.driftPhase) * 0.09f;
             const Vec3 drift {
                 std::cos((nowSeconds * 0.11f * group.evolutionRate) + puff.driftPhase) * puff.driftAmplitude,
-                std::sin((nowSeconds * 0.17f * group.evolutionRate) + puff.driftPhase) * puff.driftAmplitude * 0.32f,
+                std::sin((nowSeconds * 0.17f * group.evolutionRate) + puff.driftPhase) * puff.driftAmplitude * 0.36f,
                 std::sin((nowSeconds * 0.13f * group.evolutionRate) + puff.driftPhase + 1.7f) * puff.driftAmplitude
             };
             puff.offset = {
@@ -2941,15 +3356,17 @@ inline void updateCloudField(CloudField& cloudField, WindState& windState, float
                 puff.baseOffset.y * group.verticalScale + drift.y,
                 puff.baseOffset.z * (group.radius / 180.0f) + drift.z
             };
-            puff.scale = puff.baseScale * mix(0.82f, 1.18f, clamp(group.density, 0.0f, 1.0f)) * breathing;
-            puff.stretchY = puff.baseStretchY * mix(0.90f, 1.10f, clamp(group.verticalScale, 0.0f, 1.0f));
+            const float humidityScale = mix(0.76f, 1.24f, group.humidity);
+            puff.scale = puff.baseScale * mix(0.82f, 1.18f, clamp(group.density, 0.0f, 1.0f)) * humidityScale * breathing;
+            puff.stretchY = puff.baseStretchY * mix(0.86f, 1.14f, clamp(group.verticalScale, 0.0f, 1.0f));
         }
+
         const Vec3 delta = group.center - focusPoint;
         const float flatDistanceSq = (delta.x * delta.x) + (delta.z * delta.z);
         if (flatDistanceSq > (recycleDistance * recycleDistance)) {
             const float respawnAngle = randomRange(rng, -kPi, kPi);
             const float respawnDistance = cloudField.spawnRadius + randomRange(rng, 150.0f, 420.0f);
-            group = randomCloudGroup(
+            CloudGroup replacement = randomCloudGroup(
                 rng,
                 {
                     focusPoint.x + (std::sin(respawnAngle) * respawnDistance),
@@ -2957,15 +3374,36 @@ inline void updateCloudField(CloudField& cloudField, WindState& windState, float
                     focusPoint.z + (std::cos(respawnAngle) * respawnDistance)
                 },
                 cloudField.baseHeight,
-                nowSeconds);
+                nowSeconds,
+                false);
+            if (!group.volumeModel.faces.empty()) {
+                replacement.volumeModel = group.volumeModel;
+                replacement.localBounds = group.localBounds;
+                replacement.renderRadius = group.renderRadius;
+            }
+            group = std::move(replacement);
+            queueCloudGroupMeshBuild(cloudField, groupIndex);
             continue;
         }
 
-        if (group.meshDirty || nowSeconds >= group.nextMeshRebuildAt) {
-            rebuildCloudGroupVolume(group);
-            group.nextMeshRebuildAt = nowSeconds + randomRange(rng, 10000.8f, 11000.6f);
+        const float morphDistance =
+            std::fabs(group.radius - group.targetRadius) +
+            std::fabs(group.verticalScale - group.targetVerticalScale) * 120.0f;
+        if (morphDistance > 8.0f || std::fabs(group.density - group.targetDensity) > 0.06f) {
+            group.meshDirty = true;
+        }
+
+        if ((group.meshDirty || nowSeconds >= group.nextMeshRebuildAt) && group.pendingBuildId == 0u) {
+            queueCloudGroupMeshBuild(cloudField, groupIndex);
         }
     }
+
+    drainCompletedCloudMeshBuilds(cloudField, nowSeconds);
+}
+
+inline void updateCloudField(CloudField& cloudField, WindState& windState, float dt, float nowSeconds, const Vec3& focusPoint, std::mt19937& rng)
+{
+    updateCloudField(cloudField, windState, dt, nowSeconds, focusPoint, sampleAtmosphere(focusPoint.y), rng);
 }
 
 }  // namespace NativeGame
