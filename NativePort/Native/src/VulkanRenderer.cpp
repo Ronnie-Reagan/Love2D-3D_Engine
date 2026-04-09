@@ -18,10 +18,26 @@ namespace {
 
 constexpr std::size_t kInitialSceneCapacityBytes = 2u * 1024u * 1024u;
 constexpr float kDefaultNearClip = 0.05f;
-constexpr float kDefaultFarClip = 4200.0f;
+constexpr float kDefaultFarClip = 42000.0f;
 
 struct Mat4 {
     std::array<float, 16> m {};
+};
+
+struct alignas(16) CompositeUniforms {
+    float cameraRight[4] {};
+    float cameraUp[4] {};
+    float cameraForward[4] {};
+    float projectionParams[4] {};
+    float cameraWorldPosition[4] {};
+    float planetCenter[4] {};
+    float planetParams[4] {};
+    float lightDirection[4] {};
+    float lightColor[4] {};
+    float skyColor[4] {};
+    float groundColor[4] {};
+    float fogColor[4] {};
+    float fogAndExposure[4] {};
 };
 
 bool fail(std::string* errorMessage, std::string_view context)
@@ -212,9 +228,22 @@ std::string buildResidentMeshKey(const RenderObject& object)
     key += "|s=" + std::to_string(object.scale.x) + "," + std::to_string(object.scale.y) + "," + std::to_string(object.scale.z);
     key += "|c=" + std::to_string(object.color.x) + "," + std::to_string(object.color.y) + "," + std::to_string(object.color.z);
     key += "|a=" + std::to_string(object.alpha);
-    key += "|f=" + std::to_string(object.fogNear) + "," + std::to_string(object.fogFar);
     key += object.cullBackfaces ? "|cb=1" : "|cb=0";
     return key;
+}
+
+SDL_GPUPresentMode choosePresentMode(SDL_GPUDevice* device, SDL_Window* window, bool enableVsync)
+{
+    if (enableVsync || device == nullptr || window == nullptr) {
+        return SDL_GPU_PRESENTMODE_VSYNC;
+    }
+    if (SDL_WindowSupportsGPUPresentMode(device, window, SDL_GPU_PRESENTMODE_IMMEDIATE)) {
+        return SDL_GPU_PRESENTMODE_IMMEDIATE;
+    }
+    if (SDL_WindowSupportsGPUPresentMode(device, window, SDL_GPU_PRESENTMODE_MAILBOX)) {
+        return SDL_GPU_PRESENTMODE_MAILBOX;
+    }
+    return SDL_GPU_PRESENTMODE_VSYNC;
 }
 
 std::size_t textureFormatBytesPerPixel(SDL_GPUTextureFormat format)
@@ -263,9 +292,11 @@ bool VulkanRenderer::initialize(SDL_Window* window, const std::filesystem::path&
     shutdown();
 
     window_ = window;
+    shaderDirectory_ = shaderDirectory;
     device_ = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV, true, "vulkan");
     if (device_ == nullptr) {
         window_ = nullptr;
+        shaderDirectory_.clear();
         return fail(errorMessage, "SDL_CreateGPUDevice");
     }
 
@@ -275,6 +306,8 @@ bool VulkanRenderer::initialize(SDL_Window* window, const std::filesystem::path&
 
     SDL_SetGPUAllowedFramesInFlight(device_, 2);
     depthTextureFormat_ = chooseDepthTextureFormat(device_);
+    presentMode_ = SDL_GPU_PRESENTMODE_VSYNC;
+    swapchainFormat_ = SDL_GetGPUSwapchainTextureFormat(device_, window_);
 
     SDL_GPUSamplerCreateInfo samplerInfo {};
     samplerInfo.min_filter = SDL_GPU_FILTER_LINEAR;
@@ -283,7 +316,11 @@ bool VulkanRenderer::initialize(SDL_Window* window, const std::filesystem::path&
     samplerInfo.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
     samplerInfo.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
     samplerInfo.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    samplerInfo.mip_lod_bias = 0.0f;
     samplerInfo.compare_op = SDL_GPU_COMPAREOP_ALWAYS;
+    samplerInfo.enable_anisotropy = false;
+    samplerInfo.max_anisotropy = 1.0f;
+    samplerInfo.enable_compare = false;
     samplerInfo.min_lod = 0.0f;
     samplerInfo.max_lod = 0.0f;
     sceneSampler_ = SDL_CreateGPUSampler(device_, &samplerInfo);
@@ -292,6 +329,10 @@ bool VulkanRenderer::initialize(SDL_Window* window, const std::filesystem::path&
     }
 
     samplerInfo.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_LINEAR;
+    samplerInfo.mip_lod_bias = -0.85f;
+    samplerInfo.enable_anisotropy = true;
+    samplerInfo.max_anisotropy = 8.0f;
+    samplerInfo.min_lod = -0.75f;
     samplerInfo.max_lod = 16.0f;
     sceneMipmapSampler_ = SDL_CreateGPUSampler(device_, &samplerInfo);
     if (sceneMipmapSampler_ == nullptr) {
@@ -301,6 +342,9 @@ bool VulkanRenderer::initialize(SDL_Window* window, const std::filesystem::path&
     samplerInfo.min_filter = SDL_GPU_FILTER_NEAREST;
     samplerInfo.mag_filter = SDL_GPU_FILTER_NEAREST;
     samplerInfo.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
+    samplerInfo.mip_lod_bias = 0.0f;
+    samplerInfo.enable_anisotropy = false;
+    samplerInfo.max_anisotropy = 1.0f;
     samplerInfo.max_lod = 0.0f;
     overlaySampler_ = SDL_CreateGPUSampler(device_, &samplerInfo);
     if (overlaySampler_ == nullptr) {
@@ -321,6 +365,61 @@ bool VulkanRenderer::initialize(SDL_Window* window, const std::filesystem::path&
     return true;
 }
 
+bool VulkanRenderer::prepareForDisplayChange(std::string* errorMessage)
+{
+    if (device_ == nullptr) {
+        return true;
+    }
+    if (!SDL_WaitForGPUIdle(device_)) {
+        return fail(errorMessage, "SDL_WaitForGPUIdle");
+    }
+    releaseFramebufferResources();
+    return true;
+}
+
+bool VulkanRenderer::syncDisplayState(bool enableVsync, std::string* errorMessage)
+{
+    if (device_ == nullptr || window_ == nullptr) {
+        return fail(errorMessage, "renderer not initialized");
+    }
+    if (!SDL_WaitForGPUIdle(device_)) {
+        return fail(errorMessage, "SDL_WaitForGPUIdle");
+    }
+
+    presentMode_ = choosePresentMode(device_, window_, enableVsync);
+    if (!SDL_SetGPUSwapchainParameters(
+            device_,
+            window_,
+            SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
+            presentMode_)) {
+        return fail(errorMessage, "SDL_SetGPUSwapchainParameters");
+    }
+
+    const SDL_GPUTextureFormat newSwapchainFormat = SDL_GetGPUSwapchainTextureFormat(device_, window_);
+    if (newSwapchainFormat == SDL_GPU_TEXTUREFORMAT_INVALID) {
+        return fail(errorMessage, "SDL_GetGPUSwapchainTextureFormat");
+    }
+
+    const bool pipelinesDirty =
+        newSwapchainFormat != swapchainFormat_ ||
+        opaquePipeline_ == nullptr ||
+        opaqueCullPipeline_ == nullptr ||
+        translucentPipeline_ == nullptr ||
+        translucentCullPipeline_ == nullptr ||
+        overlayPipeline_ == nullptr;
+    swapchainFormat_ = newSwapchainFormat;
+    if (pipelinesDirty) {
+        releasePipelines();
+        if (!createPipelines(shaderDirectory_, errorMessage)) {
+            return false;
+        }
+    }
+
+    releaseFramebufferResources();
+    refreshMemoryStats();
+    return true;
+}
+
 void VulkanRenderer::setMemoryBudgets(std::size_t residentMeshBudgetBytes, std::size_t sceneTextureBudgetBytes)
 {
     residentMeshBudgetBytes_ = residentMeshBudgetBytes;
@@ -335,31 +434,17 @@ const RendererMemoryStats& VulkanRenderer::memoryStats() const
 
 void VulkanRenderer::shutdown()
 {
-    drawableWidth_ = 0;
-    drawableHeight_ = 0;
-    sceneRenderWidth_ = 0;
-    sceneRenderHeight_ = 0;
-    sceneCapacityBytes_ = 0;
-    hudTransferCapacityBytes_ = 0;
-
     if (device_ != nullptr) {
         releaseSceneTextures();
         releaseResidentMeshes();
-        SDL_ReleaseGPUTransferBuffer(device_, hudTransferBuffer_);
-        SDL_ReleaseGPUTexture(device_, hudTexture_);
-        SDL_ReleaseGPUTexture(device_, depthTexture_);
-        SDL_ReleaseGPUTexture(device_, sceneColorTexture_);
+        releaseFramebufferResources();
         SDL_ReleaseGPUBuffer(device_, overlayVertexBuffer_);
         SDL_ReleaseGPUTransferBuffer(device_, sceneTransferBuffer_);
         SDL_ReleaseGPUBuffer(device_, sceneVertexBuffer_);
         SDL_ReleaseGPUSampler(device_, sceneSampler_);
         SDL_ReleaseGPUSampler(device_, sceneMipmapSampler_);
         SDL_ReleaseGPUSampler(device_, overlaySampler_);
-        SDL_ReleaseGPUGraphicsPipeline(device_, overlayPipeline_);
-        SDL_ReleaseGPUGraphicsPipeline(device_, translucentPipeline_);
-        SDL_ReleaseGPUGraphicsPipeline(device_, translucentCullPipeline_);
-        SDL_ReleaseGPUGraphicsPipeline(device_, opaquePipeline_);
-        SDL_ReleaseGPUGraphicsPipeline(device_, opaqueCullPipeline_);
+        releasePipelines();
         if (window_ != nullptr) {
             SDL_ReleaseWindowFromGPUDevice(device_, window_);
         }
@@ -378,17 +463,22 @@ void VulkanRenderer::shutdown()
     sceneVertexBuffer_ = nullptr;
     sceneTransferBuffer_ = nullptr;
     overlayVertexBuffer_ = nullptr;
-    sceneColorTexture_ = nullptr;
-    depthTexture_ = nullptr;
-    hudTexture_ = nullptr;
-    hudTransferBuffer_ = nullptr;
     sceneMipmapSampler_ = nullptr;
+    swapchainFormat_ = SDL_GPU_TEXTUREFORMAT_INVALID;
+    shaderDirectory_.clear();
+    residentMeshIndex_.clear();
     frameCounter_ = 0;
     depthTextureFormat_ = SDL_GPU_TEXTUREFORMAT_D16_UNORM;
     residentMeshBudgetBytes_ = 0;
     sceneTextureBudgetBytes_ = 0;
     maxStreamingUploadBytes_ = std::numeric_limits<std::size_t>::max();
     streamingUploadBytesThisFrame_ = 0;
+    drawableWidth_ = 0;
+    drawableHeight_ = 0;
+    sceneRenderWidth_ = 0;
+    sceneRenderHeight_ = 0;
+    sceneCapacityBytes_ = 0;
+    hudTransferCapacityBytes_ = 0;
     memoryStats_ = {};
 }
 
@@ -422,6 +512,7 @@ void VulkanRenderer::releaseResidentMeshes()
 {
     if (device_ == nullptr) {
         residentMeshes_.clear();
+        residentMeshIndex_.clear();
         return;
     }
 
@@ -429,6 +520,7 @@ void VulkanRenderer::releaseResidentMeshes()
         releaseResidentMeshEntry(mesh);
     }
     residentMeshes_.clear();
+    residentMeshIndex_.clear();
     refreshMemoryStats();
 }
 
@@ -450,14 +542,60 @@ void VulkanRenderer::releaseResidentMeshEntry(CachedResidentMesh& mesh)
     mesh.lastFrameUsed = 0;
 }
 
-VulkanRenderer::CachedResidentMesh* VulkanRenderer::findResidentMesh(const std::string& key)
+void VulkanRenderer::releaseFramebufferResources()
 {
-    for (CachedResidentMesh& mesh : residentMeshes_) {
-        if (mesh.key == key) {
-            return &mesh;
+    if (device_ != nullptr) {
+        SDL_ReleaseGPUTransferBuffer(device_, hudTransferBuffer_);
+        SDL_ReleaseGPUTexture(device_, hudTexture_);
+        SDL_ReleaseGPUTexture(device_, depthTexture_);
+        SDL_ReleaseGPUTexture(device_, sceneColorTexture_);
+    }
+    hudTransferBuffer_ = nullptr;
+    hudTexture_ = nullptr;
+    depthTexture_ = nullptr;
+    sceneColorTexture_ = nullptr;
+    drawableWidth_ = 0;
+    drawableHeight_ = 0;
+    sceneRenderWidth_ = 0;
+    sceneRenderHeight_ = 0;
+    hudTransferCapacityBytes_ = 0;
+}
+
+void VulkanRenderer::releasePipelines()
+{
+    if (device_ != nullptr) {
+        SDL_ReleaseGPUGraphicsPipeline(device_, overlayPipeline_);
+        SDL_ReleaseGPUGraphicsPipeline(device_, translucentPipeline_);
+        SDL_ReleaseGPUGraphicsPipeline(device_, translucentCullPipeline_);
+        SDL_ReleaseGPUGraphicsPipeline(device_, opaquePipeline_);
+        SDL_ReleaseGPUGraphicsPipeline(device_, opaqueCullPipeline_);
+    }
+    overlayPipeline_ = nullptr;
+    translucentPipeline_ = nullptr;
+    translucentCullPipeline_ = nullptr;
+    opaquePipeline_ = nullptr;
+    opaqueCullPipeline_ = nullptr;
+}
+
+void VulkanRenderer::rebuildResidentMeshIndex()
+{
+    residentMeshIndex_.clear();
+    residentMeshIndex_.reserve(residentMeshes_.size());
+    for (std::size_t index = 0; index < residentMeshes_.size(); ++index) {
+        if (!residentMeshes_[index].key.empty()) {
+            residentMeshIndex_[residentMeshes_[index].key] = index;
         }
     }
-    return nullptr;
+}
+
+VulkanRenderer::CachedResidentMesh* VulkanRenderer::findResidentMesh(const std::string& key)
+{
+    const auto it = residentMeshIndex_.find(key);
+    if (it == residentMeshIndex_.end() || it->second >= residentMeshes_.size()) {
+        return nullptr;
+    }
+    CachedResidentMesh& mesh = residentMeshes_[it->second];
+    return mesh.key == key ? &mesh : nullptr;
 }
 
 bool VulkanRenderer::isResidentMeshCurrent(const CachedResidentMesh& mesh, const RenderObject& object) const
@@ -496,6 +634,7 @@ VulkanRenderer::CachedResidentMesh* VulkanRenderer::ensureResidentMesh(
         residentMeshes_.push_back({});
         mesh = &residentMeshes_.back();
         mesh->key = key;
+        residentMeshIndex_[key] = residentMeshes_.size() - 1u;
     }
     mesh->lastFrameUsed = frameCounter_;
 
@@ -582,34 +721,36 @@ void VulkanRenderer::pruneResidentMeshes(std::uint64_t minFrameToKeep)
 {
     if (device_ == nullptr) {
         residentMeshes_.clear();
+        residentMeshIndex_.clear();
         return;
     }
 
-    auto shouldKeepMesh = [&](const CachedResidentMesh& mesh) {
-        if (mesh.lastFrameUsed < minFrameToKeep) {
-            return false;
-        }
-        refreshMemoryStats();
-        if (residentMeshBudgetBytes_ > 0u &&
-            memoryStats_.residentMeshBytes > residentMeshBudgetBytes_ &&
-            mesh.lastFrameUsed < frameCounter_) {
-            return false;
-        }
-        return true;
-    };
+    std::size_t residentBytes = 0;
+    for (const CachedResidentMesh& mesh : residentMeshes_) {
+        residentBytes += mesh.vertexBufferBytes;
+    }
 
     residentMeshes_.erase(
         std::remove_if(
             residentMeshes_.begin(),
             residentMeshes_.end(),
             [&](CachedResidentMesh& mesh) {
-                if (shouldKeepMesh(mesh)) {
+                const bool stale = mesh.lastFrameUsed < minFrameToKeep;
+                const bool overBudget =
+                    residentMeshBudgetBytes_ > 0u &&
+                    residentBytes > residentMeshBudgetBytes_ &&
+                    mesh.lastFrameUsed < frameCounter_;
+                if (!stale && !overBudget) {
                     return false;
                 }
+                residentBytes = residentBytes > mesh.vertexBufferBytes
+                                    ? residentBytes - mesh.vertexBufferBytes
+                                    : 0u;
                 releaseResidentMeshEntry(mesh);
                 return true;
             }),
         residentMeshes_.end());
+    rebuildResidentMeshIndex();
     refreshMemoryStats();
 }
 
@@ -620,20 +761,27 @@ void VulkanRenderer::pruneSceneTextures(std::uint64_t minFrameToKeep)
         return;
     }
 
+    std::size_t sceneTextureBytes = 0;
+    for (const CachedSceneTexture& cached : sceneTextures_) {
+        sceneTextureBytes += cached.textureBytes;
+    }
+
     sceneTextures_.erase(
         std::remove_if(
             sceneTextures_.begin(),
             sceneTextures_.end(),
             [&](CachedSceneTexture& cached) {
-                refreshMemoryStats();
                 const bool stale = cached.lastFrameUsed < minFrameToKeep;
                 const bool overBudget =
                     sceneTextureBudgetBytes_ > 0u &&
-                    memoryStats_.sceneTextureBytes > sceneTextureBudgetBytes_ &&
+                    sceneTextureBytes > sceneTextureBudgetBytes_ &&
                     cached.lastFrameUsed < frameCounter_;
                 if (!stale && !overBudget) {
                     return false;
                 }
+                sceneTextureBytes = sceneTextureBytes > cached.textureBytes
+                                        ? sceneTextureBytes - cached.textureBytes
+                                        : 0u;
                 releaseSceneTextureEntry(cached);
                 return true;
             }),
@@ -643,7 +791,10 @@ void VulkanRenderer::pruneSceneTextures(std::uint64_t minFrameToKeep)
 
 bool VulkanRenderer::createPipelines(const std::filesystem::path& shaderDirectory, std::string* errorMessage)
 {
-    const SDL_GPUTextureFormat swapchainFormat = SDL_GetGPUSwapchainTextureFormat(device_, window_);
+    const SDL_GPUTextureFormat swapchainFormat =
+        swapchainFormat_ != SDL_GPU_TEXTUREFORMAT_INVALID
+            ? swapchainFormat_
+            : SDL_GetGPUSwapchainTextureFormat(device_, window_);
 
     SDL_GPUShader* sceneVertexShader = loadShader(
         device_,
@@ -661,7 +812,7 @@ bool VulkanRenderer::createPipelines(const std::filesystem::path& shaderDirector
         shaderDirectory / "scene.frag.spv",
         SDL_GPU_SHADERSTAGE_FRAGMENT,
         1,
-        1,
+        2,
         errorMessage);
     if (sceneFragmentShader == nullptr) {
         SDL_ReleaseGPUShader(device_, sceneVertexShader);
@@ -686,7 +837,7 @@ bool VulkanRenderer::createPipelines(const std::filesystem::path& shaderDirector
         shaderDirectory / "hud.frag.spv",
         SDL_GPU_SHADERSTAGE_FRAGMENT,
         1,
-        0,
+        1,
         errorMessage);
     if (overlayFragmentShader == nullptr) {
         SDL_ReleaseGPUShader(device_, sceneVertexShader);
@@ -1110,18 +1261,18 @@ bool VulkanRenderer::ensureFramebufferResources(
         return true;
     }
 
-    SDL_ReleaseGPUTransferBuffer(device_, hudTransferBuffer_);
-    SDL_ReleaseGPUTexture(device_, hudTexture_);
-    SDL_ReleaseGPUTexture(device_, depthTexture_);
-    SDL_ReleaseGPUTexture(device_, sceneColorTexture_);
-    hudTransferBuffer_ = nullptr;
-    hudTexture_ = nullptr;
-    depthTexture_ = nullptr;
-    sceneColorTexture_ = nullptr;
+    if ((sceneColorTexture_ != nullptr || depthTexture_ != nullptr || hudTexture_ != nullptr || hudTransferBuffer_ != nullptr) &&
+        !SDL_WaitForGPUIdle(device_)) {
+        return fail(errorMessage, "SDL_WaitForGPUIdle");
+    }
+    releaseFramebufferResources();
 
     SDL_GPUTextureCreateInfo sceneColorInfo {};
     sceneColorInfo.type = SDL_GPU_TEXTURETYPE_2D;
-    sceneColorInfo.format = SDL_GetGPUSwapchainTextureFormat(device_, window_);
+    sceneColorInfo.format =
+        swapchainFormat_ != SDL_GPU_TEXTUREFORMAT_INVALID
+            ? swapchainFormat_
+            : SDL_GetGPUSwapchainTextureFormat(device_, window_);
     sceneColorInfo.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
     sceneColorInfo.width = sceneRenderWidth;
     sceneColorInfo.height = sceneRenderHeight;
@@ -1423,6 +1574,8 @@ void VulkanRenderer::appendObjectVertices(
         command.vertexCount = static_cast<Uint32>(batch.vertices.size());
         command.image = batch.image;
         command.cullBackfaces = batch.cullBackfaces;
+        command.fogNear = fogNear;
+        command.fogFar = fogFar;
         command.sortCenter =
             batch.sortVertexCount > 0
                 ? batch.sortCenterAccumulator / static_cast<float>(batch.sortVertexCount)
@@ -1482,11 +1635,41 @@ bool VulkanRenderer::render(
     if (!ensureSceneCapacity(requiredBytes, errorMessage)) {
         return false;
     }
+    if ((swapchainFormat_ == SDL_GPU_TEXTUREFORMAT_INVALID || opaquePipeline_ == nullptr) &&
+        !syncDisplayState(presentMode_ == SDL_GPU_PRESENTMODE_VSYNC, errorMessage)) {
+        return false;
+    }
 
+    std::vector<SDL_GPUTransferBuffer*> uploadBuffers;
     SDL_GPUCommandBuffer* commandBuffer = SDL_AcquireGPUCommandBuffer(device_);
     if (commandBuffer == nullptr) {
         return fail(errorMessage, "SDL_AcquireGPUCommandBuffer");
     }
+    bool swapchainAcquired = false;
+    const auto releaseUploadBuffers = [&]() {
+        for (SDL_GPUTransferBuffer* uploadBuffer : uploadBuffers) {
+            SDL_ReleaseGPUTransferBuffer(device_, uploadBuffer);
+        }
+        uploadBuffers.clear();
+    };
+    const auto abandonFrame = [&]() -> bool {
+        releaseUploadBuffers();
+        if (!swapchainAcquired) {
+            SDL_CancelGPUCommandBuffer(commandBuffer);
+            return false;
+        }
+        if (!SDL_SubmitGPUCommandBuffer(commandBuffer) && errorMessage != nullptr && errorMessage->empty()) {
+            fail(errorMessage, "SDL_SubmitGPUCommandBuffer");
+        }
+        return false;
+    };
+    const auto completeDroppedFrame = [&]() -> bool {
+        releaseUploadBuffers();
+        if (!SDL_SubmitGPUCommandBuffer(commandBuffer)) {
+            return fail(errorMessage, "SDL_SubmitGPUCommandBuffer");
+        }
+        return true;
+    };
 
     SDL_GPUTexture* swapchainTexture = nullptr;
     Uint32 drawableWidth = 0;
@@ -1495,14 +1678,13 @@ bool VulkanRenderer::render(
         SDL_CancelGPUCommandBuffer(commandBuffer);
         return fail(errorMessage, "SDL_WaitAndAcquireGPUSwapchainTexture");
     }
+    swapchainAcquired = true;
     if (swapchainTexture == nullptr) {
-        SDL_CancelGPUCommandBuffer(commandBuffer);
-        return true;
+        return completeDroppedFrame();
     }
 
     if (drawableWidth != static_cast<Uint32>(hudCanvas.width()) || drawableHeight != static_cast<Uint32>(hudCanvas.height())) {
-        SDL_CancelGPUCommandBuffer(commandBuffer);
-        return fail(errorMessage, "HUD canvas size does not match drawable size");
+        return completeDroppedFrame();
     }
 
     const float dynamicRenderScale = clamp(
@@ -1521,24 +1703,21 @@ bool VulkanRenderer::render(
         static_cast<Uint32>(std::lround(static_cast<double>(drawableHeight) * renderScale)));
 
     if (!ensureFramebufferResources(drawableWidth, drawableHeight, sceneRenderWidth, sceneRenderHeight, errorMessage)) {
-        SDL_CancelGPUCommandBuffer(commandBuffer);
-        return false;
+        return abandonFrame();
     }
 
     SDL_GPUCopyPass* copyPass = SDL_BeginGPUCopyPass(commandBuffer);
-    std::vector<SDL_GPUTransferBuffer*> uploadBuffers;
     std::vector<SDL_GPUTexture*> mipmapTextures;
     if (ensureSceneTexture(copyPass, nullptr, uploadBuffers, &mipmapTextures, errorMessage) == nullptr) {
         SDL_EndGPUCopyPass(copyPass);
-        SDL_CancelGPUCommandBuffer(commandBuffer);
-        return false;
+        return abandonFrame();
     }
     if (!sceneVertices.empty()) {
         void* mapped = SDL_MapGPUTransferBuffer(device_, sceneTransferBuffer_, true);
         if (mapped == nullptr) {
             SDL_EndGPUCopyPass(copyPass);
-            SDL_CancelGPUCommandBuffer(commandBuffer);
-            return fail(errorMessage, "SDL_MapGPUTransferBuffer");
+            fail(errorMessage, "SDL_MapGPUTransferBuffer");
+            return abandonFrame();
         }
 
         std::memcpy(mapped, sceneVertices.data(), sceneVertices.size() * sizeof(SceneVertex));
@@ -1594,56 +1773,36 @@ bool VulkanRenderer::render(
 
     for (const SceneDrawCommand& command : opaqueCommands) {
         if (ensureSceneTexture(copyPass, command.image, uploadBuffers, &mipmapTextures, errorMessage) == nullptr) {
-            for (SDL_GPUTransferBuffer* uploadBuffer : uploadBuffers) {
-                SDL_ReleaseGPUTransferBuffer(device_, uploadBuffer);
-            }
             SDL_EndGPUCopyPass(copyPass);
-            SDL_CancelGPUCommandBuffer(commandBuffer);
-            return false;
+            return abandonFrame();
         }
     }
     for (const CachedResidentMesh* mesh : residentOpaqueMeshes) {
         for (const SceneDrawCommand& command : mesh->opaqueCommands) {
             if (ensureSceneTexture(copyPass, command.image, uploadBuffers, &mipmapTextures, errorMessage) == nullptr) {
-                for (SDL_GPUTransferBuffer* uploadBuffer : uploadBuffers) {
-                    SDL_ReleaseGPUTransferBuffer(device_, uploadBuffer);
-                }
                 SDL_EndGPUCopyPass(copyPass);
-                SDL_CancelGPUCommandBuffer(commandBuffer);
-                return false;
+                return abandonFrame();
             }
         }
     }
     for (const SceneDrawCommand& command : translucentCommands) {
         if (ensureSceneTexture(copyPass, command.image, uploadBuffers, &mipmapTextures, errorMessage) == nullptr) {
-            for (SDL_GPUTransferBuffer* uploadBuffer : uploadBuffers) {
-                SDL_ReleaseGPUTransferBuffer(device_, uploadBuffer);
-            }
             SDL_EndGPUCopyPass(copyPass);
-            SDL_CancelGPUCommandBuffer(commandBuffer);
-            return false;
+            return abandonFrame();
         }
     }
     for (const CachedResidentMesh* mesh : residentTranslucentMeshes) {
         for (const SceneDrawCommand& command : mesh->translucentCommands) {
             if (ensureSceneTexture(copyPass, command.image, uploadBuffers, &mipmapTextures, errorMessage) == nullptr) {
-                for (SDL_GPUTransferBuffer* uploadBuffer : uploadBuffers) {
-                    SDL_ReleaseGPUTransferBuffer(device_, uploadBuffer);
-                }
                 SDL_EndGPUCopyPass(copyPass);
-                SDL_CancelGPUCommandBuffer(commandBuffer);
-                return false;
+                return abandonFrame();
             }
         }
     }
 
     if (!uploadHudTexture(copyPass, hudCanvas, errorMessage)) {
-        for (SDL_GPUTransferBuffer* uploadBuffer : uploadBuffers) {
-            SDL_ReleaseGPUTransferBuffer(device_, uploadBuffer);
-        }
         SDL_EndGPUCopyPass(copyPass);
-        SDL_CancelGPUCommandBuffer(commandBuffer);
-        return false;
+        return abandonFrame();
     }
     SDL_EndGPUCopyPass(copyPass);
 
@@ -1663,6 +1822,9 @@ bool VulkanRenderer::render(
     const Mat4 view = makeView(relativeCamera);
     const Mat4 projection = makePerspective(camera.fovRadians, aspect, nearClip, farClip);
     const Mat4 viewProjection = multiply(projection, view);
+    const Vec3 cameraRight = rightFromRotation(camera.rot);
+    const Vec3 cameraUp = upFromRotation(camera.rot);
+    const Vec3 cameraForward = forwardFromRotation(camera.rot);
 
     SceneUniforms uniforms {};
     std::copy(viewProjection.m.begin(), viewProjection.m.end(), std::begin(uniforms.viewProjection));
@@ -1711,6 +1873,67 @@ bool VulkanRenderer::render(
     lightingUniforms.shadowParams[2] = lightingState.shadowDistance;
     lightingUniforms.shadowParams[3] = 0.0f;
     SDL_PushGPUFragmentUniformData(commandBuffer, 0, &lightingUniforms, sizeof(lightingUniforms));
+    const auto pushObjectUniforms = [&](const SceneDrawCommand& command) {
+        SceneObjectUniforms objectUniforms {};
+        objectUniforms.fogRange[0] = command.fogNear;
+        objectUniforms.fogRange[1] = std::max(command.fogNear + 1.0f, command.fogFar);
+        SDL_PushGPUFragmentUniformData(commandBuffer, 1, &objectUniforms, sizeof(objectUniforms));
+    };
+
+    const float tanHalfFovY = std::tan(camera.fovRadians * 0.5f);
+    CompositeUniforms compositeUniforms {};
+    compositeUniforms.cameraRight[0] = cameraRight.x;
+    compositeUniforms.cameraRight[1] = cameraRight.y;
+    compositeUniforms.cameraRight[2] = cameraRight.z;
+    compositeUniforms.cameraRight[3] = 0.0f;
+    compositeUniforms.cameraUp[0] = cameraUp.x;
+    compositeUniforms.cameraUp[1] = cameraUp.y;
+    compositeUniforms.cameraUp[2] = cameraUp.z;
+    compositeUniforms.cameraUp[3] = 0.0f;
+    compositeUniforms.cameraForward[0] = cameraForward.x;
+    compositeUniforms.cameraForward[1] = cameraForward.y;
+    compositeUniforms.cameraForward[2] = cameraForward.z;
+    compositeUniforms.cameraForward[3] = 0.0f;
+    compositeUniforms.projectionParams[0] = tanHalfFovY * aspect;
+    compositeUniforms.projectionParams[1] = tanHalfFovY;
+    compositeUniforms.projectionParams[2] = 0.0f;
+    compositeUniforms.projectionParams[3] = 0.0f;
+    compositeUniforms.cameraWorldPosition[0] = camera.pos.x;
+    compositeUniforms.cameraWorldPosition[1] = camera.pos.y;
+    compositeUniforms.cameraWorldPosition[2] = camera.pos.z;
+    compositeUniforms.cameraWorldPosition[3] = 1.0f;
+    compositeUniforms.planetCenter[0] = camera.planetCenter.x;
+    compositeUniforms.planetCenter[1] = camera.planetCenter.y;
+    compositeUniforms.planetCenter[2] = camera.planetCenter.z;
+    compositeUniforms.planetCenter[3] = 1.0f;
+    compositeUniforms.planetParams[0] = camera.planetRadiusMeters;
+    compositeUniforms.planetParams[1] = camera.atmosphereTopMeters;
+    compositeUniforms.planetParams[2] = camera.worldShape == WorldShape::Planet ? 1.0f : 0.0f;
+    compositeUniforms.planetParams[3] = 0.0f;
+    compositeUniforms.lightDirection[0] = lightingUniforms.lightDirection[0];
+    compositeUniforms.lightDirection[1] = lightingUniforms.lightDirection[1];
+    compositeUniforms.lightDirection[2] = lightingUniforms.lightDirection[2];
+    compositeUniforms.lightDirection[3] = 1.0f;
+    compositeUniforms.lightColor[0] = lightingUniforms.lightColor[0];
+    compositeUniforms.lightColor[1] = lightingUniforms.lightColor[1];
+    compositeUniforms.lightColor[2] = lightingUniforms.lightColor[2];
+    compositeUniforms.lightColor[3] = 1.0f;
+    compositeUniforms.skyColor[0] = lightingUniforms.skyColor[0];
+    compositeUniforms.skyColor[1] = lightingUniforms.skyColor[1];
+    compositeUniforms.skyColor[2] = lightingUniforms.skyColor[2];
+    compositeUniforms.skyColor[3] = 1.0f;
+    compositeUniforms.groundColor[0] = lightingUniforms.groundColor[0];
+    compositeUniforms.groundColor[1] = lightingUniforms.groundColor[1];
+    compositeUniforms.groundColor[2] = lightingUniforms.groundColor[2];
+    compositeUniforms.groundColor[3] = 1.0f;
+    compositeUniforms.fogColor[0] = lightingUniforms.fogColor[0];
+    compositeUniforms.fogColor[1] = lightingUniforms.fogColor[1];
+    compositeUniforms.fogColor[2] = lightingUniforms.fogColor[2];
+    compositeUniforms.fogColor[3] = 1.0f;
+    compositeUniforms.fogAndExposure[0] = lightingUniforms.fogAndExposure[0];
+    compositeUniforms.fogAndExposure[1] = lightingUniforms.fogAndExposure[1];
+    compositeUniforms.fogAndExposure[2] = lightingUniforms.fogAndExposure[2];
+    compositeUniforms.fogAndExposure[3] = lightingUniforms.fogAndExposure[3];
 
     struct TranslucentSubmission {
         SDL_GPUBuffer* vertexBuffer = nullptr;
@@ -1744,10 +1967,10 @@ bool VulkanRenderer::render(
 
     SDL_GPUColorTargetInfo sceneColorTarget {};
     sceneColorTarget.texture = sceneColorTexture_;
-    sceneColorTarget.clear_color.r = lightingState.backgroundColor.x;
-    sceneColorTarget.clear_color.g = lightingState.backgroundColor.y;
-    sceneColorTarget.clear_color.b = lightingState.backgroundColor.z;
-    sceneColorTarget.clear_color.a = 1.0f;
+    sceneColorTarget.clear_color.r = 0.0f;
+    sceneColorTarget.clear_color.g = 0.0f;
+    sceneColorTarget.clear_color.b = 0.0f;
+    sceneColorTarget.clear_color.a = 0.0f;
     sceneColorTarget.load_op = SDL_GPU_LOADOP_CLEAR;
     sceneColorTarget.store_op = SDL_GPU_STOREOP_STORE;
 
@@ -1793,6 +2016,7 @@ bool VulkanRenderer::render(
             if (sceneTexture == nullptr) {
                 return false;
             }
+            pushObjectUniforms(command);
             SDL_GPUTextureSamplerBinding sceneSamplerBinding {};
             sceneSamplerBinding.texture = sceneTexture;
             sceneSamplerBinding.sampler = materialSampler;
@@ -1836,6 +2060,7 @@ bool VulkanRenderer::render(
             if (sceneTexture == nullptr) {
                 return false;
             }
+            pushObjectUniforms(*submission.command);
             SDL_GPUTextureSamplerBinding sceneSamplerBinding {};
             sceneSamplerBinding.texture = sceneTexture;
             sceneSamplerBinding.sampler = materialSampler;
@@ -1848,31 +2073,19 @@ bool VulkanRenderer::render(
 
     if (!opaqueCommands.empty() && !drawCommands(sceneBinding.buffer, opaqueCommands, false)) {
         SDL_EndGPURenderPass(renderPass);
-        SDL_CancelGPUCommandBuffer(commandBuffer);
-        for (SDL_GPUTransferBuffer* uploadBuffer : uploadBuffers) {
-            SDL_ReleaseGPUTransferBuffer(device_, uploadBuffer);
-        }
-        return false;
+        return abandonFrame();
     }
 
     for (const CachedResidentMesh* mesh : residentOpaqueMeshes) {
         if (!drawCommands(mesh->vertexBuffer, mesh->opaqueCommands, false)) {
             SDL_EndGPURenderPass(renderPass);
-            SDL_CancelGPUCommandBuffer(commandBuffer);
-            for (SDL_GPUTransferBuffer* uploadBuffer : uploadBuffers) {
-                SDL_ReleaseGPUTransferBuffer(device_, uploadBuffer);
-            }
-            return false;
+            return abandonFrame();
         }
     }
 
     if (!drawTranslucentSubmissions(translucentSubmissions)) {
         SDL_EndGPURenderPass(renderPass);
-        SDL_CancelGPUCommandBuffer(commandBuffer);
-        for (SDL_GPUTransferBuffer* uploadBuffer : uploadBuffers) {
-            SDL_ReleaseGPUTransferBuffer(device_, uploadBuffer);
-        }
-        return false;
+        return abandonFrame();
     }
 
     SDL_EndGPURenderPass(renderPass);
@@ -1902,12 +2115,16 @@ bool VulkanRenderer::render(
     SDL_GPUTextureSamplerBinding sceneCompositeBinding {};
     sceneCompositeBinding.texture = sceneColorTexture_;
     sceneCompositeBinding.sampler = sceneSampler_;
+    compositeUniforms.projectionParams[3] = 0.0f;
+    SDL_PushGPUFragmentUniformData(commandBuffer, 0, &compositeUniforms, sizeof(compositeUniforms));
     SDL_BindGPUFragmentSamplers(compositePass, 0, &sceneCompositeBinding, 1);
     SDL_DrawGPUPrimitives(compositePass, 6, 1, 0, 0);
 
     SDL_GPUTextureSamplerBinding overlaySamplerBinding {};
     overlaySamplerBinding.texture = hudTexture_;
     overlaySamplerBinding.sampler = overlaySampler_;
+    compositeUniforms.projectionParams[3] = 1.0f;
+    SDL_PushGPUFragmentUniformData(commandBuffer, 0, &compositeUniforms, sizeof(compositeUniforms));
     SDL_BindGPUFragmentSamplers(compositePass, 0, &overlaySamplerBinding, 1);
     SDL_DrawGPUPrimitives(compositePass, 6, 1, 0, 0);
     if (imguiDrawData != nullptr) {
@@ -1916,15 +2133,11 @@ bool VulkanRenderer::render(
     SDL_EndGPURenderPass(compositePass);
 
     if (!SDL_SubmitGPUCommandBuffer(commandBuffer)) {
-        for (SDL_GPUTransferBuffer* uploadBuffer : uploadBuffers) {
-            SDL_ReleaseGPUTransferBuffer(device_, uploadBuffer);
-        }
+        releaseUploadBuffers();
         return fail(errorMessage, "SDL_SubmitGPUCommandBuffer");
     }
 
-    for (SDL_GPUTransferBuffer* uploadBuffer : uploadBuffers) {
-        SDL_ReleaseGPUTransferBuffer(device_, uploadBuffer);
-    }
+    releaseUploadBuffers();
 
     const std::uint64_t keepWindow =
         frameSettings.pressureTier == RendererPressureTier::Critical
@@ -1947,12 +2160,14 @@ SDL_GPUDevice* VulkanRenderer::gpuDevice() const
     return device_;
 }
 
+SDL_GPUPresentMode VulkanRenderer::presentMode() const
+{
+    return presentMode_;
+}
+
 SDL_GPUTextureFormat VulkanRenderer::swapchainTextureFormat() const
 {
-    if (device_ == nullptr || window_ == nullptr) {
-        return SDL_GPU_TEXTUREFORMAT_INVALID;
-    }
-    return SDL_GetGPUSwapchainTextureFormat(device_, window_);
+    return swapchainFormat_;
 }
 
 }  // namespace NativeGame

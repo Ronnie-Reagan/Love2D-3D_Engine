@@ -26,6 +26,8 @@ struct GeoConfig {
     float originLat = 0.0f;
     float originLon = 0.0f;
     float metersPerUnit = 1.0f;
+    WorldShape worldShape = WorldShape::Plane;
+    PlanetConfig planet {};
 };
 
 inline float wrapAngle(float angle)
@@ -346,6 +348,8 @@ struct TerrainRoadNetworkIndex {
 
 struct TerrainParams {
     int seed = 1337;
+    WorldShape worldShape = WorldShape::Plane;
+    PlanetConfig planet {};
     float chunkSize = 128.0f;
     float worldRadius = 24576.0f;
     float minY = -1400.0f;
@@ -363,6 +367,8 @@ struct TerrainParams {
     int lod0TextureResolution = 512;
     int lod1TextureResolution = 256;
     int lod2TextureResolution = 64;
+    float nearSurfaceArcRadiusMeters = 24000.0f;
+    float regionalArcRadiusMeters = 240000.0f;
     float gameplayRadiusMeters = 1024.0f;
     float midFieldRadiusMeters = 6144.0f;
     float horizonRadiusMeters = 24576.0f;
@@ -379,12 +385,12 @@ struct TerrainParams {
     int maxAdaptiveLod1Radius = 8;
     int maxPendingChunks = 96;
     int maxStaleChunks = 32;
-    int maxDisplayedChunks = 512;
-    int maxDisplayedChunksHardCap = 8192;
+    int maxDisplayedChunks = 1048;
+    int maxDisplayedChunksHardCap = 8192 * 2;
     bool drawDistanceOverridesLodRadius = true;
-    bool splitLodEnabled = false;
+    bool splitLodEnabled = true;
     float highResSplitRatio = 0.5f;
-    int chunkCacheLimit = 128;
+    int chunkCacheLimit = 256;
     bool farLodConeEnabled = true;
     float farLodConeDegrees = 110.0f;
     int rearLod2Radius = 4;
@@ -456,6 +462,8 @@ struct TerrainVerticalBoundsSample {
 
 struct TerrainFieldContext {
     TerrainParams params;
+    PlanetLocalFrame planetFrame {};
+    double planetTimeSeconds = 0.0;
     std::vector<TerrainTunnelSeed> tunnelSeeds;
     std::vector<TerrainRoadPath> roadPaths;
     std::shared_ptr<const TerrainRoadNetworkIndex> roadIndex {};
@@ -465,8 +473,16 @@ struct TerrainFieldContext {
     std::function<bool(float, float, float, float)> hasVolumetricOverridesInBounds {};
     std::function<TerrainVerticalBoundsSample(float, float, float, float)> sampleWorldVolumetricBoundsInBounds {};
     std::function<std::uint64_t(float, float, float, float)> sampleChunkRevisionSignature {};
+    std::function<std::uint64_t()> sampleChunkRevisionGeneration {};
     std::function<TerrainRoadSample(float, float)> sampleRoadAt {};
 };
+
+inline bool terrainUsesPlanet(const TerrainFieldContext& context);
+inline void syncTerrainContextPlanetTime(TerrainFieldContext& context, double timeSeconds);
+inline DVec3 terrainPointPlanetFixed(const Vec3& localPoint, const TerrainFieldContext& context);
+inline DVec3 terrainHorizontalDirectionPlanetFixed(float x, float z, const TerrainFieldContext& context);
+inline float terrainPlanetLocalSurfaceY(double surfaceRadius, float x, float z, const TerrainFieldContext& context);
+inline float samplePlanetProceduralSurfaceHeight(const DVec3& directionFixed, const TerrainFieldContext& context);
 
 struct TerrainMaterialSample {
     float surfaceHeight = 0.0f;
@@ -562,6 +578,11 @@ inline TerrainTunnelSeed sanitizeTunnelSeed(const TerrainTunnelSeed& seed)
 inline TerrainParams normalizeTerrainParams(TerrainParams params)
 {
     params.seed = std::max(1, params.seed);
+    params.planet.radiusMeters = std::max(1000.0, params.planet.radiusMeters);
+    params.planet.gravitationalParameter = std::max(1.0, params.planet.gravitationalParameter);
+    params.planet.rotationRateRadPerSec = sanitize(static_cast<float>(params.planet.rotationRateRadPerSec), static_cast<float>(7.2921159e-5));
+    params.planet.atmosphereHeightMeters = std::max(1000.0, params.planet.atmosphereHeightMeters);
+    params.planet.localOrigin = normalizeGeodetic(params.planet.localOrigin);
     params.chunkSize = std::max(8.0f, sanitize(params.chunkSize, 128.0f));
     params.worldRadius = std::max(params.chunkSize * 4.0f, sanitize(params.worldRadius, 32768.0f));
     params.minY = sanitize(params.minY, -1400.0f);
@@ -581,6 +602,12 @@ inline TerrainParams normalizeTerrainParams(TerrainParams params)
     params.lod1TextureResolution = std::clamp(params.lod1TextureResolution, 32, 512);
     params.lod2TextureResolution = std::clamp(params.lod2TextureResolution, 16, 256);
 
+    params.nearSurfaceArcRadiusMeters = clamp(sanitize(params.nearSurfaceArcRadiusMeters, 24000.0f), params.chunkSize * 4.0f, 48000.0f);
+    params.regionalArcRadiusMeters = clamp(
+        sanitize(params.regionalArcRadiusMeters, 240000.0f),
+        params.nearSurfaceArcRadiusMeters + params.chunkSize,
+        400000.0f);
+
     params.gameplayRadiusMeters = std::max(
         params.chunkSize,
         sanitize(params.gameplayRadiusMeters, std::max(1024.0f, params.chunkSize * static_cast<float>(std::max(params.lod0Radius, 4)))));
@@ -599,14 +626,14 @@ inline TerrainParams normalizeTerrainParams(TerrainParams params)
     params.lod1CellSize = clamp(params.lod1BaseCellSize / qualityScale, params.lod0CellSize, 12.0f);
     params.lod2CellSize = clamp(params.lod2BaseCellSize / qualityScale, params.lod1CellSize, 24.0f);
 
-    params.meshBuildBudget = std::clamp(params.meshBuildBudget, 1, 8);
-    params.workerMaxInflight = std::clamp(params.workerMaxInflight, 1, 6);
+    params.meshBuildBudget = std::clamp(params.meshBuildBudget, 1, 24);
+    params.workerMaxInflight = std::clamp(params.workerMaxInflight, 1, 24);
     params.workerResultBudgetPerFrame = std::clamp(params.workerResultBudgetPerFrame, 1, 12);
     params.workerResultTimeBudgetMs = clamp(sanitize(params.workerResultTimeBudgetMs, 3.0f), 0.25f, 20.0f);
     params.maxAdaptiveLod1Radius = std::clamp(params.maxAdaptiveLod1Radius, params.lod1Radius, 32);
     params.maxPendingChunks = std::clamp(params.maxPendingChunks, 16, 192);
     params.maxStaleChunks = std::clamp(params.maxStaleChunks, 8, 128);
-    params.maxDisplayedChunksHardCap = std::clamp(params.maxDisplayedChunksHardCap, 1536, 16384);
+    params.maxDisplayedChunksHardCap = std::clamp(params.maxDisplayedChunksHardCap, 1536, 16384 * 2);
     params.maxDisplayedChunks = std::clamp(params.maxDisplayedChunks, 128, params.maxDisplayedChunksHardCap);
     params.highResSplitRatio = clamp(sanitize(params.highResSplitRatio, 0.5f), 0.2f, 0.8f);
     params.chunkCacheLimit = std::clamp(params.chunkCacheLimit, 32, 256);
@@ -731,6 +758,25 @@ inline TerrainParams normalizeTerrainParams(TerrainParams params)
         params.tunnelCount = static_cast<int>(params.explicitTunnelSeeds.size());
     }
 
+    if (params.worldShape == WorldShape::Planet) {
+        const float regionalRadius = std::max(params.regionalArcRadiusMeters, params.nearSurfaceArcRadiusMeters + params.chunkSize);
+        const float curvatureDrop =
+            static_cast<float>((static_cast<double>(regionalRadius) * static_cast<double>(regionalRadius)) /
+                               (std::max(1.0, params.planet.radiusMeters) * 2.0));
+        params.worldRadius = regionalRadius;
+        params.gameplayRadiusMeters = std::max(params.chunkSize, params.nearSurfaceArcRadiusMeters);
+        params.midFieldRadiusMeters = std::max(params.gameplayRadiusMeters + params.chunkSize, regionalRadius * 0.5f);
+        params.horizonRadiusMeters = regionalRadius;
+        params.minY = std::min(params.minY, -(curvatureDrop + params.heightAmplitude + 6000.0f));
+        params.maxY = std::max(params.maxY, params.heightAmplitude + 500000.0f);
+        params.waterWaveAmplitude = std::min(params.waterWaveAmplitude, 6.0f);
+        params.drawDistanceOverridesLodRadius = false;
+        params.maxDisplayedChunks = std::min(params.maxDisplayedChunks, 640);
+        params.maxDisplayedChunksHardCap = std::min(params.maxDisplayedChunksHardCap, 1024);
+        params.maxPendingChunks = std::min(params.maxPendingChunks, 64);
+        params.chunkCacheLimit = std::min(params.chunkCacheLimit, 160);
+    }
+
     params.surfaceOnlyMeshing = !(params.caveEnabled || params.tunnelCount > 0 || !params.explicitTunnelSeeds.empty());
     return params;
 }
@@ -820,6 +866,14 @@ inline bool terrainParamsEquivalent(const TerrainParams& lhsInput, const Terrain
     const TerrainParams lhs = normalizeTerrainParams(lhsInput);
     const TerrainParams rhs = normalizeTerrainParams(rhsInput);
     return lhs.seed == rhs.seed &&
+        lhs.worldShape == rhs.worldShape &&
+        lhs.planet.radiusMeters == rhs.planet.radiusMeters &&
+        lhs.planet.gravitationalParameter == rhs.planet.gravitationalParameter &&
+        lhs.planet.rotationRateRadPerSec == rhs.planet.rotationRateRadPerSec &&
+        lhs.planet.atmosphereHeightMeters == rhs.planet.atmosphereHeightMeters &&
+        lhs.planet.localOrigin.latitudeDeg == rhs.planet.localOrigin.latitudeDeg &&
+        lhs.planet.localOrigin.longitudeDeg == rhs.planet.localOrigin.longitudeDeg &&
+        lhs.planet.localOrigin.altitudeMeters == rhs.planet.localOrigin.altitudeMeters &&
         lhs.chunkSize == rhs.chunkSize &&
         lhs.worldRadius == rhs.worldRadius &&
         lhs.minY == rhs.minY &&
@@ -834,6 +888,8 @@ inline bool terrainParamsEquivalent(const TerrainParams& lhsInput, const Terrain
         lhs.lod1ChunkScale == rhs.lod1ChunkScale &&
         lhs.lod2ChunkScale == rhs.lod2ChunkScale &&
         lhs.textureTilesEnabled == rhs.textureTilesEnabled &&
+        lhs.nearSurfaceArcRadiusMeters == rhs.nearSurfaceArcRadiusMeters &&
+        lhs.regionalArcRadiusMeters == rhs.regionalArcRadiusMeters &&
         lhs.gameplayRadiusMeters == rhs.gameplayRadiusMeters &&
         lhs.midFieldRadiusMeters == rhs.midFieldRadiusMeters &&
         lhs.horizonRadiusMeters == rhs.horizonRadiusMeters &&
@@ -1038,6 +1094,23 @@ inline float ridgeNoise01(float x, float z, float freq, int octaves, float lacun
     return weight > 1.0e-6f ? (sum / weight) : 0.0f;
 }
 
+inline float ridgeNoise3(float x, float y, float z, float freq, int octaves, float lacunarity, float gain, int seed)
+{
+    float amp = 1.0f;
+    float sum = 0.0f;
+    float weight = 0.0f;
+    float localFreq = freq;
+    for (int i = 0; i < octaves; ++i) {
+        const float n = (valueNoise3(x * localFreq, y * localFreq, z * localFreq, seed + (i * 131)) * 2.0f) - 1.0f;
+        const float r = 1.0f - std::fabs(n);
+        sum += r * r * amp;
+        weight += amp;
+        amp *= gain;
+        localFreq *= lacunarity;
+    }
+    return weight > 1.0e-6f ? (sum / weight) : 0.0f;
+}
+
 inline std::vector<TerrainTunnelSeed> buildTunnelSeeds(const TerrainParams& inputParams)
 {
     const TerrainParams params = normalizeTerrainParams(inputParams);
@@ -1152,6 +1225,16 @@ inline float sampleCoastalMountainHeight(float x, float z, const TerrainFieldCon
 inline float sampleProceduralSurfaceHeight(float x, float z, const TerrainFieldContext& context)
 {
     const TerrainParams& params = context.params;
+    if (terrainUsesPlanet(context)) {
+        float surface = samplePlanetProceduralSurfaceHeight(terrainHorizontalDirectionPlanetFixed(x, z, context), context);
+        surface = applyDynamicCratersToSurfaceHeight(x, z, surface, params);
+        if (params.terraceStrength > 0.0f) {
+            const float stepped = std::floor((surface / params.terraceStep) + 0.5f) * params.terraceStep;
+            surface = mix(surface, stepped, params.terraceStrength);
+        }
+        return terrainPlanetLocalSurfaceY(params.planet.radiusMeters + static_cast<double>(surface), x, z, context);
+    }
+
     float surface = sampleCoastalMountainHeight(x, z, context);
     const float detail = ((fbm2(x * params.surfaceDetailFrequency, z * params.surfaceDetailFrequency, 4, 2.0f, 0.55f, params.seed + 1301) * 2.0f) - 1.0f) * params.surfaceDetailAmplitude;
     surface += detail;
@@ -1686,10 +1769,89 @@ inline void attachTunnelSeedToSurface(TerrainTunnelSeed& tunnel, const TerrainFi
     applyAnchor(tunnel.points.size() - 1u, tunnel.points.size() - 2u);
 }
 
+inline bool terrainUsesPlanet(const TerrainFieldContext& context)
+{
+    return context.params.worldShape == WorldShape::Planet;
+}
+
+inline void syncTerrainContextPlanetTime(TerrainFieldContext& context, double timeSeconds)
+{
+    context.planetTimeSeconds = timeSeconds;
+}
+
+inline DVec3 terrainPointPlanetFixed(const Vec3& localPoint, const TerrainFieldContext& context)
+{
+    const DVec3 inertial = planetLocalToInertial(localPoint, context.planetFrame);
+    return inertialToPlanetFixed(inertial, context.params.planet, context.planetTimeSeconds);
+}
+
+inline DVec3 terrainHorizontalDirectionPlanetFixed(float x, float z, const TerrainFieldContext& context)
+{
+    const DVec3 inertial =
+        context.planetFrame.surfaceOriginInertial +
+        (context.planetFrame.east * static_cast<double>(x)) +
+        (context.planetFrame.up * context.planetFrame.originRadiusMeters) +
+        (context.planetFrame.north * static_cast<double>(z));
+    return normalize(
+        inertialToPlanetFixed(inertial, context.params.planet, context.planetTimeSeconds),
+        { 0.0, 1.0, 0.0 });
+}
+
+inline float terrainPlanetLocalSurfaceY(double surfaceRadius, float x, float z, const TerrainFieldContext& context)
+{
+    const double horizontalSq = (static_cast<double>(x) * static_cast<double>(x)) + (static_cast<double>(z) * static_cast<double>(z));
+    const double clampedRadius = std::max(surfaceRadius, std::sqrt(horizontalSq) + 1.0);
+    return static_cast<float>(std::sqrt(std::max(1.0, (clampedRadius * clampedRadius) - horizontalSq)) - context.planetFrame.originRadiusMeters);
+}
+
+inline float samplePlanetProceduralSurfaceHeight(const DVec3& directionFixed, const TerrainFieldContext& context)
+{
+    const TerrainParams& params = context.params;
+    const DVec3 dir = normalize(directionFixed, { 0.0, 1.0, 0.0 });
+    const float nx = static_cast<float>(dir.x);
+    const float ny = static_cast<float>(dir.y);
+    const float nz = static_cast<float>(dir.z);
+
+    const float continental =
+        (fbm3(nx * 1.35f, ny * 1.35f, nz * 1.35f, 5, 2.04f, 0.56f, params.seed + 101) * 2.0f) - 1.0f;
+    const float continentalMask = smootherstep01(remap01(continental, -0.10f, 0.22f));
+    const float macro =
+        (fbm3(nx * 5.6f, ny * 5.6f, nz * 5.6f, 5, 2.08f, 0.54f, params.seed + 211) * 2.0f) - 1.0f;
+    const float ridges = ridgeNoise3(nx, ny, nz, 13.0f, 5, 2.06f, 0.58f, params.seed + 307);
+    const float detail =
+        (fbm3(nx * 64.0f, ny * 64.0f, nz * 64.0f, 4, 2.0f, 0.52f, params.seed + 401) * 2.0f) - 1.0f;
+    const float wetBands =
+        (fbm3(nx * 10.0f, ny * 10.0f, nz * 10.0f, 3, 2.0f, 0.5f, params.seed + 509) * 2.0f) - 1.0f;
+    const float latitudeAbs = std::fabs(ny);
+    const float snowBoost = smootherstep01(remap01(latitudeAbs, 0.62f, 0.92f));
+
+    const float oceanFloor =
+        params.waterLevel -
+        (params.heightAmplitude * 0.18f) +
+        (macro * params.heightAmplitude * 0.08f) -
+        ((1.0f - continentalMask) * params.heightAmplitude * 0.18f);
+    const float continentalPlateau =
+        params.baseHeight +
+        params.waterLevel +
+        (macro * params.heightAmplitude * 0.42f) +
+        ((continentalMask - 0.5f) * params.heightAmplitude * 0.26f);
+    const float mountainLift =
+        std::pow(clamp(ridges, 0.0f, 1.0f), std::max(1.2f, params.ridgeSharpness)) *
+        params.ridgeAmplitude *
+        mix(0.10f, 0.95f, continentalMask);
+    const float climateRelief =
+        wetBands * params.heightAmplitude * 0.06f * (0.45f + (snowBoost * 0.55f));
+    float surface = mix(oceanFloor, continentalPlateau + mountainLift + climateRelief, continentalMask);
+    surface += detail * params.surfaceDetailAmplitude * mix(0.28f, 1.0f, continentalMask);
+    return surface;
+}
+
 inline TerrainFieldContext createTerrainFieldContext(const TerrainParams& inputParams)
 {
     TerrainFieldContext context;
     context.params = normalizeTerrainParams(inputParams);
+    context.planetFrame = makePlanetLocalFrame(context.params.planet);
+    context.planetTimeSeconds = 0.0;
 
     if (!context.params.explicitTunnelSeeds.empty()) {
         context.tunnelSeeds = context.params.explicitTunnelSeeds;
@@ -1716,9 +1878,54 @@ inline TerrainFieldContext createTerrainFieldContext(const TerrainParams& inputP
     return context;
 }
 
+inline Vec2 worldToGeo(const Vec3& worldPosition, const TerrainFieldContext& context)
+{
+    if (!terrainUsesPlanet(context)) {
+        GeoConfig config {};
+        config.originLat = static_cast<float>(context.params.planet.localOrigin.latitudeDeg);
+        config.originLon = static_cast<float>(context.params.planet.localOrigin.longitudeDeg);
+        return worldToGeo(worldPosition.x, worldPosition.z, config);
+    }
+
+    const GeodeticCoord geo = geodeticFromPlanetFixed(terrainPointPlanetFixed(worldPosition, context), context.params.planet);
+    return { static_cast<float>(geo.latitudeDeg), static_cast<float>(geo.longitudeDeg) };
+}
+
+inline Vec2 worldToGeo(float worldX, float worldZ, const TerrainFieldContext& context)
+{
+    return worldToGeo({ worldX, 0.0f, worldZ }, context);
+}
+
 inline float sampleWaterHeight(float x, float z, const TerrainFieldContext& context)
 {
     const TerrainParams& params = context.params;
+    if (terrainUsesPlanet(context)) {
+        float waveOffset = 0.0f;
+        if (params.waterWaveAmplitude > 0.0f) {
+            const DVec3 dir = terrainHorizontalDirectionPlanetFixed(x, z, context);
+            const float n1 = (valueNoise3(
+                                  static_cast<float>(dir.x * 48.0),
+                                  static_cast<float>(dir.y * 48.0),
+                                  static_cast<float>(dir.z * 48.0),
+                                  params.seed + 700) *
+                              2.0f) -
+                1.0f;
+            const float n2 = (valueNoise3(
+                                  static_cast<float>(dir.x * 91.0),
+                                  static_cast<float>(dir.y * 91.0),
+                                  static_cast<float>(dir.z * 91.0),
+                                  params.seed + 937) *
+                              2.0f) -
+                1.0f;
+            waveOffset = ((n1 * 0.7f) + (n2 * 0.3f)) * params.waterWaveAmplitude;
+        }
+        return terrainPlanetLocalSurfaceY(
+            params.planet.radiusMeters + static_cast<double>(params.waterLevel + waveOffset),
+            x,
+            z,
+            context);
+    }
+
     if (params.waterWaveAmplitude <= 0.0f) {
         return params.waterLevel;
     }
@@ -1776,8 +1983,17 @@ inline float sampleSurfaceHeight(float x, float z, const TerrainParams& params)
 inline float sampleSdf(float x, float y, float z, const TerrainFieldContext& context)
 {
     const TerrainParams& params = context.params;
-    const float surface = sampleSurfaceHeight(x, z, context);
-    float sdf = y - surface;
+    float sdf = 0.0f;
+    if (terrainUsesPlanet(context)) {
+        const Vec3 localPoint { x, y, z };
+        const float surfaceY = sampleSurfaceHeight(x, z, context);
+        const double surfaceRadius = planetRadialDistanceLocal({ x, surfaceY, z }, context.planetFrame);
+        const double pointRadius = planetRadialDistanceLocal(localPoint, context.planetFrame);
+        sdf = static_cast<float>(pointRadius - surfaceRadius);
+    } else {
+        const float surface = sampleSurfaceHeight(x, z, context);
+        sdf = y - surface;
+    }
 
     if (params.caveEnabled && y >= params.caveMinY && y <= params.caveMaxY) {
         const float caveNoise = fbm3(
@@ -2702,12 +2918,12 @@ struct CloudGroup {
 };
 
 struct CloudField {
-    float spawnRadius = 2600.0f;
-    float baseHeight = 620.0f;
+    float spawnRadius = 1200.0f;
+    float baseHeight = 55000.0f;
     float layerThickness = 420.0f;
     float coverage = 0.72f;
     float humidityResponse = 0.78f;
-    int groupCount = 14;
+    int groupCount = 10;
     std::size_t maxMeshBuildResultsPerUpdate = 4u;
     std::vector<CloudGroup> groups;
 };

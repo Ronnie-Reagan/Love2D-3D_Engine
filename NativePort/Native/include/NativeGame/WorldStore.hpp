@@ -34,9 +34,12 @@ struct WorldStoreOptions {
     bool createIfMissing = true;
     TerrainParams groundParams = defaultTerrainParams();
     Vec3 spawn {};
+    GeodeticCoord spawnGeodetic {};
 };
 
 struct WorldMetaTerrainProfile {
+    WorldShape worldShape = WorldShape::Plane;
+    PlanetConfig planet {};
     float chunkSize = 128.0f;
     float worldRadius = 2048.0f;
     float heightAmplitude = 120.0f;
@@ -55,10 +58,11 @@ struct WorldMetaTunnelProfile {
 
 struct WorldMeta {
     std::string worldId = "default";
-    int formatVersion = 1;
+    int formatVersion = 2;
     int seed = 1;
     WorldMetaTerrainProfile terrainProfile {};
     Vec3 spawn {};
+    GeodeticCoord spawnGeodetic {};
     WorldMetaTunnelProfile tunnelProfile {};
     std::vector<TerrainTunnelSeed> tunnelSeeds;
     int chunkResolution = 16;
@@ -69,8 +73,10 @@ struct WorldMeta {
 
 struct WorldInfoSnapshot {
     std::string worldId = "default";
-    int formatVersion = 1;
+    int formatVersion = 2;
     int seed = 1;
+    WorldShape worldShape = WorldShape::Plane;
+    PlanetConfig planet {};
     float chunkSize = 128.0f;
     float horizonRadiusMeters = 2048.0f;
     float heightAmplitude = 120.0f;
@@ -80,6 +86,9 @@ struct WorldInfoSnapshot {
     float spawnX = 0.0f;
     float spawnY = 0.0f;
     float spawnZ = 0.0f;
+    double spawnLatitudeDeg = 0.0;
+    double spawnLongitudeDeg = 0.0;
+    double spawnAltitudeMeters = 0.0;
 };
 
 struct WorldGroundParams {
@@ -92,7 +101,7 @@ struct WorldGroundParams {
 
 class WorldStore {
 public:
-    static constexpr int kFormatVersion = 1;
+    static constexpr int kFormatVersion = 2;
 
     static std::optional<WorldStore> open(const WorldStoreOptions& options, std::string* error = nullptr);
 
@@ -108,6 +117,7 @@ public:
     bool hasVolumetricOverridesInBounds(float x0, float z0, float x1, float z1, int neighborRing = 1);
     TerrainVerticalBoundsSample volumetricVerticalBoundsForBounds(float x0, float z0, float x1, float z1, int neighborRing = 1);
     std::uint64_t revisionSignatureForBounds(float x0, float z0, float x1, float z1, int neighborRing = 1);
+    [[nodiscard]] std::uint64_t contentRevision() const;
     std::vector<WorldChunkState> collectEditedChunks(int centerCx, int centerCz, int radiusChunks);
     std::pair<bool, std::vector<WorldChunkState>> applyCrater(const TerrainCrater& craterSpec);
     int flushDirty(std::string* error = nullptr);
@@ -124,6 +134,7 @@ private:
     std::unordered_map<std::string, WorldChunkState> chunks_;
     std::unordered_set<std::string> loadedRegions_;
     std::unordered_set<std::string> dirtyRegions_;
+    std::uint64_t contentRevision_ = 1u;
 
     static std::string trim(const std::string& value);
     static int parseInt(const std::string& value, int fallback);
@@ -446,6 +457,8 @@ inline bool WorldStore::applyWorldInfo(const WorldInfoSnapshot& info, std::strin
     meta_.worldId = sanitizeWorldName(info.worldId.empty() ? name_ : info.worldId);
     meta_.formatVersion = std::max(1, info.formatVersion);
     meta_.seed = std::max(1, info.seed);
+    meta_.terrainProfile.worldShape = info.worldShape;
+    meta_.terrainProfile.planet = info.planet;
     meta_.terrainProfile.chunkSize = std::max(8.0f, sanitize(info.chunkSize, meta_.terrainProfile.chunkSize));
     meta_.terrainProfile.worldRadius = std::max(meta_.terrainProfile.chunkSize * 4.0f, sanitize(info.horizonRadiusMeters, meta_.terrainProfile.worldRadius));
     meta_.terrainProfile.heightAmplitude = sanitize(info.heightAmplitude, meta_.terrainProfile.heightAmplitude);
@@ -456,6 +469,11 @@ inline bool WorldStore::applyWorldInfo(const WorldInfoSnapshot& info, std::strin
         sanitize(info.spawnY, meta_.spawn.y),
         sanitize(info.spawnZ, meta_.spawn.z)
     };
+    meta_.spawnGeodetic = normalizeGeodetic({
+        info.spawnLatitudeDeg,
+        info.spawnLongitudeDeg,
+        info.spawnAltitudeMeters
+    });
     meta_.tunnelSeeds.clear();
     for (const TerrainTunnelSeed& seed : info.tunnelSeeds) {
         TerrainTunnelSeed normalizedSeed = sanitizeTunnelSeed(seed);
@@ -490,6 +508,7 @@ inline bool WorldStore::applyChunkState(const WorldChunkState& state)
 
     chunks_[key] = incoming;
     markRegionDirty(rx, rz);
+    contentRevision_ += 1u;
     touchMeta();
     return true;
 }
@@ -674,6 +693,11 @@ inline std::uint64_t WorldStore::revisionSignatureForBounds(float x0, float z0, 
     return hash;
 }
 
+inline std::uint64_t WorldStore::contentRevision() const
+{
+    return contentRevision_;
+}
+
 inline std::vector<WorldChunkState> WorldStore::collectEditedChunks(int centerCx, int centerCz, int radiusChunks)
 {
     std::vector<WorldChunkState> out;
@@ -750,6 +774,7 @@ inline std::pair<bool, std::vector<WorldChunkState>> WorldStore::applyCrater(con
     }
 
     if (!changed.empty()) {
+        contentRevision_ += 1u;
         touchMeta();
         saveMeta(nullptr);
         return { true, changed };
@@ -786,6 +811,8 @@ inline WorldGroundParams WorldStore::buildGroundParams(const TerrainParams& base
     WorldGroundParams out;
     out.terrainParams = normalizeTerrainParams(baseParams);
     out.terrainParams.seed = std::max(1, meta_.seed);
+    out.terrainParams.worldShape = meta_.terrainProfile.worldShape;
+    out.terrainParams.planet = meta_.terrainProfile.planet;
     out.terrainParams.chunkSize = std::max(8.0f, meta_.terrainProfile.chunkSize);
     out.terrainParams.worldRadius = std::max(out.terrainParams.chunkSize * 4.0f, meta_.terrainProfile.worldRadius);
     out.terrainParams.heightAmplitude = meta_.terrainProfile.heightAmplitude;
@@ -871,12 +898,15 @@ inline bool WorldStore::loadOrCreateMeta(const WorldStoreOptions& options, std::
         meta_.worldId = name_;
         meta_.formatVersion = kFormatVersion;
         meta_.seed = params.seed;
+        meta_.terrainProfile.worldShape = params.worldShape;
+        meta_.terrainProfile.planet = params.planet;
         meta_.terrainProfile.chunkSize = params.chunkSize;
         meta_.terrainProfile.worldRadius = params.worldRadius;
         meta_.terrainProfile.heightAmplitude = params.heightAmplitude;
         meta_.terrainProfile.heightFrequency = params.heightFrequency;
         meta_.terrainProfile.waterLevel = params.waterLevel;
         meta_.spawn = options.spawn;
+        meta_.spawnGeodetic = normalizeGeodetic(options.spawnGeodetic);
         meta_.tunnelProfile.count = static_cast<int>(context.tunnelSeeds.size());
         meta_.tunnelProfile.radiusMin = params.tunnelRadiusMin;
         meta_.tunnelProfile.radiusMax = params.tunnelRadiusMax;
@@ -894,6 +924,19 @@ inline bool WorldStore::loadOrCreateMeta(const WorldStoreOptions& options, std::
     meta_.worldId = sanitizeWorldName(valueOr(stored, "world_id", name_));
     meta_.formatVersion = std::max(1, parseInt(valueOr(stored, "format_version", "1"), kFormatVersion));
     meta_.seed = std::max(1, parseInt(valueOr(stored, "seed", "1"), 1));
+    meta_.terrainProfile.worldShape =
+        parseInt(valueOr(stored, "terrain.world_shape", "0"), 0) == static_cast<int>(WorldShape::Planet)
+            ? WorldShape::Planet
+            : WorldShape::Plane;
+    meta_.terrainProfile.planet.radiusMeters = std::max(1000.0, static_cast<double>(parseFloat(valueOr(stored, "terrain.planet.radius_m", "6371000"), 6371000.0f)));
+    meta_.terrainProfile.planet.gravitationalParameter = std::max(1.0, static_cast<double>(parseFloat(valueOr(stored, "terrain.planet.mu", "3.986004418e14"), 3.986004418e14f)));
+    meta_.terrainProfile.planet.rotationRateRadPerSec = static_cast<double>(parseFloat(valueOr(stored, "terrain.planet.rotation_rate", "0.000072921159"), 0.000072921159f));
+    meta_.terrainProfile.planet.atmosphereHeightMeters = std::max(1000.0, static_cast<double>(parseFloat(valueOr(stored, "terrain.planet.atmosphere_height_m", "120000"), 120000.0f)));
+    meta_.terrainProfile.planet.localOrigin = normalizeGeodetic({
+        static_cast<double>(parseFloat(valueOr(stored, "terrain.planet.origin_lat_deg", "0"), 0.0f)),
+        static_cast<double>(parseFloat(valueOr(stored, "terrain.planet.origin_lon_deg", "0"), 0.0f)),
+        static_cast<double>(parseFloat(valueOr(stored, "terrain.planet.origin_alt_m", "0"), 0.0f))
+    });
     meta_.terrainProfile.chunkSize = std::max(8.0f, parseFloat(valueOr(stored, "terrain.chunk_size", "128"), 128.0f));
     meta_.terrainProfile.worldRadius = std::max(meta_.terrainProfile.chunkSize * 4.0f, parseFloat(valueOr(stored, "terrain.world_radius", "2048"), 2048.0f));
     meta_.terrainProfile.heightAmplitude = parseFloat(valueOr(stored, "terrain.height_amplitude", "120"), 120.0f);
@@ -904,6 +947,11 @@ inline bool WorldStore::loadOrCreateMeta(const WorldStoreOptions& options, std::
         parseFloat(valueOr(stored, "spawn.y", "0"), 0.0f),
         parseFloat(valueOr(stored, "spawn.z", "0"), 0.0f)
     };
+    meta_.spawnGeodetic = normalizeGeodetic({
+        static_cast<double>(parseFloat(valueOr(stored, "spawn.lat_deg", "0"), 0.0f)),
+        static_cast<double>(parseFloat(valueOr(stored, "spawn.lon_deg", "0"), 0.0f)),
+        static_cast<double>(parseFloat(valueOr(stored, "spawn.alt_m", "0"), 0.0f))
+    });
     meta_.tunnelProfile.count = std::max(0, parseInt(valueOr(stored, "tunnel.count", "0"), 0));
     meta_.tunnelProfile.radiusMin = parseFloat(valueOr(stored, "tunnel.radius_min", "9"), 9.0f);
     meta_.tunnelProfile.radiusMax = parseFloat(valueOr(stored, "tunnel.radius_max", "18"), 18.0f);
@@ -929,13 +977,24 @@ inline bool WorldStore::saveMeta(std::string* error) const
     values["format_version"] = std::to_string(meta_.formatVersion);
     values["region_size"] = std::to_string(meta_.regionSize);
     values["seed"] = std::to_string(meta_.seed);
+    values["spawn.alt_m"] = formatFloat(static_cast<float>(meta_.spawnGeodetic.altitudeMeters));
+    values["spawn.lat_deg"] = formatFloat(static_cast<float>(meta_.spawnGeodetic.latitudeDeg));
+    values["spawn.lon_deg"] = formatFloat(static_cast<float>(meta_.spawnGeodetic.longitudeDeg));
     values["spawn.x"] = formatFloat(meta_.spawn.x);
     values["spawn.y"] = formatFloat(meta_.spawn.y);
     values["spawn.z"] = formatFloat(meta_.spawn.z);
     values["terrain.chunk_size"] = formatFloat(meta_.terrainProfile.chunkSize);
     values["terrain.height_amplitude"] = formatFloat(meta_.terrainProfile.heightAmplitude);
     values["terrain.height_frequency"] = formatFloat(meta_.terrainProfile.heightFrequency);
+    values["terrain.planet.atmosphere_height_m"] = formatFloat(static_cast<float>(meta_.terrainProfile.planet.atmosphereHeightMeters));
+    values["terrain.planet.mu"] = formatFloat(static_cast<float>(meta_.terrainProfile.planet.gravitationalParameter), 3);
+    values["terrain.planet.origin_alt_m"] = formatFloat(static_cast<float>(meta_.terrainProfile.planet.localOrigin.altitudeMeters));
+    values["terrain.planet.origin_lat_deg"] = formatFloat(static_cast<float>(meta_.terrainProfile.planet.localOrigin.latitudeDeg));
+    values["terrain.planet.origin_lon_deg"] = formatFloat(static_cast<float>(meta_.terrainProfile.planet.localOrigin.longitudeDeg));
+    values["terrain.planet.radius_m"] = formatFloat(static_cast<float>(meta_.terrainProfile.planet.radiusMeters));
+    values["terrain.planet.rotation_rate"] = formatFloat(static_cast<float>(meta_.terrainProfile.planet.rotationRateRadPerSec), 8);
     values["terrain.water_level"] = formatFloat(meta_.terrainProfile.waterLevel);
+    values["terrain.world_shape"] = std::to_string(static_cast<int>(meta_.terrainProfile.worldShape));
     values["terrain.world_radius"] = formatFloat(meta_.terrainProfile.worldRadius);
     values["tunnel.count"] = std::to_string(meta_.tunnelProfile.count);
     values["tunnel.hill_attached"] = meta_.tunnelProfile.hillAttached ? "1" : "0";

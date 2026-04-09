@@ -10,7 +10,11 @@ struct Camera {
     Quat rot = quatIdentity();
     float fovRadians = radians(80.0f);
     float nearClipMeters = 0.05f;
-    float farClipMeters = 4200.0f;
+    float farClipMeters = 42000.0f;
+    WorldShape worldShape = WorldShape::Plane;
+    Vec3 planetCenter {};
+    float planetRadiusMeters = 6371000.0f;
+    float atmosphereTopMeters = 120000.0f;
 };
 
 struct RenderObject {

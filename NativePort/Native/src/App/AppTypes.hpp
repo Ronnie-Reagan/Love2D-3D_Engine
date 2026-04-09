@@ -203,8 +203,8 @@ namespace TrueFlightApp
     struct GraphicsSettings
     {
         WindowMode windowMode = WindowMode::Windowed;
-        int resolutionWidth = 1280;
-        int resolutionHeight = 720;
+        int resolutionWidth = 1920;
+        int resolutionHeight = 1080;
         float renderScale = 1.0f;
         float drawDistance = 5000.0f;
         bool horizonFog = true;
@@ -695,11 +695,11 @@ namespace TrueFlightApp
     {
         Model sourceModel = makeCubeModel();
         Model model = makeCubeModel();
-        std::string label = "builtin cube";
+        std::string label = "builtin procedural plane";
         std::filesystem::path sourcePath{};
         bool usesStl = false;
         Quat importRotationOffset = quatIdentity();
-        float forwardAxisYawDegrees = -90.0f;
+        float forwardAxisYawDegrees = 0.0f;
         float defaultScale = 3.0f;
         float scale = 3.0f;
         float previewZoom = 1.0f;
@@ -752,6 +752,7 @@ namespace TrueFlightApp
     {
         TerrainFarTileBand band = TerrainFarTileBand::Horizon;
         TerrainFarTileDetail detail = TerrainFarTileDetail::Lod2;
+        int tileScale = 1;
         int tileX = 0;
         int tileZ = 0;
         std::uint64_t paramsSignature = 0u;
@@ -768,6 +769,7 @@ namespace TrueFlightApp
     struct TerrainVisualCache
     {
         bool valid = false;
+        std::uint64_t sourceGeneration = 0u;
         float nearAnchorX = 0.0f;
         float nearAnchorZ = 0.0f;
         float farAnchorX = 0.0f;
@@ -904,6 +906,48 @@ namespace TrueFlightApp
             }
 
             if (!SDL_PutAudioStreamData(stream, data, dataBytes))
+            {
+                available = false;
+                SDL_DestroyAudioStream(stream);
+                stream = nullptr;
+                scratchBuffer.clear();
+            }
+        }
+
+        void queuePcmSpatial(const std::int16_t *pcm, std::size_t sampleCount, float leftGain, float rightGain)
+        {
+            if (!available || stream == nullptr || pcm == nullptr || sampleCount == 0u)
+            {
+                return;
+            }
+
+            const int maxQueuedBytes = sampleRate * queueDepth * 2 * static_cast<int>(sizeof(std::int16_t));
+            if (SDL_GetAudioStreamQueued(stream) > maxQueuedBytes)
+            {
+                SDL_ClearAudioStream(stream);
+            }
+            if (!SDL_ResumeAudioStreamDevice(stream))
+            {
+                available = false;
+                return;
+            }
+
+            const float clampedLeftGain = clamp(leftGain, 0.0f, 1.5f);
+            const float clampedRightGain = clamp(rightGain, 0.0f, 1.5f);
+            scratchBuffer.resize(sampleCount * 2u);
+            for (std::size_t index = 0; index < sampleCount; ++index)
+            {
+                const float sample = static_cast<float>(pcm[index]);
+                scratchBuffer[index * 2u] =
+                    static_cast<std::int16_t>(clamp(sample * clampedLeftGain, -32768.0f, 32767.0f));
+                scratchBuffer[index * 2u + 1u] =
+                    static_cast<std::int16_t>(clamp(sample * clampedRightGain, -32768.0f, 32767.0f));
+            }
+
+            if (!SDL_PutAudioStreamData(
+                    stream,
+                    scratchBuffer.data(),
+                    static_cast<int>(scratchBuffer.size() * sizeof(std::int16_t))))
             {
                 available = false;
                 SDL_DestroyAudioStream(stream);
@@ -1062,8 +1106,10 @@ namespace TrueFlightApp
         Vec3 worldPos{};
         float halfHeight = 0.0f;
         float distanceMeters = 0.0f;
+        std::string label;
         float health = 0.0f;
         float maxHealth = 1.0f;
+        bool showHealth = true;
         bool highlighted = false;
     };
 
@@ -1104,8 +1150,12 @@ namespace TrueFlightApp
         int completedCount = 0;
         std::uint64_t droppedRequestCount = 0;
         std::uint64_t droppedResultCount = 0;
+        std::uint64_t staleResultCount = 0;
         std::uint64_t adoptedResultCount = 0;
+        std::uint64_t workerBuildCount = 0;
         float lastFrameAdoptionTimeMs = 0.0f;
+        float lastWorkerBuildTimeMs = 0.0f;
+        float lastFrameSyncBuildTimeMs = 0.0f;
     };
 
     struct TerrainStreamBudgetOverrides
@@ -1210,6 +1260,7 @@ namespace TrueFlightApp
     {
         TerrainFarTileBand band = TerrainFarTileBand::Horizon;
         TerrainFarTileDetail detail = TerrainFarTileDetail::Lod2;
+        int tileScale = 1;
         int tileX = 0;
         int tileZ = 0;
         std::uint64_t paramsSignature = 0u;

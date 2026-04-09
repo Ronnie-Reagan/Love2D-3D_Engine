@@ -2,6 +2,8 @@
 
 namespace TrueFlightApp {
 
+
+    
 UiState defaultUiState()
 {
     UiState state {};
@@ -38,8 +40,8 @@ GraphicsSettings defaultGraphicsSettings()
 {
     GraphicsSettings settings {};
     settings.windowMode = WindowMode::Windowed;
-    settings.resolutionWidth = 1280;
-    settings.resolutionHeight = 720;
+    settings.resolutionWidth = 1920;
+    settings.resolutionHeight = 1080;
     settings.renderScale = 1.0f;
     settings.drawDistance = 5000.0f;
     settings.horizonFog = true;
@@ -140,5 +142,7 @@ void pushHudNotification(BootResources& boot, std::string text, float nowSeconds
         boot.notifications.pop_front();
     }
 }
+
+
 
 }  // namespace TrueFlightApp

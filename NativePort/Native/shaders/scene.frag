@@ -13,6 +13,10 @@ layout(set = 3, binding = 0, std140) uniform SceneLightingUniforms {
     vec4 uShadowParams;
 };
 
+layout(set = 3, binding = 1, std140) uniform SceneObjectUniforms {
+    vec4 uObjectFogRange;
+};
+
 layout(location = 0) in vec3 inRelativePosition;
 layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec4 inColor;
@@ -21,6 +25,11 @@ layout(location = 4) in vec2 inFogRange;
 layout(location = 5) in float inAlphaCutoff;
 layout(location = 6) in float inWorldHeight;
 layout(location = 0) out vec4 outColor;
+
+const float kPi = 3.14159265358979323846;
+const float kRayleighScaleHeight = 8000.0;
+const float kBaseMieScaleHeight = 1200.0;
+const vec3 kRayleighBeta = vec3(5.802e-6, 13.558e-6, 33.100e-6);
 
 vec3 safeNormalize(vec3 value)
 {
@@ -47,6 +56,55 @@ vec3 toneMapAces(vec3 color)
     return clamp((color * (a * color + b)) / (color * (c * color + d) + e), 0.0, 1.0);
 }
 
+float rayleighPhase(float mu)
+{
+    return 3.0 * (1.0 + (mu * mu)) / (16.0 * kPi);
+}
+
+float hgPhase(float mu, float g)
+{
+    float g2 = g * g;
+    float denom = max(1.0e-3, 1.0 + g2 - (2.0 * g * mu));
+    return (1.0 - g2) / (4.0 * kPi * denom * sqrt(denom));
+}
+
+vec3 computeAerialPerspective(
+    vec3 viewRay,
+    float viewDistance,
+    float cameraAltitude,
+    float fragmentAltitude,
+    out vec3 extinction)
+{
+    float haze = clamp((uFogAndExposure.w - 1.0) / 9.0, 0.0, 1.0);
+    float humidity = clamp(uFogAndExposure.x * 4500.0, 0.0, 1.4);
+    float mistScaleHeight = max(400.0, 1.0 / max(1.0e-5, uFogAndExposure.y));
+    float mieScaleHeight = mix(kBaseMieScaleHeight, mistScaleHeight, clamp(humidity * 0.55, 0.0, 1.0));
+    vec3 betaM = vec3(mix(7.0e-6, 3.0e-5, clamp((haze * 0.72) + (humidity * 0.45), 0.0, 1.0)));
+
+    float averageAltitude = clamp(max(0.0, mix(cameraAltitude, fragmentAltitude, 0.5)), 0.0, 100000.0);
+    float densityR = exp(-averageAltitude / kRayleighScaleHeight);
+    float densityM = exp(-averageAltitude / mieScaleHeight);
+
+    float skyView = clamp((viewRay.y * 0.5) + 0.5, 0.0, 1.0);
+    float horizonBoost = 1.0 + (1.0 - skyView) * mix(2.2, 6.5, clamp((haze * 0.6) + (humidity * 0.4), 0.0, 1.0));
+    float opticalDistance = max(0.0, viewDistance) * horizonBoost;
+    vec3 opticalDepth = (kRayleighBeta * (densityR * opticalDistance)) + (betaM * (densityM * opticalDistance));
+    extinction = exp(-max(opticalDepth, vec3(0.0)));
+
+    float mu = dot(viewRay, safeNormalize(uLightDirection.xyz));
+    float phaseR = rayleighPhase(mu);
+    float phaseM = hgPhase(mu, mix(0.68, 0.84, haze));
+    vec3 sunColor = max(uLightColor.xyz, vec3(0.001)) * 18.0;
+    vec3 ambientSky = mix(uGroundColor.xyz, uSkyColor.xyz, skyView);
+    vec3 atmosphereTint = mix(ambientSky, uFogColor.xyz, clamp((haze * 0.45) + (humidity * 0.55), 0.0, 1.0));
+    vec3 inscatter =
+        sunColor *
+        ((kRayleighBeta * phaseR * densityR) + (betaM * phaseM * densityM * 1.35)) *
+        opticalDistance *
+        1400.0;
+    return (atmosphereTint + inscatter) * clamp(vec3(1.0) - extinction, vec3(0.0), vec3(1.0));
+}
+
 void main()
 {
     vec4 shaded = texture(uBaseColorTexture, inTexCoord) * inColor;
@@ -58,6 +116,7 @@ void main()
     vec3 normal = safeNormalize(inNormal);
     vec3 lightDir = safeNormalize(uLightDirection.xyz);
     vec3 viewDir = safeNormalize(-inRelativePosition);
+    vec3 viewRay = safeNormalize(inRelativePosition);
     vec3 halfVector = safeNormalize(lightDir + viewDir);
 
     float nDotL = max(dot(normal, lightDir), 0.0);
@@ -92,15 +151,20 @@ void main()
 
     vec3 finalColor = max(ambient + bounce + ambientSpecular + direct, vec3(0.0));
 
-    float fogSpan = max(0.001, inFogRange.y - inFogRange.x);
-    float rangeFog = clamp((viewDistance - inFogRange.x) / fogSpan, 0.0, 1.0);
-    float exponentialFog = 0.0;
-    if (uFogAndExposure.x > 1e-6) {
-        float heightTerm = exp(-max(inWorldHeight, 0.0) * max(0.0, uFogAndExposure.y));
-        exponentialFog = 1.0 - exp(-viewDistance * uFogAndExposure.x * max(0.05, heightTerm));
+    vec3 extinction;
+    vec3 airlight = computeAerialPerspective(
+        viewRay,
+        viewDistance,
+        max(0.0, uCameraPosition.y),
+        max(0.0, inWorldHeight),
+        extinction);
+    finalColor = (finalColor * extinction) + airlight;
+
+    float fogSpan = max(0.001, uObjectFogRange.y - uObjectFogRange.x);
+    float rangeFog = clamp((viewDistance - uObjectFogRange.x) / fogSpan, 0.0, 1.0);
+    if (rangeFog > 0.0) {
+        finalColor = mix(finalColor, airlight + (uFogColor.xyz * 0.18), rangeFog * 0.65);
     }
-    float fogFactor = max(rangeFog, clamp(exponentialFog, 0.0, 1.0));
-    finalColor = mix(finalColor, uFogColor.xyz, fogFactor);
 
     finalColor *= exp2(uFogAndExposure.z);
     finalColor = linearToSrgb(toneMapAces(finalColor));

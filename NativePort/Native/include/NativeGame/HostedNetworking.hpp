@@ -547,47 +547,47 @@ struct VehicleHandlingPreset {
     float throttleResponseRelease = 5.5f;
     float steerResponseActive = 14.0f;
     float steerResponseRelease = 9.5f;
-    float tractionBase = 0.36f;
-    float tractionFrictionScale = 0.62f;
-    float tractionRoadMin = 0.88f;
-    float tractionRoadMax = 1.18f;
+    float tractionBase = 0.32f;
+    float tractionFrictionScale = 0.70f;
+    float tractionRoadMin = 0.78f;
+    float tractionRoadMax = 1.08f;
     float tractionClampMin = 0.18f;
     float tractionClampMax = 5.0f;
-    float enginePullLowSpeed = 2.5f;
+    float enginePullLowSpeed = 2.2f;
     float enginePullHighSpeed = 0.56f;
     float engineReverseScale = 0.78f;
-    float rollingDragRoad = 0.35f;
-    float rollingDragOffroad = 1.55f;
+    float rollingDragRoad = 0.48f;
+    float rollingDragOffroad = 1.85f;
     float rollingDragSpeedLow = 0.80f;
     float rollingDragSpeedHigh = 1.12f;
     float aeroDrag = 0.0092f;
     float throttleNeutralEpsilon = 0.08f;
     float brakeRoadScale = 0.96f;
     float brakeRoadMaxScale = 1.32f;
-    float steerRateLowSpeed = 1.15f;
-    float steerRateHighSpeed = 0.32f;
+    float steerRateLowSpeed = 1.08f;
+    float steerRateHighSpeed = 0.28f;
     float steerRateRoadMin = 0.60f;
     float steerRateRoadMax = 1.12f;
-    float roadAlignGainMin = 0.2f;
-    float roadAlignGainScale = 0.62f;
-    float roadAlignRate = 2.1f;
-    float lateralDampingOffroad = 0.95f;
-    float lateralDampingRoad = 4.2f;
-    float velocityConvergeBase = 2.2f;
-    float velocityConvergeFrictionScale = 1.4f;
+    float roadAlignGainMin = 0.08f;
+    float roadAlignGainScale = 0.34f;
+    float roadAlignRate = 1.45f;
+    float lateralDampingOffroad = 0.68f;
+    float lateralDampingRoad = 2.3f;
+    float velocityConvergeBase = 1.35f;
+    float velocityConvergeFrictionScale = 0.92f;
     float slopeGravity = 9.80665f;
     float slopeResistanceScale = 1.0f;
     float slopeSlipScale = 1.6f;
-    float slipTractionStart = 0.45f;
-    float slipTractionScale = 0.75f;
-    float wheelSpinGain = 0.28f;
-    float wheelSpinLateralInfluence = 0.35f;
+    float slipTractionStart = 0.30f;
+    float slipTractionScale = 0.92f;
+    float wheelSpinGain = 0.34f;
+    float wheelSpinLateralInfluence = 0.48f;
     float frontProbeExtra = 0.9f;
     float sideProbeExtra = 0.65f;
     float collisionMargin = 0.22f;
     float collisionSidePush = 0.65f;
     float collisionSideVelScale = 0.24f;
-    float bodyClearance = 0.35f;
+    float bodyClearance = 0.26f;
     float wheelbaseExtra = 0.65f;
     float trackExtra = 0.38f;
     float pitchClamp = 0.34f;
@@ -595,12 +595,12 @@ struct VehicleHandlingPreset {
     float frontProbeHeightBias = 0.55f;
     float suspensionRestScale = 0.72f;
     float suspensionScale = 1.4f;
-    float cageHeaveFromCompression = 0.75f;
+    float cageHeaveFromCompression = 0.88f;
     float cageHeaveResponseRate = 11.0f;
     float cagePitchResponseRate = 9.0f;
     float cageRollResponseRate = 8.8f;
-    float cagePitchFromThrottle = 0.25f;
-    float cageRollFromSteer = 0.255f;
+    float cagePitchFromThrottle = 0.33f;
+    float cageRollFromSteer = 0.34f;
     float cagePitchSign = -1.0f;
     float cageRollSign = -1.0f;
     float cageSteerRollSign = -1.0f;
@@ -812,7 +812,10 @@ inline void simulateSharedVehicle(
     vehicle.yawRadians = wrapAngle(vehicle.yawRadians + (vehicle.steerNormalized * steerRate * dt));
     if (terrainRoadSampleValid(road)) {
         const float desiredYaw = std::atan2(road.forward.x, road.forward.z);
-        const float alignmentGain = steeringAssist * clamp((speed01 * tuning.roadAlignGainScale) + tuning.roadAlignGainMin, 0.0f, 1.0f);
+        const float alignmentGain =
+            steeringAssist *
+            clamp((speed01 * tuning.roadAlignGainScale) + tuning.roadAlignGainMin, 0.0f, 1.0f) *
+            clamp(1.0f - (lateralSlipNorm * 0.55f), 0.25f, 1.0f);
         vehicle.yawRadians = wrapAngle(vehicle.yawRadians + wrapAngle(desiredYaw - vehicle.yawRadians) * alignmentGain * dt * tuning.roadAlignRate);
     }
     const float yawRateActual = dt > 1.0e-4f
@@ -824,10 +827,23 @@ inline void simulateSharedVehicle(
     float lateralSpeed = dot(vehicle.vel, rightUpdated);
     const float lateralDamping =
         mix(tuning.lateralDampingOffroad, tuning.lateralDampingRoad, roadAdhesion) *
-        clamp(0.55f + (traction * 0.45f), 0.25f, 1.15f);
-    lateralSpeed = mix(lateralSpeed, 0.0f, clamp(dt * lateralDamping, 0.0f, 1.0f));
+        clamp(0.42f + (traction * 0.38f), 0.18f, 0.92f);
+    const float lateralTarget =
+        lateralSpeed *
+        clamp(
+            0.14f + (lateralSlipNorm * 0.18f) + ((1.0f - roadAdhesion) * 0.20f),
+            0.10f,
+            0.52f);
+    lateralSpeed = mix(lateralSpeed, lateralTarget, clamp(dt * lateralDamping, 0.0f, 1.0f));
     const Vec3 targetVel = (forward * forwardSpeed) + (rightUpdated * lateralSpeed);
-    vehicle.vel += (targetVel - vehicle.vel) * clamp(dt * (tuning.velocityConvergeBase + (friction * tuning.velocityConvergeFrictionScale)), 0.0f, 1.0f);
+    const float velocityBlend =
+        clamp(
+            dt *
+                (tuning.velocityConvergeBase + (friction * tuning.velocityConvergeFrictionScale)) *
+                clamp(1.0f - (lateralSlipNorm * 0.25f), 0.55f, 1.0f),
+            0.0f,
+            1.0f);
+    vehicle.vel += (targetVel - vehicle.vel) * velocityBlend;
     vehicle.vel.y = 0.0f;
 
     Vec3 nextPos = vehicle.pos + (vehicle.vel * dt);

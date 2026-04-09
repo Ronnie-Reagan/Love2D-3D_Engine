@@ -27,6 +27,9 @@ struct WorldChunkState {
     int resolution = 16;
     int revision = 0;
     int materialRevision = 0;
+    WorldShape worldShape = WorldShape::Plane;
+    PlanetConfig planet {};
+    PlanetTileId planetTile {};
     std::vector<float> heightDeltas;
     std::vector<WorldVolumetricOverride> volumetricOverrides;
 };
@@ -225,6 +228,18 @@ inline WorldKeyValueFields buildChunkStateFields(const WorldChunkState& chunk)
         { "resolution", std::to_string(normalizeWorldChunkResolution(chunk.resolution)) },
         { "revision", std::to_string(std::max(0, chunk.revision)) },
         { "materialRevision", std::to_string(std::max(0, chunk.materialRevision)) },
+        { "worldShape", std::to_string(static_cast<int>(chunk.worldShape)) },
+        { "planet.radius_m", formatWorldWireFloat(static_cast<float>(chunk.planet.radiusMeters)) },
+        { "planet.mu", formatWorldWireFloat(static_cast<float>(chunk.planet.gravitationalParameter)) },
+        { "planet.rotation_rate", formatWorldWireFloat(static_cast<float>(chunk.planet.rotationRateRadPerSec)) },
+        { "planet.atmosphere_height_m", formatWorldWireFloat(static_cast<float>(chunk.planet.atmosphereHeightMeters)) },
+        { "planet.origin_lat_deg", formatWorldWireFloat(static_cast<float>(chunk.planet.localOrigin.latitudeDeg)) },
+        { "planet.origin_lon_deg", formatWorldWireFloat(static_cast<float>(chunk.planet.localOrigin.longitudeDeg)) },
+        { "planet.origin_alt_m", formatWorldWireFloat(static_cast<float>(chunk.planet.localOrigin.altitudeMeters)) },
+        { "planetTile.face", std::to_string(chunk.planetTile.face) },
+        { "planetTile.lod", std::to_string(chunk.planetTile.lod) },
+        { "planetTile.tx", std::to_string(chunk.planetTile.tx) },
+        { "planetTile.ty", std::to_string(chunk.planetTile.ty) },
         { "heightDeltas", encodeHeightDeltas(chunk.heightDeltas) },
         { "volumetricOverrides", encodeVolumetricOverrides(chunk.volumetricOverrides) }
     };
@@ -253,6 +268,23 @@ inline WorldChunkState decodeChunkStateFields(const std::unordered_map<std::stri
     chunk.resolution = normalizeWorldChunkResolution(parseWorldWireInt(lookupValue("resolution"), 16));
     chunk.revision = std::max(0, parseWorldWireInt(lookupValue("revision"), 0));
     chunk.materialRevision = std::max(0, parseWorldWireInt(lookupValue("materialRevision"), 0));
+    chunk.worldShape =
+        parseWorldWireInt(lookupValue("worldShape"), 0) == static_cast<int>(WorldShape::Planet)
+            ? WorldShape::Planet
+            : WorldShape::Plane;
+    chunk.planet.radiusMeters = std::max(1000.0, static_cast<double>(parseWorldWireFloat(lookupValue("planet.radius_m"), 6371000.0f)));
+    chunk.planet.gravitationalParameter = std::max(1.0, static_cast<double>(parseWorldWireFloat(lookupValue("planet.mu"), 3.986004418e14f)));
+    chunk.planet.rotationRateRadPerSec = static_cast<double>(parseWorldWireFloat(lookupValue("planet.rotation_rate"), 0.000072921159f));
+    chunk.planet.atmosphereHeightMeters = std::max(1000.0, static_cast<double>(parseWorldWireFloat(lookupValue("planet.atmosphere_height_m"), 120000.0f)));
+    chunk.planet.localOrigin = normalizeGeodetic({
+        static_cast<double>(parseWorldWireFloat(lookupValue("planet.origin_lat_deg"), 0.0f)),
+        static_cast<double>(parseWorldWireFloat(lookupValue("planet.origin_lon_deg"), 0.0f)),
+        static_cast<double>(parseWorldWireFloat(lookupValue("planet.origin_alt_m"), 0.0f))
+    });
+    chunk.planetTile.face = parseWorldWireInt(lookupValue("planetTile.face"), 0);
+    chunk.planetTile.lod = parseWorldWireInt(lookupValue("planetTile.lod"), 0);
+    chunk.planetTile.tx = parseWorldWireInt(lookupValue("planetTile.tx"), 0);
+    chunk.planetTile.ty = parseWorldWireInt(lookupValue("planetTile.ty"), 0);
     chunk.heightDeltas = decodeHeightDeltas(lookupValue("heightDeltas"));
     chunk.volumetricOverrides = decodeVolumetricOverrides(lookupValue("volumetricOverrides"));
     return chunk;

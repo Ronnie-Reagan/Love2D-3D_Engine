@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <limits>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct ImDrawData;
@@ -71,6 +72,8 @@ public:
 
     bool initialize(SDL_Window* window, const std::filesystem::path& shaderDirectory, std::string* errorMessage);
     void shutdown();
+    bool prepareForDisplayChange(std::string* errorMessage);
+    bool syncDisplayState(bool enableVsync, std::string* errorMessage);
 
     bool render(
         const Camera& camera,
@@ -86,6 +89,7 @@ public:
     [[nodiscard]] const RendererMemoryStats& memoryStats() const;
     [[nodiscard]] const char* backendName() const;
     [[nodiscard]] SDL_GPUDevice* gpuDevice() const;
+    [[nodiscard]] SDL_GPUPresentMode presentMode() const;
     [[nodiscard]] SDL_GPUTextureFormat swapchainTextureFormat() const;
 
 private:
@@ -112,6 +116,8 @@ private:
         Uint32 vertexCount = 0;
         const RgbaImage* image = nullptr;
         bool cullBackfaces = false;
+        float fogNear = 450.0f;
+        float fogFar = 2600.0f;
         Vec3 sortCenter {};
     };
 
@@ -161,6 +167,10 @@ private:
         float shadowParams[4] {};
     };
 
+    struct alignas(16) SceneObjectUniforms {
+        float fogRange[4] {};
+    };
+
     bool createPipelines(const std::filesystem::path& shaderDirectory, std::string* errorMessage);
     bool createOverlayGeometry(std::string* errorMessage);
     bool ensureSceneCapacity(std::size_t requiredBytes, std::string* errorMessage);
@@ -181,6 +191,8 @@ private:
     void releaseSceneTextureEntry(CachedSceneTexture& cached);
     void releaseResidentMeshes();
     void releaseResidentMeshEntry(CachedResidentMesh& mesh);
+    void releaseFramebufferResources();
+    void releasePipelines();
     void pruneSceneTextures(std::uint64_t minFrameToKeep);
     CachedResidentMesh* findResidentMesh(const std::string& key);
     bool isResidentMeshCurrent(const CachedResidentMesh& mesh, const RenderObject& object) const;
@@ -198,6 +210,7 @@ private:
     bool reserveStreamingUploadBytes(std::size_t bytes);
     void resetFrameUploadStats(const RendererFrameSettings& frameSettings);
     void refreshMemoryStats();
+    void rebuildResidentMeshIndex();
 
     SDL_Window* window_ = nullptr;
     SDL_GPUDevice* device_ = nullptr;
@@ -223,8 +236,12 @@ private:
     std::size_t sceneCapacityBytes_ = 0;
     std::size_t hudTransferCapacityBytes_ = 0;
     SDL_GPUTextureFormat depthTextureFormat_ = SDL_GPU_TEXTUREFORMAT_D16_UNORM;
+    SDL_GPUTextureFormat swapchainFormat_ = SDL_GPU_TEXTUREFORMAT_INVALID;
+    SDL_GPUPresentMode presentMode_ = SDL_GPU_PRESENTMODE_VSYNC;
+    std::filesystem::path shaderDirectory_ {};
     std::vector<CachedSceneTexture> sceneTextures_;
     std::vector<CachedResidentMesh> residentMeshes_;
+    std::unordered_map<std::string, std::size_t> residentMeshIndex_;
     std::uint64_t frameCounter_ = 0;
     std::size_t residentMeshBudgetBytes_ = 0;
     std::size_t sceneTextureBudgetBytes_ = 0;

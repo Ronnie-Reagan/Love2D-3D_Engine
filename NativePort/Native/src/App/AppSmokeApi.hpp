@@ -95,7 +95,7 @@ TerrainTileDecorationResult buildTerrainTileDecoration(
     const TerrainChunkData* sourceData = nullptr);
 TerrainFarTileDetail initialTerrainTileDetailForBand(TerrainFarTileBand band);
 std::optional<TerrainFarTileDetail> nextTerrainTileDetail(TerrainFarTileBand band, TerrainFarTileDetail detail);
-std::string terrainTileIdentityKey(TerrainFarTileBand band, int tileX, int tileZ);
+std::string terrainTileIdentityKey(TerrainFarTileBand band, int tileScale, int tileX, int tileZ);
 std::string terrainTileRequestKey(const TerrainTileRequest& request);
 void trimTerrainStreamBacklogLocked(TerrainVisualStreamState& state);
 bool shouldApplyTerrainChunkResult(const TerrainFarTile* existingTile, const TerrainTileRequest& request);

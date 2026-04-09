@@ -3,7 +3,6 @@
 #include "App/AppTypes.hpp"
 
 namespace TrueFlightApp {
-
 UiState defaultUiState();
 GraphicsSettings defaultGraphicsSettings();
 LightingSettings defaultLightingSettings();

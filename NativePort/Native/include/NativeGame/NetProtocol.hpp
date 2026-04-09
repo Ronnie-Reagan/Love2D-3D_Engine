@@ -78,12 +78,12 @@ enum class TransportLane : int {
 };
 
 struct AvatarRoleConfig {
-    std::string modelHash = "builtin-cube";
+    std::string modelHash = "builtin-procedural-plane";
     float scale = 1.0f;
     std::string skinHash;
-    std::string assetKey = "builtin:cube";
+    std::string assetKey = "builtin:procedural_plane";
     std::string modelFormat = "builtin";
-    float forwardAxisYawDegrees = -90.0f;
+    float forwardAxisYawDegrees = 0.0f;
     Quat importRotation = quatIdentity();
     bool builtinWalkingRig = false;
     float yawDegrees = 0.0f;
@@ -717,10 +717,10 @@ inline std::optional<std::string> decodeBase64(const std::string& encoded)
 inline AvatarManifest defaultAvatarManifest()
 {
     AvatarManifest manifest;
-    manifest.plane.modelHash = "builtin-cube";
-    manifest.plane.assetKey = "builtin:cube";
+    manifest.plane.modelHash = "builtin-procedural-plane";
+    manifest.plane.assetKey = "builtin:procedural_plane";
     manifest.plane.modelFormat = "builtin";
-    manifest.plane.forwardAxisYawDegrees = -90.0f;
+    manifest.plane.forwardAxisYawDegrees = 0.0f;
     manifest.plane.importRotation = quatIdentity();
     manifest.walking.modelHash = "builtin-walking-biped";
     manifest.walking.assetKey = "builtin:walking_biped";
@@ -1228,6 +1228,8 @@ inline WorldInfoSnapshot buildWorldInfoSnapshotPacketData(const WorldStore& worl
     info.worldId = meta.worldId;
     info.formatVersion = meta.formatVersion;
     info.seed = meta.seed;
+    info.worldShape = meta.terrainProfile.worldShape;
+    info.planet = meta.terrainProfile.planet;
     info.chunkSize = meta.terrainProfile.chunkSize;
     info.horizonRadiusMeters = std::max(meta.terrainProfile.worldRadius, fallbackTerrain.horizonRadiusMeters);
     info.heightAmplitude = meta.terrainProfile.heightAmplitude;
@@ -1237,6 +1239,9 @@ inline WorldInfoSnapshot buildWorldInfoSnapshotPacketData(const WorldStore& worl
     info.spawnX = meta.spawn.x;
     info.spawnY = meta.spawn.y;
     info.spawnZ = meta.spawn.z;
+    info.spawnLatitudeDeg = meta.spawnGeodetic.latitudeDeg;
+    info.spawnLongitudeDeg = meta.spawnGeodetic.longitudeDeg;
+    info.spawnAltitudeMeters = meta.spawnGeodetic.altitudeMeters;
     return info;
 }
 
@@ -1246,6 +1251,14 @@ inline std::string buildWorldInfoPacket(const WorldInfoSnapshot& info)
         { "worldId", info.worldId },
         { "formatVersion", std::to_string(info.formatVersion) },
         { "seed", std::to_string(info.seed) },
+        { "worldShape", std::to_string(static_cast<int>(info.worldShape)) },
+        { "planetRadius", formatNetFloat(static_cast<float>(info.planet.radiusMeters), 3) },
+        { "planetMu", formatNetFloat(static_cast<float>(info.planet.gravitationalParameter), 3) },
+        { "planetRotationRate", formatNetFloat(static_cast<float>(info.planet.rotationRateRadPerSec), 8) },
+        { "planetAtmosphereHeight", formatNetFloat(static_cast<float>(info.planet.atmosphereHeightMeters), 3) },
+        { "planetOriginLat", formatNetFloat(static_cast<float>(info.planet.localOrigin.latitudeDeg), 6) },
+        { "planetOriginLon", formatNetFloat(static_cast<float>(info.planet.localOrigin.longitudeDeg), 6) },
+        { "planetOriginAlt", formatNetFloat(static_cast<float>(info.planet.localOrigin.altitudeMeters), 3) },
         { "chunkSize", formatNetFloat(info.chunkSize, 6) },
         { "horizonRadius", formatNetFloat(info.horizonRadiusMeters, 6) },
         { "heightAmp", formatNetFloat(info.heightAmplitude, 6) },
@@ -1254,7 +1267,10 @@ inline std::string buildWorldInfoPacket(const WorldInfoSnapshot& info)
         { "tunnelSeeds", encodeTunnelSeeds(info.tunnelSeeds) },
         { "spawnX", formatNetFloat(info.spawnX, 6) },
         { "spawnY", formatNetFloat(info.spawnY, 6) },
-        { "spawnZ", formatNetFloat(info.spawnZ, 6) }
+        { "spawnZ", formatNetFloat(info.spawnZ, 6) },
+        { "spawnLat", formatNetFloat(static_cast<float>(info.spawnLatitudeDeg), 6) },
+        { "spawnLon", formatNetFloat(static_cast<float>(info.spawnLongitudeDeg), 6) },
+        { "spawnAlt", formatNetFloat(static_cast<float>(info.spawnAltitudeMeters), 3) }
     });
 }
 
@@ -1647,6 +1663,30 @@ inline std::optional<WorldInfoSnapshot> parseWorldInfoPacket(const std::string& 
     if (const auto it = kv.find("seed"); it != kv.end()) {
         info.seed = std::max(1, std::atoi(it->second.c_str()));
     }
+    if (const auto it = kv.find("worldShape"); it != kv.end()) {
+        info.worldShape = std::atoi(it->second.c_str()) == static_cast<int>(WorldShape::Planet) ? WorldShape::Planet : WorldShape::Plane;
+    }
+    if (const auto it = kv.find("planetRadius"); it != kv.end()) {
+        info.planet.radiusMeters = std::max(1000.0, static_cast<double>(std::strtof(it->second.c_str(), nullptr)));
+    }
+    if (const auto it = kv.find("planetMu"); it != kv.end()) {
+        info.planet.gravitationalParameter = std::max(1.0, static_cast<double>(std::strtof(it->second.c_str(), nullptr)));
+    }
+    if (const auto it = kv.find("planetRotationRate"); it != kv.end()) {
+        info.planet.rotationRateRadPerSec = static_cast<double>(std::strtof(it->second.c_str(), nullptr));
+    }
+    if (const auto it = kv.find("planetAtmosphereHeight"); it != kv.end()) {
+        info.planet.atmosphereHeightMeters = std::max(1000.0, static_cast<double>(std::strtof(it->second.c_str(), nullptr)));
+    }
+    if (const auto it = kv.find("planetOriginLat"); it != kv.end()) {
+        info.planet.localOrigin.latitudeDeg = static_cast<double>(std::strtof(it->second.c_str(), nullptr));
+    }
+    if (const auto it = kv.find("planetOriginLon"); it != kv.end()) {
+        info.planet.localOrigin.longitudeDeg = static_cast<double>(std::strtof(it->second.c_str(), nullptr));
+    }
+    if (const auto it = kv.find("planetOriginAlt"); it != kv.end()) {
+        info.planet.localOrigin.altitudeMeters = static_cast<double>(std::strtof(it->second.c_str(), nullptr));
+    }
     if (const auto it = kv.find("chunkSize"); it != kv.end()) {
         info.chunkSize = std::max(8.0f, std::strtof(it->second.c_str(), nullptr));
     }
@@ -1674,6 +1714,16 @@ inline std::optional<WorldInfoSnapshot> parseWorldInfoPacket(const std::string& 
     if (const auto it = kv.find("spawnZ"); it != kv.end()) {
         info.spawnZ = std::strtof(it->second.c_str(), nullptr);
     }
+    if (const auto it = kv.find("spawnLat"); it != kv.end()) {
+        info.spawnLatitudeDeg = static_cast<double>(std::strtof(it->second.c_str(), nullptr));
+    }
+    if (const auto it = kv.find("spawnLon"); it != kv.end()) {
+        info.spawnLongitudeDeg = static_cast<double>(std::strtof(it->second.c_str(), nullptr));
+    }
+    if (const auto it = kv.find("spawnAlt"); it != kv.end()) {
+        info.spawnAltitudeMeters = static_cast<double>(std::strtof(it->second.c_str(), nullptr));
+    }
+    info.planet.localOrigin = normalizeGeodetic(info.planet.localOrigin);
     return info;
 }
 

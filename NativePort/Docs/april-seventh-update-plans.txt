@@ -1,0 +1,36 @@
+What Sucks
+- vehicle/buggy driving feels like im driving hover-carts
+- the physics arent true enough to reality it seems; i have never gotten into a death spiral or been able to completely stall when going vertically up at no power: the plane always levels out or stabalizes
+- draw distance being a sphere around the player sucks; i cant see the ground when im above the draw distance
+- terrain mipmapping seems too sgressive resulting in dumbed down renders that are well within sight
+- terrain gameplay/render radius is directly resulting in a lock to approx 20fps, almost hardware a agnostic level
+
+
+What Needs Improvements
+- Speeds of 1000kph feel like 500kph maybe? it feels like the world is just scaled too small when being generated; including the prop scales and the prop density
+- simulated horizon in the SixPack HUD element is drawing lines outside of its dial over other elements
+
+What is sorely missed
+- 'handcrafted' and procedurally created plane objects to match the style of the game's other assets like trees and bi-ped player model
+- blob-sync / asset syncing is seeming non functional
+- Global lobby browser with a password system that defaults to no password/public
+
+What is simply wrong and simply fixed
+- simulated horizon in the SixPack HUD element is inverted for roll and pitch
+- simulated horizon in the SixPack HUD element has lines that change colour when they shouldnt
+
+What should be started now to be done in two stages
+- implement two modes, career and creative
+    - career is WiP(to be started) while creative is the current mode in a new box
+    - career mode will NOT have any of the following
+        - model loading for any asset
+        - customization of physics/world (curated worlds with difficulty settings for flight realism levels instead)
+    - career mode is outlined in NativePort\Docs\GameplayLoopBrainstorming.md
+    - creative mode will have a developer console-toggeled with '`' allowing for spawing of vehicles and adjusting of parameters etc.
+- physics based vision/rendering and limits; no more simple camera shit. we need to allow orbital flights with the entire earth in view; we cannot use shortcuts
+- visible atmosphere with lighting from the sun which needs a realistic distance and power level
+
+What is planned for the next pass
+- Finalize changing from a flight/walking to a walking/operating system where the player operate ingame objects by entering them; exactly similar to the current buggy/car system
+- full creation of career mode in a contained single pass
+

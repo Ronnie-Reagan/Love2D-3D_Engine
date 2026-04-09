@@ -28,7 +28,7 @@ enum class FlightEngineModel : std::uint8_t {
 struct FlightConfig {
     float physicsHz = 120.0f;
     int maxSubsteps = 8;
-    float maxFrameDt = 0.025f;
+    float maxFrameDt = 0.05f;
     float metersPerUnit = 1.0f;
     float massKg = 1157.0f;
     float Ixx = 1280.0f;
@@ -42,14 +42,14 @@ struct FlightConfig {
     float CLalpha = 4.95f;
     float CLElevator = 0.92f;
     float alphaStallRad = radians(20.0f);
-    float stallLiftDropoff = 0.0f;
-    float postStallSpinBlendRangeRad = radians(8.0f);
+    float stallLiftDropoff = 0.08f;
+    float postStallSpinBlendRangeRad = radians(10.0f);
     float postStallDampingScale = 0.1f;
-    float postStallAileronEffectiveness = 0.12f;
-    float postStallRudderEffectiveness = 0.32f;
-    float postStallYawStabilityScale = 0.34f;
-    float spinRollMoment = 0.42f;
-    float spinYawMoment = 0.54f;
+    float postStallAileronEffectiveness = 0.07f;
+    float postStallRudderEffectiveness = 0.22f;
+    float postStallYawStabilityScale = 0.12f;
+    float spinRollMoment = 0.78f;
+    float spinYawMoment = 1.04f;
     float CD0 = 0.031f;
     float inducedDragK = 0.045f;
     float CYbeta = -0.78f;
@@ -79,9 +79,9 @@ struct FlightConfig {
     int engineCount = 2;
     float engineLateralSpacingMeters = 5.5f;
     float engineDisplacementLiters = 5.9f;
-    int engineCylinderCount = 8;
+    int engineCylinderCount = 4;
     float maxBrakePowerKw = 134.0f;
-    float fuelMassKg = 144.0f;
+    float fuelMassKg = 500.0f;
     float throttleTimeConstant = 1.15f;
     float maxElevatorDeflectionRad = radians(25.0f);
     float maxAileronDeflectionRad = radians(24.0f);
@@ -111,14 +111,14 @@ struct FlightConfig {
     float controlAuthoritySpeed = 28.0f;
     float minControlAuthority = 0.08f;
     float pitchControlScale = 0.68f;
-    float rollControlScale = 0.85f;
+    float rollControlScale = 0.58f;
     float yawControlScale = 0.52f;
     bool crashEnabled = true;
-    float maxLinearSpeed = 600.0f;
+    float maxLinearSpeed = 6000.0f;
     float maxAngularRateRad = radians(240.0f);
     float maxForceNewton = 70000.0f;
     float maxMomentNewtonMeter = 120000.0f;
-    float maxPositionAbs = 500000.0f;
+    float maxPositionAbs = 50000000.0f;
     float crashNormalSpeed = 13.0f;
     float crashTotalSpeed = 32.0f;
     float crashAngularSpeed = radians(160.0f);
@@ -180,6 +180,9 @@ struct FlightState {
     Vec3 vel { 0.0f, 0.0f, 0.0f };
     Vec3 flightVel { 0.0f, 0.0f, 0.0f };
     Vec3 flightAngVel { 0.0f, 0.0f, 0.0f };
+    DVec3 inertialPos {};
+    DVec3 inertialVel {};
+    bool planetMode = false;
     struct {
         float pitch = 0.0f;
         float yaw = 0.0f;
@@ -212,6 +215,11 @@ struct FlightEnvironment {
     std::function<float(float, float, float)> sampleSdf;
     std::function<Vec3(float, float, float)> sampleNormal;
     float collisionRadius = 0.0f;
+    WorldShape worldShape = WorldShape::Plane;
+    PlanetConfig planet {};
+    Vec3 planetCenterWorld {};
+    Vec3 planetSpinAxisWorld { 0.0f, 1.0f, 0.0f };
+    double planetTimeSeconds = 0.0;
 };
 
 enum class FlightCrashCause : std::uint8_t {
@@ -231,7 +239,7 @@ struct FlightCrashEvent {
     FlightCrashCause cause = FlightCrashCause::Terrain;
 };
 
-constexpr int kMaxFlightEngines = 8;
+constexpr int kMaxFlightEngines = 69;
 
 struct FlightRuntimeState {
     float accumulator = 0.0f;
@@ -283,7 +291,7 @@ inline AtmosphereSample sampleAtmosphere(float altitudeMeters)
     constexpr float gammaAir = 1.4f;
     constexpr float tropopauseAltitudeM = 11000.0f;
 
-    const float altitude = clamp(altitudeMeters, -2000.0f, 32000.0f);
+    const float altitude = clamp(altitudeMeters, -2000.0f, 120000.0f);
     float temperature = 0.0f;
     float pressure = 0.0f;
 
@@ -301,6 +309,8 @@ inline AtmosphereSample sampleAtmosphere(float altitudeMeters)
     }
 
     const float density = pressure / (gasConstantAir * temperature);
+    const float radiusMeters = 6371000.0f;
+    const float gravityScale = (radiusMeters * radiusMeters) / std::max(1.0f, (radiusMeters + altitude) * (radiusMeters + altitude));
     return {
         altitude,
         temperature,
@@ -308,7 +318,7 @@ inline AtmosphereSample sampleAtmosphere(float altitudeMeters)
         density,
         density / 1.225f,
         std::sqrt(gammaAir * gasConstantAir * temperature),
-        gravity
+        gravity * gravityScale
     };
 }
 
@@ -392,6 +402,8 @@ inline void applyNumericalGuards(FlightState& state, const FlightConfig& config)
         sanitize(state.flightAngVel.y, 0.0f),
         sanitize(state.flightAngVel.z, 0.0f)
     }, std::max(radians(20.0f), config.maxAngularRateRad));
+    state.inertialPos = toDVec3(state.pos);
+    state.inertialVel = toDVec3(state.flightVel);
 }
 
 inline void updatePilotInputs(FlightState& state, float dt, float nowSeconds, const InputState& input, const FlightConfig& config)
@@ -521,7 +533,8 @@ inline AeroState computeAero(
         const float exceed = alphaAbs - config.alphaStallRad;
         const float width = std::max(radians(5.0f), config.postStallSpinBlendRangeRad + radians(2.0f));
         const float t = clamp(exceed / width, 0.0f, 1.0f);
-        const float postStallLiftScale = mix(1.0f, 0.38f, t);
+        const float postStallLiftFloor = clamp(0.38f - clamp(config.stallLiftDropoff, 0.0f, 0.20f), 0.14f, 0.55f);
+        const float postStallLiftScale = mix(1.0f, postStallLiftFloor, t);
         cl *= postStallLiftScale;
     }
     cl = clamp(cl, clMin, clMax);
@@ -620,21 +633,41 @@ inline AeroState computeAero(
     };
 }
 
+inline Vec3 computePlanetGravityAcceleration(const FlightEnvironment& environment, const Vec3& position)
+{
+    const Vec3 radial = position - environment.planetCenterWorld;
+    const float radiusSq = std::max(1.0f, lengthSquared(radial));
+    const float radius = std::sqrt(radiusSq);
+    if (radius <= 1.0f) {
+        return { 0.0f, -9.80665f, 0.0f };
+    }
+    const float accelMagnitude = static_cast<float>(environment.planet.gravitationalParameter / static_cast<double>(radiusSq));
+    return radial * (-accelMagnitude / radius);
+}
+
+inline Vec3 computePlanetAtmosphereVelocity(const FlightEnvironment& environment, const Vec3& position)
+{
+    const Vec3 spinAxis = normalize(environment.planetSpinAxisWorld, { 0.0f, 1.0f, 0.0f });
+    const Vec3 omega = spinAxis * static_cast<float>(environment.planet.rotationRateRadPerSec);
+    return cross(omega, position - environment.planetCenterWorld);
+}
+
 inline void integrateRigidBody(
     FlightState& state,
     const FlightConfig& config,
     const Vec3& forceWorld,
     const Vec3& momentBody,
+    const FlightEnvironment& environment,
     float gravityAccel,
     float dt)
 {
     const float mass = std::max(0.1f, config.massKg);
 
-    const Vec3 accelWorld {
-        forceWorld.x / mass,
-        (forceWorld.y / mass) - std::fabs(gravityAccel),
-        forceWorld.z / mass
-    };
+    const Vec3 gravityWorld =
+        environment.worldShape == WorldShape::Planet
+            ? computePlanetGravityAcceleration(environment, state.pos)
+            : Vec3 { 0.0f, -std::fabs(gravityAccel), 0.0f };
+    const Vec3 accelWorld = (forceWorld / mass) + gravityWorld;
     state.flightVel += accelWorld * dt;
     state.pos += state.flightVel * dt;
 
@@ -941,16 +974,25 @@ inline void stepFlight(
     }
 
     int substeps = 0;
+    state.planetMode = environment.worldShape == WorldShape::Planet;
 
     while (runtime.accumulator >= fixedDt && substeps < config.maxSubsteps) {
         runtime.accumulator -= fixedDt;
         ++runtime.tick;
         ++substeps;
 
-        const AtmosphereSample atmosphere = sampleAtmosphere(state.pos.y * config.metersPerUnit);
+        float atmosphereAltitudeMeters = state.pos.y * config.metersPerUnit;
+        Vec3 atmosphereVelocityWorld {};
+        if (environment.worldShape == WorldShape::Planet) {
+            const float radialDistance = length(state.pos - environment.planetCenterWorld);
+            atmosphereAltitudeMeters = (radialDistance - static_cast<float>(environment.planet.radiusMeters)) * config.metersPerUnit;
+            atmosphereVelocityWorld = computePlanetAtmosphereVelocity(environment, state.pos);
+        }
+
+        const AtmosphereSample atmosphere = sampleAtmosphere(atmosphereAltitudeMeters);
         runtime.lastAtmosphere = atmosphere;
 
-        const Vec3 airVelWorld = state.flightVel - environment.wind;
+        const Vec3 airVelWorld = state.flightVel - environment.wind - atmosphereVelocityWorld;
         const Vec3 airVelBody = worldToBody(state.rot, airVelWorld);
         const float trueAirspeed = length(airVelBody);
 
@@ -1236,7 +1278,7 @@ inline void stepFlight(
         }
         momentBody = clampMagnitude(momentBody, std::max(1000.0f, config.maxMomentNewtonMeter));
 
-        integrateRigidBody(state, config, forceWorld, momentBody, atmosphere.gravity, fixedDt);
+        integrateRigidBody(state, config, forceWorld, momentBody, environment, atmosphere.gravity, fixedDt);
         applyTerrainContact(state, runtime, config, environment, fixedDt);
         applyNumericalGuards(state, config);
 
@@ -1265,6 +1307,8 @@ inline void stepFlight(
     state.debug.cylinderHeadTempC = averageEngineValue(runtime.cylinderHeadTempK, engineCount) - 273.15f;
     state.debug.oilTempC = averageEngineValue(runtime.oilTempK, engineCount) - 273.15f;
     state.debug.fuelRemainingKg = runtime.fuelRemainingKg;
+    state.inertialPos = toDVec3(state.pos);
+    state.inertialVel = toDVec3(state.flightVel);
 }
 
 }  // namespace NativeGame

@@ -3,6 +3,7 @@
 #include "App/AppTypes.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <tuple>
 
 namespace TrueFlightApp {
@@ -10,6 +11,7 @@ namespace TrueFlightApp {
 CompiledTerrainChunk buildTerrainTileChunk(
     TerrainFarTileBand band,
     TerrainFarTileDetail detail,
+    int tileScale,
     int tileX,
     int tileZ,
     const TerrainFieldContext& terrainContext,
@@ -46,15 +48,19 @@ int terrainTileDetailRank(TerrainFarTileDetail detail)
     }
 }
 
-std::string terrainTileIdentityKey(TerrainFarTileBand band, int tileX, int tileZ)
+std::string terrainTileIdentityKey(TerrainFarTileBand band, int tileScale, int tileX, int tileZ)
 {
-    return std::to_string(static_cast<int>(band)) + "|" + std::to_string(tileX) + "|" + std::to_string(tileZ);
+    return std::to_string(static_cast<int>(band)) + "|" +
+           std::to_string(tileScale) + "|" +
+           std::to_string(tileX) + "|" +
+           std::to_string(tileZ);
 }
 
 std::string terrainTileRequestKey(const TerrainTileRequest& request)
 {
     return std::to_string(static_cast<int>(request.band)) + "|" +
            std::to_string(static_cast<int>(request.detail)) + "|" +
+           std::to_string(request.tileScale) + "|" +
            std::to_string(request.tileX) + "|" +
            std::to_string(request.tileZ) + "|" +
            std::to_string(request.paramsSignature) + "|" +
@@ -65,6 +71,7 @@ bool terrainTileRequestsEquivalent(const TerrainTileRequest& lhs, const TerrainT
 {
     return lhs.band == rhs.band &&
            lhs.detail == rhs.detail &&
+           lhs.tileScale == rhs.tileScale &&
            lhs.tileX == rhs.tileX &&
            lhs.tileZ == rhs.tileZ &&
            lhs.paramsSignature == rhs.paramsSignature &&
@@ -76,10 +83,12 @@ bool terrainStreamRequestMoreValuable(const TerrainTileRequest& lhs, const Terra
     const auto lhsKey = std::tuple{
         terrainBandPriorityRank(lhs.band),
         terrainTileDetailRank(lhs.detail),
+        lhs.tileScale,
         lhs.priority};
     const auto rhsKey = std::tuple{
         terrainBandPriorityRank(rhs.band),
         terrainTileDetailRank(rhs.detail),
+        rhs.tileScale,
         rhs.priority};
     return lhsKey < rhsKey;
 }
@@ -104,7 +113,7 @@ bool terrainStreamRequestIsDesiredLocked(
     if (generation != state.generation) {
         return false;
     }
-    const auto desiredIt = state.desiredRequests.find(terrainTileIdentityKey(request.band, request.tileX, request.tileZ));
+    const auto desiredIt = state.desiredRequests.find(terrainTileIdentityKey(request.band, request.tileScale, request.tileX, request.tileZ));
     return desiredIt != state.desiredRequests.end() && terrainTileRequestsEquivalent(desiredIt->second, request);
 }
 
@@ -210,7 +219,11 @@ void terrainStreamWorkerLoop(TerrainVisualStreamState& state)
                     continue;
                 }
 
-                state.inflightRequestKeys[terrainTileIdentityKey(request.request.band, request.request.tileX, request.request.tileZ)] = requestKey;
+                state.inflightRequestKeys[terrainTileIdentityKey(
+                    request.request.band,
+                    request.request.tileScale,
+                    request.request.tileX,
+                    request.request.tileZ)] = requestKey;
                 updateTerrainStreamStatsLocked(state);
                 foundRequest = true;
                 break;
@@ -221,9 +234,11 @@ void terrainStreamWorkerLoop(TerrainVisualStreamState& state)
             }
         }
 
+        const auto buildStart = std::chrono::steady_clock::now();
         CompiledTerrainChunk compiledChunk = buildTerrainTileChunk(
             request.request.band,
             request.request.detail,
+            request.request.tileScale,
             request.request.tileX,
             request.request.tileZ,
             request.generationContext->terrainContext,
@@ -231,10 +246,18 @@ void terrainStreamWorkerLoop(TerrainVisualStreamState& state)
             request.generationContext->terrainWorldId,
             request.request.paramsSignature,
             request.request.sourceSignature);
+        const float buildTimeMs =
+            std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - buildStart).count();
 
         {
             std::lock_guard<std::mutex> lock(state.mutex);
-            const std::string identityKey = terrainTileIdentityKey(request.request.band, request.request.tileX, request.request.tileZ);
+            state.stats.workerBuildCount += 1u;
+            state.stats.lastWorkerBuildTimeMs = buildTimeMs;
+            const std::string identityKey = terrainTileIdentityKey(
+                request.request.band,
+                request.request.tileScale,
+                request.request.tileX,
+                request.request.tileZ);
             const auto inflightIt = state.inflightRequestKeys.find(identityKey);
             if (inflightIt != state.inflightRequestKeys.end() && inflightIt->second == requestKey) {
                 state.inflightRequestKeys.erase(inflightIt);
@@ -245,7 +268,11 @@ void terrainStreamWorkerLoop(TerrainVisualStreamState& state)
                     state.completedResults.end(),
                     [&](const TerrainChunkBuildResult& existing)
                     {
-                        return terrainTileIdentityKey(existing.request.band, existing.request.tileX, existing.request.tileZ) == identityKey;
+                        return terrainTileIdentityKey(
+                                   existing.request.band,
+                                   existing.request.tileScale,
+                                   existing.request.tileX,
+                                   existing.request.tileZ) == identityKey;
                     });
                 if (existingIt != state.completedResults.end()) {
                     if (terrainStreamRequestMoreValuable(request.request, existingIt->request)) {
@@ -253,6 +280,7 @@ void terrainStreamWorkerLoop(TerrainVisualStreamState& state)
                         state.stats.droppedResultCount += 1u;
                     }
                     else {
+                        state.stats.staleResultCount += 1u;
                         updateTerrainStreamStatsLocked(state);
                         continue;
                     }
@@ -264,6 +292,7 @@ void terrainStreamWorkerLoop(TerrainVisualStreamState& state)
                         dropTerrainCompletedResultAtLocked(state, worstIndex);
                     }
                     else {
+                        state.stats.staleResultCount += 1u;
                         updateTerrainStreamStatsLocked(state);
                         continue;
                     }
@@ -271,6 +300,9 @@ void terrainStreamWorkerLoop(TerrainVisualStreamState& state)
 
                 state.completedResults.push_back({request.request, std::move(compiledChunk), request.generation});
                 trimTerrainStreamBacklogLockedImpl(state);
+            }
+            else {
+                state.stats.staleResultCount += 1u;
             }
             updateTerrainStreamStatsLocked(state);
         }
@@ -339,7 +371,7 @@ void enqueueTerrainTileRequests(
 
     const auto recordDesiredRequest = [&](const TerrainTileRequest& request)
     {
-        streamState.desiredRequests[terrainTileIdentityKey(request.band, request.tileX, request.tileZ)] = request;
+        streamState.desiredRequests[terrainTileIdentityKey(request.band, request.tileScale, request.tileX, request.tileZ)] = request;
     };
     for (const TerrainTileRequest& request : missingRequests) {
         recordDesiredRequest(request);
@@ -355,13 +387,17 @@ void enqueueTerrainTileRequests(
             return;
         }
 
-        const std::string identityKey = terrainTileIdentityKey(request.band, request.tileX, request.tileZ);
+        const std::string identityKey = terrainTileIdentityKey(request.band, request.tileScale, request.tileX, request.tileZ);
         const auto queuedIt = std::find_if(
             streamState.queuedRequests.begin(),
             streamState.queuedRequests.end(),
             [&](const TerrainChunkBuildRequest& queued)
             {
-                return terrainTileIdentityKey(queued.request.band, queued.request.tileX, queued.request.tileZ) == identityKey;
+                return terrainTileIdentityKey(
+                           queued.request.band,
+                           queued.request.tileScale,
+                           queued.request.tileX,
+                           queued.request.tileZ) == identityKey;
             });
         if (queuedIt != streamState.queuedRequests.end()) {
             return;

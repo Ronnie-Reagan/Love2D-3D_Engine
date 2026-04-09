@@ -31,6 +31,11 @@ Vec3 defaultWorldSpawn(const TerrainParams& inputParams)
 {
     const TerrainParams params = normalizeTerrainParams(inputParams);
     const TerrainFieldContext context = createTerrainFieldContext(params);
+    if (params.worldShape == WorldShape::Planet) {
+        const float ground = sampleSurfaceHeight(0.0f, 0.0f, context);
+        return { 0.0f, ground + 190.0f, 0.0f };
+    }
+
     const float dryGroundThreshold = params.waterLevel + std::max(24.0f, params.shorelineBand * 1.25f);
     const float desiredGround = dryGroundThreshold + 120.0f;
     const float maxPreferredGround = std::min(params.maxY - 400.0f, std::max(desiredGround + 1800.0f, params.snowLine * 0.55f));
@@ -236,10 +241,13 @@ std::string makeSuggestedWorldId(const BootResources& boot)
 WorldInfoSnapshot buildWorldInfoSnapshot(const TerrainParams& terrainParams, std::string_view worldId, const Vec3& spawn)
 {
     const Vec3 resolvedSpawn = lengthSquared(spawn) <= 1.0e-6f ? defaultWorldSpawn(terrainParams) : spawn;
+    const TerrainFieldContext context = createTerrainFieldContext(terrainParams);
     WorldInfoSnapshot info;
     info.worldId = worldId.empty() ? std::string("default") : std::string(worldId);
-    info.formatVersion = std::max(1, terrainParams.generatorVersion);
+    info.formatVersion = std::max(2, terrainParams.generatorVersion);
     info.seed = std::max(1, terrainParams.seed);
+    info.worldShape = terrainParams.worldShape;
+    info.planet = terrainParams.planet;
     info.chunkSize = terrainParams.chunkSize;
     info.horizonRadiusMeters = terrainParams.horizonRadiusMeters;
     info.heightAmplitude = terrainParams.heightAmplitude;
@@ -249,6 +257,10 @@ WorldInfoSnapshot buildWorldInfoSnapshot(const TerrainParams& terrainParams, std
     info.spawnX = resolvedSpawn.x;
     info.spawnY = resolvedSpawn.y;
     info.spawnZ = resolvedSpawn.z;
+    const Vec2 spawnGeo = worldToGeo(resolvedSpawn, context);
+    info.spawnLatitudeDeg = spawnGeo.x;
+    info.spawnLongitudeDeg = spawnGeo.y;
+    info.spawnAltitudeMeters = resolvedSpawn.y;
     return info;
 }
 
@@ -269,6 +281,11 @@ bool createWorldInstance(BootResources& boot, const std::string& requestedName, 
     options.regionSize = 8;
     options.chunkResolution = 16;
     options.groundParams = boot.terrainParams;
+    options.spawnGeodetic = normalizeGeodetic({
+        static_cast<double>(boot.terrainParams.planet.localOrigin.latitudeDeg),
+        static_cast<double>(boot.terrainParams.planet.localOrigin.longitudeDeg),
+        static_cast<double>(boot.terrainParams.planet.localOrigin.altitudeMeters)
+    });
 
     std::string worldError;
     std::optional<WorldStore> world = WorldStore::open(options, &worldError);
