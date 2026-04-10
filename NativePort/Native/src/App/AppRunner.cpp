@@ -5957,7 +5957,9 @@ namespace TrueFlightApp
     HardwareTier detectHardwareTier(const SystemPressureSnapshot &snapshot)
     {
         const unsigned int logicalCores = std::max(1u, std::thread::hardware_concurrency());
-        if (snapshot.gpuLocalBudgetBytes >= (12ull * kGiB) && logicalCores >= 16u)
+        if (snapshot.totalPhysicalBytes >= (16ull * kGiB) &&
+            snapshot.gpuLocalBudgetBytes >= (12ull * kGiB) &&
+            logicalCores >= 16u)
         {
             return HardwareTier::Suggested;
         }
@@ -23195,7 +23197,8 @@ namespace TrueFlightApp
         const std::vector<PeerStatComparison> *peerComparisons,
         const std::vector<HudTargetIndicator> *targetIndicators,
         const std::deque<HudNotification> *notifications,
-        const std::vector<std::string> *extraDebugLines = nullptr)
+        const std::vector<std::string> *extraDebugLines = nullptr,
+        const std::vector<std::string> *profilerOverlayLines = nullptr)
     {
         const bool flightMode = playerMode == PlayerMode::Flight;
         const bool drivingMode = playerMode == PlayerMode::Driving;
@@ -23605,6 +23608,40 @@ namespace TrueFlightApp
             {
                 canvas.text(8.0f, textY, line, text);
                 textY += 14.0f;
+            }
+            canvas.resetTransform();
+        };
+
+        const auto drawProfilerOverlay = [&]()
+        {
+            if (profilerOverlayLines == nullptr || profilerOverlayLines->empty())
+            {
+                return;
+            }
+
+            const float uiScale = effectiveUiScale(uiState);
+            const float logicalWidth = std::max(80.0f, static_cast<float>(width) / std::max(1.0f, uiScale));
+            const float rowHeight = 14.0f;
+            float panelWidth = 0.0f;
+            for (const std::string &line : *profilerOverlayLines)
+            {
+                panelWidth = std::max(panelWidth, canvas.textWidth(line));
+            }
+            panelWidth += 26.0f;
+            const float panelHeight = 12.0f + (static_cast<float>(profilerOverlayLines->size()) * rowHeight) + 8.0f;
+            const float panelX = std::max(12.0f, (logicalWidth - panelWidth) * 0.5f);
+            const float panelY = 14.0f;
+
+            canvas.setTransform(uiScale, uiScale, 0.0f, 0.0f);
+            canvas.fillRect(panelX, panelY, panelWidth, panelHeight, makeHudColor(4, 10, 16, 212));
+            canvas.strokeRect(panelX, panelY, panelWidth, panelHeight, makeHudColor(124, 178, 224, 238));
+
+            float textY = panelY + 8.0f;
+            for (const std::string &line : *profilerOverlayLines)
+            {
+                const float textX = panelX + std::max(10.0f, (panelWidth - canvas.textWidth(line)) * 0.5f);
+                canvas.text(textX, textY, line, makeHudColor(236, 244, 255, 255));
+                textY += rowHeight;
             }
             canvas.resetTransform();
         };
@@ -24634,6 +24671,7 @@ namespace TrueFlightApp
         };
 
         drawInfoPanel();
+        drawProfilerOverlay();
         drawStyledSpeedometer();
         drawDebugFooter();
         drawStyledControls();
@@ -24670,7 +24708,8 @@ namespace TrueFlightApp
         const std::vector<PeerStatComparison> *peerComparisons,
         const std::vector<HudTargetIndicator> *targetIndicators,
         const std::deque<HudNotification> *notifications,
-        const std::vector<std::string> *extraDebugLines)
+        const std::vector<std::string> *extraDebugLines,
+        const std::vector<std::string> *profilerOverlayLines)
     {
         drawHudCommon(
             canvas,
@@ -24697,7 +24736,8 @@ namespace TrueFlightApp
             peerComparisons,
             targetIndicators,
             notifications,
-            extraDebugLines);
+            extraDebugLines,
+            profilerOverlayLines);
     }
 
     void drawHudImGui(
@@ -24724,7 +24764,8 @@ namespace TrueFlightApp
         const std::vector<PeerStatComparison> *peerComparisons,
         const std::vector<HudTargetIndicator> *targetIndicators,
         const std::deque<HudNotification> *notifications,
-        const std::vector<std::string> *extraDebugLines)
+        const std::vector<std::string> *extraDebugLines,
+        const std::vector<std::string> *profilerOverlayLines)
     {
         ImGuiHudCanvas canvas;
         drawHudCommon(
@@ -24752,7 +24793,8 @@ namespace TrueFlightApp
             peerComparisons,
             targetIndicators,
             notifications,
-            extraDebugLines);
+            extraDebugLines,
+            profilerOverlayLines);
     }
 
     void drawHud(
@@ -24978,8 +25020,8 @@ namespace TrueFlightApp
         const bool hasPendingJoinLobbyId = pendingJoinLobbyId != 0ull;
         const bool useMirrorWorldStore = session.onlineRole == OnlineSessionRole::Client;
         const std::string terrainWorldName = useMirrorWorldStore
-                                                 ? buildMirroredWorldName(hasPendingJoinLobbyId ? std::to_string(pendingJoinLobbyId) : std::string("offline"), sourceWorldName)
-                                                 : sourceWorldName;
+                                                ? buildMirroredWorldName(hasPendingJoinLobbyId ? std::to_string(pendingJoinLobbyId) : std::string("offline"), sourceWorldName)
+                                                : sourceWorldName;
 
         const auto stage = [&](const std::string &stageLabel, float progress, const std::string &detail) -> bool
         {
@@ -25063,7 +25105,155 @@ namespace TrueFlightApp
             return {};
         };
 
-        if (!stage("Opening World", 0.12f, "Opening world store metadata."))
+        const auto failStartupException = [&](std::string_view stageLabel, const std::exception &exception)
+        {
+            const std::string message =
+                std::string(stageLabel) + " failed while loading persisted world data: " + exception.what();
+            SDL_Log("%s", message.c_str());
+            if (errorText != nullptr)
+            {
+                *errorText = message;
+            }
+            return false;
+        };
+
+        const auto failStartupUnknownException = [&](std::string_view stageLabel)
+        {
+            const std::string message =
+                std::string(stageLabel) + " failed while loading persisted world data.";
+            SDL_Log("%s", message.c_str());
+            if (errorText != nullptr)
+            {
+                *errorText = message;
+            }
+            return false;
+        };
+
+        const auto countTerrainTilesForBand = [&](TerrainFarTileBand band) -> int
+        {
+            const auto countMatches = [band](const auto &tiles)
+            {
+                return static_cast<int>(std::count_if(
+                    tiles.begin(),
+                    tiles.end(),
+                    [band](const TerrainFarTile &tile)
+                    {
+                        return tile.band == band;
+                    }));
+            };
+            return band == TerrainFarTileBand::Near
+                       ? countMatches(session.terrainCache.nearTiles)
+                       : countMatches(session.terrainCache.farTiles);
+        };
+
+        const auto countDetailedNearTiles = [&]() -> int
+        {
+            return static_cast<int>(std::count_if(
+                session.terrainCache.nearTiles.begin(),
+                session.terrainCache.nearTiles.end(),
+                [](const TerrainFarTile &tile)
+                {
+                    return tile.band == TerrainFarTileBand::Near &&
+                           terrainTileDetailRank(tile.detail) <= terrainTileDetailRank(TerrainFarTileDetail::Lod1);
+                }));
+        };
+
+        const auto prewarmTerrainStage = [&](const std::string &stageLabel,
+                                             float progress,
+                                             const std::string &note,
+                                             TerrainStreamBudgetOverrides overrides,
+                                             std::uint32_t maxWaitMs) -> bool
+        {
+            const std::uint64_t startedAt = SDL_GetTicks();
+            int lastNearCount = -1;
+            int lastMidCount = -1;
+            int lastHorizonCount = -1;
+            int lastDetailedNearCount = -1;
+            int stableIdlePasses = 0;
+            while (true)
+            {
+                try
+                {
+                    (void)ensureTerrainVisualCache(
+                        session.terrainCache,
+                        session.plane.pos,
+                        session.plane.flightVel,
+                        session.terrainContext,
+                        session.terrainChunkBakeCache,
+                        session.terrainWorldId,
+                        session.terrainStream.get(),
+                        &overrides);
+                }
+                catch (const std::exception &exception)
+                {
+                    return failStartupException(stageLabel, exception);
+                }
+                catch (...)
+                {
+                    return failStartupUnknownException(stageLabel);
+                }
+
+                const TerrainStreamStats streamStats = snapshotTerrainStreamStats(session.terrainStream.get());
+                const int nearCount = countTerrainTilesForBand(TerrainFarTileBand::Near);
+                const int midCount = countTerrainTilesForBand(TerrainFarTileBand::Mid);
+                const int horizonCount = countTerrainTilesForBand(TerrainFarTileBand::Horizon);
+                const int detailedNearCount = countDetailedNearTiles();
+                std::ostringstream detail;
+                detail << note
+                       << " Near " << nearCount
+                       << " | Mid " << midCount
+                       << " | Horizon " << horizonCount
+                       << " | Fine " << detailedNearCount;
+                if (streamStats.queuedCount > 0 || streamStats.inflightCount > 0 || streamStats.completedCount > 0)
+                {
+                    detail << " | q " << streamStats.queuedCount
+                           << " i " << streamStats.inflightCount
+                           << " c " << streamStats.completedCount;
+                }
+
+                if (!stage(stageLabel, progress, detail.str()))
+                {
+                    return false;
+                }
+
+                const bool idle =
+                    streamStats.queuedCount == 0 &&
+                    streamStats.inflightCount == 0 &&
+                    streamStats.completedCount == 0;
+                const bool countsUnchanged =
+                    nearCount == lastNearCount &&
+                    midCount == lastMidCount &&
+                    horizonCount == lastHorizonCount &&
+                    detailedNearCount == lastDetailedNearCount;
+                if (idle && countsUnchanged)
+                {
+                    stableIdlePasses += 1;
+                }
+                else
+                {
+                    stableIdlePasses = 0;
+                }
+
+                lastNearCount = nearCount;
+                lastMidCount = midCount;
+                lastHorizonCount = horizonCount;
+                lastDetailedNearCount = detailedNearCount;
+
+                if (idle && stableIdlePasses >= 1)
+                {
+                    return true;
+                }
+
+                if ((SDL_GetTicks() - startedAt) >= maxWaitMs)
+                {
+                    return true;
+                }
+
+                SDL_Delay(16);
+            }
+        };
+
+        if (!stage("Opening World", 0.12f, "Dusting off the world ledger and checking the hangar keys."))
         {
             return false;
         }
@@ -25077,6 +25267,7 @@ namespace TrueFlightApp
             return false;
         }
 
+        try
         {
             WorldStoreOptions worldOptions;
             worldOptions.name = terrainWorldName;
@@ -25121,8 +25312,16 @@ namespace TrueFlightApp
                 session.terrainWorldId = terrainWorldName;
             }
         }
+        catch (const std::exception &exception)
+        {
+            return failStartupException("Opening World", exception);
+        }
+        catch (...)
+        {
+            return failStartupUnknownException("Opening World");
+        }
 
-        if (!stage("Opening Terrain Cache", 0.28f, "Preparing baked terrain-cache storage."))
+        if (!stage("Opening Terrain Cache", 0.28f, "Checking which mountains we already baked last time."))
         {
             return false;
         }
@@ -25136,7 +25335,7 @@ namespace TrueFlightApp
             }
         }
 
-        if (!stage("Building Terrain", 0.48f, "Refreshing terrain field context."))
+        if (!stage("Building Terrain", 0.48f, "Spinning up the terrain field and reminding gravity which way is down."))
         {
             return false;
         }
@@ -25146,13 +25345,24 @@ namespace TrueFlightApp
                 ? &*session.mirrorWorldStore
                 : (session.worldStore.has_value() ? &*session.worldStore : nullptr);
         TerrainParams terrainParamsForSession = session.worldStoreMirrored ? session.clientReplication.mirroredTerrain : boot.terrainParams;
-        refreshTerrainContext(
-            terrainParamsForSession,
-            session.terrainContext,
-            session.terrainCache,
-            worldStorePtr,
-            session.terrainWorldMutex,
-            session.terrainStream.get());
+        try
+        {
+            refreshTerrainContext(
+                terrainParamsForSession,
+                session.terrainContext,
+                session.terrainCache,
+                worldStorePtr,
+                session.terrainWorldMutex,
+                session.terrainStream.get());
+        }
+        catch (const std::exception &exception)
+        {
+            return failStartupException("Building Terrain", exception);
+        }
+        catch (...)
+        {
+            return failStartupUnknownException("Building Terrain");
+        }
         if (session.worldStoreMirrored)
         {
             session.clientReplication.mirroredTerrain = session.terrainContext.params;
@@ -25163,7 +25373,7 @@ namespace TrueFlightApp
             boot.geoConfig = buildGeoConfig(boot.terrainParams);
         }
 
-        if (!stage("Starting Network", 0.58f, "Preparing Steam transport and hosted-world state."))
+        if (!stage("Starting Network", 0.58f, "Stringing tin cans between pilots and warming the radio."))
         {
             return false;
         }
@@ -25372,7 +25582,7 @@ namespace TrueFlightApp
             }
         }
 
-        if (!stage("Clouds and Flight", 0.66f, "Initializing wind, clouds, and aircraft state."))
+        if (!stage("Clouds and Flight", 0.66f, "Blowing smoke... I mean clouds overhead and rolling the plane out."))
         {
             return false;
         }
@@ -25434,7 +25644,7 @@ namespace TrueFlightApp
             }
         }
 
-        if (!stage("Starting Audio", 0.82f, "Starting procedural audio synth."))
+        if (!stage("Starting Audio", 0.82f, "Waking the engine goblins and tuning the prop wash."))
         {
             return false;
         }
@@ -25458,67 +25668,81 @@ namespace TrueFlightApp
             }
         }
 
-        if (!stage("Prewarming Terrain", 0.94f, "Generating near-field terrain visuals."))
+        TerrainStreamBudgetOverrides prewarmBase;
+        prewarmBase.workerCount = std::max(1, std::min(boot.terrainParams.workerMaxInflight, 6));
+        prewarmBase.maxPendingChunks = std::max(24, std::min(boot.terrainParams.maxPendingChunks, 128));
+        prewarmBase.maxStaleChunks = std::max(12, std::min(boot.terrainParams.maxStaleChunks, 32));
+        prewarmBase.resultBudgetPerFrame = 48;
+        prewarmBase.resultBudgetTimeMs = 14.0f;
+        prewarmBase.allowMidBand = true;
+        prewarmBase.allowHorizonBand = true;
+        prewarmBase.allowUpgrades = false;
+
+        TerrainStreamBudgetOverrides horizonPrime = prewarmBase;
+        horizonPrime.nearMissingBudget = 0;
+        horizonPrime.midMissingBudget = 0;
+        horizonPrime.horizonMissingBudget = 192;
+        horizonPrime.upgradeBudget = 0;
+        horizonPrime.allowMidBand = false;
+        horizonPrime.allowHorizonBand = true;
+
+        if (!prewarmTerrainStage(
+                "Planetary Bootstrap",
+                0.88f,
+                "Starting planetary gravitational generator.",
+                horizonPrime,
+                900u))
         {
             return false;
         }
 
-        if (boot.terrainParams.threadedMeshing)
-        {
-            TerrainStreamBudgetOverrides startupPrime;
-            startupPrime.workerCount = std::max(1, std::min(boot.terrainParams.workerMaxInflight, 4));
-            startupPrime.maxPendingChunks = std::max(8, startupPrime.workerCount * 2);
-            startupPrime.maxStaleChunks = std::max(4, std::min(boot.terrainParams.maxStaleChunks, 8));
-            startupPrime.resultBudgetPerFrame = 2;
-            startupPrime.resultBudgetTimeMs = 2.5f;
-            startupPrime.nearMissingBudget = std::max(4, startupPrime.workerCount * 2);
-            startupPrime.midMissingBudget = 0;
-            startupPrime.horizonMissingBudget = 0;
-            startupPrime.upgradeBudget = 0;
-            startupPrime.allowMidBand = false;
-            startupPrime.allowHorizonBand = false;
-            startupPrime.allowUpgrades = false;
-            (void)ensureTerrainVisualCache(
-                session.terrainCache,
-                session.plane.pos,
-                session.plane.flightVel,
-                session.terrainContext,
-                session.terrainChunkBakeCache,
-                session.terrainWorldId,
-                session.terrainStream.get(),
-                &startupPrime);
+        TerrainStreamBudgetOverrides midPrime = prewarmBase;
+        midPrime.nearMissingBudget = 0;
+        midPrime.midMissingBudget = 128;
+        midPrime.horizonMissingBudget = 192;
+        midPrime.upgradeBudget = 0;
 
-            const std::uint64_t prewarmStartedAt = SDL_GetTicks();
-            const std::size_t minimumReadyNearTiles = static_cast<std::size_t>(std::max(4, startupPrime.workerCount));
-            while (session.terrainCache.nearTiles.size() < minimumReadyNearTiles &&
-                   (SDL_GetTicks() - prewarmStartedAt) < 700u)
-            {
-                SDL_Delay(16);
-                if (!stage("Prewarming Terrain", 0.94f, "Waiting for initial near-field terrain coverage."))
-                {
-                    return false;
-                }
-                (void)ensureTerrainVisualCache(
-                    session.terrainCache,
-                    session.plane.pos,
-                    session.plane.flightVel,
-                    session.terrainContext,
-                    session.terrainChunkBakeCache,
-                    session.terrainWorldId,
-                    session.terrainStream.get(),
-                    &startupPrime);
-            }
-        }
-        else
+        if (!prewarmTerrainStage(
+                "Midfield Relief",
+                0.93f,
+                "Blocking out the kilometer-scale ridges before anyone flies into them.",
+                midPrime,
+                900u))
         {
-            (void)ensureTerrainVisualCache(
-                session.terrainCache,
-                session.plane.pos,
-                session.plane.flightVel,
-                session.terrainContext,
-                session.terrainChunkBakeCache,
-                session.terrainWorldId,
-                session.terrainStream.get());
+            return false;
+        }
+
+        TerrainStreamBudgetOverrides nearPrime = prewarmBase;
+        nearPrime.nearMissingBudget = 128;
+        nearPrime.midMissingBudget = 128;
+        nearPrime.horizonMissingBudget = 192;
+        nearPrime.upgradeBudget = 0;
+
+        if (!prewarmTerrainStage(
+                "Near-Field Detail",
+                0.97f,
+                "Swapping broad strokes for runway-grade terrain.",
+                nearPrime,
+                1200u))
+        {
+            return false;
+        }
+
+        TerrainStreamBudgetOverrides detailPrime = prewarmBase;
+        detailPrime.nearMissingBudget = 96;
+        detailPrime.midMissingBudget = 48;
+        detailPrime.horizonMissingBudget = 32;
+        detailPrime.upgradeBudget = 96;
+        detailPrime.allowUpgrades = true;
+
+        if (!prewarmTerrainStage(
+                "Final Terrain Touch-Up",
+                0.992f,
+                "Hand-polishing the chunks most likely to meet your landing gear.",
+                detailPrime,
+                900u))
+        {
+            return false;
         }
 
         finishLoadingUi(boot.loadingUi, static_cast<float>(SDL_GetTicks()) * 0.001f);
@@ -25690,8 +25914,8 @@ namespace TrueFlightApp
         ImGui::CreateContext();
         {
             ImGuiIO &io = ImGui::GetIO();
-            io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-            io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+            // Native menu navigation owns keyboard/gamepad routing so the
+            // rendered ImGui menu stays visually in sync with the shared menu state.
             io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
             io.IniFilename = imguiIniPathString.c_str();
             io.ConfigDpiScaleFonts = true;
@@ -26009,9 +26233,14 @@ namespace TrueFlightApp
             return imguiEnabled && menuVisible() && ImGui::GetCurrentContext() != nullptr;
         };
 
-        auto imguiWantsKeyboardCapture = [&]() -> bool
+        const auto reportRenderFailure = [&](const std::string &renderError)
         {
-            return usingImGuiMenu() && ImGui::GetIO().WantCaptureKeyboard;
+            const std::string message =
+                std::string("Rendering failed and TrueFlight needs to close.\n\n") +
+                (renderError.empty() ? std::string("No renderer error text was reported.") : renderError);
+            SDL_Log("Vulkan render failed: %s", renderError.c_str());
+            logToStdout(std::string("[fatal] Vulkan render failed: ") + renderError);
+            (void)SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "TrueFlight Render Error", message.c_str(), window);
         };
 
         auto currentWorldStore = [&]() -> WorldStore *
@@ -26343,12 +26572,7 @@ namespace TrueFlightApp
 
         auto ensureProfilerOverlayVisible = [&](float nowSeconds)
         {
-            if (!boot.hud.showDebug)
-            {
-                boot.hud.showDebug = true;
-                syncHudUi();
-                queueSave(nowSeconds);
-            }
+            (void)nowSeconds;
         };
 
         auto toggleProfilerOverlay = [&](float nowSeconds)
@@ -29967,6 +30191,7 @@ namespace TrueFlightApp
             const std::vector<HudTargetIndicator> *targetIndicators = nullptr;
             const std::deque<HudNotification> *notifications = nullptr;
             const std::vector<std::string> *extraDebugLines = nullptr;
+            const std::vector<std::string> *profilerOverlayLines = nullptr;
         };
 
         auto renderImGuiMenu = [&](float nowSeconds, const ImGuiHudFrameContext *hudFrame = nullptr) -> ImDrawData *
@@ -30015,7 +30240,8 @@ namespace TrueFlightApp
                     hudFrame->peerComparisons,
                     hudFrame->targetIndicators,
                     hudFrame->notifications,
-                    hudFrame->extraDebugLines);
+                    hudFrame->extraDebugLines,
+                    hudFrame->profilerOverlayLines);
             }
 
             if (!menuVisible())
@@ -30087,8 +30313,15 @@ namespace TrueFlightApp
 
             ImGui::SetNextWindowPos(ImVec2(layout.panelX * menuScale, layout.panelY * menuScale), ImGuiCond_Always);
             ImGui::SetNextWindowSize(ImVec2(previewAdjustedPanelWidth * menuScale, layout.panelH * menuScale), ImGuiCond_Always);
+            ImGui::SetNextWindowViewport(ImGui::GetMainViewport()->ID);
+            if (!imguiMenuWasVisible)
+            {
+                ImGui::SetNextWindowFocus();
+            }
             ImGuiWindowFlags windowFlags =
+                ImGuiWindowFlags_NoDocking |
                 ImGuiWindowFlags_NoCollapse |
+                ImGuiWindowFlags_NoSavedSettings |
                 ImGuiWindowFlags_NoResize |
                 ImGuiWindowFlags_NoMove;
 
@@ -30252,6 +30485,78 @@ namespace TrueFlightApp
                 const bool pressed = ImGui::ArrowButton(id, direction);
                 ImGui::PopItemFlag();
                 return pressed;
+            };
+
+            const auto drawSelectableMenuButton = [&](int index, const char *label, const ImVec2 &size = ImVec2(-1.0f, 0.0f))
+            {
+                const bool selected = focusedRow() == index;
+                if (selected)
+                {
+                    ImGui::PushStyleColor(ImGuiCol_Button, imguiColor(0.17f, 0.30f, 0.46f, 0.96f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, imguiColor(0.22f, 0.40f, 0.58f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, imguiColor(0.15f, 0.26f, 0.38f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_Border, imguiColor(0.56f, 0.74f, 0.94f, 1.0f));
+                    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+                }
+                const bool pressed = ImGui::Button(label, size);
+                if (selected)
+                {
+                    ImGui::PopStyleVar();
+                    ImGui::PopStyleColor(4);
+                }
+                if (pressed)
+                {
+                    hoverRow(index);
+                }
+                if (ImGui::IsItemHovered())
+                {
+                    hoverRow(index);
+                }
+                return pressed;
+            };
+
+            const auto drawSelectableMenuArrowButton = [&](int index, const char *id, ImGuiDir direction)
+            {
+                const bool selected = focusedRow() == index;
+                if (selected)
+                {
+                    ImGui::PushStyleColor(ImGuiCol_Button, imguiColor(0.17f, 0.30f, 0.46f, 0.96f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, imguiColor(0.22f, 0.40f, 0.58f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, imguiColor(0.15f, 0.26f, 0.38f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_Border, imguiColor(0.56f, 0.74f, 0.94f, 1.0f));
+                    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+                }
+                const bool pressed = repeatArrowButton(id, direction);
+                if (selected)
+                {
+                    ImGui::PopStyleVar();
+                    ImGui::PopStyleColor(4);
+                }
+                if (pressed)
+                {
+                    hoverRow(index);
+                }
+                if (ImGui::IsItemHovered())
+                {
+                    hoverRow(index);
+                }
+                return pressed;
+            };
+
+            const auto drawSelectableMenuValueText = [&](int index, const std::string &valueText)
+            {
+                if (focusedRow() == index)
+                {
+                    ImGui::TextColored(imguiColor(0.82f, 0.92f, 1.0f, 1.0f), "> %s <", valueText.c_str());
+                }
+                else
+                {
+                    ImGui::TextUnformatted(valueText.c_str());
+                }
+                if (ImGui::IsItemHovered())
+                {
+                    hoverRow(index);
+                }
             };
 
             const auto beginContentChild = [&]()
@@ -31798,20 +32103,19 @@ namespace TrueFlightApp
                                 {
                                     if (currentGameMode() == GameMode::Creative)
                                     {
-                                        if (ImGui::Button("Start World", ImVec2(-1.0f, 0.0f)))
+                                        if (drawSelectableMenuButton(0, "Start World"))
                                         {
-                                            selectRowAndActivate(0);
+                                            activateSelectedRow(nowSeconds);
                                         }
 
                                         ImGui::SeparatorText("Mode");
-                                        if (ImGui::Button("Switch to Career", ImVec2(-1.0f, 0.0f)))
+                                        if (drawSelectableMenuButton(1, "Switch to Career"))
                                         {
-                                            menuState.selectedIndex = 1;
-                                            selectRowAndActivate(1);
+                                            activateSelectedRow(nowSeconds);
                                         }
 
                                         ImGui::SeparatorText("World");
-                                        if (repeatArrowButton("##PrevWorld", ImGuiDir_Left))
+                                        if (drawSelectableMenuArrowButton(2, "##PrevWorld", ImGuiDir_Left))
                                         {
                                             menuState.selectedIndex = 2;
                                             cycleSelectedWorldInstance(boot, -1);
@@ -31819,9 +32123,9 @@ namespace TrueFlightApp
                                             queueSave(nowSeconds);
                                         }
                                         ImGui::SameLine();
-                                        ImGui::TextUnformatted(boot.selectedWorldId.empty() ? "native_default" : boot.selectedWorldId.c_str());
+                                        drawSelectableMenuValueText(2, boot.selectedWorldId.empty() ? std::string("native_default") : boot.selectedWorldId);
                                         ImGui::SameLine();
-                                        if (repeatArrowButton("##NextWorld", ImGuiDir_Right))
+                                        if (drawSelectableMenuArrowButton(2, "##NextWorld", ImGuiDir_Right))
                                         {
                                             menuState.selectedIndex = 2;
                                             cycleSelectedWorldInstance(boot, 1);
@@ -31829,25 +32133,25 @@ namespace TrueFlightApp
                                             queueSave(nowSeconds);
                                         }
 
-                                        if (ImGui::Button("Create World Instance", ImVec2(-1.0f, 0.0f)))
+                                        if (drawSelectableMenuButton(3, "Create World Instance"))
                                         {
-                                            beginWorldPrompt(nowSeconds);
+                                            activateSelectedRow(nowSeconds);
                                         }
-                                        if (ImGui::Button("Delete Selected World", ImVec2(-1.0f, 0.0f)))
+                                        if (drawSelectableMenuButton(4, "Delete Selected World"))
                                         {
-                                            selectRowAndActivate(4);
+                                            activateSelectedRow(nowSeconds);
                                         }
-                                        if (ImGui::Button("Restore Defaults", ImVec2(-1.0f, 0.0f)))
+                                        if (drawSelectableMenuButton(5, "Restore Defaults"))
                                         {
-                                            selectRowAndActivate(5);
+                                            activateSelectedRow(nowSeconds);
                                         }
-                                        if (ImGui::Button("Refresh World Catalog", ImVec2(-1.0f, 0.0f)))
+                                        if (drawSelectableMenuButton(6, "Refresh World Catalog"))
                                         {
-                                            selectRowAndActivate(6);
+                                            activateSelectedRow(nowSeconds);
                                         }
-                                        if (ImGui::Button("Quit", ImVec2(-1.0f, 0.0f)))
+                                        if (drawSelectableMenuButton(7, "Quit"))
                                         {
-                                            selectRowAndActivate(7);
+                                            activateSelectedRow(nowSeconds);
                                         }
 
                                         ImGui::Spacing();
@@ -31886,28 +32190,29 @@ namespace TrueFlightApp
                                                 ? careerAircraftRepairRemainingSeconds(selectedAircraft->id)
                                                 : 0.0;
 
-                                        if (ImGui::Button("Start Career Sortie", ImVec2(-1.0f, 0.0f)))
+                                        if (drawSelectableMenuButton(0, "Start Career Sortie"))
                                         {
-                                            selectRowAndActivate(0);
+                                            activateSelectedRow(nowSeconds);
                                         }
 
                                         ImGui::SeparatorText("Mode");
-                                        if (ImGui::Button("Switch to Creative", ImVec2(-1.0f, 0.0f)))
+                                        if (drawSelectableMenuButton(1, "Switch to Creative"))
                                         {
-                                            menuState.selectedIndex = 1;
-                                            selectRowAndActivate(1);
+                                            activateSelectedRow(nowSeconds);
                                         }
 
                                         ImGui::SeparatorText("Aircraft");
-                                        if (repeatArrowButton("##PrevCareerAircraft", ImGuiDir_Left))
+                                        if (drawSelectableMenuArrowButton(2, "##PrevCareerAircraft", ImGuiDir_Left))
                                         {
+                                            menuState.selectedIndex = 2;
                                             cycleCareerAircraftSelection(-1, nowSeconds);
                                         }
                                         ImGui::SameLine();
-                                        ImGui::TextUnformatted(selectedAircraft != nullptr ? selectedAircraft->name.c_str() : "Unavailable");
+                                        drawSelectableMenuValueText(2, selectedAircraft != nullptr ? selectedAircraft->name : std::string("Unavailable"));
                                         ImGui::SameLine();
-                                        if (repeatArrowButton("##NextCareerAircraft", ImGuiDir_Right))
+                                        if (drawSelectableMenuArrowButton(2, "##NextCareerAircraft", ImGuiDir_Right))
                                         {
+                                            menuState.selectedIndex = 2;
                                             cycleCareerAircraftSelection(1, nowSeconds);
                                         }
                                         if (selectedAircraft != nullptr)
@@ -31916,15 +32221,17 @@ namespace TrueFlightApp
                                         }
 
                                         ImGui::SeparatorText("Contract");
-                                        if (repeatArrowButton("##PrevCareerContract", ImGuiDir_Left))
+                                        if (drawSelectableMenuArrowButton(3, "##PrevCareerContract", ImGuiDir_Left))
                                         {
+                                            menuState.selectedIndex = 3;
                                             cycleCareerContractSelection(-1, nowSeconds);
                                         }
                                         ImGui::SameLine();
-                                        ImGui::TextUnformatted(selectedOffer != nullptr ? selectedOffer->name.c_str() : "No contract");
+                                        drawSelectableMenuValueText(3, selectedOffer != nullptr ? selectedOffer->name : std::string("No contract"));
                                         ImGui::SameLine();
-                                        if (repeatArrowButton("##NextCareerContract", ImGuiDir_Right))
+                                        if (drawSelectableMenuArrowButton(3, "##NextCareerContract", ImGuiDir_Right))
                                         {
+                                            menuState.selectedIndex = 3;
                                             cycleCareerContractSelection(1, nowSeconds);
                                         }
                                         if (selectedOffer != nullptr)
@@ -31934,22 +32241,21 @@ namespace TrueFlightApp
                                         }
 
                                         ImGui::SeparatorText("Launch");
-                                        if (ImGui::Button(careerProgress.prewarmedStart ? "Pre-warmed Start" : "Cold Start", ImVec2(-1.0f, 0.0f)))
+                                        if (drawSelectableMenuButton(4, careerProgress.prewarmedStart ? "Pre-warmed Start" : "Cold Start"))
                                         {
-                                            menuState.selectedIndex = 4;
-                                            selectRowAndActivate(4);
+                                            activateSelectedRow(nowSeconds);
                                         }
-                                        if (ImGui::Button(selectedAircraftState.owned ? "Buy / Upgrade Aircraft" : "Purchase Aircraft", ImVec2(-1.0f, 0.0f)))
+                                        if (drawSelectableMenuButton(5, selectedAircraftState.owned ? "Buy / Upgrade Aircraft" : "Purchase Aircraft"))
                                         {
-                                            selectRowAndActivate(5);
+                                            activateSelectedRow(nowSeconds);
                                         }
-                                        if (ImGui::Button("Advance Repairs", ImVec2(-1.0f, 0.0f)))
+                                        if (drawSelectableMenuButton(6, "Advance Repairs"))
                                         {
-                                            selectRowAndActivate(6);
+                                            activateSelectedRow(nowSeconds);
                                         }
-                                        if (ImGui::Button("Quit", ImVec2(-1.0f, 0.0f)))
+                                        if (drawSelectableMenuButton(7, "Quit"))
                                         {
-                                            selectRowAndActivate(7);
+                                            activateSelectedRow(nowSeconds);
                                         }
 
                                         ImGui::Spacing();
@@ -31981,31 +32287,29 @@ namespace TrueFlightApp
                                 }
                                 else
                                 {
-                                    if (ImGui::Button("Resume", ImVec2(-1.0f, 0.0f)))
+                                    if (drawSelectableMenuButton(0, "Resume"))
                                     {
-                                        selectRowAndActivate(0);
+                                        activateSelectedRow(nowSeconds);
                                     }
-                                    if (ImGui::Button(menuState.sessionFlightMode ? "Switch to Walking Mode" : "Switch to Flight Mode", ImVec2(-1.0f, 0.0f)))
+                                    if (drawSelectableMenuButton(1, menuState.sessionFlightMode ? "Switch to Walking Mode" : "Switch to Flight Mode"))
                                     {
-                                        selectRowAndActivate(1);
+                                        activateSelectedRow(nowSeconds);
                                     }
-                                    if (ImGui::Button("Reset Flight", ImVec2(-1.0f, 0.0f)))
+                                    if (drawSelectableMenuButton(2, "Reset Flight"))
                                     {
-                                        selectRowAndActivate(2);
+                                        activateSelectedRow(nowSeconds);
                                     }
-                                    if (ImGui::Button(
-                                            currentGameMode() == GameMode::Career ? careerGroundOpsLabel().c_str() : "Refresh Road Vehicles",
-                                            ImVec2(-1.0f, 0.0f)))
+                                    if (drawSelectableMenuButton(3, currentGameMode() == GameMode::Career ? careerGroundOpsLabel().c_str() : "Refresh Road Vehicles"))
                                     {
-                                        selectRowAndActivate(3);
+                                        activateSelectedRow(nowSeconds);
                                     }
-                                    if (ImGui::Button("Return to Main Menu", ImVec2(-1.0f, 0.0f)))
+                                    if (drawSelectableMenuButton(4, "Return to Main Menu"))
                                     {
-                                        selectRowAndActivate(4);
+                                        activateSelectedRow(nowSeconds);
                                     }
-                                    if (ImGui::Button("Quit", ImVec2(-1.0f, 0.0f)))
+                                    if (drawSelectableMenuButton(5, "Quit"))
                                     {
-                                        selectRowAndActivate(5);
+                                        activateSelectedRow(nowSeconds);
                                     }
                                 }
                             }
@@ -33564,15 +33868,6 @@ namespace TrueFlightApp
                             handleGamepadMenuBack(uiNowSeconds);
                             continue;
                         }
-                        if (!imguiWantsKeyboardCapture())
-                        {
-                            continue;
-                        }
-                    }
-
-                    if (triggerBoundActionsFromKey(scancode, modifiers, uiNowSeconds))
-                    {
-                        continue;
                     }
 
                     if (scancode == SDL_SCANCODE_ESCAPE)
@@ -33606,7 +33901,16 @@ namespace TrueFlightApp
                     }
 
                     if ((scancode == SDL_SCANCODE_Q || scancode == SDL_SCANCODE_LEFTBRACKET) &&
-                        (menuState.tab == PauseTab::Settings || menuState.tab == PauseTab::Hud || menuState.tab == PauseTab::Instruments || menuState.tab == PauseTab::Characters || menuState.tab == PauseTab::Paint))
+                        !pauseTabHasSubTabs(menuState.tab))
+                    {
+                        cyclePauseTab(menuState, -1);
+                        boot.paintUi.draggingCanvas = false;
+                        clampMenuSelection();
+                        continue;
+                    }
+
+                    if ((scancode == SDL_SCANCODE_Q || scancode == SDL_SCANCODE_LEFTBRACKET) &&
+                        pauseTabHasSubTabs(menuState.tab))
                     {
                         cyclePauseSubTab(menuState, -1);
                         boot.paintUi.draggingCanvas = false;
@@ -33615,7 +33919,16 @@ namespace TrueFlightApp
                     }
 
                     if ((scancode == SDL_SCANCODE_E || scancode == SDL_SCANCODE_RIGHTBRACKET) &&
-                        (menuState.tab == PauseTab::Settings || menuState.tab == PauseTab::Hud || menuState.tab == PauseTab::Instruments || menuState.tab == PauseTab::Characters || menuState.tab == PauseTab::Paint))
+                        !pauseTabHasSubTabs(menuState.tab))
+                    {
+                        cyclePauseTab(menuState, 1);
+                        boot.paintUi.draggingCanvas = false;
+                        clampMenuSelection();
+                        continue;
+                    }
+
+                    if ((scancode == SDL_SCANCODE_E || scancode == SDL_SCANCODE_RIGHTBRACKET) &&
+                        pauseTabHasSubTabs(menuState.tab))
                     {
                         cyclePauseSubTab(menuState, 1);
                         boot.paintUi.draggingCanvas = false;
@@ -33720,6 +34033,11 @@ namespace TrueFlightApp
                     if (scancode == SDL_SCANCODE_RETURN || scancode == SDL_SCANCODE_SPACE)
                     {
                         activateSelectedRow(uiNowSeconds);
+                        continue;
+                    }
+
+                    if (triggerBoundActionsFromKey(scancode, modifiers, uiNowSeconds))
+                    {
                         continue;
                     }
                 }
@@ -34792,6 +35110,7 @@ namespace TrueFlightApp
                 }
                 std::vector<std::string> runtimeDebugLines =
                     buildRuntimeDebugLines(runtimeGovernor, rendererStats, terrainStreamStats);
+                std::vector<std::string> profilerOverlayLines;
                 const PlaneDurabilityState localDurability = localDurabilityState();
                 runtimeDebugLines.push_back("Online Role: " + std::string(
                                                                   session->onlineRole == OnlineSessionRole::Host ? "host" : (session->onlineRole == OnlineSessionRole::Client ? "client" : "offline")));
@@ -34823,8 +35142,7 @@ namespace TrueFlightApp
                 if (profilerOverlayEnabled)
                 {
                     const auto profilerSelfCost = runtimeProfiler.scopeProfilerSelfCost();
-                    const std::vector<std::string> profilerOverlayLines = runtimeProfiler.buildOverlayLines();
-                    runtimeDebugLines.insert(runtimeDebugLines.end(), profilerOverlayLines.begin(), profilerOverlayLines.end());
+                    profilerOverlayLines = runtimeProfiler.buildOverlayLines();
                 }
                 if (currentGameMode() == GameMode::Career)
                 {
@@ -35600,7 +35918,8 @@ namespace TrueFlightApp
                         &peerComparisons,
                         &hudTargetIndicators,
                         &boot.notifications,
-                        &runtimeDebugLines);
+                        &runtimeDebugLines,
+                        &profilerOverlayLines);
                     drawCreativeConsoleOverlay(boot.hudCanvas, drawableWidth, drawableHeight, uiNowSeconds);
                 }
 
@@ -35628,7 +35947,8 @@ namespace TrueFlightApp
                     &peerComparisons,
                     &hudTargetIndicators,
                     &boot.notifications,
-                    &runtimeDebugLines};
+                    &runtimeDebugLines,
+                    &profilerOverlayLines};
                 sceneAssemblyProfilerStage.finish();
                 auto hudProfilerStage = runtimeProfiler.scope(RuntimeProfilerStage::Hud);
                 auto imguiProfilerStage = runtimeProfiler.scope(RuntimeProfilerStage::ImGui);
@@ -35702,7 +36022,7 @@ namespace TrueFlightApp
                         imguiDrawData,
                         &renderError))
                 {
-                    SDL_Log("Vulkan render failed: %s", renderError.c_str());
+                    reportRenderFailure(renderError);
                     running = false;
                 }
                 renderProfilerStage.finish();
@@ -35909,7 +36229,7 @@ namespace TrueFlightApp
                         imguiDrawData,
                         &renderError))
                 {
-                    SDL_Log("Vulkan render failed: %s", renderError.c_str());
+                    reportRenderFailure(renderError);
                     running = false;
                 }
                 renderProfilerStage.finish();

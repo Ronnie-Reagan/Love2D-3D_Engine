@@ -590,6 +590,9 @@ inline float WorldStore::sampleVolumetricSubtractiveSdf(float x, float y, float 
 
 inline bool WorldStore::hasVolumetricOverridesInBounds(float x0, float z0, float x1, float z1, int neighborRing)
 {
+    if (chunks_.empty()) {
+        return false;
+    }
     const float chunkSize = std::max(1.0f, chunkSize_);
     const int ring = std::max(0, neighborRing);
     const float minX = std::min(x0, x1);
@@ -623,6 +626,9 @@ inline bool WorldStore::hasVolumetricOverridesInBounds(float x0, float z0, float
 inline TerrainVerticalBoundsSample WorldStore::volumetricVerticalBoundsForBounds(float x0, float z0, float x1, float z1, int neighborRing)
 {
     TerrainVerticalBoundsSample out;
+    if (chunks_.empty()) {
+        return out;
+    }
     const float chunkSize = std::max(1.0f, chunkSize_);
     const int ring = std::max(0, neighborRing);
     const float minX = std::min(x0, x1);
@@ -662,6 +668,9 @@ inline TerrainVerticalBoundsSample WorldStore::volumetricVerticalBoundsForBounds
 
 inline std::uint64_t WorldStore::revisionSignatureForBounds(float x0, float z0, float x1, float z1, int neighborRing)
 {
+    if (chunks_.empty()) {
+        return 1469598103934665603ull;
+    }
     const float chunkSize = std::max(1.0f, chunkSize_);
     const int ring = std::max(0, neighborRing);
     const int minCx = static_cast<int>(std::floor(std::min(x0, x1) / chunkSize)) - ring;

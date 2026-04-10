@@ -86,23 +86,25 @@ vec3 computeAerialPerspective(
     float densityM = exp(-averageAltitude / mieScaleHeight);
 
     float skyView = clamp((viewRay.y * 0.5) + 0.5, 0.0, 1.0);
-    float horizonBoost = 1.0 + (1.0 - skyView) * mix(2.2, 6.5, clamp((haze * 0.6) + (humidity * 0.4), 0.0, 1.0));
-    float opticalDistance = max(0.0, viewDistance) * horizonBoost;
+    float atmosphereStrength = clamp((haze * 0.35) + (humidity * 0.65), 0.08, 1.0);
+    float horizonBoost = 1.0 + ((1.0 - skyView) * mix(0.35, 1.4, atmosphereStrength));
+    float opticalDistance = max(0.0, viewDistance) * mix(0.045, 0.16, atmosphereStrength) * horizonBoost;
     vec3 opticalDepth = (kRayleighBeta * (densityR * opticalDistance)) + (betaM * (densityM * opticalDistance));
     extinction = exp(-max(opticalDepth, vec3(0.0)));
 
     float mu = dot(viewRay, safeNormalize(uLightDirection.xyz));
     float phaseR = rayleighPhase(mu);
     float phaseM = hgPhase(mu, mix(0.68, 0.84, haze));
-    vec3 sunColor = max(uLightColor.xyz, vec3(0.001)) * 18.0;
+    vec3 sunColor = max(uLightColor.xyz, vec3(0.001)) * mix(4.0, 9.0, atmosphereStrength);
     vec3 ambientSky = mix(uGroundColor.xyz, uSkyColor.xyz, skyView);
     vec3 atmosphereTint = mix(ambientSky, uFogColor.xyz, clamp((haze * 0.45) + (humidity * 0.55), 0.0, 1.0));
+    vec3 atmosphereBase = atmosphereTint * mix(0.04, 0.14, atmosphereStrength);
     vec3 inscatter =
         sunColor *
         ((kRayleighBeta * phaseR * densityR) + (betaM * phaseM * densityM * 1.35)) *
         opticalDistance *
-        1400.0;
-    return (atmosphereTint + inscatter) * clamp(vec3(1.0) - extinction, vec3(0.0), vec3(1.0));
+        mix(110.0, 280.0, atmosphereStrength);
+    return (atmosphereBase + inscatter) * clamp(vec3(1.0) - extinction, vec3(0.0), vec3(1.0));
 }
 
 void main()
@@ -163,7 +165,8 @@ void main()
     float fogSpan = max(0.001, uObjectFogRange.y - uObjectFogRange.x);
     float rangeFog = clamp((viewDistance - uObjectFogRange.x) / fogSpan, 0.0, 1.0);
     if (rangeFog > 0.0) {
-        finalColor = mix(finalColor, airlight + (uFogColor.xyz * 0.18), rangeFog * 0.65);
+        float humidity = clamp(uFogAndExposure.x * 4500.0, 0.0, 1.0);
+        finalColor = mix(finalColor, airlight + (uFogColor.xyz * 0.10), rangeFog * mix(0.20, 0.48, humidity));
     }
 
     finalColor *= exp2(uFogAndExposure.z);

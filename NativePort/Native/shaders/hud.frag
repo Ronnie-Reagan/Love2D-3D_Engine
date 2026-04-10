@@ -233,6 +233,13 @@ vec3 sampleSky(vec3 origin, vec3 viewDir, float planetRadius, float outerRadius)
     vec3 ambientSky = mix(uGroundColor.xyz, uSkyColor.xyz, skyView);
     vec3 hazeTint = mix(ambientSky, uFogColor.xyz, clamp((haze * 0.42) + (humidity * 0.58), 0.0, 1.0));
     sky = (sky * sunColor * 24.0) + (hazeTint * (0.18 + (0.18 * humidity)));
+
+    // Approximate the solar disc at a real angular size, with a soft halo for visibility after tone mapping.
+    float sunAngle = acos(clamp(mu, -1.0, 1.0));
+    float sunCore = 1.0 - smoothstep(0.00465, 0.00930, sunAngle);
+    float sunHalo = 1.0 - smoothstep(0.012, 0.050, sunAngle);
+    sky += max(uLightColor.xyz, vec3(0.001)) * ((sunCore * 68.0) + (sunHalo * 7.5));
+
     sky = mix(sky, vec3(0.0014, 0.0024, 0.0052), clamp((altitude - (outerRadius - planetRadius) * 0.6) / max(1.0, (outerRadius - planetRadius) * 0.8), 0.0, 1.0) * 0.82);
     sky *= exp2(uFogAndExposure.z);
     return linearToSrgb(toneMapAces(sky));

@@ -982,17 +982,16 @@ inline void stepFlight(
         ++substeps;
 
         float atmosphereAltitudeMeters = state.pos.y * config.metersPerUnit;
-        Vec3 atmosphereVelocityWorld {};
         if (environment.worldShape == WorldShape::Planet) {
             const float radialDistance = length(state.pos - environment.planetCenterWorld);
             atmosphereAltitudeMeters = (radialDistance - static_cast<float>(environment.planet.radiusMeters)) * config.metersPerUnit;
-            atmosphereVelocityWorld = computePlanetAtmosphereVelocity(environment, state.pos);
         }
 
         const AtmosphereSample atmosphere = sampleAtmosphere(atmosphereAltitudeMeters);
         runtime.lastAtmosphere = atmosphere;
 
-        const Vec3 airVelWorld = state.flightVel - environment.wind - atmosphereVelocityWorld;
+        // Flight state is simulated in the planet-fixed local frame, so the atmosphere is already stationary here.
+        const Vec3 airVelWorld = state.flightVel - environment.wind;
         const Vec3 airVelBody = worldToBody(state.rot, airVelWorld);
         const float trueAirspeed = length(airVelBody);
 

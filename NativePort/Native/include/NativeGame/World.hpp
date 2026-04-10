@@ -352,7 +352,7 @@ struct TerrainParams {
     PlanetConfig planet {};
     float chunkSize = 128.0f;
     float worldRadius = 24576.0f;
-    float minY = -1400.0f;
+    float minY = -900.0f;
     float maxY = 10000.0f;
     int lod0Radius = 4;
     int lod1Radius = 12;

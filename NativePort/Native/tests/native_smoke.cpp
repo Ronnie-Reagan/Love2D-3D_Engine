@@ -429,6 +429,44 @@ void runFlightParityChecks(bool& failed)
         config.enableAutoTrim = false;
         config.autoTrimUseWorker = false;
         config.maxThrustSeaLevel = 0.0f;
+        config.crashEnabled = false;
+
+        FlightState plane = makeFlightState({ 0.0f, 190.0f, 0.0f }, { 0.0f, 0.0f, 0.0f }, 0.0f, 1.2f);
+        FlightRuntimeState runtime {};
+        FlightEnvironment environment {};
+        environment.worldShape = WorldShape::Planet;
+        environment.planet = PlanetConfig {};
+        environment.planetCenterWorld = { 0.0f, static_cast<float>(-environment.planet.radiusMeters), 0.0f };
+        environment.planetSpinAxisWorld = { 0.0f, 0.0f, 1.0f };
+        environment.wind = { 0.0f, 0.0f, 0.0f };
+        environment.groundHeightAt = [](float, float) {
+            return -1.0e6f;
+        };
+        environment.sampleSdf = [](float, float, float) {
+            return 1.0e6f;
+        };
+        environment.sampleNormal = [](float, float, float) {
+            return Vec3 { 0.0f, 1.0f, 0.0f };
+        };
+        environment.collisionRadius = plane.collisionRadius;
+
+        stepFlight(plane, runtime, 1.0f / 120.0f, 0.0f, InputState {}, environment, config);
+
+        require(
+            runtime.lastDynamicPressure < 1.0f,
+            "Planet-fixed flight should not treat Earth rotation as a constant atmospheric crosswind",
+            failed);
+        require(
+            length(plane.flightVel) < 1.0f,
+            "Planet-fixed flight should only pick up a small gravity step from rest",
+            failed);
+    }
+
+    {
+        FlightConfig config = defaultFlightConfig();
+        config.enableAutoTrim = false;
+        config.autoTrimUseWorker = false;
+        config.maxThrustSeaLevel = 0.0f;
 
         FlightState plane = makeFlightState({ 0.0f, 2.8f, 0.0f }, { 0.0f, -2.5f, 22.0f }, 0.0f, 1.2f);
         FlightRuntimeState runtime {};

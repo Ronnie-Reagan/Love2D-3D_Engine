@@ -752,3 +752,19 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+"""
+┌───────────────────────────┐
+│ Copy-Pasta Build Commands │
+├───────────────────────────┴─────────────────────────────────────┐
+│ python NativePort/build_trueflight.py --enable-steamworks       │
+│ python NativePort/build_trueflight.py --disable-steamworks      │
+│ python NativePort/build_trueflight.py --reconfigure             │
+│ python NativePort/build_trueflight.py --clean                   │
+│ python NativePort/build_trueflight.py --ctest                   │
+│ python NativePort/build_trueflight.py --ctest --clean           │
+│ --enable-steamworks --reconfigure --clean --ctest               │
+│                                                                 │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+"""
