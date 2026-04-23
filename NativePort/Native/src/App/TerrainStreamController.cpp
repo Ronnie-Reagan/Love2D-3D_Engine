@@ -18,7 +18,9 @@ CompiledTerrainChunk buildTerrainTileChunk(
     const std::optional<TerrainChunkBakeCache>& bakeCache,
     std::string_view terrainWorldId,
     std::uint64_t paramsSignature,
-    std::uint64_t sourceSignature);
+    std::uint64_t sourceSignature,
+    bool usePlanetTile,
+    const PlanetTileId& planetTile);
 
 namespace {
 
@@ -56,13 +58,34 @@ std::string terrainTileIdentityKey(TerrainFarTileBand band, int tileScale, int t
            std::to_string(tileZ);
 }
 
+std::string terrainTileIdentityKey(const TerrainTileRequest& request)
+{
+    if (!request.usePlanetTile) {
+        return terrainTileIdentityKey(request.band, request.tileScale, request.tileX, request.tileZ);
+    }
+    return std::to_string(static_cast<int>(request.band)) + "|" +
+           std::to_string(request.tileScale) + "|p|" +
+           std::to_string(request.planetTile.face) + "|" +
+           std::to_string(request.planetTile.lod) + "|" +
+           std::to_string(request.planetTile.tx) + "|" +
+           std::to_string(request.planetTile.ty);
+}
+
 std::string terrainTileRequestKey(const TerrainTileRequest& request)
 {
     return std::to_string(static_cast<int>(request.band)) + "|" +
            std::to_string(static_cast<int>(request.detail)) + "|" +
-           std::to_string(request.tileScale) + "|" +
-           std::to_string(request.tileX) + "|" +
-           std::to_string(request.tileZ) + "|" +
+           (request.usePlanetTile
+                ? ("p|" +
+                   std::to_string(request.tileScale) + "|" +
+                   std::to_string(request.planetTile.face) + "|" +
+                   std::to_string(request.planetTile.lod) + "|" +
+                   std::to_string(request.planetTile.tx) + "|" +
+                   std::to_string(request.planetTile.ty))
+                : (std::to_string(request.tileScale) + "|" +
+                   std::to_string(request.tileX) + "|" +
+                   std::to_string(request.tileZ))) +
+           "|" +
            std::to_string(request.paramsSignature) + "|" +
            std::to_string(request.sourceSignature);
 }
@@ -72,8 +95,13 @@ bool terrainTileRequestsEquivalent(const TerrainTileRequest& lhs, const TerrainT
     return lhs.band == rhs.band &&
            lhs.detail == rhs.detail &&
            lhs.tileScale == rhs.tileScale &&
-           lhs.tileX == rhs.tileX &&
-           lhs.tileZ == rhs.tileZ &&
+           lhs.usePlanetTile == rhs.usePlanetTile &&
+           (lhs.usePlanetTile
+                ? (lhs.planetTile.face == rhs.planetTile.face &&
+                   lhs.planetTile.lod == rhs.planetTile.lod &&
+                   lhs.planetTile.tx == rhs.planetTile.tx &&
+                   lhs.planetTile.ty == rhs.planetTile.ty)
+                : (lhs.tileX == rhs.tileX && lhs.tileZ == rhs.tileZ)) &&
            lhs.paramsSignature == rhs.paramsSignature &&
            lhs.sourceSignature == rhs.sourceSignature;
 }
@@ -113,7 +141,7 @@ bool terrainStreamRequestIsDesiredLocked(
     if (generation != state.generation) {
         return false;
     }
-    const auto desiredIt = state.desiredRequests.find(terrainTileIdentityKey(request.band, request.tileScale, request.tileX, request.tileZ));
+    const auto desiredIt = state.desiredRequests.find(terrainTileIdentityKey(request));
     return desiredIt != state.desiredRequests.end() && terrainTileRequestsEquivalent(desiredIt->second, request);
 }
 
@@ -220,10 +248,7 @@ void terrainStreamWorkerLoop(TerrainVisualStreamState& state)
                 }
 
                 state.inflightRequestKeys[terrainTileIdentityKey(
-                    request.request.band,
-                    request.request.tileScale,
-                    request.request.tileX,
-                    request.request.tileZ)] = requestKey;
+                    request.request)] = requestKey;
                 updateTerrainStreamStatsLocked(state);
                 foundRequest = true;
                 break;
@@ -245,7 +270,9 @@ void terrainStreamWorkerLoop(TerrainVisualStreamState& state)
             request.generationContext->bakeCache,
             request.generationContext->terrainWorldId,
             request.request.paramsSignature,
-            request.request.sourceSignature);
+            request.request.sourceSignature,
+            request.request.usePlanetTile,
+            request.request.planetTile);
         const float buildTimeMs =
             std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - buildStart).count();
 
@@ -253,11 +280,7 @@ void terrainStreamWorkerLoop(TerrainVisualStreamState& state)
             std::lock_guard<std::mutex> lock(state.mutex);
             state.stats.workerBuildCount += 1u;
             state.stats.lastWorkerBuildTimeMs = buildTimeMs;
-            const std::string identityKey = terrainTileIdentityKey(
-                request.request.band,
-                request.request.tileScale,
-                request.request.tileX,
-                request.request.tileZ);
+            const std::string identityKey = terrainTileIdentityKey(request.request);
             const auto inflightIt = state.inflightRequestKeys.find(identityKey);
             if (inflightIt != state.inflightRequestKeys.end() && inflightIt->second == requestKey) {
                 state.inflightRequestKeys.erase(inflightIt);
@@ -268,11 +291,7 @@ void terrainStreamWorkerLoop(TerrainVisualStreamState& state)
                     state.completedResults.end(),
                     [&](const TerrainChunkBuildResult& existing)
                     {
-                        return terrainTileIdentityKey(
-                                   existing.request.band,
-                                   existing.request.tileScale,
-                                   existing.request.tileX,
-                                   existing.request.tileZ) == identityKey;
+                        return terrainTileIdentityKey(existing.request) == identityKey;
                     });
                 if (existingIt != state.completedResults.end()) {
                     if (terrainStreamRequestMoreValuable(request.request, existingIt->request)) {
@@ -371,7 +390,7 @@ void enqueueTerrainTileRequests(
 
     const auto recordDesiredRequest = [&](const TerrainTileRequest& request)
     {
-        streamState.desiredRequests[terrainTileIdentityKey(request.band, request.tileScale, request.tileX, request.tileZ)] = request;
+        streamState.desiredRequests[terrainTileIdentityKey(request)] = request;
     };
     for (const TerrainTileRequest& request : missingRequests) {
         recordDesiredRequest(request);
@@ -387,17 +406,13 @@ void enqueueTerrainTileRequests(
             return;
         }
 
-        const std::string identityKey = terrainTileIdentityKey(request.band, request.tileScale, request.tileX, request.tileZ);
+        const std::string identityKey = terrainTileIdentityKey(request);
         const auto queuedIt = std::find_if(
             streamState.queuedRequests.begin(),
             streamState.queuedRequests.end(),
             [&](const TerrainChunkBuildRequest& queued)
             {
-                return terrainTileIdentityKey(
-                           queued.request.band,
-                           queued.request.tileScale,
-                           queued.request.tileX,
-                           queued.request.tileZ) == identityKey;
+                return terrainTileIdentityKey(queued.request) == identityKey;
             });
         if (queuedIt != streamState.queuedRequests.end()) {
             return;

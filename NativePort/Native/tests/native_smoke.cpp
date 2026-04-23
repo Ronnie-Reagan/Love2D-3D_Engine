@@ -1222,6 +1222,81 @@ void runTerrainLodChecks(bool& failed)
         !nearPatch.vertices.empty() && nearPatch.vertexNormals.size() == nearPatch.vertices.size(),
         "Surface terrain patch no longer generates per-vertex normals for near-field lighting",
         failed);
+
+    TerrainParams planetParams = defaultTerrainParams();
+    planetParams.worldShape = WorldShape::Planet;
+    planetParams.planet.radiusMeters = 6371000.0;
+    planetParams.planet.gravitationalParameter = 3.986004418e14;
+    planetParams.planet.rotationRateRadPerSec = 7.2921159e-5;
+    planetParams.planet.atmosphereHeightMeters = 120000.0;
+    planetParams.chunkSize = 128.0f;
+    planetParams.gameplayRadiusMeters = 1024.0f;
+    planetParams.midFieldRadiusMeters = 8192.0f;
+    planetParams.horizonRadiusMeters = 65536.0f;
+    planetParams.regionalArcRadiusMeters = 384000.0f;
+    planetParams.lod0ChunkScale = 1;
+    planetParams.lod1ChunkScale = 8;
+    planetParams.lod2ChunkScale = 32;
+    planetParams.lod0BaseCellSize = 1.7f;
+    planetParams.lod1BaseCellSize = 6.0f;
+    planetParams.lod2BaseCellSize = 20.0f;
+    planetParams.heightAmplitude = 8200.0f;
+    planetParams.ridgeAmplitude = 6400.0f;
+    planetParams.surfaceDetailAmplitude = 240.0f;
+    planetParams.waterRatio = 0.62f;
+    planetParams.maxChunkCellsPerAxis = 128;
+    planetParams = normalizeTerrainParams(planetParams);
+
+    const int finestPlanetScale = std::max(1, planetParams.lod0ChunkScale);
+    const int coarsestPlanetScale = finestPlanetScale << 9;
+    const float coarsestPlanetTileSize = std::max(planetParams.chunkSize, planetParams.chunkSize * static_cast<float>(coarsestPlanetScale));
+    require(
+        planetParams.lod0CellSize <= 1.05f,
+        "Planet terrain defaults should preserve roughly one-meter near-field surface detail",
+        failed);
+    require(
+        coarsestPlanetTileSize >= 60000.0f,
+        "Planet terrain defaults should span a deep far-field quadtree ladder",
+        failed);
+
+    const TerrainFieldContext planetContext = createTerrainFieldContext(planetParams);
+    const auto directionFromDegrees = [](double latitudeDeg, double longitudeDeg) -> DVec3 {
+        static constexpr double kDegToRad = 0.017453292519943295769;
+        const double latitudeRad = latitudeDeg * kDegToRad;
+        const double longitudeRad = longitudeDeg * kDegToRad;
+        const double cosLatitude = std::cos(latitudeRad);
+        return {
+            cosLatitude * std::cos(longitudeRad),
+            std::sin(latitudeRad),
+            cosLatitude * std::sin(longitudeRad)
+        };
+    };
+
+    float oceanFloorMin = std::numeric_limits<float>::infinity();
+    float oceanFloorMax = -std::numeric_limits<float>::infinity();
+    int oceanSampleCount = 0;
+    int landSampleCount = 0;
+    for (int latitude = -75; latitude <= 75; latitude += 15) {
+        for (int longitude = -180; longitude <= 180; longitude += 15) {
+            const float surface = samplePlanetProceduralSurfaceHeight(directionFromDegrees(latitude, longitude), planetContext);
+            if (surface < planetParams.waterLevel) {
+                ++oceanSampleCount;
+                oceanFloorMin = std::min(oceanFloorMin, surface);
+                oceanFloorMax = std::max(oceanFloorMax, surface);
+            } else {
+                ++landSampleCount;
+            }
+        }
+    }
+
+    require(
+        oceanSampleCount > 40 && landSampleCount > 40,
+        "Planet terrain sampling should produce both ocean basins and emergent land",
+        failed);
+    require(
+        (oceanFloorMax - oceanFloorMin) > (planetParams.heightAmplitude * 0.14f),
+        "Planet ocean floors regressed toward flat under-water shelves",
+        failed);
 }
 
 void runCloudFieldChecks(bool& failed)

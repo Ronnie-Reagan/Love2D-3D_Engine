@@ -764,6 +764,8 @@ namespace TrueFlightApp
         Model waterModel{};
         Model propModel{};
         std::vector<TerrainPropCollider> propColliders;
+        bool usePlanetTile = false;
+        PlanetTileId planetTile{};
     };
 
     struct TerrainVisualCache
@@ -1266,6 +1268,8 @@ namespace TrueFlightApp
         std::uint64_t paramsSignature = 0u;
         std::uint64_t sourceSignature = 0u;
         float priority = 0.0f;
+        bool usePlanetTile = false;
+        PlanetTileId planetTile{};
     };
 
     struct TerrainStreamGenerationSnapshot;

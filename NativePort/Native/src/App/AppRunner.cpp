@@ -99,6 +99,7 @@ namespace TrueFlightApp
     constexpr float kWalkingGroundSnapDistance = 0.10f;
     constexpr float kUiScaleStep = 0.1f;
     constexpr float kTrimStepsPerSecond = 8.0f;
+    constexpr int kPlanetTerrainQuadtreeLevels = 14;
     constexpr RuntimeTuning kDefaultRuntimeTuning = defaultRuntimeTuning();
     const GamepadControlConfig kGamepadControlConfig = defaultGamepadControlConfig();
 
@@ -140,39 +141,40 @@ namespace TrueFlightApp
         params.planet.rotationRateRadPerSec = 7.2921159e-5;
         params.planet.atmosphereHeightMeters = 120000.0;
         params.planet.localOrigin = { 47.6062, -122.3321, 0.0 };
-        params.chunkSize = 1024.0f;
-        params.worldRadius = 240000.0f;
+        params.chunkSize = 128.0f;
+        params.worldRadius = 512000.0f;
         params.nearSurfaceArcRadiusMeters = 24000.0f;
-        params.regionalArcRadiusMeters = 240000.0f;
-        params.gameplayRadiusMeters = 24000.0f;
-        params.midFieldRadiusMeters = 96000.0f;
-        params.horizonRadiusMeters = 240000.0f;
-        params.lod0Radius = 2;
-        params.lod1Radius = 5;
-        params.lod2Radius = 10;
-        params.lod0ChunkScale = 2;
+        params.regionalArcRadiusMeters = 384000.0f;
+        params.gameplayRadiusMeters = 1024.0f;
+        params.midFieldRadiusMeters = 8192.0f;
+        params.horizonRadiusMeters = 65536.0f;
+        params.lod0Radius = 4;
+        params.lod1Radius = 12;
+        params.lod2Radius = 48;
+        params.lod0ChunkScale = 1;
         params.lod1ChunkScale = 8;
         params.lod2ChunkScale = 32;
-        params.maxAdaptiveLod1Radius = 6;
-        params.lod0BaseCellSize = 10.0f;
-        params.lod1BaseCellSize = 36.0f;
-        params.lod2BaseCellSize = 140.0f;
+        params.maxAdaptiveLod1Radius = 12;
+        params.lod0BaseCellSize = 1.7f;
+        params.lod1BaseCellSize = 6.0f;
+        params.lod2BaseCellSize = 20.0f;
         params.heightAmplitude = 8200.0f;
-        params.ridgeAmplitude = 5600.0f;
-        params.surfaceDetailAmplitude = 180.0f;
+        params.ridgeAmplitude = 6400.0f;
+        params.surfaceDetailAmplitude = 240.0f;
         params.waterLevel = 0.0f;
+        params.waterRatio = 0.62f;
         params.snowLine = 3200.0f;
-        params.maxChunkCellsPerAxis = 96;
-        params.meshBuildBudget = 6;
+        params.maxChunkCellsPerAxis = 128;
+        params.meshBuildBudget = 8;
         params.workerMaxInflight = 6;
-        params.workerResultBudgetPerFrame = 6;
-        params.maxPendingChunks = 64;
-        params.maxDisplayedChunks = 512;
-        params.maxDisplayedChunksHardCap = 1024;
-        params.chunkCacheLimit = 160;
+        params.workerResultBudgetPerFrame = 8;
+        params.maxPendingChunks = 128;
+        params.maxDisplayedChunks = 768;
+        params.maxDisplayedChunksHardCap = 1536;
+        params.chunkCacheLimit = 256;
         params.splitLodEnabled = true;
         params.drawDistanceOverridesLodRadius = false;
-        params.surfaceOnlyMeshing = false;
+        params.surfaceOnlyMeshing = true;
         return normalizeTerrainParams(params);
     }
 
@@ -1625,6 +1627,15 @@ namespace TrueFlightApp
     std::string formatFixed(float value, int precision);
     TerrainMaterialSample sampleTerrainMaterialFromChunkData(const TerrainChunkData &data, float x, float z);
     float sampleTerrainSlopeFromChunkData(const TerrainChunkData &data, float x, float z);
+    float terrainTileSizeForScale(const TerrainParams &params, int tileScale);
+    DVec3 terrainPlanetTileDirection(const PlanetTileId &planetTile, float fx, float fz);
+    Vec3 terrainPlanetDirectionToLocalPosition(
+        const DVec3 &directionFixed,
+        double surfaceRadiusMeters,
+        const TerrainFieldContext &terrainContext);
+    float samplePlanetTileSurfaceElevationForDirection(
+        const DVec3 &directionFixed,
+        const TerrainFieldContext &terrainContext);
     void pushHudNotification(BootResources &boot, std::string text, float nowSeconds, float duration);
     void touchModelCacheRevision(Model &model);
     void rebuildVisualRigModels(PlaneVisualState &visual);
@@ -2276,9 +2287,19 @@ namespace TrueFlightApp
     {
         if (terrainContext.params.worldShape == WorldShape::Planet)
         {
-            return std::max(
+            const float groundHeight = sampleGroundHeight(position.x, position.z, terrainContext);
+            const float altitudeAgl = std::max(0.0f, position.y - groundHeight);
+            const float baseRadius = std::max(
                 terrainContext.params.horizonRadiusMeters,
-                terrainContext.params.regionalArcRadiusMeters);
+                terrainContext.params.gameplayRadiusMeters * 8.0f);
+            const float maxRadius = std::max(
+                terrainContext.params.regionalArcRadiusMeters,
+                terrainContext.params.horizonRadiusMeters * 2.0f);
+            const float altitudeBoost =
+                altitudeAgl <= 0.0f
+                    ? 0.0f
+                    : std::min(maxRadius, (altitudeAgl * 6.0f) + (std::sqrt(altitudeAgl) * 1200.0f));
+            return clamp(baseRadius + altitudeBoost, baseRadius, maxRadius);
         }
 
         const float groundHeight = sampleGroundHeight(position.x, position.z, terrainContext);
@@ -3710,6 +3731,129 @@ namespace TrueFlightApp
             clamp(params.waterColor.z + (waveTint * 0.06f) + (foam * 0.18f), 0.0f, 1.0f)};
     }
 
+    bool terrainChunkUsesPlanetPatch(const TerrainChunkData &data)
+    {
+        return data.key.worldShape == WorldShape::Planet;
+    }
+
+    float samplePlanetTileWaterElevationForDirection(
+        const DVec3 &directionFixed,
+        const TerrainFieldContext &terrainContext)
+    {
+        const TerrainParams &params = terrainContext.params;
+        float waveOffset = 0.0f;
+        if (params.waterWaveAmplitude > 0.0f)
+        {
+            const float n1 =
+                (valueNoise3(
+                     static_cast<float>(directionFixed.x * 48.0),
+                     static_cast<float>(directionFixed.y * 48.0),
+                     static_cast<float>(directionFixed.z * 48.0),
+                     params.seed + 700) *
+                 2.0f) -
+                1.0f;
+            const float n2 =
+                (valueNoise3(
+                     static_cast<float>(directionFixed.x * 91.0),
+                     static_cast<float>(directionFixed.y * 91.0),
+                     static_cast<float>(directionFixed.z * 91.0),
+                     params.seed + 937) *
+                 2.0f) -
+                1.0f;
+            waveOffset = ((n1 * 0.7f) + (n2 * 0.3f)) * params.waterWaveAmplitude;
+        }
+        return clamp(params.waterLevel + waveOffset, params.minY, params.maxY);
+    }
+
+    Vec3 terrainChunkSampleLocalPosition(
+        const TerrainChunkData &data,
+        int ix,
+        int iz,
+        const std::vector<float> &heights,
+        float fallbackHeight,
+        const TerrainFieldContext &terrainContext)
+    {
+        const float sampleHeight = terrainChunkGridValue(heights, data, ix, iz, fallbackHeight);
+        if (!terrainChunkUsesPlanetPatch(data))
+        {
+            const int nx = std::max(1, data.gridWidth - 1);
+            const int nz = std::max(1, data.gridHeight - 1);
+            const float spanX = std::max(1.0f, data.bounds.x1 - data.bounds.x0);
+            const float spanZ = std::max(1.0f, data.bounds.z1 - data.bounds.z0);
+            const float x = data.bounds.x0 + (static_cast<float>(ix) / static_cast<float>(nx)) * spanX;
+            const float z = data.bounds.z0 + (static_cast<float>(iz) / static_cast<float>(nz)) * spanZ;
+            return { x, sampleHeight, z };
+        }
+
+        const int nx = std::max(1, data.gridWidth - 1);
+        const int nz = std::max(1, data.gridHeight - 1);
+        const float fx = static_cast<float>(ix) / static_cast<float>(nx);
+        const float fz = static_cast<float>(iz) / static_cast<float>(nz);
+        const DVec3 direction = terrainPlanetTileDirection(data.key.planetTile, fx, fz);
+        return terrainPlanetDirectionToLocalPosition(
+            direction,
+            terrainContext.params.planet.radiusMeters + static_cast<double>(sampleHeight),
+            terrainContext);
+    }
+
+    void appendPlanetSkirtQuadsFromChunkData(
+        Model &model,
+        const TerrainChunkData &data,
+        const TerrainFieldContext &terrainContext,
+        const std::vector<int> &grid)
+    {
+        if (!terrainChunkUsesPlanetPatch(data))
+        {
+            return;
+        }
+
+        const int nx = data.gridWidth - 1;
+        const int nz = data.gridHeight - 1;
+        if (nx <= 0 || nz <= 0)
+        {
+            return;
+        }
+
+        const float skirtDepth = std::max(2.0f, terrainContext.params.skirtDepth);
+        const Vec3 planetCenter = planetCenterLocal(terrainContext.planetFrame);
+        const auto gridIndex = [nx](int ix, int iz)
+        {
+            return static_cast<std::size_t>(iz * (nx + 1) + ix);
+        };
+
+        const auto addSkirtQuad = [&](const Vec3 &a, const Vec3 &b)
+        {
+            const Vec3 radialA = normalize(a - planetCenter, { 0.0f, 1.0f, 0.0f });
+            const Vec3 radialB = normalize(b - planetCenter, { 0.0f, 1.0f, 0.0f });
+            const Vec3 aIn = a - (radialA * skirtDepth);
+            const Vec3 bIn = b - (radialB * skirtDepth);
+            const Vec3 center = (a + b + aIn + bIn) * 0.25f;
+            const Vec3 color = sampleTerrainColor(center.x, center.y, center.z, terrainContext);
+            addColoredTriangle(model, a, b, bIn, color);
+            addColoredTriangle(model, a, bIn, aIn, color);
+        };
+
+        for (int ix = 0; ix < nx; ++ix)
+        {
+            addSkirtQuad(
+                model.vertices[static_cast<std::size_t>(grid[gridIndex(ix, 0)])],
+                model.vertices[static_cast<std::size_t>(grid[gridIndex(ix + 1, 0)])]);
+            addSkirtQuad(
+                model.vertices[static_cast<std::size_t>(grid[gridIndex(ix + 1, nz)])],
+                model.vertices[static_cast<std::size_t>(grid[gridIndex(ix, nz)])]);
+        }
+
+        for (int iz = 0; iz < nz; ++iz)
+        {
+            addSkirtQuad(
+                model.vertices[static_cast<std::size_t>(grid[gridIndex(0, iz + 1)])],
+                model.vertices[static_cast<std::size_t>(grid[gridIndex(0, iz)])]);
+            addSkirtQuad(
+                model.vertices[static_cast<std::size_t>(grid[gridIndex(nx, iz)])],
+                model.vertices[static_cast<std::size_t>(grid[gridIndex(nx, iz + 1)])]);
+        }
+    }
+
     Model buildSurfaceTerrainPatchFromChunkData(const TerrainChunkData &data, const TerrainFieldContext &terrainContext)
     {
         Model model;
@@ -3721,11 +3865,6 @@ namespace TrueFlightApp
         const TerrainParams &params = terrainContext.params;
         const int nx = data.gridWidth - 1;
         const int nz = data.gridHeight - 1;
-        const float spanX = std::max(1.0f, data.bounds.x1 - data.bounds.x0);
-        const float spanZ = std::max(1.0f, data.bounds.z1 - data.bounds.z0);
-        const float xStep = spanX / static_cast<float>(nx);
-        const float zStep = spanZ / static_cast<float>(nz);
-
         std::vector<int> grid(static_cast<std::size_t>(data.gridWidth * data.gridHeight), 0);
         auto gridIndex = [nx](int ix, int iz)
         {
@@ -3734,13 +3873,17 @@ namespace TrueFlightApp
 
         for (int iz = 0; iz <= nz; ++iz)
         {
-            const float z = data.bounds.z0 + (static_cast<float>(iz) * zStep);
             for (int ix = 0; ix <= nx; ++ix)
             {
-                const float x = data.bounds.x0 + (static_cast<float>(ix) * xStep);
-                const float y = terrainChunkGridValue(data.surfaceHeights, data, ix, iz, 0.0f);
                 grid[gridIndex(ix, iz)] = static_cast<int>(model.vertices.size());
-                model.vertices.push_back({x, y, z});
+                model.vertices.push_back(
+                    terrainChunkSampleLocalPosition(
+                        data,
+                        ix,
+                        iz,
+                        data.surfaceHeights,
+                        0.0f,
+                        terrainContext));
             }
         }
 
@@ -3753,14 +3896,12 @@ namespace TrueFlightApp
             {
                 const int ix0 = std::max(0, ix - 1);
                 const int ix1 = std::min(nx, ix + 1);
-                const float hL = terrainChunkGridValue(data.surfaceHeights, data, ix0, iz, 0.0f);
-                const float hR = terrainChunkGridValue(data.surfaceHeights, data, ix1, iz, 0.0f);
-                const float hD = terrainChunkGridValue(data.surfaceHeights, data, ix, iz0, 0.0f);
-                const float hU = terrainChunkGridValue(data.surfaceHeights, data, ix, iz1, 0.0f);
-                const float dx = xStep * static_cast<float>(std::max(1, ix1 - ix0));
-                const float dz = zStep * static_cast<float>(std::max(1, iz1 - iz0));
-                const Vec3 tangentZ{0.0f, hU - hD, dz};
-                const Vec3 tangentX{dx, hR - hL, 0.0f};
+                const Vec3 pL = model.vertices[static_cast<std::size_t>(grid[gridIndex(ix0, iz)])];
+                const Vec3 pR = model.vertices[static_cast<std::size_t>(grid[gridIndex(ix1, iz)])];
+                const Vec3 pD = model.vertices[static_cast<std::size_t>(grid[gridIndex(ix, iz0)])];
+                const Vec3 pU = model.vertices[static_cast<std::size_t>(grid[gridIndex(ix, iz1)])];
+                const Vec3 tangentZ = pU - pD;
+                const Vec3 tangentX = pR - pL;
                 model.vertexNormals[static_cast<std::size_t>(grid[gridIndex(ix, iz)])] =
                     normalize(cross(tangentZ, tangentX), {0.0f, 1.0f, 0.0f});
             }
@@ -3771,14 +3912,23 @@ namespace TrueFlightApp
             const Vec3 &a = model.vertices[static_cast<std::size_t>(ia)];
             const Vec3 &b = model.vertices[static_cast<std::size_t>(ib)];
             const Vec3 &c = model.vertices[static_cast<std::size_t>(ic)];
-            const float centerX = (a.x + b.x + c.x) / 3.0f;
-            const float centerZ = (a.z + b.z + c.z) / 3.0f;
-            if (pointInsideHole(centerX, centerZ, data.bounds))
+            const Vec3 center = (a + b + c) / 3.0f;
+            if (!terrainChunkUsesPlanetPatch(data) && pointInsideHole(center.x, center.z, data.bounds))
             {
                 return;
             }
-            const TerrainMaterialSample material = sampleTerrainMaterialFromChunkData(data, centerX, centerZ);
-            addFace(model, {ia, ib, ic}, composeTerrainColorFromWeights(centerX, centerZ, material, terrainContext));
+
+            Vec3 color {};
+            if (terrainChunkUsesPlanetPatch(data))
+            {
+                color = sampleTerrainColor(center.x, center.y, center.z, terrainContext);
+            }
+            else
+            {
+                const TerrainMaterialSample material = sampleTerrainMaterialFromChunkData(data, center.x, center.z);
+                color = composeTerrainColorFromWeights(center.x, center.z, material, terrainContext);
+            }
+            addFace(model, {ia, ib, ic}, color);
         };
 
         for (int iz = 0; iz < nz; ++iz)
@@ -3796,7 +3946,14 @@ namespace TrueFlightApp
 
         if (params.enableSkirts)
         {
-            appendSkirtQuads(model, terrainContext, data.bounds, data.cellSize, params.skirtDepth);
+            if (terrainChunkUsesPlanetPatch(data))
+            {
+                appendPlanetSkirtQuadsFromChunkData(model, data, terrainContext, grid);
+            }
+            else
+            {
+                appendSkirtQuads(model, terrainContext, data.bounds, data.cellSize, params.skirtDepth);
+            }
         }
         return model;
     }
@@ -3849,12 +4006,16 @@ namespace TrueFlightApp
                 const float centerSurface = (s00 + s10 + s01 + s11) * 0.25f;
                 const float centerWater = (w00 + w10 + w01 + w11) * 0.25f;
                 const Vec3 color = composeTerrainWaterColorFromChunkData(data, cellCenterX, cellCenterZ, centerSurface, centerWater, terrainContext);
+                const Vec3 p00 = terrainChunkSampleLocalPosition(data, ix, iz, data.waterHeights, s00, terrainContext);
+                const Vec3 p10 = terrainChunkSampleLocalPosition(data, ix + 1, iz, data.waterHeights, s10, terrainContext);
+                const Vec3 p01 = terrainChunkSampleLocalPosition(data, ix, iz + 1, data.waterHeights, s01, terrainContext);
+                const Vec3 p11 = terrainChunkSampleLocalPosition(data, ix + 1, iz + 1, data.waterHeights, s11, terrainContext);
                 addColoredQuad(
                     model,
-                    {x0, w00, z0},
-                    {x0, w01, z1},
-                    {x1, w11, z1},
-                    {x1, w10, z0},
+                    p00,
+                    p01,
+                    p11,
+                    p10,
                     color);
             }
         }
@@ -4017,6 +4178,116 @@ namespace TrueFlightApp
         const TerrainChunkSourcePlan &plan)
     {
         const TerrainParams &params = terrainContext.params;
+        if (key.worldShape == WorldShape::Planet)
+        {
+            const Vec3 c00 = terrainPlanetDirectionToLocalPosition(
+                terrainPlanetTileDirection(key.planetTile, 0.0f, 0.0f),
+                params.planet.radiusMeters,
+                terrainContext);
+            const Vec3 c10 = terrainPlanetDirectionToLocalPosition(
+                terrainPlanetTileDirection(key.planetTile, 1.0f, 0.0f),
+                params.planet.radiusMeters,
+                terrainContext);
+            const Vec3 c01 = terrainPlanetDirectionToLocalPosition(
+                terrainPlanetTileDirection(key.planetTile, 0.0f, 1.0f),
+                params.planet.radiusMeters,
+                terrainContext);
+            const Vec3 c11 = terrainPlanetDirectionToLocalPosition(
+                terrainPlanetTileDirection(key.planetTile, 1.0f, 1.0f),
+                params.planet.radiusMeters,
+                terrainContext);
+            const float spanU = std::max(length(c10 - c00), length(c11 - c01));
+            const float spanV = std::max(length(c01 - c00), length(c11 - c10));
+            const float requestedStep = std::max(1.0f, sanitize(cellSize, params.lod1CellSize));
+            const int nx = std::clamp(
+                static_cast<int>(std::ceil(std::max(1.0f, spanU) / requestedStep)),
+                2,
+                std::max(2, params.maxChunkCellsPerAxis));
+            const int nz = std::clamp(
+                static_cast<int>(std::ceil(std::max(1.0f, spanV) / requestedStep)),
+                2,
+                std::max(2, params.maxChunkCellsPerAxis));
+
+            TerrainChunkData data;
+            data.key = key;
+            data.bounds = bounds;
+            data.cellSize = cellSize;
+            data.gridWidth = nx + 1;
+            data.gridHeight = nz + 1;
+
+            const std::size_t valueCount = static_cast<std::size_t>(data.gridWidth * data.gridHeight);
+            data.surfaceHeights.resize(valueCount);
+            data.waterHeights.resize(plan.needWater ? valueCount : 0);
+            data.waterWeights.resize(plan.needWater ? valueCount : 0);
+            data.wetnessWeights.resize(plan.needWetness ? valueCount : 0);
+            data.snowWeights.resize(plan.needSnow ? valueCount : 0);
+            data.rockWeights.resize(plan.needRock ? valueCount : 0);
+            data.biomeWeights.resize(plan.needBiome ? valueCount : 0);
+            data.hardnessWeights.resize(plan.needHardness ? valueCount : 0);
+            data.resourceWeights.resize(plan.needResource ? valueCount : 0);
+            data.erosionWeights.resize(plan.needErosion ? valueCount : 0);
+            data.flowWeights.resize(plan.needFlow ? valueCount : 0);
+
+            for (int iz = 0; iz <= nz; ++iz)
+            {
+                const float fz = static_cast<float>(iz) / static_cast<float>(std::max(1, nz));
+                for (int ix = 0; ix <= nx; ++ix)
+                {
+                    const float fx = static_cast<float>(ix) / static_cast<float>(std::max(1, nx));
+                    const std::size_t index = static_cast<std::size_t>(iz * data.gridWidth + ix);
+                    const DVec3 direction = terrainPlanetTileDirection(key.planetTile, fx, fz);
+                    const float surfaceElevation = samplePlanetTileSurfaceElevationForDirection(direction, terrainContext);
+                    const Vec3 localSurface = terrainPlanetDirectionToLocalPosition(
+                        direction,
+                        params.planet.radiusMeters + static_cast<double>(surfaceElevation),
+                        terrainContext);
+                    data.surfaceHeights[index] = surfaceElevation;
+
+                    float waterElevation = surfaceElevation;
+                    if (plan.needWater)
+                    {
+                        waterElevation = samplePlanetTileWaterElevationForDirection(direction, terrainContext);
+                        data.waterHeights[index] = waterElevation;
+                        data.waterWeights[index] = clamp(
+                            (waterElevation - surfaceElevation + 0.12f) / std::max(0.1f, params.shorelineBand),
+                            0.0f,
+                            1.0f);
+                    }
+
+                    if (terrainChunkSourcePlanNeedsExtendedMaterial(plan))
+                    {
+                        const TerrainHydraulicSample hydraulic = sampleTerrainHydraulic(localSurface.x, localSurface.z, terrainContext);
+                        const TerrainMaterialSample material = sampleTerrainMaterialWeights(
+                            localSurface.x,
+                            localSurface.z,
+                            surfaceElevation,
+                            waterElevation,
+                            hydraulic,
+                            terrainContext);
+
+                        if (plan.needWetness)
+                            data.wetnessWeights[index] = material.wetness;
+                        if (plan.needSnow)
+                            data.snowWeights[index] = material.snowWeight;
+                        if (plan.needRock)
+                            data.rockWeights[index] = material.rockWeight;
+                        if (plan.needBiome)
+                            data.biomeWeights[index] = material.biomeBlend;
+                        if (plan.needHardness)
+                            data.hardnessWeights[index] = material.hardnessWeight;
+                        if (plan.needResource)
+                            data.resourceWeights[index] = material.resourceWeight;
+                        if (plan.needErosion)
+                            data.erosionWeights[index] = material.erosionWeight;
+                        if (plan.needFlow)
+                            data.flowWeights[index] = material.flowWeight;
+                    }
+                }
+            }
+
+            return data;
+        }
+
         const float spanX = std::max(1.0f, bounds.x1 - bounds.x0);
         const float spanZ = std::max(1.0f, bounds.z1 - bounds.z0);
         const float requestedStep = std::max(1.0f, sanitize(cellSize, params.lod1CellSize));
@@ -4164,6 +4435,11 @@ namespace TrueFlightApp
         const TerrainPatchBounds &bounds,
         const TerrainFieldContext &terrainContext)
     {
+        if (terrainContext.params.worldShape == WorldShape::Planet)
+        {
+            return false;
+        }
+
         if (terrainPatchNeedsLocalVolumetrics(bounds, terrainContext))
         {
             if (band == TerrainFarTileBand::Near)
@@ -4336,19 +4612,214 @@ namespace TrueFlightApp
         return initialTerrainTileDetailForBand(band);
     }
 
-    TerrainFarTile *findTerrainTile(std::vector<TerrainFarTile> &tiles, TerrainFarTileBand band, int tileScale, int tileX, int tileZ)
+    bool terrainTileUsesPlanetPatch(const TerrainFarTile &tile)
+    {
+        return tile.usePlanetTile;
+    }
+
+    bool terrainTileUsesPlanetPatch(const TerrainTileRequest &request)
+    {
+        return request.usePlanetTile;
+    }
+
+    bool terrainPlanetTilesEqual(const PlanetTileId &lhs, const PlanetTileId &rhs)
+    {
+        return lhs.face == rhs.face &&
+               lhs.lod == rhs.lod &&
+               lhs.tx == rhs.tx &&
+               lhs.ty == rhs.ty;
+    }
+
+    bool terrainTileIdentityMatches(
+        const TerrainFarTile &tile,
+        TerrainFarTileBand band,
+        int tileScale,
+        int tileX,
+        int tileZ,
+        bool usePlanetTile = false,
+        const PlanetTileId &planetTile = {})
+    {
+        if (tile.band != band || tile.tileScale != tileScale)
+        {
+            return false;
+        }
+        if (usePlanetTile)
+        {
+            return tile.usePlanetTile && terrainPlanetTilesEqual(tile.planetTile, planetTile);
+        }
+        return !tile.usePlanetTile &&
+               tile.tileX == tileX &&
+               tile.tileZ == tileZ;
+    }
+
+    TerrainFarTile *findTerrainTile(
+        std::vector<TerrainFarTile> &tiles,
+        TerrainFarTileBand band,
+        int tileScale,
+        int tileX,
+        int tileZ,
+        bool usePlanetTile = false,
+        const PlanetTileId &planetTile = {})
     {
         for (TerrainFarTile &tile : tiles)
         {
-            if (tile.band == band &&
-                tile.tileScale == tileScale &&
-                tile.tileX == tileX &&
-                tile.tileZ == tileZ)
+            if (terrainTileIdentityMatches(tile, band, tileScale, tileX, tileZ, usePlanetTile, planetTile))
             {
                 return &tile;
             }
         }
         return nullptr;
+    }
+
+    DVec3 cubeSphereDirectionForFaceUv(int face, double u, double v)
+    {
+        DVec3 direction { 0.0, 1.0, 0.0 };
+        switch (face)
+        {
+        case 0:
+            direction = { 1.0, v, -u };
+            break;
+        case 1:
+            direction = { -1.0, v, u };
+            break;
+        case 2:
+            direction = { u, 1.0, -v };
+            break;
+        case 3:
+            direction = { u, -1.0, v };
+            break;
+        case 4:
+            direction = { u, v, 1.0 };
+            break;
+        case 5:
+            direction = { -u, v, -1.0 };
+            break;
+        default:
+            break;
+        }
+        return normalize(direction, { 0.0, 1.0, 0.0 });
+    }
+
+    void terrainPlanetTileUvBounds(const PlanetTileId &planetTile, double &u0, double &u1, double &v0, double &v1)
+    {
+        const int tilesPerAxis = std::max(1, 1 << std::clamp(planetTile.lod, 0, 24));
+        const double invTiles = 1.0 / static_cast<double>(tilesPerAxis);
+        u0 = (static_cast<double>(planetTile.tx) * invTiles * 2.0) - 1.0;
+        u1 = (static_cast<double>(planetTile.tx + 1) * invTiles * 2.0) - 1.0;
+        v0 = (static_cast<double>(planetTile.ty) * invTiles * 2.0) - 1.0;
+        v1 = (static_cast<double>(planetTile.ty + 1) * invTiles * 2.0) - 1.0;
+    }
+
+    DVec3 terrainPlanetTileDirection(const PlanetTileId &planetTile, float fx, float fz)
+    {
+        double u0 = 0.0;
+        double u1 = 0.0;
+        double v0 = 0.0;
+        double v1 = 0.0;
+        terrainPlanetTileUvBounds(planetTile, u0, u1, v0, v1);
+        const double u = u0 + ((u1 - u0) * std::clamp(static_cast<double>(fx), 0.0, 1.0));
+        const double v = v0 + ((v1 - v0) * std::clamp(static_cast<double>(fz), 0.0, 1.0));
+        return cubeSphereDirectionForFaceUv(planetTile.face, u, v);
+    }
+
+    Vec3 terrainPlanetDirectionToLocalPosition(
+        const DVec3 &directionFixed,
+        double surfaceRadiusMeters,
+        const TerrainFieldContext &terrainContext)
+    {
+        const DVec3 fixedPosition = directionFixed * surfaceRadiusMeters;
+        return inertialToPlanetLocal(
+            planetFixedToInertial(fixedPosition, terrainContext.params.planet, terrainContext.planetTimeSeconds),
+            terrainContext.planetFrame);
+    }
+
+    float samplePlanetTileSurfaceElevationForDirection(
+        const DVec3 &directionFixed,
+        const TerrainFieldContext &terrainContext)
+    {
+        float surfaceElevation = samplePlanetProceduralSurfaceHeight(directionFixed, terrainContext);
+        if (terrainContext.sampleHeightDeltaAt)
+        {
+            const Vec3 localSurface = terrainPlanetDirectionToLocalPosition(
+                directionFixed,
+                terrainContext.params.planet.radiusMeters + static_cast<double>(surfaceElevation),
+                terrainContext);
+            surfaceElevation += sanitize(terrainContext.sampleHeightDeltaAt(localSurface.x, localSurface.z), 0.0f);
+        }
+        return clamp(surfaceElevation, terrainContext.params.minY, terrainContext.params.maxY);
+    }
+
+    TerrainPatchBounds terrainPlanetTileLocalBounds(const PlanetTileId &planetTile, const TerrainFieldContext &terrainContext)
+    {
+        const std::array<Vec2, 5> samples {
+            Vec2 { 0.0f, 0.0f },
+            Vec2 { 1.0f, 0.0f },
+            Vec2 { 0.0f, 1.0f },
+            Vec2 { 1.0f, 1.0f },
+            Vec2 { 0.5f, 0.5f }
+        };
+
+        float minX = std::numeric_limits<float>::infinity();
+        float maxX = -std::numeric_limits<float>::infinity();
+        float minZ = std::numeric_limits<float>::infinity();
+        float maxZ = -std::numeric_limits<float>::infinity();
+        for (const Vec2 &sample : samples)
+        {
+            const DVec3 direction = terrainPlanetTileDirection(planetTile, sample.x, sample.y);
+            const float elevation = samplePlanetTileSurfaceElevationForDirection(direction, terrainContext);
+            const Vec3 localPosition = terrainPlanetDirectionToLocalPosition(
+                direction,
+                terrainContext.params.planet.radiusMeters + static_cast<double>(elevation),
+                terrainContext);
+            minX = std::min(minX, localPosition.x);
+            maxX = std::max(maxX, localPosition.x);
+            minZ = std::min(minZ, localPosition.z);
+            maxZ = std::max(maxZ, localPosition.z);
+        }
+
+        const float margin = std::max(2.0f, terrainContext.params.chunkSize * 0.25f);
+        return {
+            minX - margin,
+            maxX + margin,
+            minZ - margin,
+            maxZ + margin,
+            false,
+            0.0f,
+            0.0f,
+            0.0f,
+            0.0f
+        };
+    }
+
+    TerrainPatchBounds terrainTileLocalBounds(
+        TerrainFarTileBand band,
+        int tileScale,
+        int tileX,
+        int tileZ,
+        bool usePlanetTile,
+        const PlanetTileId &planetTile,
+        const TerrainFieldContext &terrainContext)
+    {
+        if (usePlanetTile && terrainContext.params.worldShape == WorldShape::Planet)
+        {
+            return terrainPlanetTileLocalBounds(planetTile, terrainContext);
+        }
+
+        const float tileSize = terrainTileSizeForScale(terrainContext.params, tileScale);
+        const float tileMinX = static_cast<float>(tileX) * tileSize;
+        const float tileMinZ = static_cast<float>(tileZ) * tileSize;
+        (void)band;
+        return {
+            tileMinX,
+            tileMinX + tileSize,
+            tileMinZ,
+            tileMinZ + tileSize,
+            false,
+            0.0f,
+            0.0f,
+            0.0f,
+            0.0f
+        };
     }
 
     float tileCenterDistanceSquared(const Vec3 &center, float tileSize, int tileX, int tileZ)
@@ -4357,6 +4828,19 @@ namespace TrueFlightApp
         const float sampleZ = (static_cast<float>(tileZ) + 0.5f) * tileSize;
         const float dx = sampleX - center.x;
         const float dz = sampleZ - center.z;
+        return (dx * dx) + (dz * dz);
+    }
+
+    float tileMinDistanceSquared(const Vec3 &center, float tileSize, int tileX, int tileZ)
+    {
+        const float tileMinX = static_cast<float>(tileX) * tileSize;
+        const float tileMinZ = static_cast<float>(tileZ) * tileSize;
+        const float tileMaxX = tileMinX + tileSize;
+        const float tileMaxZ = tileMinZ + tileSize;
+        const float closestX = clamp(center.x, tileMinX, tileMaxX);
+        const float closestZ = clamp(center.z, tileMinZ, tileMaxZ);
+        const float dx = center.x - closestX;
+        const float dz = center.z - closestZ;
         return (dx * dx) + (dz * dz);
     }
 
@@ -4400,6 +4884,14 @@ namespace TrueFlightApp
 
     bool tileIntersectsRange(const TerrainVisualCache &terrainCache, const TerrainFarTile &tile, const Vec3 &position, float range)
     {
+        if (tile.usePlanetTile && tile.cullRadius > 0.0f)
+        {
+            const float dx = tile.cullCenter.x - position.x;
+            const float dz = tile.cullCenter.z - position.z;
+            const float maxDistance = range + tile.cullRadius;
+            return ((dx * dx) + (dz * dz)) <= (maxDistance * maxDistance);
+        }
+
         const float tileSize = terrainTileSizeForTile(terrainCache, tile);
         const float tileMinX = static_cast<float>(tile.tileX) * tileSize;
         const float tileMinZ = static_cast<float>(tile.tileZ) * tileSize;
@@ -4650,6 +5142,25 @@ namespace TrueFlightApp
         return std::max(1, params.lod0ChunkScale);
     }
 
+    int terrainPlanetScaleLevel(const TerrainParams &params, int tileScale)
+    {
+        const int baseScale = terrainNearScaleLimit(params);
+        int safeScale = std::max(baseScale, tileScale);
+        int level = 0;
+        while (safeScale > baseScale && level < 30)
+        {
+            safeScale = std::max(baseScale, safeScale / 2);
+            ++level;
+        }
+        return level;
+    }
+
+    int terrainPlanetTileLodForScale(const TerrainParams &params, int tileScale)
+    {
+        const int scaleLevel = terrainPlanetScaleLevel(params, tileScale);
+        return std::clamp((kPlanetTerrainQuadtreeLevels - 1) - scaleLevel, 0, 24);
+    }
+
     TerrainFarTileBand terrainTileBandForScale(const TerrainParams &params, int tileScale)
     {
         const int safeScale = std::max(1, tileScale);
@@ -4697,22 +5208,19 @@ namespace TrueFlightApp
         const std::optional<TerrainChunkBakeCache> &bakeCache,
         std::string_view terrainWorldId,
         std::uint64_t paramsSignature,
-        std::uint64_t sourceSignature)
+        std::uint64_t sourceSignature,
+        bool usePlanetTile = false,
+        const PlanetTileId &planetTile = {})
     {
-        const float tileSize = terrainTileSizeForScale(terrainContext.params, tileScale);
-        const float tileMinX = static_cast<float>(tileX) * tileSize;
-        const float tileMinZ = static_cast<float>(tileZ) * tileSize;
         const float cellSize = terrainCellSizeForTile(terrainContext, band, detail, tileScale);
-        const TerrainPatchBounds tileBounds{
-            tileMinX,
-            tileMinX + tileSize,
-            tileMinZ,
-            tileMinZ + tileSize,
-            false,
-            0.0f,
-            0.0f,
-            0.0f,
-            0.0f};
+        const TerrainPatchBounds tileBounds = terrainTileLocalBounds(
+            band,
+            tileScale,
+            tileX,
+            tileZ,
+            usePlanetTile,
+            planetTile,
+            terrainContext);
 
         TerrainChunkKey key;
         key.worldId = terrainWorldId.empty() ? std::string("default") : std::string(terrainWorldId);
@@ -4727,11 +5235,15 @@ namespace TrueFlightApp
         key.tileZ = tileZ;
         if (terrainContext.params.worldShape == WorldShape::Planet)
         {
-            const float centerX = tileMinX + (tileSize * 0.5f);
-            const float centerZ = tileMinZ + (tileSize * 0.5f);
-            key.planetTile = cubeSphereTileForDirection(
-                terrainHorizontalDirectionPlanetFixed(centerX, centerZ, terrainContext),
-                std::max(0, 10 - std::min(10, key.tileScale / std::max(1, terrainContext.params.lod0ChunkScale))));
+            key.planetTile =
+                usePlanetTile
+                    ? planetTile
+                    : cubeSphereTileForDirection(
+                          terrainHorizontalDirectionPlanetFixed(
+                              (tileBounds.x0 + tileBounds.x1) * 0.5f,
+                              (tileBounds.z0 + tileBounds.z1) * 0.5f,
+                              terrainContext),
+                          terrainPlanetTileLodForScale(terrainContext.params, key.tileScale));
         }
         key.paramsSignature = paramsSignature;
         key.sourceSignature = sourceSignature;
@@ -4808,13 +5320,51 @@ namespace TrueFlightApp
                std::to_string(tileZ);
     }
 
+    std::string terrainTileIdentityKey(const TerrainTileRequest &request)
+    {
+        if (!request.usePlanetTile)
+        {
+            return terrainTileIdentityKey(request.band, request.tileScale, request.tileX, request.tileZ);
+        }
+
+        return std::to_string(static_cast<int>(request.band)) + "|" +
+               std::to_string(request.tileScale) + "|p|" +
+               std::to_string(request.planetTile.face) + "|" +
+               std::to_string(request.planetTile.lod) + "|" +
+               std::to_string(request.planetTile.tx) + "|" +
+               std::to_string(request.planetTile.ty);
+    }
+
+    std::string terrainTileIdentityKey(const TerrainFarTile &tile)
+    {
+        if (!tile.usePlanetTile)
+        {
+            return terrainTileIdentityKey(tile.band, tile.tileScale, tile.tileX, tile.tileZ);
+        }
+
+        return std::to_string(static_cast<int>(tile.band)) + "|" +
+               std::to_string(tile.tileScale) + "|p|" +
+               std::to_string(tile.planetTile.face) + "|" +
+               std::to_string(tile.planetTile.lod) + "|" +
+               std::to_string(tile.planetTile.tx) + "|" +
+               std::to_string(tile.planetTile.ty);
+    }
+
     std::string terrainTileRequestKey(const TerrainTileRequest &request)
     {
         return std::to_string(static_cast<int>(request.band)) + "|" +
                std::to_string(static_cast<int>(request.detail)) + "|" +
-               std::to_string(request.tileScale) + "|" +
-               std::to_string(request.tileX) + "|" +
-               std::to_string(request.tileZ) + "|" +
+               (request.usePlanetTile
+                    ? ("p|" +
+                       std::to_string(request.tileScale) + "|" +
+                       std::to_string(request.planetTile.face) + "|" +
+                       std::to_string(request.planetTile.lod) + "|" +
+                       std::to_string(request.planetTile.tx) + "|" +
+                       std::to_string(request.planetTile.ty))
+                    : (std::to_string(request.tileScale) + "|" +
+                       std::to_string(request.tileX) + "|" +
+                       std::to_string(request.tileZ))) +
+               "|" +
                std::to_string(request.paramsSignature) + "|" +
                std::to_string(request.sourceSignature);
     }
@@ -4824,8 +5374,10 @@ namespace TrueFlightApp
         return lhs.band == rhs.band &&
                lhs.detail == rhs.detail &&
                lhs.tileScale == rhs.tileScale &&
-               lhs.tileX == rhs.tileX &&
-               lhs.tileZ == rhs.tileZ &&
+               lhs.usePlanetTile == rhs.usePlanetTile &&
+               (lhs.usePlanetTile
+                    ? terrainPlanetTilesEqual(lhs.planetTile, rhs.planetTile)
+                    : (lhs.tileX == rhs.tileX && lhs.tileZ == rhs.tileZ)) &&
                lhs.paramsSignature == rhs.paramsSignature &&
                lhs.sourceSignature == rhs.sourceSignature;
     }
@@ -4981,7 +5533,9 @@ namespace TrueFlightApp
             result.request.band,
             result.request.tileScale,
             result.request.tileX,
-            result.request.tileZ);
+            result.request.tileZ,
+            result.request.usePlanetTile,
+            result.request.planetTile);
         if (!shouldApplyTerrainChunkResult(existingTile, result.request))
         {
             return;
@@ -4997,6 +5551,8 @@ namespace TrueFlightApp
             tile.tileZ = result.request.tileZ;
             tile.paramsSignature = result.request.paramsSignature;
             tile.sourceSignature = result.request.sourceSignature;
+            tile.usePlanetTile = result.request.usePlanetTile;
+            tile.planetTile = result.request.planetTile;
             tile.terrainModel = std::move(result.compiledChunk.terrainModel);
             tile.waterModel = std::move(result.compiledChunk.waterModel);
             tile.propModel = std::move(result.compiledChunk.propModel);
@@ -5010,6 +5566,8 @@ namespace TrueFlightApp
         existingTile->tileScale = result.request.tileScale;
         existingTile->paramsSignature = result.request.paramsSignature;
         existingTile->sourceSignature = result.request.sourceSignature;
+        existingTile->usePlanetTile = result.request.usePlanetTile;
+        existingTile->planetTile = result.request.planetTile;
         existingTile->terrainModel = std::move(result.compiledChunk.terrainModel);
         existingTile->waterModel = std::move(result.compiledChunk.waterModel);
         existingTile->propModel = std::move(result.compiledChunk.propModel);
@@ -5065,13 +5623,23 @@ namespace TrueFlightApp
             center.x + clamp(velocity.x * leadSeconds, -(lod0TileSize * 8.0f), lod0TileSize * 8.0f),
             center.y,
             center.z + clamp(velocity.z * leadSeconds, -(lod0TileSize * 8.0f), lod0TileSize * 8.0f)};
-        const auto tileSourceSignature = [&](TerrainFarTileBand band, int tileScale, int tileX, int tileZ)
+        const auto tileSourceSignature = [&](
+                                             TerrainFarTileBand band,
+                                             int tileScale,
+                                             int tileX,
+                                             int tileZ,
+                                             bool usePlanetTile = false,
+                                             const PlanetTileId &planetTile = {})
         {
-            (void)band;
-            const float tileSize = terrainTileSizeForScale(params, tileScale);
-            const float x0 = static_cast<float>(tileX) * tileSize;
-            const float z0 = static_cast<float>(tileZ) * tileSize;
-            return terrainSourceSignature(terrainContext, x0, z0, x0 + tileSize, z0 + tileSize);
+            const TerrainPatchBounds tileBounds = terrainTileLocalBounds(
+                band,
+                tileScale,
+                tileX,
+                tileZ,
+                usePlanetTile,
+                planetTile,
+                terrainContext);
+            return terrainSourceSignature(terrainContext, tileBounds.x0, tileBounds.z0, tileBounds.x1, tileBounds.z1);
         };
         const int displayedChunkLimit = std::max(
             32,
@@ -5173,7 +5741,9 @@ namespace TrueFlightApp
                                                         result.request.band,
                                                         result.request.tileScale,
                                                         result.request.tileX,
-                                                        result.request.tileZ))
+                                                        result.request.tileZ,
+                                                        result.request.usePlanetTile,
+                                                        result.request.planetTile))
                 {
                     continue;
                 }
@@ -5195,19 +5765,32 @@ namespace TrueFlightApp
         for (TerrainFarTile &tile : terrainCache.nearTiles)
         {
             nearTileLookup.emplace(
-                terrainTileIdentityKey(tile.band, tile.tileScale, tile.tileX, tile.tileZ),
+                terrainTileIdentityKey(tile),
                 &tile);
         }
         for (TerrainFarTile &tile : terrainCache.farTiles)
         {
             farTileLookup.emplace(
-                terrainTileIdentityKey(tile.band, tile.tileScale, tile.tileX, tile.tileZ),
+                terrainTileIdentityKey(tile),
                 &tile);
         }
 
-        const auto lookupTerrainTile = [&](TerrainFarTileBand band, int tileScale, int tileX, int tileZ) -> TerrainFarTile *
+        const auto lookupTerrainTile = [&](
+                                           TerrainFarTileBand band,
+                                           int tileScale,
+                                           int tileX,
+                                           int tileZ,
+                                           bool usePlanetTile = false,
+                                           const PlanetTileId &planetTile = {}) -> TerrainFarTile *
         {
-            const std::string key = terrainTileIdentityKey(band, tileScale, tileX, tileZ);
+            TerrainTileRequest lookupRequest;
+            lookupRequest.band = band;
+            lookupRequest.tileScale = tileScale;
+            lookupRequest.tileX = tileX;
+            lookupRequest.tileZ = tileZ;
+            lookupRequest.usePlanetTile = usePlanetTile;
+            lookupRequest.planetTile = planetTile;
+            const std::string key = terrainTileIdentityKey(lookupRequest);
             if (band == TerrainFarTileBand::Near)
             {
                 const auto it = nearTileLookup.find(key);
@@ -5217,42 +5800,9 @@ namespace TrueFlightApp
             return it != farTileLookup.end() ? it->second : nullptr;
         };
 
-        struct TerrainScaleLevel
-        {
-            int tileScale = 1;
-            float tileSize = 0.0f;
-            float halfExtent = 0.0f;
-            float anchorX = 0.0f;
-            float anchorZ = 0.0f;
-        };
-
         const int baseTileScale = std::max(1, params.lod0ChunkScale);
         const float baseTileSize = terrainTileSizeForScale(params, baseTileScale);
-        const int tileRadius = std::max(2, static_cast<int>(std::ceil(nearHalfExtent / std::max(1.0f, baseTileSize))));
         const float desiredFarRadius = std::max(farHalfExtent, computeAltitudeAwareTerrainRadius(center, terrainContext));
-        std::vector<TerrainScaleLevel> levels;
-        levels.reserve(12u);
-        for (int scale = baseTileScale, safety = 0; safety < 12; ++safety)
-        {
-            const float tileSize = terrainTileSizeForScale(params, scale);
-            float halfExtent = std::max(nearHalfExtent, tileSize * static_cast<float>(tileRadius));
-            bool isLastLevel = halfExtent >= desiredFarRadius * 0.98f || scale >= 16384;
-            if (isLastLevel)
-            {
-                halfExtent = std::max(halfExtent, quantizeUp(desiredFarRadius, tileSize));
-            }
-            levels.push_back({
-                scale,
-                tileSize,
-                halfExtent,
-                snapToSpacing(center.x, tileSize),
-                snapToSpacing(center.z, tileSize)});
-            if (isLastLevel)
-            {
-                break;
-            }
-            scale *= 2;
-        }
 
         const float planarVelocitySq = (velocity.x * velocity.x) + (velocity.z * velocity.z);
         const float planarVelocity = std::sqrt(std::max(0.0f, planarVelocitySq));
@@ -5293,72 +5843,264 @@ namespace TrueFlightApp
             int tileX = 0;
             int tileZ = 0;
             float priority = 0.0f;
+            bool usePlanetTile = false;
+            PlanetTileId planetTile{};
         };
 
         std::vector<TerrainTileCandidate> candidateTiles;
         candidateTiles.reserve(static_cast<std::size_t>(displayedChunkLimit * 2));
-        for (std::size_t levelIndex = 0u; levelIndex < levels.size(); ++levelIndex)
+        if (params.worldShape == WorldShape::Planet)
         {
-            const TerrainScaleLevel &level = levels[levelIndex];
-            const float levelX0 = level.anchorX - level.halfExtent;
-            const float levelX1 = level.anchorX + level.halfExtent;
-            const float levelZ0 = level.anchorZ - level.halfExtent;
-            const float levelZ1 = level.anchorZ + level.halfExtent;
-
-            bool hasInnerBounds = false;
-            float innerX0 = 0.0f;
-            float innerX1 = 0.0f;
-            float innerZ0 = 0.0f;
-            float innerZ1 = 0.0f;
-            if (levelIndex > 0u)
+            struct PlanetTileCoverage
             {
-                const TerrainScaleLevel &innerLevel = levels[levelIndex - 1u];
-                hasInnerBounds = true;
-                innerX0 = innerLevel.anchorX - innerLevel.halfExtent;
-                innerX1 = innerLevel.anchorX + innerLevel.halfExtent;
-                innerZ0 = innerLevel.anchorZ - innerLevel.halfExtent;
-                innerZ1 = innerLevel.anchorZ + innerLevel.halfExtent;
-            }
+                TerrainPatchBounds bounds{};
+                Vec3 centerLocal{};
+                float radius = 0.0f;
+            };
 
-            const TerrainFarTileBand band = terrainTileBandForScale(params, level.tileScale);
-            if ((band == TerrainFarTileBand::Mid && !allowMidBand) ||
-                (band == TerrainFarTileBand::Horizon && !allowHorizonBand))
+            const auto estimatePlanetTileCoverage = [&](const PlanetTileId &planetTile) -> PlanetTileCoverage
             {
-                continue;
-            }
+                const std::array<Vec2, 5> samples {
+                    Vec2 { 0.0f, 0.0f },
+                    Vec2 { 1.0f, 0.0f },
+                    Vec2 { 0.0f, 1.0f },
+                    Vec2 { 1.0f, 1.0f },
+                    Vec2 { 0.5f, 0.5f }
+                };
 
-            for (int tileZ = tileIndexBegin(levelZ0, level.tileSize); tileZ < tileIndexEnd(levelZ1, level.tileSize); ++tileZ)
-            {
-                for (int tileX = tileIndexBegin(levelX0, level.tileSize); tileX < tileIndexEnd(levelX1, level.tileSize); ++tileX)
+                Vec3 minBounds {
+                    std::numeric_limits<float>::infinity(),
+                    std::numeric_limits<float>::infinity(),
+                    std::numeric_limits<float>::infinity()
+                };
+                Vec3 maxBounds {
+                    -std::numeric_limits<float>::infinity(),
+                    -std::numeric_limits<float>::infinity(),
+                    -std::numeric_limits<float>::infinity()
+                };
+                Vec3 sampleSum {};
+                std::array<Vec3, 5> samplePositions {};
+                for (std::size_t index = 0; index < samples.size(); ++index)
                 {
-                    if (hasInnerBounds && tileInsideSquare(tileX, tileZ, level.tileSize, innerX0, innerX1, innerZ0, innerZ1))
-                    {
-                        continue;
-                    }
-                    if (!tileWithinDirectionalCoverage(band, level.tileSize, tileX, tileZ))
-                    {
-                        continue;
-                    }
+                    const DVec3 direction = terrainPlanetTileDirection(planetTile, samples[index].x, samples[index].y);
+                    const float elevation = samplePlanetTileSurfaceElevationForDirection(direction, terrainContext);
+                    const Vec3 localPosition = terrainPlanetDirectionToLocalPosition(
+                        direction,
+                        params.planet.radiusMeters + static_cast<double>(elevation),
+                        terrainContext);
+                    samplePositions[index] = localPosition;
+                    sampleSum += localPosition;
+                    minBounds.x = std::min(minBounds.x, localPosition.x);
+                    minBounds.y = std::min(minBounds.y, localPosition.y);
+                    minBounds.z = std::min(minBounds.z, localPosition.z);
+                    maxBounds.x = std::max(maxBounds.x, localPosition.x);
+                    maxBounds.y = std::max(maxBounds.y, localPosition.y);
+                    maxBounds.z = std::max(maxBounds.z, localPosition.z);
+                }
 
-                    const TerrainPatchBounds tileBounds{
-                        static_cast<float>(tileX) * level.tileSize,
-                        (static_cast<float>(tileX) + 1.0f) * level.tileSize,
-                        static_cast<float>(tileZ) * level.tileSize,
-                        (static_cast<float>(tileZ) + 1.0f) * level.tileSize,
-                        false,
-                        0.0f,
-                        0.0f,
-                        0.0f,
-                        0.0f};
-                    candidateTiles.push_back({
-                        band,
-                        preferredTerrainTileDetail(band, tileBounds, terrainContext),
-                        level.tileScale,
-                        tileX,
-                        tileZ,
-                        tileCenterDistanceSquared(prefetchCenter, level.tileSize, tileX, tileZ) +
-                            terrainTilePriorityBias(band) +
-                            static_cast<float>(level.tileScale * level.tileScale)});
+                PlanetTileCoverage coverage;
+                coverage.centerLocal = sampleSum / static_cast<float>(samples.size());
+                coverage.radius = 0.0f;
+                for (const Vec3 &samplePosition : samplePositions)
+                {
+                    coverage.radius = std::max(coverage.radius, length(samplePosition - coverage.centerLocal));
+                }
+                coverage.radius = std::max(coverage.radius, 1.0f);
+                coverage.bounds = {
+                    minBounds.x,
+                    maxBounds.x,
+                    minBounds.z,
+                    maxBounds.z,
+                    false,
+                    0.0f,
+                    0.0f,
+                    0.0f,
+                    0.0f
+                };
+                return coverage;
+            };
+
+            const auto tileScaleForPlanetTile = [&](const PlanetTileId &planetTile)
+            {
+                const int scaleLevel = std::max(0, (kPlanetTerrainQuadtreeLevels - 1) - planetTile.lod);
+                return baseTileScale << scaleLevel;
+            };
+
+            const auto tileWithinPlanetDirectionalCoverage = [&](TerrainFarTileBand band, const Vec3 &sampleCenter)
+            {
+                if (!useForwardCone || band != TerrainFarTileBand::Horizon)
+                {
+                    return true;
+                }
+
+                const float dx = sampleCenter.x - center.x;
+                const float dz = sampleCenter.z - center.z;
+                const float distanceSq = (dx * dx) + (dz * dz);
+                if (distanceSq <= (rearCoverageRadius * rearCoverageRadius))
+                {
+                    return true;
+                }
+                const float distance = std::sqrt(std::max(1.0f, distanceSq));
+                const float alignment = ((dx * forwardX) + (dz * forwardZ)) / distance;
+                return alignment >= horizonConeCosine;
+            };
+
+            const auto appendPlanetQuadtreeTile = [&](auto &&self, const PlanetTileId &planetTile) -> void
+            {
+                const int tileScale = tileScaleForPlanetTile(planetTile);
+                const TerrainFarTileBand band = terrainTileBandForScale(params, tileScale);
+                if ((band == TerrainFarTileBand::Mid && !allowMidBand) ||
+                    (band == TerrainFarTileBand::Horizon && !allowHorizonBand))
+                {
+                    return;
+                }
+
+                const PlanetTileCoverage coverage = estimatePlanetTileCoverage(planetTile);
+                const float distanceToTile = std::max(0.0f, length(coverage.centerLocal - center) - coverage.radius);
+                if (distanceToTile > desiredFarRadius)
+                {
+                    return;
+                }
+                if (!tileWithinPlanetDirectionalCoverage(band, coverage.centerLocal))
+                {
+                    return;
+                }
+
+                const float projectedSize = coverage.radius / std::max(1.0f, distanceToTile + coverage.radius);
+                const float splitThreshold =
+                    band == TerrainFarTileBand::Near
+                        ? 0.11f
+                        : (band == TerrainFarTileBand::Mid ? 0.16f : 0.24f);
+                if (planetTile.lod < (kPlanetTerrainQuadtreeLevels - 1) && projectedSize > splitThreshold)
+                {
+                    const int childTx = planetTile.tx * 2;
+                    const int childTy = planetTile.ty * 2;
+                    const int childLod = planetTile.lod + 1;
+                    self(self, { planetTile.face, childLod, childTx, childTy });
+                    self(self, { planetTile.face, childLod, childTx + 1, childTy });
+                    self(self, { planetTile.face, childLod, childTx, childTy + 1 });
+                    self(self, { planetTile.face, childLod, childTx + 1, childTy + 1 });
+                    return;
+                }
+
+                candidateTiles.push_back({
+                    band,
+                    preferredTerrainTileDetail(band, coverage.bounds, terrainContext),
+                    tileScale,
+                    planetTile.tx,
+                    planetTile.ty,
+                    lengthSquared(coverage.centerLocal - prefetchCenter) +
+                        terrainTilePriorityBias(band) +
+                        static_cast<float>(tileScale * tileScale),
+                    true,
+                    planetTile
+                });
+            };
+
+            for (int face = 0; face < 6; ++face)
+            {
+                appendPlanetQuadtreeTile(appendPlanetQuadtreeTile, { face, 0, 0, 0 });
+            }
+        }
+        else
+        {
+            struct TerrainScaleLevel
+            {
+                int tileScale = 1;
+                float tileSize = 0.0f;
+                float halfExtent = 0.0f;
+                float anchorX = 0.0f;
+                float anchorZ = 0.0f;
+            };
+
+            const int tileRadius = std::max(2, static_cast<int>(std::ceil(nearHalfExtent / std::max(1.0f, baseTileSize))));
+            std::vector<TerrainScaleLevel> levels;
+            levels.reserve(12u);
+            for (int scale = baseTileScale, safety = 0; safety < 12; ++safety)
+            {
+                const float tileSize = terrainTileSizeForScale(params, scale);
+                float halfExtent = std::max(nearHalfExtent, tileSize * static_cast<float>(tileRadius));
+                bool isLastLevel = halfExtent >= desiredFarRadius * 0.98f || scale >= 16384;
+                if (isLastLevel)
+                {
+                    halfExtent = std::max(halfExtent, quantizeUp(desiredFarRadius, tileSize));
+                }
+                levels.push_back({
+                    scale,
+                    tileSize,
+                    halfExtent,
+                    snapToSpacing(center.x, tileSize),
+                    snapToSpacing(center.z, tileSize)});
+                if (isLastLevel)
+                {
+                    break;
+                }
+                scale *= 2;
+            }
+
+            for (std::size_t levelIndex = 0u; levelIndex < levels.size(); ++levelIndex)
+            {
+                const TerrainScaleLevel &level = levels[levelIndex];
+                const float levelX0 = level.anchorX - level.halfExtent;
+                const float levelX1 = level.anchorX + level.halfExtent;
+                const float levelZ0 = level.anchorZ - level.halfExtent;
+                const float levelZ1 = level.anchorZ + level.halfExtent;
+
+                bool hasInnerBounds = false;
+                float innerX0 = 0.0f;
+                float innerX1 = 0.0f;
+                float innerZ0 = 0.0f;
+                float innerZ1 = 0.0f;
+                if (levelIndex > 0u)
+                {
+                    const TerrainScaleLevel &innerLevel = levels[levelIndex - 1u];
+                    hasInnerBounds = true;
+                    innerX0 = innerLevel.anchorX - innerLevel.halfExtent;
+                    innerX1 = innerLevel.anchorX + innerLevel.halfExtent;
+                    innerZ0 = innerLevel.anchorZ - innerLevel.halfExtent;
+                    innerZ1 = innerLevel.anchorZ + innerLevel.halfExtent;
+                }
+
+                const TerrainFarTileBand band = terrainTileBandForScale(params, level.tileScale);
+                if ((band == TerrainFarTileBand::Mid && !allowMidBand) ||
+                    (band == TerrainFarTileBand::Horizon && !allowHorizonBand))
+                {
+                    continue;
+                }
+
+                for (int tileZ = tileIndexBegin(levelZ0, level.tileSize); tileZ < tileIndexEnd(levelZ1, level.tileSize); ++tileZ)
+                {
+                    for (int tileX = tileIndexBegin(levelX0, level.tileSize); tileX < tileIndexEnd(levelX1, level.tileSize); ++tileX)
+                    {
+                        if (hasInnerBounds && tileInsideSquare(tileX, tileZ, level.tileSize, innerX0, innerX1, innerZ0, innerZ1))
+                        {
+                            continue;
+                        }
+                        if (!tileWithinDirectionalCoverage(band, level.tileSize, tileX, tileZ))
+                        {
+                            continue;
+                        }
+
+                        const TerrainPatchBounds tileBounds{
+                            static_cast<float>(tileX) * level.tileSize,
+                            (static_cast<float>(tileX) + 1.0f) * level.tileSize,
+                            static_cast<float>(tileZ) * level.tileSize,
+                            (static_cast<float>(tileZ) + 1.0f) * level.tileSize,
+                            false,
+                            0.0f,
+                            0.0f,
+                            0.0f,
+                            0.0f};
+                        candidateTiles.push_back({
+                            band,
+                            preferredTerrainTileDetail(band, tileBounds, terrainContext),
+                            level.tileScale,
+                            tileX,
+                            tileZ,
+                            tileCenterDistanceSquared(prefetchCenter, level.tileSize, tileX, tileZ) +
+                                terrainTilePriorityBias(band) +
+                                static_cast<float>(level.tileScale * level.tileScale)});
+                    }
                 }
             }
         }
@@ -5377,7 +6119,13 @@ namespace TrueFlightApp
 
         for (const TerrainTileCandidate &candidate : candidateTiles)
         {
-            TerrainFarTile *tile = lookupTerrainTile(candidate.band, candidate.tileScale, candidate.tileX, candidate.tileZ);
+            TerrainFarTile *tile = lookupTerrainTile(
+                candidate.band,
+                candidate.tileScale,
+                candidate.tileX,
+                candidate.tileZ,
+                candidate.usePlanetTile,
+                candidate.planetTile);
             const bool needsSourceValidation =
                 tile == nullptr ||
                 paramsChanged ||
@@ -5385,7 +6133,13 @@ namespace TrueFlightApp
                 tile->paramsSignature != paramsSignature;
             const std::uint64_t sourceSignature =
                 needsSourceValidation
-                    ? tileSourceSignature(candidate.band, candidate.tileScale, candidate.tileX, candidate.tileZ)
+                    ? tileSourceSignature(
+                          candidate.band,
+                          candidate.tileScale,
+                          candidate.tileX,
+                          candidate.tileZ,
+                          candidate.usePlanetTile,
+                          candidate.planetTile)
                     : tile->sourceSignature;
             if (tile != nullptr)
             {
@@ -5396,51 +6150,67 @@ namespace TrueFlightApp
                         : tile->detail;
                 if (tile->paramsSignature != paramsSignature || tile->sourceSignature != sourceSignature)
                 {
-                    missingTiles.push_back({candidate.band,
-                                            requestDetail,
-                                            candidate.tileScale,
-                                            candidate.tileX,
-                                            candidate.tileZ,
-                                            paramsSignature,
-                                            sourceSignature,
-                                            candidate.priority});
+                    TerrainTileRequest request;
+                    request.band = candidate.band;
+                    request.detail = requestDetail;
+                    request.tileScale = candidate.tileScale;
+                    request.tileX = candidate.tileX;
+                    request.tileZ = candidate.tileZ;
+                    request.paramsSignature = paramsSignature;
+                    request.sourceSignature = sourceSignature;
+                    request.priority = candidate.priority;
+                    request.usePlanetTile = candidate.usePlanetTile;
+                    request.planetTile = candidate.planetTile;
+                    missingTiles.push_back(request);
                 }
                 else if (allowUpgrades)
                 {
                     if (terrainTileDetailRank(tile->detail) > terrainTileDetailRank(candidate.detail))
                     {
-                        upgradeTiles.push_back({candidate.band,
-                                                candidate.detail,
-                                                candidate.tileScale,
-                                                candidate.tileX,
-                                                candidate.tileZ,
-                                                paramsSignature,
-                                                sourceSignature,
-                                                candidate.priority});
+                        TerrainTileRequest request;
+                        request.band = candidate.band;
+                        request.detail = candidate.detail;
+                        request.tileScale = candidate.tileScale;
+                        request.tileX = candidate.tileX;
+                        request.tileZ = candidate.tileZ;
+                        request.paramsSignature = paramsSignature;
+                        request.sourceSignature = sourceSignature;
+                        request.priority = candidate.priority;
+                        request.usePlanetTile = candidate.usePlanetTile;
+                        request.planetTile = candidate.planetTile;
+                        upgradeTiles.push_back(request);
                     }
                     else if (const auto nextDetail = nextTerrainTileDetail(candidate.band, tile->detail); nextDetail.has_value())
                     {
-                        upgradeTiles.push_back({candidate.band,
-                                                *nextDetail,
-                                                candidate.tileScale,
-                                                candidate.tileX,
-                                                candidate.tileZ,
-                                                paramsSignature,
-                                                sourceSignature,
-                                                candidate.priority});
+                        TerrainTileRequest request;
+                        request.band = candidate.band;
+                        request.detail = *nextDetail;
+                        request.tileScale = candidate.tileScale;
+                        request.tileX = candidate.tileX;
+                        request.tileZ = candidate.tileZ;
+                        request.paramsSignature = paramsSignature;
+                        request.sourceSignature = sourceSignature;
+                        request.priority = candidate.priority;
+                        request.usePlanetTile = candidate.usePlanetTile;
+                        request.planetTile = candidate.planetTile;
+                        upgradeTiles.push_back(request);
                     }
                 }
                 continue;
             }
 
-            missingTiles.push_back({candidate.band,
-                                    candidate.detail,
-                                    candidate.tileScale,
-                                    candidate.tileX,
-                                    candidate.tileZ,
-                                    paramsSignature,
-                                    sourceSignature,
-                                    candidate.priority});
+            TerrainTileRequest request;
+            request.band = candidate.band;
+            request.detail = candidate.detail;
+            request.tileScale = candidate.tileScale;
+            request.tileX = candidate.tileX;
+            request.tileZ = candidate.tileZ;
+            request.paramsSignature = paramsSignature;
+            request.sourceSignature = sourceSignature;
+            request.priority = candidate.priority;
+            request.usePlanetTile = candidate.usePlanetTile;
+            request.planetTile = candidate.planetTile;
+            missingTiles.push_back(request);
         }
 
         std::sort(
@@ -5548,14 +6318,18 @@ namespace TrueFlightApp
                     bakeCache,
                     terrainWorldId,
                     request.paramsSignature,
-                    request.sourceSignature);
+                    request.sourceSignature,
+                    request.usePlanetTile,
+                    request.planetTile);
                 applyTerrainChunkResult(terrainCache, std::move(result));
                 if (TerrainFarTile *tile = findTerrainTile(
                         request.band == TerrainFarTileBand::Near ? terrainCache.nearTiles : terrainCache.farTiles,
                         request.band,
                         request.tileScale,
                         request.tileX,
-                        request.tileZ);
+                        request.tileZ,
+                        request.usePlanetTile,
+                        request.planetTile);
                     tile != nullptr)
                 {
                     tile->active = true;
@@ -5582,14 +6356,18 @@ namespace TrueFlightApp
                     bakeCache,
                     terrainWorldId,
                     request.paramsSignature,
-                    request.sourceSignature);
+                    request.sourceSignature,
+                    request.usePlanetTile,
+                    request.planetTile);
                 applyTerrainChunkResult(terrainCache, std::move(result));
                 if (TerrainFarTile *tile = findTerrainTile(
                         request.band == TerrainFarTileBand::Near ? terrainCache.nearTiles : terrainCache.farTiles,
                         request.band,
                         request.tileScale,
                         request.tileX,
-                        request.tileZ);
+                        request.tileZ,
+                        request.usePlanetTile,
+                        request.planetTile);
                     tile != nullptr)
                 {
                     tile->active = true;
@@ -5640,18 +6418,21 @@ namespace TrueFlightApp
         bool performedSyncBuild = false;
         const auto tileTouchesChangedChunk = [&](const TerrainFarTile &tile) -> bool
         {
-            const float tileSize = terrainTileSizeForTile(terrainCache, tile);
-            const float tileX0 = static_cast<float>(tile.tileX) * tileSize;
-            const float tileZ0 = static_cast<float>(tile.tileZ) * tileSize;
-            const float tileX1 = tileX0 + tileSize;
-            const float tileZ1 = tileZ0 + tileSize;
+            const TerrainPatchBounds tileBounds = terrainTileLocalBounds(
+                tile.band,
+                tile.tileScale,
+                tile.tileX,
+                tile.tileZ,
+                tile.usePlanetTile,
+                tile.planetTile,
+                terrainContext);
             for (const WorldChunkState &chunk : changedChunks)
             {
                 const float chunkX0 = static_cast<float>(chunk.cx) * chunkSize;
                 const float chunkZ0 = static_cast<float>(chunk.cz) * chunkSize;
                 const float chunkX1 = chunkX0 + chunkSize;
                 const float chunkZ1 = chunkZ0 + chunkSize;
-                if (tileX0 < chunkX1 && tileX1 > chunkX0 && tileZ0 < chunkZ1 && tileZ1 > chunkZ0)
+                if (tileBounds.x0 < chunkX1 && tileBounds.x1 > chunkX0 && tileBounds.z0 < chunkZ1 && tileBounds.z1 > chunkZ0)
                 {
                     return true;
                 }
@@ -5669,10 +6450,16 @@ namespace TrueFlightApp
                     continue;
                 }
 
-                const float tileSize = terrainTileSizeForTile(terrainCache, tile);
-                const float x0 = static_cast<float>(tile.tileX) * tileSize;
-                const float z0 = static_cast<float>(tile.tileZ) * tileSize;
-                const std::uint64_t sourceSignature = terrainSourceSignature(terrainContext, x0, z0, x0 + tileSize, z0 + tileSize);
+                const TerrainPatchBounds tileBounds = terrainTileLocalBounds(
+                    tile.band,
+                    tile.tileScale,
+                    tile.tileX,
+                    tile.tileZ,
+                    tile.usePlanetTile,
+                    tile.planetTile,
+                    terrainContext);
+                const std::uint64_t sourceSignature =
+                    terrainSourceSignature(terrainContext, tileBounds.x0, tileBounds.z0, tileBounds.x1, tileBounds.z1);
                 if (tile.paramsSignature == paramsSignature && tile.sourceSignature == sourceSignature)
                 {
                     continue;
@@ -5682,14 +6469,18 @@ namespace TrueFlightApp
                 {
                     tile.paramsSignature = 0u;
                     tile.sourceSignature = 0u;
-                    refreshRequests.push_back({tile.band,
-                                               tile.detail,
-                                               tile.tileScale,
-                                               tile.tileX,
-                                               tile.tileZ,
-                                               paramsSignature,
-                                               sourceSignature,
-                                               0.0f});
+                    TerrainTileRequest request;
+                    request.band = tile.band;
+                    request.detail = tile.detail;
+                    request.tileScale = tile.tileScale;
+                    request.tileX = tile.tileX;
+                    request.tileZ = tile.tileZ;
+                    request.paramsSignature = paramsSignature;
+                    request.sourceSignature = sourceSignature;
+                    request.priority = 0.0f;
+                    request.usePlanetTile = tile.usePlanetTile;
+                    request.planetTile = tile.planetTile;
+                    refreshRequests.push_back(request);
                     continue;
                 }
 
@@ -5701,6 +6492,8 @@ namespace TrueFlightApp
                 result.request.tileZ = tile.tileZ;
                 result.request.paramsSignature = paramsSignature;
                 result.request.sourceSignature = sourceSignature;
+                result.request.usePlanetTile = tile.usePlanetTile;
+                result.request.planetTile = tile.planetTile;
                 result.compiledChunk = buildTerrainTileChunk(
                     tile.band,
                     tile.detail,
@@ -5711,7 +6504,9 @@ namespace TrueFlightApp
                     bakeCache,
                     terrainWorldId,
                     paramsSignature,
-                    sourceSignature);
+                    sourceSignature,
+                    tile.usePlanetTile,
+                    tile.planetTile);
                 applyTerrainChunkResult(terrainCache, std::move(result));
                 performedSyncBuild = true;
             }
@@ -25909,6 +26704,7 @@ namespace TrueFlightApp
         }
 
         bool imguiEnabled = false;
+        bool imguiMenuEnabled = false; // The shared native menu path is currently the reliable mouse-driven UI.
         std::string imguiIniPathString = (boot.preferencesPath.parent_path() / "imgui_layout.ini").string();
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
@@ -26223,6 +27019,33 @@ namespace TrueFlightApp
         std::uint64_t previousCounter = SDL_GetPerformanceCounter();
         const double counterFrequency = static_cast<double>(SDL_GetPerformanceFrequency());
 
+        // -----------------------------------------------------------------------------
+        // 2) ADD THESE HELPERS NEAR menuVisible / usingImGuiMenu
+        // -----------------------------------------------------------------------------
+        auto isMouseEvent = [](const SDL_Event &event) -> bool
+        {
+            return event.type == SDL_EVENT_MOUSE_MOTION ||
+                event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+                event.type == SDL_EVENT_MOUSE_BUTTON_UP ||
+                event.type == SDL_EVENT_MOUSE_WHEEL;
+        };
+
+        auto releaseMouseForMenu = [&]()
+        {
+            if (mouseCaptured)
+            {
+                setMouseCapture(window, false);
+                mouseCaptured = false;
+            }
+        };
+
+        auto imguiWantsMouseNow = [&]() -> bool
+        {
+            return imguiEnabled &&
+                ImGui::GetCurrentContext() != nullptr &&
+                ImGui::GetIO().WantCaptureMouse;
+        };
+
         auto menuVisible = [&]() -> bool
         {
             return screen == AppScreen::MainMenu || (screen == AppScreen::InFlight && menuState.active);
@@ -26230,7 +27053,7 @@ namespace TrueFlightApp
 
         auto usingImGuiMenu = [&]() -> bool
         {
-            return imguiEnabled && menuVisible() && ImGui::GetCurrentContext() != nullptr;
+            return imguiEnabled && imguiMenuEnabled && menuVisible() && ImGui::GetCurrentContext() != nullptr;
         };
 
         const auto reportRenderFailure = [&](const std::string &renderError)
@@ -30244,10 +31067,10 @@ namespace TrueFlightApp
                     hudFrame->profilerOverlayLines);
             }
 
-            if (!menuVisible())
+            if (!menuVisible() || !imguiMenuEnabled)
             {
                 imguiMenuWasVisible = false;
-                if (creativeConsole.active && creativeConsoleAllowed())
+                if (!menuVisible() && creativeConsole.active && creativeConsoleAllowed())
                 {
                     int consoleWidth = 0;
                     int consoleHeight = 0;
@@ -33155,9 +33978,33 @@ namespace TrueFlightApp
             SDL_Event event{};
             while (SDL_PollEvent(&event))
             {
+                // -----------------------------------------------------------------------------
+                // 3) AT THE TOP OF THE SDL_PollEvent LOOP, CHANGE IMGUI EVENT HANDLING
+                //
+                //    replace this:
+                //        if (imguiEnabled && ImGui::GetCurrentContext() != nullptr)
+                //        {
+                //            ImGui_ImplSDL3_ProcessEvent(&event);
+                //        }
+                //
+                //    with this:
+                // -----------------------------------------------------------------------------
+                bool imguiConsumedEvent = false;
                 if (imguiEnabled && ImGui::GetCurrentContext() != nullptr)
                 {
-                    ImGui_ImplSDL3_ProcessEvent(&event);
+                    imguiConsumedEvent = ImGui_ImplSDL3_ProcessEvent(&event);
+                }
+
+                const bool mouseEvent = isMouseEvent(event);
+                const bool imguiOwnsMouseEvent =
+                    usingImGuiMenu() &&
+                    mouseEvent &&
+                    (imguiConsumedEvent || imguiWantsMouseNow());
+
+                // menu visible should never keep relative mouse mode alive
+                if (menuVisible() && mouseEvent)
+                {
+                    releaseMouseForMenu();
                 }
 
                 if (event.type == SDL_EVENT_QUIT)
@@ -33554,20 +34401,48 @@ namespace TrueFlightApp
                     continue;
                 }
 
-                if (menuVisible() && event.type == SDL_EVENT_MOUSE_MOTION)
-                {
-                    int menuWidth = 0;
-                    int menuHeight = 0;
-                    SDL_GetWindowSizeInPixels(window, &menuWidth, &menuHeight);
-                    const float menuScale = effectiveUiScale(boot.uiState);
-                    const PauseLayout layout = buildPauseLayout(menuWidth, menuHeight, menuScale, menuState.tab);
-                    const float logicalMouseX = static_cast<float>(event.motion.x) / menuScale;
-                    const float logicalMouseY = static_cast<float>(event.motion.y) / menuScale;
-                    boot.paintUi.canvasRect = paintCanvasRect(layout);
-
-                    if (usingImGuiMenu())
+                    // -----------------------------------------------------------------------------
+                    // 4) REPLACE YOUR MENU MOUSE-MOTION BLOCK WITH THIS
+                    // -----------------------------------------------------------------------------
+                    if (menuVisible() && event.type == SDL_EVENT_MOUSE_MOTION)
                     {
-                        if (boot.paintUi.draggingCanvas && menuState.tab == PauseTab::Paint)
+                        int menuWidth = 0;
+                        int menuHeight = 0;
+                        SDL_GetWindowSizeInPixels(window, &menuWidth, &menuHeight);
+                        const float menuScale = effectiveUiScale(boot.uiState);
+                        const PauseLayout layout = buildPauseLayout(menuWidth, menuHeight, menuScale, menuState.tab);
+                        const float logicalMouseX = static_cast<float>(event.motion.x) / menuScale;
+                        const float logicalMouseY = static_cast<float>(event.motion.y) / menuScale;
+                        boot.paintUi.canvasRect = paintCanvasRect(layout);
+
+                        // keep paint canvas working in ImGui mode
+                        if (usingImGuiMenu())
+                        {
+                            if (boot.paintUi.draggingCanvas && menuState.tab == PauseTab::Paint)
+                            {
+                                tryPaintCanvasStroke(
+                                    layout,
+                                    menuState,
+                                    boot.paintUi,
+                                    boot.planeVisual,
+                                    boot.walkingVisual,
+                                    boot.enemyEscortVisual,
+                                    boot.groundTargetVisual,
+                                    logicalMouseX,
+                                    logicalMouseY,
+                                    false);
+                            }
+
+                            // let ImGui own actual menu hover/click handling
+                            if (imguiOwnsMouseEvent)
+                            {
+                                continue;
+                            }
+
+                            continue;
+                        }
+
+                        if (boot.paintUi.draggingCanvas)
                         {
                             tryPaintCanvasStroke(
                                 layout,
@@ -33580,49 +34455,40 @@ namespace TrueFlightApp
                                 logicalMouseX,
                                 logicalMouseY,
                                 false);
+                            continue;
                         }
-                        continue;
-                    }
 
-                    if (boot.paintUi.draggingCanvas)
-                    {
-                        tryPaintCanvasStroke(
-                            layout,
-                            menuState,
-                            boot.paintUi,
-                            boot.planeVisual,
-                            boot.walkingVisual,
-                            boot.enemyEscortVisual,
-                            boot.groundTargetVisual,
-                            logicalMouseX,
-                            logicalMouseY,
-                            false);
-                        continue;
-                    }
-
-                    if (menuState.rowDragActive)
-                    {
-                        constexpr float dragStepPixels = 18.0f;
-                        float deltaX = logicalMouseX - menuState.rowDragLastX;
-                        while (std::fabs(deltaX) >= dragStepPixels)
+                        if (menuState.rowDragActive)
                         {
-                            const int direction = deltaX > 0.0f ? 1 : -1;
-                            adjustSelectedRow(direction, uiNowSeconds);
-                            menuState.rowDragLastX += dragStepPixels * static_cast<float>(direction);
-                            deltaX = logicalMouseX - menuState.rowDragLastX;
+                            constexpr float dragStepPixels = 18.0f;
+                            float deltaX = logicalMouseX - menuState.rowDragLastX;
+                            while (std::fabs(deltaX) >= dragStepPixels)
+                            {
+                                const int direction = deltaX > 0.0f ? 1 : -1;
+                                adjustSelectedRow(direction, uiNowSeconds);
+                                menuState.rowDragLastX += dragStepPixels * static_cast<float>(direction);
+                                deltaX = logicalMouseX - menuState.rowDragLastX;
+                            }
+                            continue;
                         }
+
                         continue;
                     }
 
-                    continue;
-                }
-
+                // -----------------------------------------------------------------------------
+                // 5) REPLACE YOUR MENU MOUSE-WHEEL BLOCK WITH THIS
+                // -----------------------------------------------------------------------------
                 if (menuVisible() && event.type == SDL_EVENT_MOUSE_WHEEL)
                 {
                     if (usingImGuiMenu())
                     {
+                        if (imguiOwnsMouseEvent)
+                        {
+                            continue;
+                        }
                         continue;
                     }
+
                     const int wheelY = static_cast<int>(event.wheel.y);
                     const int moveDirection = wheelY > 0 ? -1 : 1;
                     if (wheelY != 0)
@@ -33631,7 +34497,9 @@ namespace TrueFlightApp
                     }
                     continue;
                 }
-
+                // -----------------------------------------------------------------------------
+                // 6) REPLACE YOUR MENU MOUSE-BUTTON-DOWN BLOCK WITH THIS
+                // -----------------------------------------------------------------------------
                 if (menuVisible() && event.type == SDL_EVENT_MOUSE_BUTTON_DOWN)
                 {
                     int menuWidth = 0;
@@ -33644,6 +34512,7 @@ namespace TrueFlightApp
 
                     if (usingImGuiMenu())
                     {
+                        // keep paint canvas working in ImGui mode
                         if (event.button.button == SDL_BUTTON_LEFT &&
                             menuState.tab == PauseTab::Paint &&
                             tryPaintCanvasStroke(
@@ -33659,7 +34528,15 @@ namespace TrueFlightApp
                                 true))
                         {
                             boot.paintUi.draggingCanvas = true;
+                            continue;
                         }
+
+                        // actual menu widgets are owned by ImGui
+                        if (imguiOwnsMouseEvent)
+                        {
+                            continue;
+                        }
+
                         continue;
                     }
 
@@ -33841,7 +34718,9 @@ namespace TrueFlightApp
                     }
                     continue;
                 }
-
+                // -----------------------------------------------------------------------------
+                // 7) REPLACE YOUR MENU MOUSE-BUTTON-UP BLOCK WITH THIS
+                // -----------------------------------------------------------------------------
                 if (menuVisible() && event.type == SDL_EVENT_MOUSE_BUTTON_UP)
                 {
                     if (event.button.button == SDL_BUTTON_LEFT)
@@ -33849,13 +34728,14 @@ namespace TrueFlightApp
                         boot.paintUi.draggingCanvas = false;
                         menuState.rowDragActive = false;
                     }
-                    if (usingImGuiMenu())
+
+                    if (usingImGuiMenu() && imguiOwnsMouseEvent)
                     {
                         continue;
                     }
+
                     continue;
                 }
-
                 if (menuVisible() && event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat)
                 {
                     const SDL_Scancode scancode = event.key.scancode;

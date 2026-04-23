@@ -763,18 +763,27 @@ inline TerrainParams normalizeTerrainParams(TerrainParams params)
         const float curvatureDrop =
             static_cast<float>((static_cast<double>(regionalRadius) * static_cast<double>(regionalRadius)) /
                                (std::max(1.0, params.planet.radiusMeters) * 2.0));
-        params.worldRadius = regionalRadius;
-        params.gameplayRadiusMeters = std::max(params.chunkSize, params.nearSurfaceArcRadiusMeters);
-        params.midFieldRadiusMeters = std::max(params.gameplayRadiusMeters + params.chunkSize, regionalRadius * 0.5f);
-        params.horizonRadiusMeters = regionalRadius;
+        params.worldRadius = std::max(params.worldRadius, regionalRadius);
+        params.gameplayRadiusMeters = clamp(
+            params.gameplayRadiusMeters,
+            params.chunkSize,
+            std::max(params.chunkSize, regionalRadius));
+        params.midFieldRadiusMeters = clamp(
+            params.midFieldRadiusMeters,
+            params.gameplayRadiusMeters + params.chunkSize,
+            regionalRadius);
+        params.horizonRadiusMeters = clamp(
+            params.horizonRadiusMeters,
+            params.midFieldRadiusMeters + params.chunkSize,
+            regionalRadius);
         params.minY = std::min(params.minY, -(curvatureDrop + params.heightAmplitude + 6000.0f));
         params.maxY = std::max(params.maxY, params.heightAmplitude + 500000.0f);
         params.waterWaveAmplitude = std::min(params.waterWaveAmplitude, 6.0f);
         params.drawDistanceOverridesLodRadius = false;
-        params.maxDisplayedChunks = std::min(params.maxDisplayedChunks, 640);
-        params.maxDisplayedChunksHardCap = std::min(params.maxDisplayedChunksHardCap, 1024);
-        params.maxPendingChunks = std::min(params.maxPendingChunks, 64);
-        params.chunkCacheLimit = std::min(params.chunkCacheLimit, 160);
+        params.maxDisplayedChunks = std::min(params.maxDisplayedChunks, 768);
+        params.maxDisplayedChunksHardCap = std::min(params.maxDisplayedChunksHardCap, 1536);
+        params.maxPendingChunks = std::min(params.maxPendingChunks, 128);
+        params.chunkCacheLimit = std::min(params.chunkCacheLimit, 256);
     }
 
     params.surfaceOnlyMeshing = !(params.caveEnabled || params.tunnelCount > 0 || !params.explicitTunnelSeeds.empty());
@@ -1811,30 +1820,61 @@ inline float samplePlanetProceduralSurfaceHeight(const DVec3& directionFixed, co
     const float nx = static_cast<float>(dir.x);
     const float ny = static_cast<float>(dir.y);
     const float nz = static_cast<float>(dir.z);
+    const float waterCoverage = clamp(params.waterRatio, 0.0f, 1.0f);
 
     const float continental =
         (fbm3(nx * 1.35f, ny * 1.35f, nz * 1.35f, 5, 2.04f, 0.56f, params.seed + 101) * 2.0f) - 1.0f;
-    const float continentalMask = smootherstep01(remap01(continental, -0.10f, 0.22f));
+    const float plateWarp =
+        (fbm3(nx * 2.4f, ny * 2.4f, nz * 2.4f, 4, 2.02f, 0.55f, params.seed + 131) * 2.0f) - 1.0f;
+    const float seaBias = mix(-0.18f, 0.12f, waterCoverage);
+    const float continentalMask = smootherstep01(remap01(continental + (plateWarp * 0.18f), seaBias - 0.18f, seaBias + 0.16f));
     const float macro =
         (fbm3(nx * 5.6f, ny * 5.6f, nz * 5.6f, 5, 2.08f, 0.54f, params.seed + 211) * 2.0f) - 1.0f;
+    const float regional =
+        (fbm3(nx * 22.0f, ny * 22.0f, nz * 22.0f, 4, 2.0f, 0.52f, params.seed + 257) * 2.0f) - 1.0f;
     const float ridges = ridgeNoise3(nx, ny, nz, 13.0f, 5, 2.06f, 0.58f, params.seed + 307);
+    const float shelfNoise =
+        (fbm3(nx * 36.0f, ny * 36.0f, nz * 36.0f, 4, 2.02f, 0.53f, params.seed + 347) * 2.0f) - 1.0f;
+    const float abyssNoise =
+        (fbm3(nx * 92.0f, ny * 92.0f, nz * 92.0f, 4, 2.0f, 0.5f, params.seed + 379) * 2.0f) - 1.0f;
+    const float trenchNoise = ridgeNoise3(nx, ny, nz, 92.0f, 4, 2.0f, 0.56f, params.seed + 433);
+    const float seamountNoise = ridgeNoise3(nx, ny, nz, 156.0f, 3, 2.0f, 0.52f, params.seed + 467);
     const float detail =
         (fbm3(nx * 64.0f, ny * 64.0f, nz * 64.0f, 4, 2.0f, 0.52f, params.seed + 401) * 2.0f) - 1.0f;
     const float wetBands =
         (fbm3(nx * 10.0f, ny * 10.0f, nz * 10.0f, 3, 2.0f, 0.5f, params.seed + 509) * 2.0f) - 1.0f;
     const float latitudeAbs = std::fabs(ny);
     const float snowBoost = smootherstep01(remap01(latitudeAbs, 0.62f, 0.92f));
+    const float oceanMask = 1.0f - continentalMask;
+    const float shelfMask = smootherstep01(remap01(continentalMask + (shelfNoise * 0.24f), 0.10f, 0.62f));
+    const float trenchDepth =
+        std::pow(clamp(trenchNoise, 0.0f, 1.0f), 2.6f) *
+        params.heightAmplitude *
+        0.22f *
+        oceanMask *
+        (1.0f - (shelfMask * 0.85f));
+    const float seamountLift =
+        std::pow(clamp(seamountNoise, 0.0f, 1.0f), 2.0f) *
+        params.heightAmplitude *
+        0.10f *
+        oceanMask *
+        (1.0f - (shelfMask * 0.55f));
 
     const float oceanFloor =
         params.waterLevel -
-        (params.heightAmplitude * 0.18f) +
-        (macro * params.heightAmplitude * 0.08f) -
-        ((1.0f - continentalMask) * params.heightAmplitude * 0.18f);
+        (params.heightAmplitude * (0.10f + (oceanMask * 0.26f))) +
+        (macro * params.heightAmplitude * 0.12f) +
+        (regional * params.heightAmplitude * 0.10f * oceanMask) +
+        (shelfNoise * params.heightAmplitude * 0.16f * shelfMask) +
+        (abyssNoise * params.heightAmplitude * 0.18f * oceanMask * (1.0f - shelfMask)) -
+        trenchDepth +
+        seamountLift;
     const float continentalPlateau =
         params.baseHeight +
         params.waterLevel +
-        (macro * params.heightAmplitude * 0.42f) +
-        ((continentalMask - 0.5f) * params.heightAmplitude * 0.26f);
+        (macro * params.heightAmplitude * 0.44f) +
+        (regional * params.heightAmplitude * 0.16f) +
+        ((continentalMask - 0.5f) * params.heightAmplitude * 0.22f);
     const float mountainLift =
         std::pow(clamp(ridges, 0.0f, 1.0f), std::max(1.2f, params.ridgeSharpness)) *
         params.ridgeAmplitude *
@@ -1842,6 +1882,11 @@ inline float samplePlanetProceduralSurfaceHeight(const DVec3& directionFixed, co
     const float climateRelief =
         wetBands * params.heightAmplitude * 0.06f * (0.45f + (snowBoost * 0.55f));
     float surface = mix(oceanFloor, continentalPlateau + mountainLift + climateRelief, continentalMask);
+    const float coastalShelfBlend = smootherstep01(remap01(continentalMask + (shelfNoise * 0.12f), 0.18f, 0.54f));
+    surface = mix(
+        surface,
+        mix(oceanFloor + (shelfNoise * params.heightAmplitude * 0.08f), surface, coastalShelfBlend),
+        0.55f * oceanMask);
     surface += detail * params.surfaceDetailAmplitude * mix(0.28f, 1.0f, continentalMask);
     return surface;
 }
